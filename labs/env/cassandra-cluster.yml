@@ -1,0 +1,55 @@
+# Apache Cassandra 5.0, THREE nodes, for the NoSQL lessons on partitioning and replication.
+#   docker compose -f env/cassandra-cluster.yml up -d --wait            start it (about 3 minutes: one node at a time)
+#   docker compose -f env/cassandra-cluster.yml exec cass1 nodetool status
+#   docker compose -f env/cassandra-cluster.yml exec cass1 cqlsh         a CQL prompt on node 1 (cass2, cass3 work too)
+#   docker compose -f env/cassandra-cluster.yml stop cass3               "fail" a node; `start cass3` brings it back
+#   docker compose -f env/cassandra-cluster.yml down -v                  stop all three and delete the data
+# CQL files in env/cassandra/ are mounted read-only at /sfz, so `cqlsh -f /sfz/<file>.cql` loads one.
+# No host ports: talk to the nodes through `exec`, so this file never clashes with env/cassandra.yml.
+# Memory: three small heaps, about 1 GB per container, about 3 GB in all.
+name: sfz-cassandra-cluster
+
+x-node: &node
+  image: cassandra:5.0.9
+  # Lab-only change: turn the dynamic snitch off, so a node that holds a row always answers a
+  # CONSISTENCY ONE read from its own copy. That makes the stale read in lesson 6 repeatable.
+  # Production clusters keep it on; it steers reads away from slow replicas.
+  entrypoint:
+    - bash
+    - -c
+    - "grep -q '^dynamic_snitch:' /etc/cassandra/cassandra.yaml || echo 'dynamic_snitch: false' >> /etc/cassandra/cassandra.yaml; exec docker-entrypoint.sh cassandra -f"
+  environment:
+    CASSANDRA_CLUSTER_NAME: sfz-ring
+    CASSANDRA_SEEDS: cass1                       # new nodes ask cass1 who is in the ring
+    CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    CASSANDRA_DC: dc1                            # one datacenter, one rack: replication factor 3 = every node
+    CASSANDRA_RACK: rack1
+    # left alone, each node sizes its heap from the VM's memory and three of them run out
+    MAX_HEAP_SIZE: 320M
+    HEAP_NEWSIZE: 64M
+  mem_limit: 1g
+  volumes:
+    - ./cassandra:/sfz:ro
+  healthcheck:
+    # healthy once the node has joined the ring and accepts CQL
+    test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' > /dev/null 2>&1"]
+    interval: 5s
+    timeout: 10s
+    retries: 60
+    start_period: 30s
+
+services:
+  cass1:
+    <<: *node
+    hostname: cass1
+  # Cassandra wants nodes to join one at a time, so each waits until the one before is healthy
+  cass2:
+    <<: *node
+    hostname: cass2
+    depends_on:
+      cass1: { condition: service_healthy }
+  cass3:
+    <<: *node
+    hostname: cass3
+    depends_on:
+      cass2: { condition: service_healthy }

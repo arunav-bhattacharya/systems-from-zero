@@ -1,0 +1,430 @@
+{
+  "id": "redis-09",
+  "title": "Messaging: pub/sub and Streams",
+  "minutes": 40,
+  "goal": "By the end you can say when pub/sub's at-most-once delivery is good enough, and build a Streams consumer group that settles every payment at least once, even when a worker crashes halfway through a batch.",
+  "warmup": {
+    "q": "A pod is restarting while another pod runs `PUBLISH payments:status \"p-981 approved\"`. One second later the restarted pod subscribes to the channel. What does it receive?",
+    "options": [
+      "The message: Redis keeps it until every subscriber has read it",
+      "The message, if it subscribes within the channel's retention time",
+      "Nothing: PUBLISH went to whoever was subscribed at that moment, and Redis kept no copy",
+      "An error that tells it a message was missed"
+    ],
+    "answer": 2,
+    "why": "Pub/sub stores nothing and has no retention. PUBLISH pushes the message to the connections subscribed at that instant and returns how many there were; then the message is gone. The Redis docs call it at-most-once: delivered once, if at all. A stream keeps its entries in a key, so a reader that comes back can continue from the last ID it saw."
+  },
+  "sections": [
+    {
+      "h": "Pub/sub hands each message to whoever is listening, then forgets it",
+      "body": "When a payment's status changes, the 20 pods that hold the checkout pages' WebSocket connections need to know, so they can tell the shopper. Polling a key from 20 pods every 100 ms is 200 GETs a second, for an event that happens a few times a minute per shopper.\n\nRedis pub/sub turns that around. A client sends `SUBSCRIBE payments:status`, and its connection switches into a mode where it only receives. Any other client can then run `PUBLISH payments:status \"p-981 approved\"`, and Redis pushes the message, on lesson 1's event loop, to every connection subscribed to that channel at that moment. PUBLISH returns how many subscribers it reached. A channel is only a name: it isn't a key, it takes no memory when nobody listens, and it is the same channel in every database number.\n\nThe catch is that Redis keeps no copy. If a pod is restarting, if its connection dropped for two seconds, or if it was too slow to read, the messages published in the meantime are gone for it, and nobody is told. The Redis docs say it plainly: pub/sub delivery is at-most-once, and a message the subscriber couldn't handle is \"forever lost\". A slow subscriber is the quiet case. Redis holds its unread messages in the connection's output buffer, and by default disconnects a pub/sub client whose buffer passes 32 MB, or stays above 8 MB for 60 seconds. The client reconnects and subscribes again, and everything in between is lost.\n\nSo pub/sub fits messages whose loss nobody would notice, or that the receiver can rebuild: \"something changed, reload it\", live dashboard updates, cache invalidation hints (lesson 5's client-side caching uses it). It doesn't fit \"settle payment p-981\". In Redis Cluster, `SSUBSCRIBE` and `SPUBLISH` (sharded pub/sub, Redis 7.0) keep each channel on one shard, instead of copying every message to every node.\n\nThat sets up the model for this lesson. Pub/sub is a broadcast that keeps nothing. A stream is a log that keeps everything until you trim it, and a consumer group on that log remembers, for every message, who has it and whether it is done.",
+      "try": {
+        "title": "Publish to nobody",
+        "minutes": 3,
+        "steps": [
+          "Open two terminals in the `labs` folder. In the first, subscribe from the command line: `docker compose -f env/redis.yml exec redis redis-cli SUBSCRIBE payments:status`.",
+          "In the second (`docker compose -f env/redis.yml exec redis redis-cli`), publish two messages and watch the first terminal.",
+          "Stop the subscriber with Ctrl-C, publish a third message, and ask Redis how many subscribers the channel has. Then subscribe again. Does p-983 arrive?"
+        ],
+        "code": {
+          "lang": "text",
+          "title": "the publisher's prompt",
+          "src": "PUBLISH payments:status \"p-981 approved\"\nPUBLISH payments:status \"p-982 declined\"\n# now press Ctrl-C in the subscriber's terminal\nPUBLISH payments:status \"p-983 approved\"\nPUBSUB NUMSUB payments:status"
+        },
+        "expect": "The subscriber first prints `1) \"subscribe\"`, `2) \"payments:status\"`, `3) (integer) 1`. Each of the first two PUBLISHes returns `(integer) 1`, and the subscriber prints `1) \"message\"`, `2) \"payments:status\"` and the text. After Ctrl-C, the third PUBLISH returns `(integer) 0`, and `PUBSUB NUMSUB` shows `2) (integer) 0`. Subscribing again shows only the subscribe confirmation: p-983 was never stored anywhere."
+      },
+      "refs": [
+        {
+          "title": "Redis pub/sub: delivery semantics",
+          "url": "https://redis.io/docs/latest/develop/pubsub/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A stream is a log that stays in Redis",
+      "body": "To keep messages, store them. A Redis **stream** is a key that holds an append-only log. Each entry is a small set of field-value pairs, like a hash, and has an ID that Redis assigns:\n\n```text\nXADD payments * payment p-981 amount 1250\n\"1794082605087-0\"\n```\n\nThe `*` asks Redis for the next ID. The part before the dash is the server's clock in milliseconds, and the part after it numbers the entries added in the same millisecond. IDs only grow: if the clock goes backwards, Redis keeps using the last time it saw. So an ID is a position in the log and a rough timestamp at once.\n\nReading doesn't remove anything. `XRANGE payments - +` returns every entry in order, and `XRANGE payments <id> + COUNT 100` pages forward from an ID. `XREAD COUNT 100 STREAMS payments <last-id>` returns the entries after the last ID you saw, and with `BLOCK 5000` it waits up to 5 seconds for new ones, so a reader doesn't poll. Each reader keeps its own position, the last ID it handled. After a reconnect it asks for everything after that ID and misses nothing, because the log is still there. If you know Kafka, that is one partition and an offset, in one key.\n\nAny number of readers can follow the same stream, each from its own position: an audit job from the first entry, a dashboard from `$`, which means \"only entries added after this call\". Every reader sees every entry. That is fan-out, the job pub/sub did, now without losses.\n\nA log that keeps everything grows until Redis runs out of memory, so you trim it. `XADD payments MAXLEN ~ 100000 * ...` keeps about the last 100,000 entries. The `~` allows Redis to keep a few more than that, which makes trimming much cheaper than cutting to exactly 100,000. `MINID ~ <id>` trims by age instead, since IDs are times. Inside, a stream is a radix tree whose nodes are listpacks, lesson 2's compact encoding, holding up to 100 entries or 4 KB each by default (`stream-node-max-entries` and `stream-node-max-bytes`).",
+      "try": {
+        "title": "Append, read, block and trim",
+        "minutes": 4,
+        "steps": [
+          "At a redis-cli prompt (`docker compose -f env/redis.yml exec redis redis-cli`), start from an empty stream, add three payments and read them back three ways.",
+          "Trim the stream to 2 entries exactly (no `~`), then read the first entry. Which payment is it now?",
+          "In a second terminal, run `XREAD BLOCK 0 STREAMS payments $`. It waits. Add one more payment in the first terminal and watch the second."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL payments\nXADD payments * payment p-981 amount 1250\nXADD payments * payment p-982 amount 4000\nXADD payments * payment p-983 amount 990\nXLEN payments\nXRANGE payments - + COUNT 1\nXREAD COUNT 2 STREAMS payments 0\nXTRIM payments MAXLEN 2\nXRANGE payments - + COUNT 1\n# second terminal: XREAD BLOCK 0 STREAMS payments $\nXADD payments * payment p-984 amount 2500"
+        },
+        "expect": "The first `DEL` prints `(integer) 0`, or 1 if an earlier run left the key behind. Each XADD prints an ID such as `\"1794082605087-0\"`: the server's time in ms, then a sequence number. Yours differ, and they always grow. `XLEN` prints `(integer) 3`. `XRANGE ... COUNT 1` returns p-981 with its fields, and `XREAD ... 0` returns p-981 and p-982 under the stream's name. `XTRIM` prints `(integer) 1`, and the first entry is now p-982: trimming drops the oldest. The blocked `XREAD` in the second terminal returns the moment p-984 is added, with that entry's ID and fields."
+      },
+      "refs": [
+        {
+          "title": "Redis Streams (Redis docs)",
+          "url": "https://redis.io/docs/latest/develop/data-types/streams/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A consumer group splits the stream and remembers every delivery",
+      "body": "Settling payments is a different job from showing them. Three settlement workers should share the stream so that each payment goes to exactly one of them, and if a worker dies holding a payment, somebody has to know.\n\nThat is a **consumer group**. `XGROUP CREATE payments settlers $ MKSTREAM` creates a group named `settlers` that starts at the end of the stream (`$`; use `0` to start from the first entry), and creates the stream if it doesn't exist yet. Each worker reads through the group under its own consumer name:\n\n```text\nXREADGROUP GROUP settlers w1 COUNT 10 BLOCK 2000 STREAMS payments >\n```\n\n`>` means \"entries never delivered to anyone in this group\". Redis hands each new entry to one consumer only, so three workers split the stream between them, and Redis creates a consumer the first time it sees its name.\n\nRedis also writes down every delivery. When it hands an entry to w1, it adds the entry's ID to the group's **pending entries list** (PEL), with the consumer's name, the time of delivery and a delivery count. The entry stays pending until w1 confirms it with `XACK payments settlers <id>`. A worker that crashes after reading and before XACK leaves its entries in the PEL under its name. Nothing is lost; it is only stuck, and the next section unsticks it.\n\n`XPENDING payments settlers` summarizes the PEL: how many entries are pending, the lowest and highest ID, and how many each consumer holds. `XPENDING payments settlers - + 10` lists them one by one, with owner, idle time in milliseconds and delivery count. A restarted worker reads its own pending entries first: `XREADGROUP ... STREAMS payments 0` returns the entries already delivered to it and not acknowledged, and adds one to their delivery count. When that comes back empty, it switches to `>`.\n\nThis is **at-least-once** delivery: every entry is settled at least once, and occasionally twice, when a worker settles it and crashes before its XACK. So the handler must be idempotent, which is lesson 7's idempotency key with the payment id as the key: the second settlement finds DONE and changes nothing. Compared with Kafka: a Kafka consumer commits one offset per partition, while a Redis group acknowledges each entry on its own. A slow entry doesn't hold back the ones after it, and the price is that entries can finish in any order.",
+      "try": {
+        "title": "Split a stream between two workers",
+        "minutes": 4,
+        "steps": [
+          "At a redis-cli prompt (`docker compose -f env/redis.yml exec redis redis-cli`), start clean, create the group and add four payments. Explicit IDs (`1-1`, `1-2`, ...) make the commands easy to type; in production you use `*`.",
+          "Read two entries as w1 and two as w2, then try a third read as w2. Look at `XPENDING` before and after w2's `XACK`.",
+          "Play w1 restarting: it asks for its own pending entries with ID `0`. Compare the delivery counts in the last `XPENDING` with the earlier one."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL settle\nXGROUP CREATE settle settlers $ MKSTREAM\nXADD settle 1-1 payment p-1 amount 1250\nXADD settle 1-2 payment p-2 amount 4000\nXADD settle 1-3 payment p-3 amount 990\nXADD settle 1-4 payment p-4 amount 310\nXREADGROUP GROUP settlers w1 COUNT 2 STREAMS settle >\nXREADGROUP GROUP settlers w2 COUNT 2 STREAMS settle >\nXREADGROUP GROUP settlers w2 COUNT 2 STREAMS settle >\nXPENDING settle settlers\nXACK settle settlers 1-3 1-4\nXPENDING settle settlers - + 10\nXREADGROUP GROUP settlers w1 STREAMS settle 0\nXPENDING settle settlers - + 10"
+        },
+        "expect": "The first `DEL` prints `(integer) 0`, or 1 if an earlier run left the key behind. w1 gets 1-1 and 1-2, w2 gets 1-3 and 1-4, and w2's third read prints `(nil)`: nothing new is left. The summary shows `1) (integer) 4`, IDs `\"1-1\"` to `\"1-4\"`, and 2 pending for each of w1 and w2. `XACK` prints `(integer) 2`. The list then shows only 1-1 and 1-2, owner `\"w1\"`, idle a few ms (more if you typed slowly), delivery count `(integer) 1`. w1's read with `0` returns those same two entries, and afterwards their delivery count is `(integer) 2` and their idle time is back near 0. Keep this stream: the last Try it uses it."
+      },
+      "refs": [
+        {
+          "title": "XREADGROUP (Redis docs)",
+          "url": "https://redis.io/docs/latest/commands/xreadgroup/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "When a worker dies, another one claims its entries",
+      "body": "w1 read three payments and was OOM-killed. Its three entries sit in the PEL under its name, and `>` won't give them to anyone else, because they were already delivered. Someone has to take them over.\n\n`XCLAIM payments settlers w3 30000 <id>` moves a pending entry to w3, but only if it has been idle for at least 30,000 ms. That idle check is what stops w3 from stealing an entry that w1, alive but slow, is still working on, because delivering or claiming an entry resets its idle time. `XAUTOCLAIM` (Redis 6.2) does the search for you. `XAUTOCLAIM payments settlers w3 30000 0-0 COUNT 100` scans the PEL from the start, claims up to 100 entries idle for at least 30 seconds, and returns a cursor plus the claimed entries. Call it again with the cursor until the cursor comes back as `0-0`. If it finds an entry that was trimmed out of the stream in the meantime, it drops it from the PEL and reports its ID in a third list (Redis 7.0).\n\nEach claim adds one to the entry's delivery count, and that count is how you find a **poison message**: an entry that makes every worker fail, such as a payment in a currency the settlement code rejects. Without a limit it is claimed, fails, waits 30 seconds and is claimed again, forever. So every consumer group needs a rule: when the delivery count passes, say, 5, copy the entry to a dead-letter stream for a person to look at, and XACK it. The lab's `DeadLetters` does that, in one MULTI/EXEC so the entry can't end up in both places or in neither.\n\nPick the idle threshold from your slowest legitimate run. If settling one payment can take 20 seconds at the issuer, a 5-second threshold makes two workers settle the same payment. If it is 10 minutes, a crash delays payments by 10 minutes.\n\nIn the demo, the claim right after the crash found nothing, because the entries had been idle for well under a second. 1.1 seconds later they had been idle past the 1,000 ms threshold, all three were claimed in one call, and their delivery count went from 1 to 2.",
+      "stepper": {
+        "title": "A crashed worker's entries are claimed by another",
+        "intro": "Payments 1-1 to 1-5 in the stream `payments`, the group `settlers`, and three workers. Idle times are in milliseconds.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 310\" role=\"img\" aria-label=\"Five payments wait in the stream; nothing is pending\"><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">stream: payments</text><text class=\"t-s t-a\" x=\"390\" y=\"22\" text-anchor=\"start\">group: last delivered 0-0</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"75\" y=\"57\" text-anchor=\"middle\">1-1 p-1</text><rect class=\"box\" x=\"140\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"195\" y=\"57\" text-anchor=\"middle\">1-2 p-2</text><rect class=\"box\" x=\"260\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315\" y=\"57\" text-anchor=\"middle\">1-3 p-3</text><rect class=\"box\" x=\"380\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"435\" y=\"57\" text-anchor=\"middle\">1-4 p-4</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"555\" y=\"57\" text-anchor=\"middle\">1-5 p-5</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"380\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"106\" text-anchor=\"middle\">pending entries list (PEL) of group settlers</text><text class=\"t-s t-m\" x=\"40\" y=\"130\" text-anchor=\"start\">ID</text><text class=\"t-s t-m\" x=\"110\" y=\"130\" text-anchor=\"start\">owner</text><text class=\"t-s t-m\" x=\"190\" y=\"130\" text-anchor=\"start\">idle (ms)</text><text class=\"t-s t-m\" x=\"290\" y=\"130\" text-anchor=\"start\">deliveries</text><text class=\"t-s t-ok\" x=\"210\" y=\"170\" text-anchor=\"middle\">(empty: nothing pending)</text><rect class=\"box\" x=\"414\" y=\"86\" width=\"206\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"517\" y=\"106\" text-anchor=\"middle\">consumers</text><text class=\"t-s t-code\" x=\"428\" y=\"132\" text-anchor=\"start\">w1: XREADGROUP ... &gt;</text><text class=\"t-s t-code\" x=\"428\" y=\"154\" text-anchor=\"start\">w2: XREADGROUP ... &gt;</text><text class=\"t-s t-code\" x=\"428\" y=\"176\" text-anchor=\"start\">w3: XREADGROUP ... &gt;</text><rect class=\"box\" x=\"20\" y=\"256\" width=\"600\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"283.0\" text-anchor=\"middle\">The group was created at $ before these five were added, so all five are new to it.</text></svg>",
+            "say": "Five payments sit in the stream. The group `settlers` was created at `$` before they arrived, so its last-delivered ID is still 0-0 and all five are new to it. Three workers, w1 to w3, read with `>`. Nothing has been delivered yet, so the PEL is empty."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 310\" role=\"img\" aria-label=\"w1 reads three entries and they become pending under its name\"><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">stream: payments</text><text class=\"t-s t-a\" x=\"390\" y=\"22\" text-anchor=\"start\">group: last delivered 1-3</text><rect class=\"box-a\" x=\"20\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"75\" y=\"57\" text-anchor=\"middle\">1-1 p-1</text><rect class=\"box-a\" x=\"140\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"195\" y=\"57\" text-anchor=\"middle\">1-2 p-2</text><rect class=\"box-a\" x=\"260\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315\" y=\"57\" text-anchor=\"middle\">1-3 p-3</text><rect class=\"box\" x=\"380\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"435\" y=\"57\" text-anchor=\"middle\">1-4 p-4</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"555\" y=\"57\" text-anchor=\"middle\">1-5 p-5</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"380\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"106\" text-anchor=\"middle\">pending entries list (PEL) of group settlers</text><text class=\"t-s t-m\" x=\"40\" y=\"130\" text-anchor=\"start\">ID</text><text class=\"t-s t-m\" x=\"110\" y=\"130\" text-anchor=\"start\">owner</text><text class=\"t-s t-m\" x=\"190\" y=\"130\" text-anchor=\"start\">idle (ms)</text><text class=\"t-s t-m\" x=\"290\" y=\"130\" text-anchor=\"start\">deliveries</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"154\" text-anchor=\"start\">1-1</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"154\" text-anchor=\"start\">w1</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"154\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"154\" text-anchor=\"start\">1</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"176\" text-anchor=\"start\">1-2</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"176\" text-anchor=\"start\">w1</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"176\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"176\" text-anchor=\"start\">1</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"198\" text-anchor=\"start\">1-3</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"198\" text-anchor=\"start\">w1</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"198\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"198\" text-anchor=\"start\">1</text><rect class=\"box\" x=\"414\" y=\"86\" width=\"206\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"517\" y=\"106\" text-anchor=\"middle\">consumers</text><text class=\"t-s t-a\" x=\"428\" y=\"132\" text-anchor=\"start\">w1: got 1-1, 1-2, 1-3</text><text class=\"t-s\" x=\"428\" y=\"154\" text-anchor=\"start\">w2: (waiting)</text><text class=\"t-s\" x=\"428\" y=\"176\" text-anchor=\"start\">w3: (waiting)</text><rect class=\"box\" x=\"20\" y=\"256\" width=\"600\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"283.0\" text-anchor=\"middle\">Delivering an entry records who has it, since when, and how many times it was delivered.</text></svg>",
+            "say": "w1 runs `XREADGROUP GROUP settlers w1 COUNT 3 STREAMS payments >` and gets 1-1 to 1-3. Redis moves the group's last-delivered ID to 1-3 and adds the three IDs to the PEL with owner w1, idle 0 and delivery count 1. They stay there until w1 acknowledges them."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 310\" role=\"img\" aria-label=\"w2 settles its entries; w1 is killed before any XACK\"><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">stream: payments</text><text class=\"t-s t-a\" x=\"390\" y=\"22\" text-anchor=\"start\">group: last delivered 1-5</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"75\" y=\"57\" text-anchor=\"middle\">1-1 p-1</text><rect class=\"box\" x=\"140\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"195\" y=\"57\" text-anchor=\"middle\">1-2 p-2</text><rect class=\"box\" x=\"260\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315\" y=\"57\" text-anchor=\"middle\">1-3 p-3</text><rect class=\"box-ok\" x=\"380\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"435\" y=\"57\" text-anchor=\"middle\">1-4 p-4</text><rect class=\"box-ok\" x=\"500\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"555\" y=\"57\" text-anchor=\"middle\">1-5 p-5</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"380\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"106\" text-anchor=\"middle\">pending entries list (PEL) of group settlers</text><text class=\"t-s t-m\" x=\"40\" y=\"130\" text-anchor=\"start\">ID</text><text class=\"t-s t-m\" x=\"110\" y=\"130\" text-anchor=\"start\">owner</text><text class=\"t-s t-m\" x=\"190\" y=\"130\" text-anchor=\"start\">idle (ms)</text><text class=\"t-s t-m\" x=\"290\" y=\"130\" text-anchor=\"start\">deliveries</text><text class=\"t-s t-code\" x=\"40\" y=\"154\" text-anchor=\"start\">1-1</text><text class=\"t-s t-code\" x=\"110\" y=\"154\" text-anchor=\"start\">w1</text><text class=\"t-s t-code\" x=\"190\" y=\"154\" text-anchor=\"start\">1,840</text><text class=\"t-s t-code\" x=\"290\" y=\"154\" text-anchor=\"start\">1</text><text class=\"t-s t-code\" x=\"40\" y=\"176\" text-anchor=\"start\">1-2</text><text class=\"t-s t-code\" x=\"110\" y=\"176\" text-anchor=\"start\">w1</text><text class=\"t-s t-code\" x=\"190\" y=\"176\" text-anchor=\"start\">1,840</text><text class=\"t-s t-code\" x=\"290\" y=\"176\" text-anchor=\"start\">1</text><text class=\"t-s t-code\" x=\"40\" y=\"198\" text-anchor=\"start\">1-3</text><text class=\"t-s t-code\" x=\"110\" y=\"198\" text-anchor=\"start\">w1</text><text class=\"t-s t-code\" x=\"190\" y=\"198\" text-anchor=\"start\">1,840</text><text class=\"t-s t-code\" x=\"290\" y=\"198\" text-anchor=\"start\">1</text><rect class=\"box\" x=\"414\" y=\"86\" width=\"206\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"517\" y=\"106\" text-anchor=\"middle\">consumers</text><text class=\"t-s t-bad\" x=\"428\" y=\"132\" text-anchor=\"start\">w1: OOM-killed</text><text class=\"t-s t-ok\" x=\"428\" y=\"154\" text-anchor=\"start\">w2: settled 1-4, 1-5</text><text class=\"t-s t-ok\" x=\"428\" y=\"176\" text-anchor=\"start\">    XACK: out of the PEL</text><text class=\"t-s\" x=\"428\" y=\"198\" text-anchor=\"start\">w3: (waiting)</text><rect class=\"box\" x=\"20\" y=\"256\" width=\"600\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"283.0\" text-anchor=\"middle\">w1's three entries are not lost. They are stuck: nobody gets them with &gt; again.</text></svg>",
+            "say": "w2 reads 1-4 and 1-5, settles them and runs `XACK`, which removes them from the PEL. w1 is OOM-killed before it acknowledged anything. Its three entries stay pending under its name, and their idle time keeps growing. `>` will never hand them out again, because they were already delivered."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 310\" role=\"img\" aria-label=\"w3 claims the entries that have been idle for 30 seconds\"><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">stream: payments</text><text class=\"t-s t-a\" x=\"390\" y=\"22\" text-anchor=\"start\">group: last delivered 1-5</text><rect class=\"box-a\" x=\"20\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"75\" y=\"57\" text-anchor=\"middle\">1-1 p-1</text><rect class=\"box-a\" x=\"140\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"195\" y=\"57\" text-anchor=\"middle\">1-2 p-2</text><rect class=\"box-a\" x=\"260\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315\" y=\"57\" text-anchor=\"middle\">1-3 p-3</text><rect class=\"box-ok\" x=\"380\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"435\" y=\"57\" text-anchor=\"middle\">1-4 p-4</text><rect class=\"box-ok\" x=\"500\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"555\" y=\"57\" text-anchor=\"middle\">1-5 p-5</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"380\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"106\" text-anchor=\"middle\">pending entries list (PEL) of group settlers</text><text class=\"t-s t-m\" x=\"40\" y=\"130\" text-anchor=\"start\">ID</text><text class=\"t-s t-m\" x=\"110\" y=\"130\" text-anchor=\"start\">owner</text><text class=\"t-s t-m\" x=\"190\" y=\"130\" text-anchor=\"start\">idle (ms)</text><text class=\"t-s t-m\" x=\"290\" y=\"130\" text-anchor=\"start\">deliveries</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"154\" text-anchor=\"start\">1-1</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"154\" text-anchor=\"start\">w3</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"154\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"154\" text-anchor=\"start\">2</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"176\" text-anchor=\"start\">1-2</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"176\" text-anchor=\"start\">w3</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"176\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"176\" text-anchor=\"start\">2</text><text class=\"t-s t-code t-a\" x=\"40\" y=\"198\" text-anchor=\"start\">1-3</text><text class=\"t-s t-code t-a\" x=\"110\" y=\"198\" text-anchor=\"start\">w3</text><text class=\"t-s t-code t-a\" x=\"190\" y=\"198\" text-anchor=\"start\">0</text><text class=\"t-s t-code t-a\" x=\"290\" y=\"198\" text-anchor=\"start\">2</text><rect class=\"box\" x=\"414\" y=\"86\" width=\"206\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"517\" y=\"106\" text-anchor=\"middle\">consumers</text><text class=\"t-s t-m\" x=\"428\" y=\"132\" text-anchor=\"start\">w1: (gone)</text><text class=\"t-s t-code\" x=\"428\" y=\"154\" text-anchor=\"start\">w3: XAUTOCLAIM payments</text><text class=\"t-s t-code\" x=\"428\" y=\"176\" text-anchor=\"start\">  settlers w3 30000 0-0</text><text class=\"t-s t-code t-ok\" x=\"428\" y=\"198\" text-anchor=\"start\">&gt; claimed 3, cursor 0-0</text><rect class=\"box\" x=\"20\" y=\"256\" width=\"600\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"283.0\" text-anchor=\"middle\">Claiming changes the owner, resets the idle time and adds one to the delivery count.</text></svg>",
+            "say": "Thirty seconds later w3 runs `XAUTOCLAIM payments settlers w3 30000 0-0 COUNT 100`. All three entries have been idle for over 30,000 ms, so they move to w3: owner w3, idle reset to 0, delivery count 2. The cursor comes back as 0-0: the whole PEL was scanned. Had w1 been alive and merely slow, its entries' idle time would have been lower, and they would have stayed with it."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 310\" role=\"img\" aria-label=\"w3 settles two; the poison entry goes to the dead-letter stream\"><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">stream: payments</text><text class=\"t-s t-a\" x=\"390\" y=\"22\" text-anchor=\"start\">group: last delivered 1-5</text><rect class=\"box-ok\" x=\"20\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"75\" y=\"57\" text-anchor=\"middle\">1-1 p-1</text><rect class=\"box-bad\" x=\"140\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"195\" y=\"57\" text-anchor=\"middle\">1-2 p-2</text><rect class=\"box-ok\" x=\"260\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315\" y=\"57\" text-anchor=\"middle\">1-3 p-3</text><rect class=\"box-ok\" x=\"380\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"435\" y=\"57\" text-anchor=\"middle\">1-4 p-4</text><rect class=\"box-ok\" x=\"500\" y=\"32\" width=\"110\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"555\" y=\"57\" text-anchor=\"middle\">1-5 p-5</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"380\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"106\" text-anchor=\"middle\">pending entries list (PEL) of group settlers</text><text class=\"t-s t-m\" x=\"40\" y=\"130\" text-anchor=\"start\">ID</text><text class=\"t-s t-m\" x=\"110\" y=\"130\" text-anchor=\"start\">owner</text><text class=\"t-s t-m\" x=\"190\" y=\"130\" text-anchor=\"start\">idle (ms)</text><text class=\"t-s t-m\" x=\"290\" y=\"130\" text-anchor=\"start\">deliveries</text><text class=\"t-s t-ok\" x=\"210\" y=\"170\" text-anchor=\"middle\">(empty: nothing pending)</text><rect class=\"box\" x=\"414\" y=\"86\" width=\"206\" height=\"158\" rx=\"8\"/><text class=\"t-s t-m\" x=\"517\" y=\"106\" text-anchor=\"middle\">consumers</text><text class=\"t-s t-ok\" x=\"428\" y=\"132\" text-anchor=\"start\">w3: settled 1-1, 1-3</text><text class=\"t-s t-bad\" x=\"428\" y=\"154\" text-anchor=\"start\">1-2 failed 6 times:</text><text class=\"t-s t-code\" x=\"428\" y=\"176\" text-anchor=\"start\">XADD payments:dead ...</text><text class=\"t-s t-code\" x=\"428\" y=\"198\" text-anchor=\"start\">XACK payments 1-2</text><rect class=\"box\" x=\"20\" y=\"256\" width=\"600\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"283.0\" text-anchor=\"middle\">Every entry ends acknowledged: settled, or parked in a dead-letter stream for a person.</text></svg>",
+            "say": "w3 settles 1-1 and 1-3 and acknowledges them. 1-2 has a currency the settlement code rejects, so it fails, is claimed again after 30 seconds, and fails again. When its delivery count passes 5, a sweeper copies it to `payments:dead` and acknowledges it in one transaction. The PEL is empty, and someone looks at the dead-letter stream in the morning."
+          }
+        ]
+      },
+      "try": {
+        "title": "Crash a worker and recover its entries",
+        "minutes": 3,
+        "steps": [
+          "Run `CrashRecoveryDemo` or `CrashRecoveryDemoKt` from the `labs` folder. w1 reads three payments and never acknowledges them; w2 reads and acknowledges the other two.",
+          "Before you look, predict how many entries the first XAUTOCLAIM claims, right after the crash, with a 1,000 ms threshold.",
+          "Read the delivery counts before and after the claim. What would they be after a second crash and claim?"
+        ],
+        "code": {
+          "lang": "java",
+          "title": "CrashRecoveryDemo.java",
+          "src": "package sfz.redis.l09.demo;\n\nimport redis.clients.jedis.RedisClient;\nimport redis.clients.jedis.StreamEntryID;\nimport redis.clients.jedis.params.XAddParams;\nimport redis.clients.jedis.params.XAutoClaimParams;\nimport redis.clients.jedis.params.XPendingParams;\nimport redis.clients.jedis.params.XReadGroupParams;\nimport redis.clients.jedis.resps.StreamEntry;\nimport redis.clients.jedis.resps.StreamPendingEntry;\n\nimport java.util.List;\nimport java.util.Map;\n\n/** Worker w1 reads three payments and dies before XACK. Worker w3 claims them once they have been idle for 1 s. */\npublic class CrashRecoveryDemo {\n    static final String STREAM = \"demo:l09:payments\";\n    static final String GROUP = \"settlers\";\n\n    static List<StreamEntry> readNew(RedisClient redis, String consumer, int count) {\n        List<Map.Entry<String, List<StreamEntry>>> reply = redis.xreadGroup(GROUP, consumer,\n                XReadGroupParams.xReadGroupParams().count(count), Map.of(STREAM, StreamEntryID.XREADGROUP_UNDELIVERED_ENTRY));\n        return reply == null || reply.isEmpty() ? List.of() : reply.get(0).getValue();\n    }\n\n    static void printPending(RedisClient redis) {\n        List<StreamPendingEntry> pending = redis.xpending(STREAM, GROUP, XPendingParams.xPendingParams(\"-\", \"+\", 10));\n        System.out.println(\"  XPENDING: \" + pending.size() + \" pending\");\n        for (StreamPendingEntry p : pending) {\n            System.out.printf(\"    %s owner=%s idle=%d ms deliveries=%d%n\",\n                    redis.xrange(STREAM, p.getID(), p.getID()).get(0).getFields().get(\"payment\"),\n                    p.getConsumerName(), p.getIdleTime(), p.getDeliveredTimes());\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        try (RedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()) {\n            redis.del(STREAM);\n            redis.xgroupCreate(STREAM, GROUP, StreamEntryID.XGROUP_LAST_ENTRY, true);   // XGROUP CREATE ... $ MKSTREAM\n            for (int i = 1; i <= 5; i++) {\n                redis.xadd(STREAM, XAddParams.xAddParams(), Map.of(\"payment\", \"p-\" + i, \"amount\", String.valueOf(1000 + i)));\n            }\n\n            List<StreamEntry> w1 = readNew(redis, \"w1\", 3);          // w1 takes three... and its pod is killed\n            List<StreamEntry> w2 = readNew(redis, \"w2\", 10);         // w2 takes the rest and settles them\n            for (StreamEntry e : w2) redis.xack(STREAM, GROUP, e.getID());\n            System.out.println(\"w1 read \" + w1.size() + \" and crashed; w2 read \" + w2.size() + \" and acknowledged them\");\n            printPending(redis);\n\n            var early = redis.xautoclaim(STREAM, GROUP, \"w3\", 1_000, new StreamEntryID(0, 0),\n                    XAutoClaimParams.xAutoClaimParams().count(100));\n            System.out.println(\"w3 XAUTOCLAIM min-idle 1000 ms, right away: claimed \" + early.getValue().size());\n\n            Thread.sleep(1_100);\n            var claimed = redis.xautoclaim(STREAM, GROUP, \"w3\", 1_000, new StreamEntryID(0, 0),\n                    XAutoClaimParams.xAutoClaimParams().count(100));\n            System.out.println(\"w3 XAUTOCLAIM min-idle 1000 ms, 1.1 s later: claimed \" + claimed.getValue().size()\n                    + \", next cursor \" + claimed.getKey());\n            printPending(redis);\n            for (StreamEntry e : claimed.getValue()) redis.xack(STREAM, GROUP, e.getID());   // settle, then ack\n            System.out.println(\"w3 acknowledged them. XPENDING total: \" + redis.xpending(STREAM, GROUP).getTotal());\n        }\n    }\n}\n",
+          "run": "./gradlew :redis:demo -Pmain=sfz.redis.l09.demo.CrashRecoveryDemo",
+          "file": "labs/redis/src/demo/java/sfz/redis/l09/demo/CrashRecoveryDemo.java",
+          "alt": {
+            "lang": "kotlin",
+            "title": "CrashRecoveryDemo.kt",
+            "src": "package sfz.redis.l09.demo\n\nimport redis.clients.jedis.RedisClient\nimport redis.clients.jedis.StreamEntryID\nimport redis.clients.jedis.params.XAddParams\nimport redis.clients.jedis.params.XAutoClaimParams\nimport redis.clients.jedis.params.XPendingParams\nimport redis.clients.jedis.params.XReadGroupParams\nimport redis.clients.jedis.resps.StreamEntry\n\n/** Worker w1 reads three payments and dies before XACK. Worker w3 claims them once they have been idle for 1 s. */\nprivate const val STREAM = \"demo:l09:payments\"\nprivate const val GROUP = \"settlers\"\n\nprivate fun RedisClient.readNew(consumer: String, count: Int): List<StreamEntry> =\n    xreadGroup(GROUP, consumer, XReadGroupParams.xReadGroupParams().count(count),\n        mapOf(STREAM to StreamEntryID.XREADGROUP_UNDELIVERED_ENTRY))?.firstOrNull()?.value.orEmpty()\n\nprivate fun RedisClient.printPending() {\n    val pending = xpending(STREAM, GROUP, XPendingParams.xPendingParams(\"-\", \"+\", 10))\n    println(\"  XPENDING: ${pending.size} pending\")\n    for (p in pending) {\n        val payment = xrange(STREAM, p.id, p.id).single().fields[\"payment\"]\n        println(\"    $payment owner=${p.consumerName} idle=${p.idleTime} ms deliveries=${p.deliveredTimes}\")\n    }\n}\n\nfun main() {\n    RedisClient.builder().hostAndPort(\"localhost\", 6379).build().use { redis ->\n        redis.del(STREAM)\n        redis.xgroupCreate(STREAM, GROUP, StreamEntryID.XGROUP_LAST_ENTRY, true)    // XGROUP CREATE ... $ MKSTREAM\n        (1..5).forEach { redis.xadd(STREAM, XAddParams.xAddParams(), mapOf(\"payment\" to \"p-$it\", \"amount\" to \"${1000 + it}\")) }\n\n        val w1 = redis.readNew(\"w1\", 3)                            // w1 takes three... and its pod is killed\n        val w2 = redis.readNew(\"w2\", 10)                           // w2 takes the rest and settles them\n        w2.forEach { redis.xack(STREAM, GROUP, it.id) }\n        println(\"w1 read ${w1.size} and crashed; w2 read ${w2.size} and acknowledged them\")\n        redis.printPending()\n\n        val early = redis.xautoclaim(STREAM, GROUP, \"w3\", 1_000, StreamEntryID(0, 0), XAutoClaimParams.xAutoClaimParams().count(100))\n        println(\"w3 XAUTOCLAIM min-idle 1000 ms, right away: claimed ${early.value.size}\")\n\n        Thread.sleep(1_100)\n        val claimed = redis.xautoclaim(STREAM, GROUP, \"w3\", 1_000, StreamEntryID(0, 0), XAutoClaimParams.xAutoClaimParams().count(100))\n        println(\"w3 XAUTOCLAIM min-idle 1000 ms, 1.1 s later: claimed ${claimed.value.size}, next cursor ${claimed.key}\")\n        redis.printPending()\n        claimed.value.forEach { redis.xack(STREAM, GROUP, it.id) }  // settle, then ack\n        println(\"w3 acknowledged them. XPENDING total: ${redis.xpending(STREAM, GROUP).total}\")\n    }\n}\n",
+            "run": "./gradlew :redis:demo -Pmain=sfz.redis.l09.demo.CrashRecoveryDemoKt",
+            "file": "labs/redis/src/demo/kotlin/sfz/redis/l09/demo/CrashRecoveryDemo.kt"
+          }
+        },
+        "expect": "`w1 read 3 and crashed; w2 read 2 and acknowledged them`, then 3 pending: p-1 to p-3, `owner=w1`, idle a few ms to a few hundred (29 ms in the Java run, 437 ms in the Kotlin one) and `deliveries=1`. The first XAUTOCLAIM prints `claimed 0`: not idle long enough. 1.1 s later it prints `claimed 3, next cursor 0-0`, and the list shows `owner=w3`, idle near 0 and `deliveries=2`. After the XACKs, `XPENDING total: 0`. Another crash and claim would make the count 3."
+      },
+      "refs": [
+        {
+          "title": "XAUTOCLAIM (Redis docs)",
+          "url": "https://redis.io/docs/latest/commands/xautoclaim/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Redis 8 adds hand-back, recovery in the read, and producer dedup",
+      "body": "Three recent commands shorten the code above. Each needs a recent Redis 8, so write the version into your runbook.\n\n`XNACK` (8.8) lets a worker hand entries back on purpose instead of waiting for them to be claimed. The entries become unowned and immediately claimable, whatever the idle threshold. Its mode says what happens to the delivery count. `SILENT` subtracts one, for a clean shutdown where the delivery shouldn't count. `FAIL` leaves it, for \"I couldn't process this, let someone else try\". `FATAL` sets it to the maximum, which marks a poison message so that your dead-letter rule catches it at once.\n\n`XREADGROUP ... CLAIM <min-idle>` (8.4) folds recovery into the normal read. `XREADGROUP GROUP settlers w3 COUNT 10 CLAIM 30000 STREAMS payments >` first returns pending entries idle for at least 30 seconds (XNACKed ones first, then the longest idle), then new entries. Each claimed entry comes with two extra values: milliseconds since its last delivery, and how many times it was delivered before. One loop now covers new work and a crashed worker's work.\n\n`XADD ... IDMP <producer-id> <idempotent-id>` (8.6) fixes duplicates on the producing side. A producer that times out on XADD and retries can add the same payment twice, and the group would settle both. With IDMP, Redis remembers each producer's recent ids and returns the original entry's ID instead of adding a second entry. On the lab server it remembered the last 100 ids per producer for 100 seconds (`XINFO STREAM` shows `idmp-maxsize` and `idmp-duration`), and `XCFGSET` changes both. That window covers a retry, not a replay of yesterday's file.\n\nTrimming and the PEL meet in one more place. By default `MAXLEN` trimming removes old entries even if some group still has them pending: the PEL keeps the ID, and reading it returns the ID with nil instead of fields. Since Redis 8.2, `ACKED` on XADD or XTRIM trims only entries that every group has acknowledged.",
+      "try": {
+        "title": "Hand back, claim in the read, add twice",
+        "minutes": 4,
+        "steps": [
+          "Continue at the same prompt, with the `settle` stream from the third Try it: 1-1 and 1-2 are pending for w1.",
+          "Hand 1-1 back with `XNACK ... FAIL` and look at the PEL. Then add 1-5 and read as w3 with `CLAIM 3600000`: only entries idle for an hour qualify. Which entries come back, and in what order?",
+          "Add the same payment twice with the same `IDMP` producer and id, and count the entries."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "XNACK settle settlers FAIL IDS 1 1-1\nXPENDING settle settlers - + 10\nXADD settle 1-5 payment p-5 amount 700\nXREADGROUP GROUP settlers w3 COUNT 10 CLAIM 3600000 STREAMS settle >\nXPENDING settle settlers - + 10\nXADD settle IDMP checkout-3 pay-6 * payment p-6 amount 2500\nXADD settle IDMP checkout-3 pay-6 * payment p-6 amount 2500\nXLEN settle"
+        },
+        "expect": "`XNACK` prints `(integer) 1`. The PEL now shows 1-1 with owner `\"\"`, idle `(integer) -1` and delivery count 2 (FAIL kept it), while 1-2 is still w1's. The CLAIM read returns 1-1 first, with two extra values: a huge \"ms since last delivery\" such as `1794082612818` (XNACK set its delivery time to 0, the epoch) and `(integer) 2`, then the new 1-5 with `0` and `0`. 1-2 isn't claimed: it hasn't been idle for an hour. The PEL then shows 1-1 and 1-5 owned by w3, 1-1 with 3 deliveries. Both IDMP XADDs print the same ID, such as `\"1794082612820-0\"`, and `XLEN` prints `(integer) 6`: the retry added nothing."
+      },
+      "refs": [
+        {
+          "title": "XNACK (Redis 8.8)",
+          "url": "https://redis.io/docs/latest/commands/xnack/",
+          "kind": "docs"
+        },
+        {
+          "title": "XADD, with IDMP and trimming options",
+          "url": "https://redis.io/docs/latest/commands/xadd/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Pub/sub is the public address system in a train station: an announcement reaches whoever is on the platform right now, and someone who arrives a minute later never hears it. A stream is the departures board's printed log, kept at the ticket office, that anyone can read from any line onward. A consumer group is the parcel desk behind it. Each parcel is handed to one courier, and the clerk writes in a ledger who took it and when. When a courier doesn't come back, the clerk checks the ledger and, after half an hour, hands the parcel to someone else and adds a tick next to it; a parcel with five ticks goes to the lost-and-found shelf. The analogy breaks on delivery: a real clerk can see a parcel arrive, while Redis only knows a courier finished when the courier says so with XACK, so a courier who delivers and then forgets to report gets the parcel's job done twice.",
+  "in_your_world": "You already run Kafka, so the question is when a Redis stream is the better tool. Kafka keeps days of history on disk, partitions for parallelism, and keeps order inside a partition; a Redis stream lives in memory, holds what you trim it to, and acknowledges each entry on its own, so one slow payment doesn't stall the ones behind it. Streams fit work queues inside one service: settlement retries, outbound webhook deliveries, fraud checks that call a slow external API. Kafka stays the system of record between services. Pub/sub fits signals: the status push to checkout pages, or telling every pod to drop a cached merchant. If you consume streams from a Quarkus service with a non-blocking client (Lettuce or the Vert.x Redis client), give the blocking `XREADGROUP ... BLOCK` its own connection: on a shared, multiplexed connection, every other command waits behind it. And keep the settlement idempotent by payment id, because every reliable consumer, Kafka or Redis, eventually delivers twice.",
+  "mistake": "The most common mistake is a consumer group with no recovery: workers read with `>`, settle, XACK, and nothing ever looks at the PEL. It works for months. Then a deploy kills pods mid-batch, and the entries they held stay pending forever, because `>` never redelivers them. Nobody notices until a merchant asks where a payout went. People build it that way because the happy path is complete and Kafka redelivers after a rebalance without any extra code. Add a recovery loop (`XAUTOCLAIM` on a timer, or `XREADGROUP ... CLAIM` on Redis 8.4), a dead-letter rule on the delivery count, and an alert on the age of the oldest pending entry (`XPENDING` summary).",
+  "compare": {
+    "title": "A settlement worker loop in Java and Kotlin",
+    "java": {
+      "title": "SettlementLoop.java",
+      "src": "while (running) {\n    List<Map.Entry<String, List<StreamEntry>>> batch = redis.xreadGroup(\"settlers\", consumer,\n            XReadGroupParams.xReadGroupParams().count(10).block(2_000),\n            Map.of(\"payments\", StreamEntryID.XREADGROUP_UNDELIVERED_ENTRY));\n    if (batch == null || batch.isEmpty()) continue;                // BLOCK timed out: nothing new\n    for (StreamEntry e : batch.get(0).getValue()) {\n        try {\n            settle(e.getFields());                                 // idempotent: keyed by the payment id\n            redis.xack(\"payments\", \"settlers\", e.getID());\n        } catch (Exception ex) {\n            log.warn(\"left pending, a claim will retry it: \" + e.getID(), ex);\n        }\n    }\n}"
+    },
+    "kotlin": {
+      "title": "SettlementLoop.kt",
+      "src": "while (running) {\n    val batch = redis.xreadGroup(\"settlers\", consumer,\n        XReadGroupParams.xReadGroupParams().count(10).block(2_000),\n        mapOf(\"payments\" to StreamEntryID.XREADGROUP_UNDELIVERED_ENTRY))\n        ?.firstOrNull()?.value ?: continue                         // BLOCK timed out: nothing new\n    for (e in batch) {\n        runCatching { settle(e.fields) }                           // idempotent: keyed by the payment id\n            .onSuccess { redis.xack(\"payments\", \"settlers\", e.id) }\n            .onFailure { log.warn(\"left pending, a claim will retry it: ${e.id}\", it) }\n    }\n}"
+    },
+    "note": "Both loops send the same commands: XREADGROUP with BLOCK, then one XACK per settled entry. A failure leaves the entry pending on purpose; the recovery loop claims it later. Kotlin's safe calls and `?: continue` turn the null-or-empty reply into one expression, and `runCatching` makes success and failure two named branches. One caution: `runCatching` also catches a coroutine's `CancellationException`, so inside a coroutine rethrow it. Jedis's `RedisClient` borrows a pooled connection for the whole 2-second BLOCK, so size the pool for the number of workers. With Lettuce, give the loop a dedicated connection."
+  },
+  "worked": {
+    "title": "Replace the status pub/sub with a stream that every pod reads",
+    "steps": [
+      {
+        "say": "The publisher appends instead of broadcasting. `MAXLEN ~ 100000` keeps the stream bounded in the same command, and the reply is the new entry's ID.",
+        "code": "StreamEntryID id = redis.xadd(\"payments:status\",\n        XAddParams.xAddParams().maxLen(100_000).approximateTrimming(),\n        Map.of(\"payment\", \"p-981\", \"status\", \"approved\"));     // XADD payments:status MAXLEN ~ 100000 * ...",
+        "lang": "java",
+        "alt_code": "val id = redis.xadd(\"payments:status\",\n    XAddParams.xAddParams().maxLen(100_000).approximateTrimming(),\n    mapOf(\"payment\" to \"p-981\", \"status\" to \"approved\"))       // XADD payments:status MAXLEN ~ 100000 * ...",
+        "alt_lang": "kotlin"
+      },
+      {
+        "say": "Each pod reads the whole stream, so there is no group: every pod sees every status change. The pod keeps its position in `lastId`, starting at `$`, \"only what arrives from now on\", and blocks for up to 5 seconds instead of polling.",
+        "code": "StreamEntryID lastId = StreamEntryID.XREAD_NEW_ENTRY;           // \"$\"\nwhile (running) {\n    List<Map.Entry<String, List<StreamEntry>>> reply = redis.xread(\n            XReadParams.xReadParams().count(100).block(5_000), Map.of(\"payments:status\", lastId));\n    if (reply == null || reply.isEmpty()) continue;            // 5 s with nothing new\n    for (StreamEntry e : reply.get(0).getValue()) {\n        pushToBrowsers(e.getFields());\n        lastId = e.getID();                                    // our position in the log\n    }\n}",
+        "lang": "java",
+        "alt_code": "var lastId: StreamEntryID = StreamEntryID.XREAD_NEW_ENTRY      // \"$\"\nwhile (running) {\n    val entries = redis.xread(XReadParams.xReadParams().count(100).block(5_000),\n        mapOf(\"payments:status\" to lastId))?.firstOrNull()?.value ?: continue   // 5 s with nothing new\n    for (e in entries) {\n        pushToBrowsers(e.fields)\n        lastId = e.id                                          // our position in the log\n    }\n}",
+        "alt_lang": "kotlin"
+      },
+      {
+        "say": "Now a dropped connection costs nothing. When the client reconnects, the loop asks for everything after `lastId`, and the entries published during the outage are still in the stream. With pub/sub they were gone. A pod that restarts begins again at `$`, which is right for a page that only shows live updates.",
+        "code": "",
+        "lang": ""
+      },
+      {
+        "say": "Trim by age when time matters more than count. Stream IDs are milliseconds, so \"one hour ago\" is just a number: now minus 3,600,000. `MINID ~` with that number drops every entry older than an hour.",
+        "code": "XTRIM payments:status MINID ~ 1794079005087",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A settlement worker that survives crashes, and a dead-letter sweeper",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/redis/src/main/java/sfz/redis/l09/SettlementWorker.java",
+      "labs/redis/src/main/kotlin/sfz/redis/l09/DeadLetters.kt"
+    ],
+    "run": "./gradlew :redis:test --tests 'sfz.redis.l09.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. All 10 fail: six in `SettlementWorkerTest` and four in `DeadLettersTest`, against the shared Redis container. `createGroup` is already written; read it first.",
+      "In `SettlementWorker.java`, write `processNew`: one XREADGROUP with `>`, then settle and XACK each entry, leaving failures pending. Run `./gradlew :redis:test --tests 'sfz.redis.l09.SettlementWorkerTest'`: four tests pass.",
+      "Write `recoverAbandoned` with an XAUTOCLAIM loop that follows the cursor until it is 0-0. Read the test `another worker recovers a crashed worker's entries ...`: its first claim must find nothing, because the entries are not idle yet.",
+      "In `DeadLetters.kt`, write `sweep`: XPENDING, then for each entry over the limit, XADD to the dead-letter stream and XACK in one transaction. Run all 10 tests."
+    ],
+    "hints": [
+      "`redis.xreadGroup(...)` returns null or an empty list when there is nothing new. Loop over every `Map.Entry` in the reply and over its `getValue()` list.",
+      "Put the settle-then-XACK step in one private method and call it from both `processNew` and `recoverAbandoned`, so a failure is handled the same way in both.",
+      "`page.getKey()` is the next cursor. Stop when it equals `new StreamEntryID(0, 0)`: `cursor.compareTo(start) == 0`.",
+      "Kotlin sees `getID()`, `getDeliveredTimes()` and `getFields()` as `id`, `deliveredTimes` and `fields`. `fields + mapOf(\"original-id\" to p.id.toString(), ...)` builds the copy."
+    ],
+    "done_when": "All 10 tests in `sfz.redis.l09` pass."
+  },
+  "drill": {
+    "title": "The recovery loop from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write `recoverAbandoned(minIdleMillis)` with Jedis: XAUTOCLAIM from cursor 0-0 in pages of 100, settle and XACK each claimed entry, and stop when the cursor comes back as 0-0. Then say why the min-idle threshold must be longer than your slowest settlement.",
+    "answer": {
+      "lang": "java",
+      "src": "int recoverAbandoned(long minIdleMillis) {\n    StreamEntryID start = new StreamEntryID(0, 0);\n    StreamEntryID cursor = start;\n    int settled = 0;\n    do {\n        Map.Entry<StreamEntryID, List<StreamEntry>> page = redis.xautoclaim(\"payments\", \"settlers\", consumer,\n                minIdleMillis, cursor, XAutoClaimParams.xAutoClaimParams().count(100));\n        for (StreamEntry e : page.getValue()) {\n            settle(e.getFields());                              // idempotent by payment id\n            redis.xack(\"payments\", \"settlers\", e.getID());\n            settled++;\n        }\n        cursor = page.getKey();                                 // 0-0: the whole PEL was scanned\n    } while (cursor.compareTo(start) != 0);\n    return settled;\n}\n// a shorter threshold claims entries a live but slow worker is still settling: they get settled twice",
+      "alt": {
+        "lang": "kotlin",
+        "src": "fun recoverAbandoned(minIdleMillis: Long): Int {\n    val start = StreamEntryID(0, 0)\n    var cursor = start\n    var settled = 0\n    do {\n        val page = redis.xautoclaim(\"payments\", \"settlers\", consumer,\n            minIdleMillis, cursor, XAutoClaimParams.xAutoClaimParams().count(100))\n        for (e in page.value) {\n            settle(e.fields)                                    // idempotent by payment id\n            redis.xack(\"payments\", \"settlers\", e.id)\n            settled++\n        }\n        cursor = page.key                                       // 0-0: the whole PEL was scanned\n    } while (cursor.compareTo(start) != 0)\n    return settled\n}\n// a shorter threshold claims entries a live but slow worker is still settling: they get settled twice"
+      }
+    }
+  },
+  "recap": [
+    "Pub/sub is at-most-once: PUBLISH reaches the subscribers connected at that moment and stores nothing. Use it for signals a receiver can afford to miss.",
+    "A stream is an append-only log in a key, with IDs of the form `<ms>-<seq>`. Readers keep their own position and block with `XREAD BLOCK`; trim with `MAXLEN ~` or `MINID ~`.",
+    "A consumer group gives each new entry (`>`) to one consumer and records it in the PEL until XACK: at-least-once delivery, so handlers must be idempotent.",
+    "A crashed consumer's entries stay pending; `XAUTOCLAIM` with a min-idle-time hands them to a live one and adds one to their delivery count.",
+    "A rising delivery count marks a poison message: move it to a dead-letter stream and XACK it. Redis 8 adds XNACK (8.8), XREADGROUP CLAIM (8.4) and XADD IDMP (8.6)."
+  ],
+  "quiz": [
+    {
+      "q": "`PUBLISH payments:status \"p-990 approved\"` returns `(integer) 0`. What does that tell you?",
+      "options": [
+        "The message is queued until a subscriber connects",
+        "Nobody was subscribed at that moment, so the message went nowhere",
+        "The channel doesn't exist yet and has to be created first",
+        "Redis refused the message because a subscriber's output buffer is full"
+      ],
+      "answer": 1,
+      "why": "PUBLISH returns how many subscribers received the message, and 0 means none were connected. Channels are never created or stored, and nothing is queued: the message is gone. That return value is the only feedback pub/sub gives you."
+    },
+    {
+      "q": "Worker w1 reads 10 entries with `XREADGROUP ... >`, settles and acknowledges 7, and is killed. A new w1 starts with the same consumer name and runs `XREADGROUP GROUP settlers w1 STREAMS payments 0`. What does it get?",
+      "options": [
+        "The 3 unacknowledged entries, and their delivery count goes up to 2",
+        "Nothing: entries delivered before a restart are lost",
+        "All 10 entries again, because w1 is a new connection",
+        "An error, because a consumer named w1 already exists"
+      ],
+      "answer": 0,
+      "why": "The PEL belongs to the group and records the consumer by name, not by connection, so the 3 entries are still pending under w1. Reading with an ID instead of `>` returns this consumer's pending entries and counts another delivery. The 7 acknowledged ones left the PEL for good."
+    },
+    {
+      "q": "Your recovery loop runs `XAUTOCLAIM` with a min-idle-time of 2 seconds, but settling a payment sometimes takes 5 seconds at the issuer. What happens?",
+      "options": [
+        "Nothing: XAUTOCLAIM never takes an entry from a consumer that is still connected",
+        "XAUTOCLAIM waits until the first worker has finished",
+        "Slow entries are claimed while the first worker is still settling them, so some payments are settled twice",
+        "The slow entries are removed from the PEL"
+      ],
+      "answer": 2,
+      "why": "Redis doesn't know whether a consumer is alive or working; it only knows how long an entry has been idle since its last delivery. After 2 seconds a slow entry looks abandoned and is handed to another worker. Set the threshold above your slowest legitimate settlement, and keep the handler idempotent for the cases it still misses."
+    },
+    {
+      "q": "From lesson 7: a consumer group gives at-least-once delivery. What makes a second settlement of payment p-981 harmless?",
+      "options": [
+        "Acknowledging the entry twice",
+        "Reading with `NOACK` so entries are never redelivered",
+        "Trimming the stream right after each read",
+        "Settling through an idempotency key on the payment id, so the second run finds DONE and changes nothing"
+      ],
+      "answer": 3,
+      "why": "A second delivery happens when a worker settles and dies before XACK, and Redis can't prevent it. The handler has to: claim `settle:p-981` with `SET ... NX GET` before the work and store DONE after it, as in lesson 7. NOACK swaps duplicates for losses (at-most-once), and trimming doesn't change who already has the entry.",
+      "from": "redis-07"
+    },
+    {
+      "q": "`XPENDING payments settlers - + 10` shows one entry with a delivery count of 47. What is the most likely cause, and the fix?",
+      "options": [
+        "47 workers are in the group; reduce them",
+        "It is a poison message that fails every worker; move it to a dead-letter stream and XACK it",
+        "Redis delivered it 47 times by mistake; restart Redis",
+        "The entry is too large; raise MAXLEN"
+      ],
+      "answer": 1,
+      "why": "Every claim adds one to the count, so 47 means it has been claimed and failed again and again. Left alone it keeps failing and keeps wasting a worker every few seconds. Past a limit, copy it to a dead-letter stream for a person, acknowledge it, and alert on it. On Redis 8.8, `XNACK ... FATAL` lets the failing worker mark it at once."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What delivery guarantee does Redis pub/sub give?",
+      "back": "At-most-once: a message reaches the subscribers connected at that moment, is never stored and never redelivered."
+    },
+    {
+      "front": "What does a stream entry ID mean?",
+      "back": "`<milliseconds>-<sequence>`, assigned by `XADD *`. IDs always grow, even if the server's clock goes back."
+    },
+    {
+      "front": "XREADGROUP with `>` versus `0`?",
+      "back": "`>`: entries never delivered to anyone in the group. `0`: this consumer's own pending entries, whose delivery count goes up."
+    },
+    {
+      "front": "What is the PEL?",
+      "back": "A consumer group's pending entries list: every delivered, unacknowledged entry with its owner, idle time and delivery count. XACK removes an entry."
+    },
+    {
+      "front": "What does XAUTOCLAIM do?",
+      "back": "Scans the PEL from a cursor and gives entries idle for at least min-idle-time to this consumer, adding one to their delivery count. Repeat until the cursor is 0-0."
+    },
+    {
+      "front": "How do you handle a poison message?",
+      "back": "Spot it by its rising delivery count; past a limit, copy it to a dead-letter stream and XACK it, in one transaction."
+    },
+    {
+      "front": "What does `XADD ... IDMP <producer> <id>` do (Redis 8.6)?",
+      "back": "Dedupes a producer's retries: the same producer and id within the window returns the original entry's ID instead of adding another."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Pub/sub channel",
+      "plain": "A name that messages are published to; Redis pushes each message to the connections subscribed at that moment and keeps nothing."
+    },
+    {
+      "term": "At-most-once",
+      "plain": "Each message is delivered once or not at all; losses are possible, duplicates are not."
+    },
+    {
+      "term": "At-least-once",
+      "plain": "Each message is delivered until it is acknowledged; nothing is lost, and duplicates are possible."
+    },
+    {
+      "term": "Stream",
+      "plain": "A Redis key holding an append-only log of entries, each with an ID and field-value pairs."
+    },
+    {
+      "term": "Consumer group",
+      "plain": "A named reader of a stream that hands each new entry to one of its consumers and tracks what each has acknowledged."
+    },
+    {
+      "term": "Pending entries list (PEL)",
+      "plain": "The group's record of delivered but unacknowledged entries, with owner, idle time and delivery count."
+    },
+    {
+      "term": "Poison message",
+      "plain": "An entry that makes every consumer fail, so it is redelivered forever unless something moves it aside."
+    },
+    {
+      "term": "Dead-letter stream",
+      "plain": "A separate stream where entries that failed too many times are copied for a person to inspect."
+    }
+  ],
+  "explain_back": {
+    "prompt": "The \"payment settled\" events are sent with PUBLISH today, and the ledger service subscribes. Explain to a teammate why that loses payments, and what changes when you move to a stream with a consumer group.",
+    "answer": "PUBLISH delivers to whoever is subscribed at that instant and stores nothing. Whenever the ledger service restarts, deploys or loses its connection for a second, the events published in that window are gone, and nothing tells anyone. A slow ledger can even be disconnected by Redis when its output buffer grows past the pub/sub limit. With a stream, each event is an entry in a key. The ledger workers read through a consumer group: each new entry goes to one worker and is recorded in the pending entries list until that worker acknowledges it with XACK. If a worker dies before acknowledging, its entries stay pending, and a recovery loop with XAUTOCLAIM gives them to another worker once they have been idle long enough. So nothing is lost, but an entry can be processed twice, which means the ledger write must be idempotent, keyed by the payment id. We also need a dead-letter rule for entries whose delivery count keeps rising, a MAXLEN or MINID trim so the stream doesn't grow forever, and an alert on old pending entries."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Measuring a group's backlog.** `XINFO GROUPS payments` shows each group's `last-delivered-id`, how many entries are `pending`, and since Redis 7.0 `entries-read` and `lag`: how many entries were added after the group's last delivered one. Lag that keeps rising means the workers can't keep up; a pending count that keeps rising means they read but don't acknowledge.\n\n**Keyspace notifications.** Redis can publish an event whenever a key changes or expires (`notify-keyspace-events`, off by default). It is built on pub/sub, so it inherits at-most-once delivery: a subscriber that was disconnected misses expirations for good. Don't build a reliable job on \"tell me when this key expires\".\n\n**Bounding a read.** `COUNT` limits entries per stream. Redis 8.10 added `MAXCOUNT` and `MAXSIZE` to XREAD and XREADGROUP, to cap the total entries and bytes of one reply when a worker reads several streams at once.\n\n**Acknowledge and delete together.** Redis 8.2 added `XACKDEL`, which acknowledges entries and deletes them from the stream in one command, and `XDELEX`. With the `KEEPREF`, `DELREF` and `ACKED` options they decide what happens to other groups' references to those entries. A stream used only as a work queue by one group can then shrink as work completes, without a separate trim.\n\n**Streams and Kafka, side by side.** A Kafka topic is partitioned across brokers and kept on disk for days; a Redis stream is one key on one server (one hash slot in Cluster, lesson 11), kept in memory and copied to disk only by Redis persistence (lesson 10). Kafka keeps order within a partition and commits one offset per partition; a Redis group acknowledges each entry and lets entries finish in any order. For 50,000 settlement retries a day inside one service, a stream is simpler. For the event history several teams build on, Kafka is the system of record."
+  },
+  "sources": [
+    {
+      "title": "Redis pub/sub (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/pubsub/"
+    },
+    {
+      "title": "Redis Streams (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/data-types/streams/"
+    },
+    {
+      "title": "XREADGROUP (Redis docs)",
+      "url": "https://redis.io/docs/latest/commands/xreadgroup/"
+    },
+    {
+      "title": "XAUTOCLAIM (Redis docs)",
+      "url": "https://redis.io/docs/latest/commands/xautoclaim/"
+    },
+    {
+      "title": "XNACK (Redis docs)",
+      "url": "https://redis.io/docs/latest/commands/xnack/"
+    }
+  ]
+}

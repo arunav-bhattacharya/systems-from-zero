@@ -1,0 +1,137 @@
+WEBVTT
+
+1
+00:00:02.700 --> 00:00:08.595
+Two pods can each start the nightly settlement batch, which builds the payout file for the bank.
+
+2
+00:00:08.595 --> 00:00:11.481
+If both run it, every merchant gets paid twice.
+
+3
+00:00:11.700 --> 00:00:13.881
+So they take a lock in Redis.
+
+4
+00:00:13.881 --> 00:00:17.943
+Pod A sends a SET command with two options, NX and PX.
+
+5
+00:00:18.167 --> 00:00:21.851
+NX means: only set the key if it doesn't exist yet.
+
+6
+00:00:21.851 --> 00:00:24.452
+The key is free, so A gets the lock.
+
+7
+00:00:24.667 --> 00:00:25.813
+PX sets a lease.
+
+8
+00:00:25.813 --> 00:00:32.979
+Redis deletes the key by itself after 30 seconds, so a pod that crashes can't hold the lock forever.
+
+9
+00:00:33.200 --> 00:00:35.189
+Pod B sends the same command.
+
+10
+00:00:35.189 --> 00:00:38.824
+The key already exists, so B gets nothing, and waits.
+
+11
+00:00:39.033 --> 00:00:40.133
+Now A freezes.
+
+12
+00:00:40.133 --> 00:00:45.397
+A 35-second garbage collection pause halts every thread in its JVM.
+
+13
+00:00:45.397 --> 00:00:48.461
+Pod A has no idea that time is passing.
+
+14
+00:00:48.667 --> 00:00:49.902
+30 seconds go by.
+
+15
+00:00:49.902 --> 00:00:53.245
+The lease runs out, and Redis deletes the key.
+
+16
+00:00:53.245 --> 00:00:56.516
+As far as Redis knows, nobody holds the lock.
+
+17
+00:00:57.033 --> 00:00:59.308
+B asks again and gets the lock.
+
+18
+00:00:59.308 --> 00:01:01.143
+B writes the payout file.
+
+19
+00:01:01.367 --> 00:01:02.404
+Then A wakes up.
+
+20
+00:01:02.404 --> 00:01:04.869
+From where A stands, nothing happened.
+
+21
+00:01:04.869 --> 00:01:09.280
+It still thinks it holds the lock, so it writes the payout file too.
+
+22
+00:01:09.500 --> 00:01:11.077
+A lease can't prevent this.
+
+23
+00:01:11.077 --> 00:01:15.807
+Checking the lock first doesn't help: the pause can strike right after the check.
+
+24
+00:01:16.033 --> 00:01:17.783
+The fix is a fencing token.
+
+25
+00:01:17.783 --> 00:01:24.132
+The script that takes the lock also adds one to a counter in Redis, and hands back the new number.
+
+26
+00:01:24.333 --> 00:01:25.338
+Run it again.
+
+27
+00:01:25.338 --> 00:01:28.970
+Pod A gets the lock with token 33, then pauses.
+
+28
+00:01:28.970 --> 00:01:33.143
+The lease runs out, and B gets the lock with token 34.
+
+29
+00:01:33.367 --> 00:01:39.920
+Every write carries its token, and the store remembers the highest token it has accepted.
+
+30
+00:01:39.920 --> 00:01:41.172
+B writes with 34.
+
+31
+00:01:41.172 --> 00:01:41.835
+Accepted.
+
+32
+00:01:42.067 --> 00:01:49.433
+When A wakes up and writes with 33, the store sees that 33 is lower than 34, and refuses the write.
+
+33
+00:01:49.633 --> 00:01:51.426
+The lock alone is not enough.
+
+34
+00:01:51.426 --> 00:01:55.876
+The store has to check the token and refuse any write with an older one.

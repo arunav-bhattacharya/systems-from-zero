@@ -1,0 +1,128 @@
+{
+  "id": "sql",
+  "intro": "By the end of this track you can write the SQL a payments backend needs, from a NULL-safe filter and an anti join to a recursive walk of a referral tree, a running balance with the right window frame and a keyset-paged API. You can design tables whose constraints stop bad rows at the door, read an EXPLAIN plan and choose an index from it, say what each isolation level does about lost updates and write skew and when to lock rows instead, build a job queue that ten workers drain at once, and call PostgreSQL from Kotlin with a pool, prepared statements, batches and Flyway migrations, counting round trips instead of guessing.\n\nYou need to be able to program; no SQL beyond `SELECT *` is assumed. Lesson 1 sets up the picture the whole track uses: a table is a bag of rows with no order, a query runs its clauses in a fixed logical order, and NULL means unknown. Every lesson works on one schema, a small card-payments company (customers, accounts, cards, merchants, payments, refunds, a double-entry ledger, logins and a job queue) on PostgreSQL 18. A hand-checkable seed of about 250 rows backs every example, and a generated large data set with a million payments backs the index and paging lessons. You use Oracle at work, so where Oracle behaves differently each lesson puts the two side by side.\n\nThe Try-its run in psql against the Compose service, from the `labs` folder: `docker compose -f env/postgres.yml up -d --wait`, then `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. The large data set loads once with `docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql` and is read after `SET search_path = big, public`. The isolation and locking lessons open two or three terminals at once, and lesson 14's Try-its are Kotlin demos in `labs/sql/src/demo`. Each lab is a `.sql` file in `labs/sql/src/main/resources/sfz/sql/lNN/` (or Kotlin, in lessons 12 and 14) that tests in package `sfz.sql.lNN` run against a PostgreSQL 18 container loaded with the same seed, so Docker must be running: `./gradlew :sql:test --tests 'sfz.sql.lNN.*'`. `./gradlew :sql:solutionTest` runs the same tests against the reference answers.",
+  "cheatsheet": "## The picture\n\nA table is a **bag** of rows: duplicates stay and there is no order unless you write `ORDER BY`. A query runs its clauses in a fixed logical order, whatever order you type them in. NULL means unknown, and `WHERE` keeps only rows that are true. Underneath, PostgreSQL never overwrites a row: it writes new versions, each statement reads a snapshot of committed ones, B-tree indexes find rows without reading the table, and every statement from the JVM is a round trip.\n\n| step | clause | what it sees |\n|---|---|---|\n| 1 | `FROM`, `JOIN ... ON` | the tables; a join keeps the pairs `ON` makes true |\n| 2 | `WHERE` | single rows; no aggregates, no select aliases |\n| 3 | `GROUP BY` | folds rows into one per key |\n| 4 | `HAVING` | the groups; aggregates allowed |\n| 5 | window functions | the grouped rows, without folding them |\n| 6 | `SELECT`, `DISTINCT` | computes the output columns |\n| 7 | `ORDER BY` | may use select aliases; end it with a unique column |\n| 8 | `LIMIT` / `OFFSET` / `FETCH FIRST` | cuts the sorted result |\n\n## NULL and counting (lesson 1)\n\n| expression | result |\n|---|---|\n| `NULL = NULL`, `x <> NULL` | NULL (unknown): `WHERE` drops the row |\n| `NULL IS NULL`, `a IS NOT DISTINCT FROM b` | true or false, never NULL |\n| `true OR NULL`, `false AND NULL` | true, false |\n| `count(*)` / `count(col)` / `count(DISTINCT col)` | rows / non-NULL values / different non-NULL values |\n| `sum(col)` over no rows | NULL: wrap it in `coalesce(..., 0)` |\n\nTime ranges are half-open: `created_at >= '2026-03-01' AND created_at < '2026-04-01'`. `BETWEEN` includes both ends.\n\n## Schema design (lesson 2)\n\n- A fact stored on many rows drifts. Find the dependencies with `GROUP BY x HAVING count(DISTINCT y) > 1`, and move each to a table keyed by its left side.\n- Every candidate key gets `PRIMARY KEY` or `UNIQUE`. A foreign key does **not** create an index on the referencing column.\n- A `CHECK` passes on NULL: pair it with `NOT NULL`. `UNIQUE NULLS NOT DISTINCT` (PostgreSQL 15) allows one NULL.\n- No overlapping periods: `PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)` (PostgreSQL 18), or `EXCLUDE USING gist`.\n- Keep a denormalized copy only for a measured read path, write it in the same transaction, and keep a reconciliation query.\n\n## Joins and subqueries (lessons 3 and 5)\n\n| you want | write |\n|---|---|\n| rows with at least one match | `WHERE EXISTS (SELECT 1 ...)`: a semi join, each row once |\n| rows with no match | `WHERE NOT EXISTS (...)`: a Hash Anti Join. Never `NOT IN` on a column that can hold NULL: one NULL empties the result |\n| unmatched left rows too | `LEFT JOIN`, with conditions on the right table in `ON`; in `WHERE` they undo the outer join |\n| a sum per parent across two child tables | aggregate each child to one row per key first, then join; `sum(DISTINCT ...)` is not a fix |\n| one value | a scalar subquery: no row gives NULL, two rows fail with 21000 at run time |\n\nA correlated subquery runs per outer row (SubPlan) unless PostgreSQL turns it into a join. Qualify every column inside subqueries. A CTE used once is inlined (since PostgreSQL 12); `MATERIALIZED` and `NOT MATERIALIZED` override.\n\n## Grouping and windows (lessons 4, 7, 8)\n\n| tool | filters or folds | example |\n|---|---|---|\n| `WHERE` | rows, before grouping | `WHERE status = 'succeeded'` |\n| `HAVING` | groups, after grouping | `HAVING sum(amount_minor) > 100000` |\n| `agg(...) FILTER (WHERE ...)` | the rows one aggregate folds | `count(*) FILTER (WHERE status = 'failed')` |\n| `ROLLUP (a, b)` | adds subtotals: `GROUPING SETS ((a, b), (a), ())` | label them with `GROUPING(a)` |\n| `fn() OVER (PARTITION BY ... ORDER BY ...)` | nothing: keeps every row | running totals, ranks, `lag` |\n\nTies 100, 90, 90, 80: `row_number` 1, 2, 3, 4; `rank` 1, 2, 2, 4; `dense_rank` 1, 2, 2, 3.\n\nWith `ORDER BY` and no frame clause the frame is `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, so **tied rows share one running total**. `ROWS` counts rows, `RANGE` measures the ORDER BY value (`interval '6 days' PRECEDING`), `GROUPS` counts peer groups. Give `last_value` the frame `ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING`. Filter on a window's result one query level up.\n\nGaps and islands: `row_number() OVER (ORDER BY t) - row_number() OVER (PARTITION BY v ORDER BY t)` is constant within a run. For gaps in time, flag each start with `lag` and take a running sum of the flags.\n\n## Recursion (lesson 6)\n\n```sql\nWITH RECURSIVE tree AS (\n    SELECT customer_id, 1 AS depth, ARRAY[customer_id] AS path FROM customers WHERE referred_by IS NULL\n    UNION ALL\n    SELECT c.customer_id, t.depth + 1, t.path || c.customer_id\n    FROM customers c JOIN tree t ON c.referred_by = t.customer_id\n)\nSELECT * FROM tree ORDER BY path;\n```\n\nThe anchor runs once, the recursive term runs on the previous round's rows until a round returns nothing. PostgreSQL has no depth limit and does not detect cycles: use `CYCLE id SET is_cycle USING path` (PostgreSQL 14), a path check, or `UNION` on rows that repeat exactly.\n\n## Top N, LATERAL and paging (lesson 9)\n\n- Top N per group: `row_number()` in a subquery, `CROSS JOIN LATERAL (... ORDER BY ... LIMIT n)`, or `DISTINCT ON (key)` for N = 1. `LEFT JOIN LATERAL (...) ON true` keeps groups with no rows.\n- OFFSET reads and discards every skipped row. Keyset pagination seeks past the last row sent:\n\n```sql\nWHERE (created_at, payment_id) < (:last_created_at, :last_payment_id)\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20                       -- index on (created_at, payment_id)\n```\n\n## JSONB, upserts and MERGE (lesson 10)\n\n- `->` returns jsonb, `->>` returns text: cast before comparing numbers. `metadata @> '{\"channel\": \"web\"}'` can use a GIN index; `->>` conditions cannot.\n- Check-then-insert races. The unique index is the referee: `INSERT ... ON CONFLICT (payment_uid) DO NOTHING`, or `DO UPDATE SET x = EXCLUDED.x WHERE ...`.\n- `MERGE` (PostgreSQL 15; `NOT MATCHED BY SOURCE` and `RETURNING` since 17, `old` and `new` in `RETURNING` since 18) syncs a table with a source. For concurrent inserts of the same new key, use `ON CONFLICT`.\n\n## Indexes and EXPLAIN (lesson 11)\n\n| plan node | reads |\n|---|---|\n| Seq Scan | every page of the table |\n| Index Scan | a few index pages, then one table page per matching row |\n| Index Only Scan | the index alone, for pages the visibility map marks all-visible; `Heap Fetches` counts the rest (VACUUM fixes it) |\n| Bitmap Index Scan + Bitmap Heap Scan | collects row addresses, then reads each table page once |\n\nRead `EXPLAIN (ANALYZE, BUFFERS)` from the most indented node up; `rows` is per loop, so multiply by `loops`; compare estimated and actual rows. Multicolumn index: equality columns first, then the range or sort column; `INCLUDE` adds columns for an Index Only Scan. The index cannot be searched when the query wraps the column in a function or cast (`created_at::date`, a numeric bind on a bigint), and a condition that matches most rows is rightly a Seq Scan. Every index costs on every write.\n\n## Transactions and isolation (lesson 12)\n\n| PostgreSQL | Read Committed (default) | Repeatable Read | Serializable |\n|---|---|---|---|\n| snapshot taken | per statement | at the first statement | at the first statement |\n| non-repeatable read, phantom | yes | no | no |\n| lost update (read, compute, write) | yes | error 40001 | error 40001 |\n| write skew | yes | yes | error 40001 |\n\nOn 40001 or 40P01, roll back and run the **whole** transaction again. Without retries: write relative updates (`SET x = x - 1000`), lock the rows the rule reads with `SELECT ... FOR UPDATE`, or lock a parent row everyone must touch.\n\n## Row locks and queues (lesson 13)\n\n| requested \\ held | KEY SHARE | SHARE | NO KEY UPDATE | UPDATE |\n|---|---|---|---|---|\n| FOR KEY SHARE (foreign-key checks) | | | | waits |\n| FOR SHARE | | | waits | waits |\n| FOR NO KEY UPDATE (plain UPDATE) | | waits | waits | waits |\n| FOR UPDATE (DELETE, key change) | waits | waits | waits | waits |\n\n```sql\nUPDATE jobs SET status = 'running', locked_by = :worker, locked_at = now(), attempts = attempts + 1\nWHERE job_id = (SELECT job_id FROM jobs WHERE status = 'queued' AND run_after <= now()\n                ORDER BY run_after, job_id LIMIT 1 FOR UPDATE SKIP LOCKED)\nRETURNING job_id, kind, payload;\n```\n\n`FOR UPDATE` waits, `NOWAIT` fails at once (55P03), `SKIP LOCKED` takes the next free row. Deadlocks come from opposite lock orders: lock rows in ascending key order. `lock_timeout` bounds a wait; advisory locks (`pg_try_advisory_xact_lock`) serialize things that are not rows.\n\n## From the JVM (lesson 14)\n\n- A connection is a socket plus a server process: open it once. Pool size near (cores × 2) + spindles for the database as a whole; short `connectionTimeout`; borrow in `use { }`; `leakDetectionThreshold` finds leaks.\n- `PreparedStatement` with `?` for every value; identifiers from a fixed list. New ids: `prepareStatement(sql, arrayOf(\"payment_id\"))`.\n- `addBatch` / `executeBatch` cut round trips; `reWriteBatchedInserts=true` cuts statements. Stream big results with autocommit off and `fetchSize`.\n- N+1 queries: replace the loop with a join, `LATERAL`, or `= ANY (?)`; find it by `calls` in `pg_stat_statements`.\n- Flyway: versioned scripts, a checksum per applied version in `flyway_schema_history`. Never edit an applied migration; test migrations on tables with rows.\n\n## SQLSTATEs worth knowing\n\n| code | meaning | what to do |\n|---|---|---|\n| 23505 / 23503 / 23514 / 23502 / 23P01 | unique, foreign key, check, not null, exclusion violated | fix the data or the request |\n| 21000 | a scalar subquery returned two rows | fix the query |\n| 40001 | serialization failure | retry the whole transaction |\n| 40P01 | deadlock detected | retry, and fix the lock order |\n| 55P03 | lock not available (NOWAIT, lock_timeout) | fail fast or retry later |\n| 57014 | statement cancelled (statement_timeout) | make the query cheaper |\n\n## PostgreSQL and Oracle\n\n| | PostgreSQL 18 | Oracle |\n|---|---|---|\n| `''` | an empty string | NULL |\n| row limit | `LIMIT` or `FETCH FIRST` | `FETCH FIRST` (old code: `ROWNUM`) |\n| upsert | `INSERT ... ON CONFLICT` | `MERGE` |\n| `SERIALIZABLE` | SSI: catches write skew | snapshot isolation: allows it |\n| DDL | transactional | commits each statement |\n| filter on a window | a subquery | `QUALIFY` (26ai) |\n| claim with a limit | `LIMIT 1 FOR UPDATE SKIP LOCKED` | `FETCH FIRST` with `SKIP LOCKED` only since 26ai |\n| deadlock | 40P01, the transaction is aborted | ORA-00060, the statement is rolled back |\n| JDBC fetch default | the whole result at once | 10 rows per round trip |\n| `RETURN_GENERATED_KEYS` | `RETURNING *` | the ROWID |\n",
+  "recap": [
+    "A SQL table is a bag with no order, a query runs FROM, WHERE, GROUP BY, HAVING, windows, SELECT, ORDER BY, LIMIT in that order, and any comparison with NULL is unknown, which WHERE drops.",
+    "Store each fact once, let constraints guard every writer (a CHECK passes on NULL, a foreign key indexes nothing), and keep a denormalized copy only with a reconciliation query.",
+    "Joins multiply rows by matches: use EXISTS and NOT EXISTS for semi and anti joins, never NOT IN over a nullable column, and aggregate each child table before joining it.",
+    "Window functions keep every row. Rank ties on purpose, remember that the default frame includes tied rows, and filter on a window's result one level up.",
+    "LATERAL runs a subquery per row; with LIMIT and a matching index it gives a cheap top N per group. Page with a keyset cursor, not OFFSET.",
+    "An index is a sorted copy of some columns with row addresses. Read EXPLAIN from the inside out, put equality columns first, and keep functions off indexed columns.",
+    "Each statement reads a snapshot. Read Committed allows lost updates and write skew, Repeatable Read stops lost updates, Serializable stops both; a 40001 means retry the whole transaction.",
+    "Row locks make writers wait, SKIP LOCKED lets queue workers pass each other, foreign-key checks take the weak KEY SHARE, and a fixed lock order prevents deadlocks.",
+    "From the JVM, count connections and round trips: pool a few connections, bind every value, batch writes, replace N+1 loops with one query, and change the schema only through versioned migrations."
+  ],
+  "quiz": [
+    {
+      "q": "You want the merchants whose succeeded March payments add up to more than 100,000. Where does each condition go?",
+      "options": [
+        "Both in WHERE: `WHERE status = 'succeeded' AND sum(amount_minor) > 100000`",
+        "The status and the March range in WHERE, `sum(amount_minor) > 100000` in HAVING",
+        "Both in HAVING, after GROUP BY merchant_id",
+        "The status in HAVING, the sum in WHERE"
+      ],
+      "answer": 1,
+      "why": "WHERE filters single rows before grouping, so it can drop failed payments and other months, but it runs before any sum exists: an aggregate in WHERE is an error. HAVING filters the folded groups, so it is where the sum's condition goes. Putting `status = 'succeeded'` in HAVING fails too, because status is neither grouped nor aggregated (lessons 1 and 4)."
+    },
+    {
+      "q": "To list customers who never referred anyone, a report runs `WHERE customer_id NOT IN (SELECT referred_by FROM customers)`. It returns no rows, though six customers never referred anyone. Why?",
+      "options": [
+        "NOT IN needs DISTINCT in the subquery",
+        "NOT IN is slower than NOT EXISTS, and the query timed out",
+        "Five customers have NULL in referred_by, so `x NOT IN (..., NULL)` is never true; write NOT EXISTS with a correlated subquery",
+        "NOT IN compares the ids as text"
+      ],
+      "answer": 2,
+      "why": "`x NOT IN (a, b, NULL)` means `x <> a AND x <> b AND x <> NULL`, and the last part is unknown for every x, so no row is ever true. NOT EXISTS asks whether a matching row exists, which NULLs cannot spoil, and it plans as a Hash Anti Join. Duplicates in the subquery change nothing here (lessons 3 and 5)."
+    },
+    {
+      "q": "A statement shows account 900's running balance with `sum(amount_minor) OVER (ORDER BY created_at)`. Its first four ledger entries share one created_at. What do those four rows show?",
+      "options": [
+        "Each one adds its own amount: four different running totals",
+        "An error, because the ORDER BY is not unique",
+        "The first row's amount on all four",
+        "The same total on all four, which already includes all four amounts"
+      ],
+      "answer": 3,
+      "why": "With ORDER BY and no frame clause the frame is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, and in RANGE mode the current row brings all its peers, the rows with the same created_at. So all four tied rows see the same sum. Write ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW and add a unique tiebreaker such as entry_id to the ORDER BY to get one step per row (lessons 7 and 8)."
+    },
+    {
+      "q": "An admin API pages through a million payments newest first, 20 per page, with an index on (created_at, payment_id). What changes when page 5,001 uses `WHERE (created_at, payment_id) < (:c, :id)` instead of `OFFSET 100000`?",
+      "options": [
+        "PostgreSQL seeks to the cursor in the index and reads about 20 entries instead of about 100,020, and new payments no longer shift rows between pages",
+        "Nothing: OFFSET also seeks straight to entry 100,001 through the index",
+        "It reads fewer rows, but a payment can now appear on two pages",
+        "It only helps when the index is on payment_id alone"
+      ],
+      "answer": 0,
+      "why": "OFFSET has to produce and throw away every skipped row, so its cost grows with the page number, and inserts between requests shift rows across page boundaries. The row comparison is an Index Cond on the matching index: one descent to the cursor, then the next 20 entries, the same work on page 2 and page 5,001. The sort key must be unique, which is why payment_id is in it (lessons 9 and 11)."
+    },
+    {
+      "q": "Two withdrawals of 8,000 each read the sum of Ivy's two accounts (10,000) and then update different accounts. At REPEATABLE READ both commit and her total ends at -6,000. What does SERIALIZABLE do instead?",
+      "options": [
+        "The same: both are snapshot isolation",
+        "The second transaction waits at its SELECT until the first commits",
+        "It aborts one of them with SQLSTATE 40001; the application retries it from BEGIN, and the retry sees 2,000 and refuses",
+        "It aborts both, and neither withdrawal happens"
+      ],
+      "answer": 2,
+      "why": "Repeatable Read is snapshot isolation: it only reports two transactions that change the same row, and these changed different rows, so the write skew goes through. PostgreSQL's SERIALIZABLE also tracks what each transaction read, sees the cycle (each read what the other wrote), and aborts one. Nobody waits, because SSI's predicate locks never block. Oracle's SERIALIZABLE is snapshot isolation and lets the skew through (lesson 12)."
+    },
+    {
+      "q": "A refund handler must check a payment's refunds so far before inserting a new refund, and a background worker must claim the next queued job. Which locking clause belongs where?",
+      "options": [
+        "SKIP LOCKED in both, so neither ever waits",
+        "Plain FOR UPDATE on the payment row in the refund handler, FOR UPDATE SKIP LOCKED in the job claim",
+        "SKIP LOCKED in the refund handler, plain FOR UPDATE in the job claim",
+        "NOWAIT in both"
+      ],
+      "answer": 1,
+      "why": "The refund check needs that one payment row: if another refund holds it, the handler must wait and then read the new total, which is what plain FOR UPDATE does. SKIP LOCKED there would skip the very row the check is about and see nothing. A worker can take any due job, so stepping over locked rows is exactly right for the claim, and plain FOR UPDATE would make the workers queue behind each other (lessons 12 and 13)."
+    },
+    {
+      "q": "EXPLAIN shows `Index Only Scan using ledger_account_created_idx ... Heap Fetches: 4980` for a statement query. What does that mean, and what fixes it?",
+      "options": [
+        "Many of the table's pages are not marked all-visible yet, so PostgreSQL had to check those rows in the table; a VACUUM updates the visibility map",
+        "The index is missing columns; add them with INCLUDE",
+        "It is an ordinary Index Scan that EXPLAIN labels oddly",
+        "The index is corrupt and needs REINDEX"
+      ],
+      "answer": 0,
+      "why": "An Index Only Scan answers from the index alone, but the index does not know whether a row version is visible to this snapshot. PostgreSQL may skip the table only for pages the visibility map marks all-visible, and Heap Fetches counts the rows it still checked in the table. VACUUM sets those bits. A missing column would give an Index Scan, not an Index Only Scan (lesson 11)."
+    },
+    {
+      "q": "A recursive CTE follows money from account to account, and accounts 101 and 102 send money to each other. The recursive term uses UNION ALL and carries a depth column that grows by one each round. What happens, and what stops it?",
+      "options": [
+        "PostgreSQL detects the repeated account and stops the loop",
+        "Switching to UNION stops it, because the rows repeat",
+        "It loops until statement_timeout or memory runs out; stop it with the CYCLE clause or a check that the next account is not already on the path",
+        "It stops after 100 rounds, PostgreSQL's recursion limit"
+      ],
+      "answer": 2,
+      "why": "PostgreSQL has no depth limit and does not detect cycles. UNION removes only rows that repeat exactly, and the growing depth makes every round's rows new, so UNION does not help here. `CYCLE account_id SET is_cycle USING path` (PostgreSQL 14) or `WHERE next <> ALL (path)` stops the walk at the first repeat (lesson 6)."
+    },
+    {
+      "q": "Two Kafka consumers receive the same payment message at the same moment and both try to store it. Which statement stores it exactly once, with no error, under that race?",
+      "options": [
+        "A SELECT for the payment_uid, then an INSERT if it found nothing, in one transaction",
+        "`MERGE INTO payments ... WHEN NOT MATCHED THEN INSERT ...`",
+        "An INSERT with a CHECK constraint on payment_uid",
+        "`INSERT INTO payments ... ON CONFLICT (payment_uid) DO NOTHING`"
+      ],
+      "answer": 3,
+      "why": "Both consumers can run the SELECT before either inserts, so check-then-insert stores the payment twice when there is no unique constraint, and fails with 23505 when there is one. MERGE decides MATCHED or NOT MATCHED before it writes, so two concurrent MERGEs of the same new key can both insert, and the second fails with 23505. ON CONFLICT asks the unique index in the same step as the write, and the loser does nothing. A CHECK sees one row and cannot compare rows (lessons 2 and 10)."
+    },
+    {
+      "q": "A dashboard endpoint loads 2,500 merchants and then runs one query per merchant for its latest payment. Each query takes 0.2 ms on the server and a round trip takes 1 ms. About how long does the endpoint spend on SQL, and what is the fix?",
+      "options": [
+        "About 0.5 s; add an index on payments (merchant_id, created_at)",
+        "About 3 s, mostly waiting for 2,501 round trips; fetch everything in one query with LEFT JOIN LATERAL, or two with `merchant_id = ANY (?)`",
+        "About 3 s; send the queries with addBatch",
+        "About 3 s; give the pool more connections so the queries run in parallel"
+      ],
+      "answer": 1,
+      "why": "2,501 queries at 1 ms of round trip plus 0.2 ms of work each is about 3 seconds, and an index cannot remove the round trips. Batching is for statements whose results you do not need one by one, such as inserts. More connections let more requests run, but this request still waits for its own 2,501 answers in order. One LATERAL query moves the loop into the server: one round trip (lessons 9 and 14)."
+    }
+  ]
+}

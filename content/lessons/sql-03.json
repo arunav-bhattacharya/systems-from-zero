@@ -1,0 +1,404 @@
+{
+  "id": "sql-03",
+  "title": "Joins, including semi and anti joins",
+  "minutes": 40,
+  "goal": "By the end you can predict how many rows any join returns, keep unmatched rows with an outer join without losing them in WHERE, write semi and anti joins with EXISTS and NOT EXISTS, and read which join method PostgreSQL chose in EXPLAIN.",
+  "warmup": {
+    "q": "`accounts.customer_id` is NULL for the 9 merchant and internal accounts. Customer 11 has no account. How many rows does `SELECT * FROM customers WHERE customer_id NOT IN (SELECT customer_id FROM accounts)` return?",
+    "options": [
+      "1: customer 11",
+      "0",
+      "9: one per NULL",
+      "It raises an error because the subquery contains NULL"
+    ],
+    "answer": 1,
+    "why": "`NOT IN` means \"not equal to every value in the list\". For customer 11 that includes `11 <> NULL`, which is unknown, so the whole test is unknown and WHERE drops the row. Customers with an account fail on their own id. Nothing is returned and nothing raises an error. `NOT EXISTS` returns customer 11."
+  },
+  "sections": [
+    {
+      "h": "A join pairs rows that match",
+      "body": "Payment 17 says `card_id 8, merchant_id 4, amount_minor 18999`. Support wants a sentence: \"Farid Haddad paid Volt Electronics 189.99\". The names are not in the payment row, and lesson 2 explained why: each fact lives once, in its own table, and other tables point at it by key. To print the sentence you follow the keys from payments to merchants, and from payments through cards and accounts to customers. Following keys between tables is what a **join** does.\n\nHere is the simplest way to do it, in Kotlin:\n\n```kotlin\nfor (p in payments) {\n    for (m in merchants) {\n        if (p.merchantId == m.merchantId) emit(p, m)\n    }\n}\n```\n\nThat loop is the meaning of a join, and this lesson keeps it as its picture: **for each row on the left, look at every row on the right, and keep the pairs the condition makes true.** The engine may run it differently (the last section shows how), but the result must be what this loop produces.\n\nTake the `if` away and the loop emits every pair. That is a **cross join**: 37 payments times 8 merchants is 296 rows, almost all of them nonsense. Put the `if` back as an `ON` condition and you have an **inner join**:\n\n```sql\nSELECT p.payment_id, p.amount_minor, m.merchant_id, m.name\nFROM payments p\nJOIN merchants m ON m.merchant_id = p.merchant_id   -- the if\nWHERE p.card_id = 8;\n```\n\n`p` and `m` are aliases, short names for the tables in this query. `JOIN` on its own means `INNER JOIN`. For card 8 it returns four rows, and Volt Electronics appears twice, once next to payment 17 and once next to payment 18. A join copies the right-hand row once for every left-hand row it matches. This is how the flat export in lesson 2 was produced.\n\nSo you can predict the size of any join: for each left row, count its matches, and add them up. Every payment has exactly one merchant, because `merchant_id` is `NOT NULL` and a foreign key, so payments joined to merchants returns exactly 37 rows. Turn it around and a merchant with 7 payments appears 7 times. Lesson 4 of this track shows how that multiplication breaks sums.\n\nJoins chain. To reach the customer you go payments, then cards, then accounts, then customers, one `JOIN ... ON` per step, each on a foreign key and the primary key it references. Forget one `ON` condition and that step becomes a cross join: every row is paired with every row of the next table, and the result is wrong and large.",
+      "try": {
+        "title": "Count the pairs",
+        "minutes": 4,
+        "steps": [
+          "Start the database if needed (`docker compose -f env/postgres.yml up -d`) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Predict both counts before you run them: every pair, then only the matching pairs.",
+          "Run the five-table join and read off who paid whom for payment 17."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT count(*) FROM payments CROSS JOIN merchants;\nSELECT count(*) FROM payments p JOIN merchants m ON m.merchant_id = p.merchant_id;\n\nSELECT p.payment_id, cu.full_name AS customer, m.name AS merchant, p.amount_minor\nFROM payments p\nJOIN cards c      ON c.card_id = p.card_id\nJOIN accounts a   ON a.account_id = c.account_id\nJOIN customers cu ON cu.customer_id = a.customer_id\nJOIN merchants m  ON m.merchant_id = p.merchant_id\nWHERE p.payment_id = 17;"
+        },
+        "expect": "The counts are 296 and 37. The chain returns one row:\n\n```postgresql\n payment_id |   customer   |     merchant     | amount_minor\n------------+--------------+------------------+--------------\n         17 | Farid Haddad | Volt Electronics |        18999\n(1 row)\n```\n\nEach step follows a foreign key to the primary key it references, so each step finds exactly one row, and one payment stays one row."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18 tutorial: Joins between tables",
+          "url": "https://www.postgresql.org/docs/18/tutorial-join.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Outer joins keep the rows that found no partner",
+      "body": "The finance team wants every merchant with its June payments. An inner join answers for four merchants and silently leaves out the other four, because the inner loop found no June payment for them, and an inner join emits nothing in that case. The report must list all eight.\n\nChange one rule in the loop: if the inner loop found no match, emit the left row once anyway, with NULL in every column from the right table. That is a **left outer join**, written `LEFT JOIN`:\n\n```postgresql\ncourse=# SELECT m.merchant_id, m.name, p.payment_id\ncourse-# FROM merchants m\ncourse-# LEFT JOIN payments p ON p.merchant_id = m.merchant_id\ncourse-#   AND p.created_at >= '2026-06-01' AND p.created_at < '2026-07-01'\ncourse-# ORDER BY m.merchant_id, p.payment_id;\n merchant_id |        name         | payment_id\n-------------+---------------------+------------\n           1 | Northwind Grocers   |         34\n           2 | Blue Fern Cafe      |         36\n           3 | Metro Transit       |         37\n           4 | Volt Electronics    |          ∅\n           5 | Harbor Hotel        |         35\n           6 | Paper Lantern Books |          ∅\n           7 | Quick Bite          |          ∅\n           8 | Sunrise Grocers     |          ∅\n(8 rows)\n```\n\n`RIGHT JOIN` is the mirror image: it keeps unmatched rows of the right table. Nobody needs it, because you can swap the tables. `FULL JOIN` keeps unmatched rows from both sides.\n\nNow the trap. Move the June condition from `ON` to `WHERE` and the same query returns four rows, as if you had written an inner join. Lesson 1's logical order explains it. `ON` is part of the join (step 1, FROM): it decides which payments count as a match, and merchants without a match still get their NULL row. `WHERE` runs after the join is finished (step 2). By then the NULL rows exist, and for them `p.created_at >= '2026-06-01'` is `NULL >= ...`, which is unknown, so WHERE drops them. Every condition on the right table of a LEFT JOIN belongs in `ON`. A condition on the left table, such as `m.country_code = 'US'`, belongs in `WHERE`.\n\nA join does not need two different tables. `customers.referred_by` points at another row of `customers`, so a **self join** joins the table to itself under two aliases. `FROM customers c JOIN customers r ON r.customer_id = c.referred_by` pairs each customer with their referrer, and the loop picture still holds: the left and right tables just happen to be the same one.",
+      "try": {
+        "title": "Turn a LEFT JOIN into an inner join by accident",
+        "minutes": 4,
+        "steps": [
+          "Type `\\pset null '∅'`. Run the first query: the June condition is in `ON`. Count the rows.",
+          "Run the second: the same condition, moved to `WHERE`. Predict the count first.",
+          "Run the self join. Which customers were referred by someone from another country?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nSELECT m.merchant_id, m.name, p.payment_id\nFROM merchants m\nLEFT JOIN payments p ON p.merchant_id = m.merchant_id\n  AND p.created_at >= '2026-06-01' AND p.created_at < '2026-07-01'\nORDER BY m.merchant_id, p.payment_id;\n\nSELECT m.merchant_id, m.name, p.payment_id\nFROM merchants m\nLEFT JOIN payments p ON p.merchant_id = m.merchant_id\nWHERE p.created_at >= '2026-06-01' AND p.created_at < '2026-07-01'\nORDER BY m.merchant_id, p.payment_id;\n\nSELECT c.customer_id, c.country_code, r.customer_id AS referrer_id, r.country_code AS referrer_country\nFROM customers c\nJOIN customers r ON r.customer_id = c.referred_by\nWHERE c.country_code <> r.country_code\nORDER BY c.customer_id;"
+        },
+        "expect": "The first query returns 8 rows, the second only 4 (merchants 1, 2, 3 and 5). The self join returns four cross-border referrals:\n\n```postgresql\n customer_id | country_code | referrer_id | referrer_country\n-------------+--------------+-------------+------------------\n           3 | FR           |           1 | IN\n           5 | DE           |           1 | IN\n           6 | GB           |           3 | FR\n          12 | DE           |           7 | SG\n(4 rows)\n```\n\nCustomers nobody referred do not appear: the self join is an inner join, and `r.customer_id = NULL` never matches."
+      }
+    },
+    {
+      "h": "EXISTS and NOT EXISTS ask whether a match exists",
+      "body": "Some questions only ask whether a match exists. Which customers have at least one card? The inner join answers with 14 rows for 11 customers: Ben, Daniel and Ivy each appear twice, because each has two cards and the join emits one row per match. You did not want the cards. You wanted the customers.\n\n`SELECT DISTINCT` would hide the repeats. It also makes PostgreSQL build every pair first and then sort or hash them away, and it hides the real question in the query text. Change the loop instead: as soon as the inner loop finds one match, emit the left row and stop looking. Emit no columns from the right. That is a **semi join**, and SQL spells it `EXISTS`:\n\n```sql\nSELECT cu.customer_id, cu.full_name\nFROM customers cu\nWHERE EXISTS (\n    SELECT 1\n    FROM accounts a\n    JOIN cards c ON c.account_id = a.account_id\n    WHERE a.customer_id = cu.customer_id     -- refers to the outer row\n);\n```\n\nThe inner query mentions `cu` from the outer query, so it is a **correlated subquery**: in the loop picture it runs once per customer. `SELECT 1` is a convention, because EXISTS looks only at whether a row comes back, never at its columns. The result is 11 rows, each customer once.\n\nThe opposite question is just as common. Which customers have no account? Emit the left row only if the inner loop found nothing: an **anti join**. There are three ways to write it, and only two of them are safe.\n\n`NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id)` returns Kofi, customer 11. So does `LEFT JOIN accounts a ON a.customer_id = cu.customer_id WHERE a.account_id IS NULL`, which keeps the NULL-padded rows and nothing else. Test a column that cannot be NULL in a real row, such as the right table's primary key.\n\n`WHERE customer_id NOT IN (SELECT customer_id FROM accounts)` reads the most naturally and returns **0 rows**. `accounts.customer_id` is NULL for the 8 merchant accounts and the internal account, and lesson 1's three-valued logic does the rest. `11 NOT IN (list)` means `11 <> 1 AND 11 <> 2 AND ...` for every value in the list, including `11 <> NULL`, which is unknown. True AND unknown is unknown, and WHERE drops Kofi. One NULL anywhere in the subquery empties the result. The stepper walks through both versions for Kofi. `NOT EXISTS` asks \"is there a row for which the condition is **true**?\", and a NULL row gives unknown, which never counts as a match.\n\nUse `NOT EXISTS` for anti joins. `NOT IN` with a list of constants, such as `status NOT IN ('failed', 'pending')`, is fine, as long as the column itself cannot be NULL.",
+      "stepper": {
+        "title": "NOT IN and NOT EXISTS meet a NULL",
+        "intro": "Who has no account? Click Next to see how each anti join treats customer 11 when the subquery contains NULLs.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 296\" role=\"img\" aria-label=\"One customer tested against the customer_id values of accounts, which include nine NULLs\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">WHERE customer_id NOT IN (SELECT customer_id FROM accounts)</text><text class=\"t-s t-m\" x=\"105\" y=\"58\" text-anchor=\"middle\">outer row</text><rect class=\"box\" x=\"20\" y=\"68\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"105\" y=\"92\" text-anchor=\"middle\">customer 11</text><text class=\"t-s\" x=\"105\" y=\"112\" text-anchor=\"middle\">Kofi Mensah</text><text class=\"t-s t-m\" x=\"475\" y=\"58\" text-anchor=\"middle\">accounts.customer_id (23 rows)</text><rect class=\"box\" x=\"330\" y=\"68\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475\" y=\"88\" text-anchor=\"middle\">1 2 2 3 4 5 6 7 8 9 9 10 12 13</text><rect class=\"box-b\" x=\"330\" y=\"106\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"475\" y=\"126\" text-anchor=\"middle\">NULL x 9 (merchant, internal)</text><line class=\"ln-d\" x1=\"20\" y1=\"152\" x2=\"620\" y2=\"152\"/><text class=\"t-s\" x=\"20\" y=\"178\" text-anchor=\"start\">Question: does 11 appear in the list on the right?</text><text class=\"t-s\" x=\"20\" y=\"280\" text-anchor=\"start\"></text></svg>",
+            "say": "Kofi (customer 11) has no account, so he should be the one row in the answer. The subquery returns 23 values: 14 customer ids, and 9 NULLs from the merchant and internal accounts, which have no customer."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 296\" role=\"img\" aria-label=\"One customer tested against the customer_id values of accounts, which include nine NULLs\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">WHERE customer_id NOT IN (SELECT customer_id FROM accounts)</text><text class=\"t-s t-m\" x=\"105\" y=\"58\" text-anchor=\"middle\">outer row</text><rect class=\"box-a\" x=\"20\" y=\"68\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"105\" y=\"92\" text-anchor=\"middle\">customer 11</text><text class=\"t-s\" x=\"105\" y=\"112\" text-anchor=\"middle\">Kofi Mensah</text><text class=\"t-s t-m\" x=\"475\" y=\"58\" text-anchor=\"middle\">accounts.customer_id (23 rows)</text><rect class=\"box\" x=\"330\" y=\"68\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475\" y=\"88\" text-anchor=\"middle\">1 2 2 3 4 5 6 7 8 9 9 10 12 13</text><rect class=\"box-b\" x=\"330\" y=\"106\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"475\" y=\"126\" text-anchor=\"middle\">NULL x 9 (merchant, internal)</text><line class=\"ln-d\" x1=\"20\" y1=\"152\" x2=\"620\" y2=\"152\"/><text class=\"t-s t-code\" x=\"20\" y=\"178\" text-anchor=\"start\">11 NOT IN (...)  =  11 &lt;&gt; 1 AND 11 &lt;&gt; 2 AND ... AND 11 &lt;&gt; NULL</text><text class=\"t-s t-ok\" x=\"20\" y=\"202\" text-anchor=\"start\">the 14 numbers:  11 &lt;&gt; 1, 11 &lt;&gt; 2, ... 11 &lt;&gt; 13   all true</text><text class=\"t-s\" x=\"20\" y=\"280\" text-anchor=\"start\"></text></svg>",
+            "say": "`NOT IN` is shorthand for a chain of `<>` comparisons joined by AND, one for every value in the list. Against the 14 real ids, every comparison is true: 11 is not in that part of the list."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 296\" role=\"img\" aria-label=\"One customer tested against the customer_id values of accounts, which include nine NULLs\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">WHERE customer_id NOT IN (SELECT customer_id FROM accounts)</text><text class=\"t-s t-m\" x=\"105\" y=\"58\" text-anchor=\"middle\">outer row</text><rect class=\"box-bad\" x=\"20\" y=\"68\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"105\" y=\"92\" text-anchor=\"middle\">customer 11</text><text class=\"t-s\" x=\"105\" y=\"112\" text-anchor=\"middle\">Kofi Mensah</text><text class=\"t-s t-m\" x=\"475\" y=\"58\" text-anchor=\"middle\">accounts.customer_id (23 rows)</text><rect class=\"box\" x=\"330\" y=\"68\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475\" y=\"88\" text-anchor=\"middle\">1 2 2 3 4 5 6 7 8 9 9 10 12 13</text><rect class=\"box-b\" x=\"330\" y=\"106\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"475\" y=\"126\" text-anchor=\"middle\">NULL x 9 (merchant, internal)</text><line class=\"ln-d\" x1=\"20\" y1=\"152\" x2=\"620\" y2=\"152\"/><text class=\"t-s t-code\" x=\"20\" y=\"178\" text-anchor=\"start\">11 NOT IN (...)  =  11 &lt;&gt; 1 AND 11 &lt;&gt; 2 AND ... AND 11 &lt;&gt; NULL</text><text class=\"t-s t-ok\" x=\"20\" y=\"202\" text-anchor=\"start\">the 14 numbers:  11 &lt;&gt; 1, 11 &lt;&gt; 2, ... 11 &lt;&gt; 13   all true</text><text class=\"t-s t-b\" x=\"20\" y=\"226\" text-anchor=\"start\">the 9 NULLs:  11 &lt;&gt; NULL   unknown</text><text class=\"t-s t-b\" x=\"20\" y=\"250\" text-anchor=\"start\">true AND unknown  =  unknown</text><text class=\"t-s t-bad\" x=\"20\" y=\"280\" text-anchor=\"start\">WHERE sees unknown: Kofi is dropped. Every customer is dropped: 0 rows.</text></svg>",
+            "say": "Against a NULL the comparison is unknown (lesson 1), and `true AND unknown` is unknown. WHERE keeps only true, so Kofi is dropped. Customers who do have an account hit a false comparison and are dropped too. The query returns 0 rows, with no error."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 296\" role=\"img\" aria-label=\"One customer tested against the customer_id values of accounts, which include nine NULLs\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id)</text><text class=\"t-s t-m\" x=\"105\" y=\"58\" text-anchor=\"middle\">outer row</text><rect class=\"box-a\" x=\"20\" y=\"68\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"105\" y=\"92\" text-anchor=\"middle\">customer 11</text><text class=\"t-s\" x=\"105\" y=\"112\" text-anchor=\"middle\">Kofi Mensah</text><text class=\"t-s t-m\" x=\"475\" y=\"58\" text-anchor=\"middle\">accounts.customer_id (23 rows)</text><rect class=\"box\" x=\"330\" y=\"68\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475\" y=\"88\" text-anchor=\"middle\">1 2 2 3 4 5 6 7 8 9 9 10 12 13</text><rect class=\"box-b\" x=\"330\" y=\"106\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"475\" y=\"126\" text-anchor=\"middle\">NULL x 9 (merchant, internal)</text><line class=\"ln-d\" x1=\"20\" y1=\"152\" x2=\"620\" y2=\"152\"/><text class=\"t-s\" x=\"20\" y=\"178\" text-anchor=\"start\">Question: is there an accounts row where a.customer_id = 11 is TRUE?</text><text class=\"t-s t-bad\" x=\"20\" y=\"202\" text-anchor=\"start\">14 rows:  1 = 11, 2 = 11, ... 13 = 11   false</text><text class=\"t-s t-b\" x=\"20\" y=\"226\" text-anchor=\"start\">9 rows:  NULL = 11   unknown, which is not true</text><text class=\"t-s\" x=\"20\" y=\"280\" text-anchor=\"start\"></text></svg>",
+            "say": "`NOT EXISTS` asks a different question: is there at least one row for which the condition is true? It tests each accounts row on its own. The 14 real ids give false, the 9 NULL rows give unknown, and neither counts as a match."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 296\" role=\"img\" aria-label=\"One customer tested against the customer_id values of accounts, which include nine NULLs\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id)</text><text class=\"t-s t-m\" x=\"105\" y=\"58\" text-anchor=\"middle\">outer row</text><rect class=\"box-ok\" x=\"20\" y=\"68\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"105\" y=\"92\" text-anchor=\"middle\">customer 11</text><text class=\"t-s\" x=\"105\" y=\"112\" text-anchor=\"middle\">Kofi Mensah</text><text class=\"t-s t-m\" x=\"475\" y=\"58\" text-anchor=\"middle\">accounts.customer_id (23 rows)</text><rect class=\"box\" x=\"330\" y=\"68\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475\" y=\"88\" text-anchor=\"middle\">1 2 2 3 4 5 6 7 8 9 9 10 12 13</text><rect class=\"box-b\" x=\"330\" y=\"106\" width=\"290\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"475\" y=\"126\" text-anchor=\"middle\">NULL x 9 (merchant, internal)</text><line class=\"ln-d\" x1=\"20\" y1=\"152\" x2=\"620\" y2=\"152\"/><text class=\"t-s\" x=\"20\" y=\"178\" text-anchor=\"start\">Question: is there an accounts row where a.customer_id = 11 is TRUE?</text><text class=\"t-s t-bad\" x=\"20\" y=\"202\" text-anchor=\"start\">14 rows:  1 = 11, 2 = 11, ... 13 = 11   false</text><text class=\"t-s t-b\" x=\"20\" y=\"226\" text-anchor=\"start\">9 rows:  NULL = 11   unknown, which is not true</text><text class=\"t-s t-ok\" x=\"20\" y=\"280\" text-anchor=\"start\">No matching row, so NOT EXISTS is true: Kofi is kept. Result: 1 row.</text></svg>",
+            "say": "No row matched, so `EXISTS` is false and `NOT EXISTS` is true. Kofi is kept. A customer with an account finds a matching row and is dropped. The answer is one row, which is the right one. EXISTS never returns unknown, so NULLs in the subquery cannot poison it."
+          }
+        ]
+      },
+      "try": {
+        "title": "Find the customer with no account, three ways",
+        "minutes": 4,
+        "steps": [
+          "Run the three anti joins. Predict each row count first.",
+          "Run the count of accounts and of non-NULL `customer_id` values. The difference is the number of NULLs that poison `NOT IN`.",
+          "Add `WHERE customer_id IS NOT NULL` inside the `NOT IN` subquery and run it again."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT cu.customer_id, cu.full_name\nFROM customers cu\nWHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id);\n\nSELECT cu.customer_id, cu.full_name\nFROM customers cu\nLEFT JOIN accounts a ON a.customer_id = cu.customer_id\nWHERE a.account_id IS NULL;\n\nSELECT customer_id, full_name\nFROM customers\nWHERE customer_id NOT IN (SELECT customer_id FROM accounts);\n\nSELECT count(*) AS accounts, count(customer_id) AS with_customer FROM accounts;"
+        },
+        "expect": "The first two return Kofi Mensah, customer 11. The `NOT IN` version returns `(0 rows)`. The counts are 23 and 14, so 9 accounts have a NULL `customer_id`. With `WHERE customer_id IS NOT NULL` inside the subquery, `NOT IN` returns Kofi as well, but only for as long as someone remembers to keep that filter. `NOT EXISTS` needs no filter."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Subquery expressions (EXISTS, IN, NOT IN)",
+          "url": "https://www.postgresql.org/docs/18/functions-subquery.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL wiki: Don't Do This (Don't use NOT IN)",
+          "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "How PostgreSQL finds the pairs without trying them all",
+      "body": "The nested loop gives a join its meaning. As a method it is slow. On the large data set that the index lesson loads, there are 1,000,000 payments and 2,500 merchants. With the faster methods switched off, PostgreSQL joined just the first 10,000 payments to the merchants by brute force in 0.44 seconds, making 6.3 million comparisons. (It stops at the first match for each payment, because `merchant_id` is unique.) All 1,000,000 payments would take about 100 times as long, around 40 seconds. Here are the three methods PostgreSQL uses instead, each fixing the previous one's weak spot. The times are from an Apple-silicon laptop under Docker Desktop. Yours will differ with the CPU, but the ratios hold.\n\nFirst fix: don't scan the inner table, look the row up. `merchants` has a primary-key B-tree index (lesson 1), so for each payment PostgreSQL can find the merchant by reading a few index pages. That is a **nested loop with an index scan**. It suits a small outer input. For all 1,000,000 payments it took 265 ms, helped by a small cache of recent lookups that PostgreSQL calls Memoize.\n\nSecond fix: build a lookup table once, in memory. A **hash join** reads the smaller input (2,500 merchants) and puts every row into a hash table keyed on the join column: about 130 kB. Then it reads the payments once, and for each one computes the hash, jumps to one bucket and compares the key there. That is one pass over each input and no index needed. It took 174 ms on one CPU core and 67 ms with two parallel workers. The stepper below shows the build and the probe. Hash joins work only for `=` conditions, and the hash table must fit in memory (the `work_mem` setting, 4 MB by default), or PostgreSQL splits the work into batches on disk.\n\nThird method: if both inputs already come sorted by the join key, for example from indexes, a **merge join** walks the two sorted lists side by side, the way you would merge two sorted Kotlin lists.\n\nThe **planner** picks one by estimating the cost of each, from statistics about your tables, and EXPLAIN shows the choice. Semi and anti joins use the same machinery: `NOT EXISTS` becomes a **Hash Anti Join**, which emits a probe row only when its bucket has no match. `NOT IN` cannot become an anti join, because of the NULL rule. It runs as a filter that checks each row against a hashed copy of the subquery result, called a hashed SubPlan, and when that copy does not fit in `work_mem`, PostgreSQL falls back to scanning the whole subquery result once per outer row. That is the second reason to prefer `NOT EXISTS`.",
+      "stepper": {
+        "title": "A hash join: build once, probe once per row",
+        "intro": "Click Next to watch PostgreSQL join payments to merchants without comparing every pair.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: empty</text><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: empty</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: empty</text><rect class=\"box\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: empty</text><rect class=\"box\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><rect class=\"box\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><rect class=\"box\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-code\" x=\"20\" y=\"300\" text-anchor=\"start\">Hash Join   Hash Cond: (p.merchant_id = m.merchant_id)</text></svg>",
+            "say": "PostgreSQL has two inputs: a few merchants and many payments. It picks the smaller input, merchants, as the **build** side. To keep the picture small, the build side here has four merchants."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box-a\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: 1 Northwind</text><line class=\"ln-a\" x1=\"180\" y1=\"49\" x2=\"218\" y2=\"49\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: empty</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: empty</text><rect class=\"box\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: empty</text><rect class=\"box\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><rect class=\"box\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><rect class=\"box\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-m\" x=\"20\" y=\"300\" text-anchor=\"start\">build: read merchant 1, hash its id, store it in bucket 1</text></svg>",
+            "say": "Build phase. PostgreSQL reads merchant 1, computes a hash of the join key (here simply `id mod 4`) and stores the row in that bucket of an in-memory hash table."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box-a\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: 1 Northwind</text><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: 2 Blue</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: 3 Metro</text><rect class=\"box-a\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: 4 Volt</text><line class=\"ln-a\" x1=\"180\" y1=\"169\" x2=\"218\" y2=\"169\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><rect class=\"box\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><rect class=\"box\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-m\" x=\"20\" y=\"300\" text-anchor=\"start\">build done: 4 rows in memory. The big input has not been read yet.</text></svg>",
+            "say": "It does the same for every merchant. On the large data set this table holds all 2,500 merchants and uses about 130 kB of memory. Now the build side is never read again."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box-ok\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: 1 Northwind</text><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: 2 Blue</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: 3 Metro</text><rect class=\"box\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: 4 Volt</text><rect class=\"box-a\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><line class=\"ln-a\" x1=\"450\" y1=\"49\" x2=\"402\" y2=\"49\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><rect class=\"box\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-code\" x=\"80\" y=\"228\" text-anchor=\"start\">(1, Northwind Grocers)</text><text class=\"t-s t-m\" x=\"20\" y=\"300\" text-anchor=\"start\">probe: payment 1 has merchant 1 -&gt; bucket 1 -&gt; match</text></svg>",
+            "say": "Probe phase. PostgreSQL reads payments one at a time. Payment 1 has merchant 1: hash it, go straight to bucket 1, compare the key, match. Out comes one joined row. It never looked at merchants 2, 3 or 4."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: 1 Northwind</text><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: 2 Blue</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: 3 Metro</text><rect class=\"box-ok\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: 4 Volt</text><rect class=\"box-ok\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><rect class=\"box-ok\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box-a\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><line class=\"ln-a\" x1=\"450\" y1=\"129\" x2=\"402\" y2=\"169\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-code\" x=\"80\" y=\"228\" text-anchor=\"start\">(1, Northwind Grocers)</text><text class=\"t-s t-code\" x=\"80\" y=\"248\" text-anchor=\"start\">(2, Blue Fern Cafe)</text><text class=\"t-s t-code\" x=\"80\" y=\"268\" text-anchor=\"start\">(3, Volt Electronics)</text><text class=\"t-s t-m\" x=\"20\" y=\"300\" text-anchor=\"start\">probe: payment 3 has merchant 4 -&gt; bucket 0 -&gt; match</text></svg>",
+            "say": "Payments 2 and 3 do the same: one hash, one bucket, one comparison each. Payment 3 belongs to merchant 4, which lives in bucket 0."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 312\" role=\"img\" aria-label=\"A hash join: four merchants go into a hash table, then each payment looks up one bucket\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"100\" y=\"22\" text-anchor=\"middle\">merchants (build)</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"middle\">hash table: id mod 4</text><text class=\"t-s t-m\" x=\"530\" y=\"22\" text-anchor=\"middle\">payments (probe)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"54\" text-anchor=\"middle\">1 Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"94\" text-anchor=\"middle\">2 Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"134\" text-anchor=\"middle\">3 Metro Transit</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"174\" text-anchor=\"middle\">4 Volt Electronics</text><rect class=\"box-bad\" x=\"220\" y=\"34\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"54\" text-anchor=\"middle\">bucket 1: 1 Northwind</text><rect class=\"box\" x=\"220\" y=\"74\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"94\" text-anchor=\"middle\">bucket 2: 2 Blue</text><rect class=\"box\" x=\"220\" y=\"114\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"134\" text-anchor=\"middle\">bucket 3: 3 Metro</text><rect class=\"box\" x=\"220\" y=\"154\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"310\" y=\"174\" text-anchor=\"middle\">bucket 0: 4 Volt</text><rect class=\"box-ok\" x=\"450\" y=\"34\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"54\" text-anchor=\"middle\">payment 1: m1</text><rect class=\"box-ok\" x=\"450\" y=\"74\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"94\" text-anchor=\"middle\">payment 2: m2</text><rect class=\"box-ok\" x=\"450\" y=\"114\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"134\" text-anchor=\"middle\">payment 3: m4</text><rect class=\"box-a\" x=\"450\" y=\"154\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"530\" y=\"174\" text-anchor=\"middle\">payment 5: m5</text><line class=\"ln-a\" x1=\"450\" y1=\"169\" x2=\"402\" y2=\"49\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"20\" y1=\"206\" x2=\"620\" y2=\"206\"/><text class=\"t-s t-m\" x=\"20\" y=\"228\" text-anchor=\"start\">output:</text><text class=\"t-s t-code\" x=\"80\" y=\"228\" text-anchor=\"start\">(1, Northwind Grocers)</text><text class=\"t-s t-code\" x=\"80\" y=\"248\" text-anchor=\"start\">(2, Blue Fern Cafe)</text><text class=\"t-s t-code\" x=\"80\" y=\"268\" text-anchor=\"start\">(3, Volt Electronics)</text><text class=\"t-s t-bad\" x=\"20\" y=\"300\" text-anchor=\"start\">probe: payment 5 has merchant 5 -&gt; bucket 1 -&gt; 1 != 5, no match</text></svg>",
+            "say": "Payment 5 belongs to merchant 5, which is not in the table. Its hash lands in bucket 1, the key comparison fails, and an inner join emits nothing. A **Hash Left Join** would emit the payment with NULLs, and a **Hash Anti Join** would emit only rows like this one: the same machine, a different rule for misses. Total work: one pass over each input."
+          }
+        ]
+      },
+      "try": {
+        "title": "Read the join method in EXPLAIN",
+        "minutes": 4,
+        "steps": [
+          "`EXPLAIN` prints the plan PostgreSQL chose without running the query. `COSTS OFF` hides the cost estimates so the shape is easier to read.",
+          "Run the three statements. Find the join node in each, and which input is under the `Hash` node.",
+          "Compare the `NOT EXISTS` plan with the `NOT IN` plan. Which one is a join?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "EXPLAIN (COSTS OFF)\nSELECT p.payment_id, m.name FROM payments p JOIN merchants m ON m.merchant_id = p.merchant_id;\n\nEXPLAIN (COSTS OFF)\nSELECT cu.customer_id FROM customers cu\nWHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id);\n\nEXPLAIN (COSTS OFF)\nSELECT customer_id FROM customers\nWHERE customer_id NOT IN (SELECT customer_id FROM accounts);"
+        },
+        "expect": "The first plan is a `Hash Join` with merchants under the `Hash` node: the build side. The second is a join too:\n\n```postgresql\n                  QUERY PLAN\n-----------------------------------------------\n Hash Anti Join\n   Hash Cond: (cu.customer_id = a.customer_id)\n   ->  Seq Scan on customers cu\n   ->  Hash\n         ->  Seq Scan on accounts a\n(5 rows)\n```\n\nThe third is not a join at all. It is a scan of customers with a filter: `Filter: (NOT (ANY (customer_id = (hashed SubPlan 1).col1)))`. On tables this small, PostgreSQL picks hash joins almost every time. Lesson 11 shows the plans change as tables grow and indexes appear."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/18/using-explain.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of an event with a guest list and a cloakroom. An inner join is the list of coats with their owners' names: guests without a coat are not on it, and a guest with two coats appears twice. A left join is the guest list with a coat column, blank for guests who brought none. A semi join answers \"who brought a coat?\" and names each guest once. An anti join answers \"who came without one?\". Now picture a few cloakroom tickets with the name smudged. Asked \"is Kofi's name nowhere on the tickets?\", an honest clerk says \"can't tell, a smudged one might be his\". That is `NOT IN`. `NOT EXISTS` asks \"is there a ticket that clearly says Kofi?\", and the answer is no. The analogy breaks at speed: a clerk checks every ticket, while PostgreSQL builds a hash table of tickets once and looks each guest up in one step.",
+  "in_your_world": "Hibernate users meet row multiplication as \"my fetch join returns the same order twice\": `JOIN FETCH o.lines` turns one order with three lines into three result rows, and the classic fix is `DISTINCT`. Now you know why it happens and what it costs. Idempotent Kafka consumers lean on anti joins: \"insert the event where `NOT EXISTS` a row with this idempotency key\" (or a unique constraint, which is better still). Older Oracle reports at work may use the `(+)` outer-join syntax, and every `NOT IN (SELECT ...)` in them has the same NULL trap in Oracle as in PostgreSQL: SQL defines it that way, so rewrite them as `NOT EXISTS` when you port them. And when a settlement reconciliation compares two tables, a `FULL JOIN` on the key followed by `WHERE a.id IS NULL OR b.id IS NULL` lists the rows each side is missing in one pass.",
+  "mistake": "The most damaging join mistake is `WHERE x NOT IN (SELECT y FROM t)` where `y` can be NULL. It works in every test, because the test data has no NULL there, and then returns nothing the day one row with a NULL arrives. No error, just an empty report or a dedupe check that lets everything through. People write it because it reads like English and behaves like `NOT EXISTS` most of the time. The fix is to write anti joins as `NOT EXISTS (SELECT 1 FROM t WHERE t.y = x)`, which ignores NULLs correctly and plans as a Hash Anti Join. Keep `NOT IN` for short lists of constants on columns that are `NOT NULL`.",
+  "compare": {
+    "title": "An outer join in legacy Oracle syntax and in standard SQL",
+    "a": {
+      "label": "Oracle (legacy (+) syntax)",
+      "lang": "sql",
+      "title": "Oracle, old style",
+      "src": "-- (+) marks the side that may be missing\nSELECT m.merchant_id, m.name, p.payment_id\nFROM merchants m, payments p\nWHERE p.merchant_id (+) = m.merchant_id\n  AND p.created_at (+) >= DATE '2026-06-01'\n  AND p.created_at (+) <  DATE '2026-07-01';\n-- leave out one (+) and the outer join\n-- quietly becomes an inner join"
+    },
+    "b": {
+      "label": "PostgreSQL 18 (and Oracle 9i or later)",
+      "lang": "sql",
+      "title": "Standard SQL",
+      "src": "-- the join conditions sit together in ON\nSELECT m.merchant_id, m.name, p.payment_id\nFROM merchants m\nLEFT JOIN payments p\n       ON p.merchant_id = m.merchant_id\n      AND p.created_at >= '2026-06-01'\n      AND p.created_at <  '2026-07-01';\n-- conditions on the outer side go in WHERE"
+    },
+    "note": "Both queries list every merchant with its June payments. Oracle's `(+)` operator predates the SQL standard's `LEFT JOIN` and is still accepted, but PostgreSQL does not support it, so ported queries must be rewritten. The rewrite also fixes a class of bugs: with `(+)`, every condition on the optional table needs its own `(+)`, and missing one is exactly the ON-versus-WHERE trap from this lesson. Oracle has accepted `LEFT JOIN ... ON` since version 9i and recommends it. Semi and anti joins behave the same in both databases, including the `NOT IN` NULL trap."
+  },
+  "worked": {
+    "title": "Customers with no successful payment in the second quarter",
+    "steps": [
+      {
+        "say": "Marketing wants customers who did not complete a payment between April and June 2026. Start with the positive question, because it is easier to check: which customers did pay? Follow the keys from payments to cards to accounts. Eight customers come back: 1 to 7 and 13.",
+        "code": "-- 1. the positive set: who paid in Q2 (half-open range from lesson 1)\nSELECT DISTINCT a.customer_id\nFROM payments p\nJOIN cards c    ON c.card_id = p.card_id\nJOIN accounts a ON a.account_id = c.account_id\nWHERE p.status = 'succeeded'\n  AND p.created_at >= '2026-04-01' AND p.created_at < '2026-07-01';",
+        "lang": "sql"
+      },
+      {
+        "say": "The answer is every customer not in that set: an anti join. Move the join chain inside `NOT EXISTS` and tie it to the outer row with `a.customer_id = cu.customer_id`.",
+        "code": "-- 2. the anti join: keep a customer when no such payment exists\nSELECT cu.customer_id, cu.full_name\nFROM customers cu\nWHERE NOT EXISTS (\n    SELECT 1\n    FROM accounts a\n    JOIN cards c    ON c.account_id = a.account_id\n    JOIN payments p ON p.card_id = c.card_id\n    WHERE a.customer_id = cu.customer_id          -- correlate with the outer row\n      AND p.status = 'succeeded'\n      AND p.created_at >= '2026-04-01' AND p.created_at < '2026-07-01'\n)\nORDER BY cu.customer_id;",
+        "lang": "sql"
+      },
+      {
+        "say": "Check the answer row by row. It returns five customers, each missing for a different reason: Hugo (8) only has a failed payment in February, Ivy (9) has cards but never paid, Jonas (10) had a payment fail in April, Kofi (11) has no account and Lena (12) has an account but no card. An anti join is right for all five because it asks only whether a matching row exists.",
+        "code": "--  customer_id |  full_name\n-- -------------+-------------\n--            8 | Hugo Silva\n--            9 | Ivy Chen\n--           10 | Jonas Weber\n--           11 | Kofi Mensah\n--           12 | Lena Novak",
+        "lang": "sql"
+      },
+      {
+        "say": "Compare a tempting alternative: join everything and keep the customers whose Q2 count is zero. It returns only Hugo and Jonas. Ivy, Kofi and Lena have no payment rows at all, so the inner joins drop them before the count ever runs. A customer with nothing to count is exactly the customer an anti join is for.",
+        "code": "-- 4. wrong: inner joins remove the customers with no rows to count\nSELECT cu.customer_id, cu.full_name\nFROM customers cu\nJOIN accounts a ON a.customer_id = cu.customer_id\nJOIN cards c    ON c.account_id = a.account_id\nJOIN payments p ON p.card_id = c.card_id\nGROUP BY cu.customer_id, cu.full_name\nHAVING count(*) FILTER (WHERE p.status = 'succeeded'\n                          AND p.created_at >= '2026-04-01' AND p.created_at < '2026-07-01') = 0;\n-- returns 8 Hugo Silva and 10 Jonas Weber only",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "An anti join, an outer join and a semi join, checked against the seed",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l03/never_referred_anyone.sql",
+      "labs/sql/src/main/resources/sfz/sql/l03/merchant_failed_payments.sql",
+      "labs/sql/src/main/resources/sfz/sql/l03/merchants_with_refunds.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l03.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder. All six fail. Each of the three files already holds a query that runs and looks plausible.",
+      "`never_referred_anyone.sql` uses `NOT IN` and returns nothing. Rewrite it as an anti join with `NOT EXISTS`.",
+      "`merchant_failed_payments.sql` uses a LEFT JOIN and still loses merchants. Move the condition to where it belongs.",
+      "`merchants_with_refunds.sql` repeats merchants. Rewrite it as a semi join with `EXISTS`, without `DISTINCT`.",
+      "Run the tests until all six pass. Each exercise has a second test that adds rows first."
+    ],
+    "hints": [
+      "`SELECT count(*), count(referred_by) FROM customers` tells you whether the `NOT IN` list contains NULLs.",
+      "In the loop picture, a condition in `ON` decides what counts as a match. A condition in `WHERE` runs on the finished rows, NULL-padded ones included.",
+      "The EXISTS subquery needs the refunds joined to their payments, and one condition that ties a payment to the outer merchant."
+    ],
+    "done_when": "All six tests in `JoinsTest` pass."
+  },
+  "drill": {
+    "title": "Write the four join shapes from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write four queries over `customers cu` and `cards c` (joined through `accounts a`): every card with its owner's name (inner join); every customer with their cards, keeping customers with none (left join); customers with at least one card, each once (semi join); customers with no card (anti join). Then say which one `NOT IN` could break, and why.",
+    "answer": {
+      "lang": "sql",
+      "src": "-- inner: one row per card (14 rows)\nSELECT c.card_id, cu.full_name\nFROM cards c JOIN accounts a   ON a.account_id = c.account_id\n             JOIN customers cu ON cu.customer_id = a.customer_id;\n\n-- left: one row per card, plus a NULL row for each customer without one (16 rows)\nSELECT cu.full_name, c.card_id\nFROM customers cu\nLEFT JOIN (accounts a JOIN cards c ON c.account_id = a.account_id)\n       ON a.customer_id = cu.customer_id;\n\n-- semi: each customer with a card, once (11 rows)\nSELECT cu.full_name FROM customers cu\nWHERE EXISTS (SELECT 1 FROM accounts a JOIN cards c ON c.account_id = a.account_id\n              WHERE a.customer_id = cu.customer_id);\n\n-- anti: customers with no card (Kofi and Lena)\nSELECT cu.full_name FROM customers cu\nWHERE NOT EXISTS (SELECT 1 FROM accounts a JOIN cards c ON c.account_id = a.account_id\n                  WHERE a.customer_id = cu.customer_id);\n-- NOT IN could break the anti join: one NULL customer_id in its list and it returns nothing"
+    }
+  },
+  "recap": [
+    "A join means: for each left row, look at every right row and keep the pairs the ON condition makes true. Its size is the sum of each left row's matches.",
+    "Following a foreign key to a primary key keeps one row per row; going the other way repeats the parent once per child.",
+    "A LEFT JOIN keeps unmatched left rows with NULLs. Conditions on the right table go in ON; in WHERE they drop the NULL rows and undo the outer join.",
+    "A semi join (`EXISTS`) keeps each left row once if any match exists. Use it instead of `JOIN` plus `DISTINCT`.",
+    "An anti join keeps left rows with no match. Write `NOT EXISTS`: one NULL in a `NOT IN` subquery empties the result.",
+    "PostgreSQL runs joins as a nested loop with an index, a hash join or a merge join, and EXPLAIN shows which; anti joins appear as Hash Anti Join."
+  ],
+  "quiz": [
+    {
+      "q": "There are 37 payments and 6 refunds. Payment 5 has two refunds, four other payments have one each, and the rest have none. How many rows does `payments p LEFT JOIN refunds r ON r.payment_id = p.payment_id` return?",
+      "options": [
+        "37",
+        "38",
+        "43",
+        "6"
+      ],
+      "answer": 1,
+      "why": "Each payment appears once per matching refund, or once with NULLs if it has none. Payment 5 matches twice, so it adds one extra row: 37 + 1 = 38. 43 would be 37 plus all 6 refunds, as if every refund added a row on top of its payment."
+    },
+    {
+      "q": "`SELECT * FROM merchants WHERE merchant_id NOT IN (SELECT merchant_id FROM accounts)` returns 0 rows, although some merchants have no settlement account yet. What is the best fix?",
+      "options": [
+        "Add DISTINCT to the subquery",
+        "Swap NOT IN for != ALL",
+        "Rewrite it as `WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.merchant_id = merchants.merchant_id)`",
+        "Wrap the subquery column in coalesce(merchant_id, 0)"
+      ],
+      "answer": 2,
+      "why": "`accounts.merchant_id` is NULL for customer accounts, and one NULL makes every NOT IN test unknown. NOT EXISTS ignores NULL rows because they never make the condition true. `!= ALL` is the same operator as NOT IN, and DISTINCT keeps the NULL. coalesce works only as long as nobody ever has id 0, which is a guess, not a rule."
+    },
+    {
+      "q": "A query has `FROM merchants m LEFT JOIN payments p ON p.merchant_id = m.merchant_id WHERE p.status = 'failed'`. What does it return?",
+      "options": [
+        "Every merchant, with NULLs where there are no failed payments",
+        "Every merchant once, whether or not it has payments",
+        "An error: a LEFT JOIN cannot have a WHERE on the right table",
+        "Only merchants that have failed payments, one row per failed payment"
+      ],
+      "answer": 3,
+      "why": "WHERE runs after the join. Merchants without a failed payment get rows with `p.status` NULL or another status, and those rows fail the test, so the LEFT JOIN behaves like an inner join. Put `AND p.status = 'failed'` in ON to keep every merchant."
+    },
+    {
+      "q": "Both `customers` and `accounts` are large. What join node do you expect in the plan for `... WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = c.customer_id)`?",
+      "options": [
+        "Hash Anti Join (or Merge Anti Join)",
+        "Seq Scan with a Filter on a hashed SubPlan",
+        "Hash Join followed by a Unique node",
+        "Nested Loop with the subquery rerun from scratch for every customer, always"
+      ],
+      "answer": 0,
+      "why": "PostgreSQL turns NOT EXISTS into an anti join, so it can use the hash or merge machinery and read each table once. The filter on a hashed SubPlan is what NOT IN produces; it is not a join, and it gets slow when the subquery result outgrows work_mem."
+    },
+    {
+      "q": "Lesson 2 split the export into payments, merchants and mcc_codes, each keyed by what determines it. Joining `payments` to `merchants` to `mcc_codes` on those keys returns how many rows per payment?",
+      "options": [
+        "One per payment of the same merchant",
+        "Exactly one, because each step follows a foreign key to a primary key",
+        "Zero or one, depending on the payment's status",
+        "One per row of mcc_codes"
+      ],
+      "answer": 1,
+      "why": "Each step goes from a NOT NULL foreign key to a primary key, so each payment finds exactly one merchant and that merchant exactly one category. Joins only multiply rows when you go from a parent to its children.",
+      "from": "sql-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "How many rows does an inner join return?",
+      "back": "For each left row, the number of right rows that match it, added up. A cross join is left rows times right rows."
+    },
+    {
+      "front": "Where does a condition on the right table of a LEFT JOIN go?",
+      "back": "In ON. In WHERE it runs after the join, drops the NULL-padded rows and turns the LEFT JOIN into an inner join."
+    },
+    {
+      "front": "What is a semi join, and how do you write it?",
+      "back": "Keep each left row once if at least one match exists. `WHERE EXISTS (SELECT 1 FROM ... WHERE <match>)`."
+    },
+    {
+      "front": "Why does `x NOT IN (SELECT y ...)` return nothing when y has a NULL?",
+      "back": "It means x <> every y, and x <> NULL is unknown, so the whole test is never true."
+    },
+    {
+      "front": "Two safe ways to write an anti join?",
+      "back": "`WHERE NOT EXISTS (...)`, or `LEFT JOIN ... WHERE right_pk IS NULL`."
+    },
+    {
+      "front": "How does a hash join work?",
+      "back": "Build an in-memory hash table from the smaller input, then read the larger input once and probe one bucket per row. Equality joins only."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Inner join",
+      "plain": "All pairs of rows from two tables for which the ON condition is true."
+    },
+    {
+      "term": "Cross join",
+      "plain": "Every row paired with every row: left rows times right rows."
+    },
+    {
+      "term": "Left outer join",
+      "plain": "An inner join plus every unmatched left row once, with NULL in the right table's columns."
+    },
+    {
+      "term": "Semi join",
+      "plain": "Keeps each left row once if at least one matching right row exists. Written with EXISTS."
+    },
+    {
+      "term": "Anti join",
+      "plain": "Keeps the left rows that have no matching right row. Written with NOT EXISTS."
+    },
+    {
+      "term": "Correlated subquery",
+      "plain": "A subquery that refers to a column of the outer query, so it is evaluated per outer row."
+    },
+    {
+      "term": "Hash join",
+      "plain": "A join method: build a hash table from one input, then probe it once for each row of the other."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate's dedupe check, `WHERE event_key NOT IN (SELECT event_key FROM processed_events)`, suddenly lets nothing through after a release added rows with a NULL `event_key`. Explain what happened and what to write instead.",
+    "answer": "`NOT IN` means \"not equal to every value in the list\". Once the list contains a NULL, the comparison with that NULL is unknown for every incoming key, so the whole `NOT IN` is unknown, and WHERE keeps only rows where it is true. Every row is dropped, without an error. `NOT EXISTS (SELECT 1 FROM processed_events p WHERE p.event_key = e.event_key)` asks whether a row with a true match exists. NULL rows never match, so they cannot affect the answer. It also plans as a hash anti join. And `event_key` should probably be `NOT NULL` with a unique constraint."
+  },
+  "deeper": {
+    "minutes": 8,
+    "body": "Joins multiply rows, and aggregates add up whatever rows they get. Put the two together carelessly and totals inflate without any error. Merchant 5 took six succeeded payments worth 335,500 cents. Join in the refunds to show them next to the payments, then sum:\n\n```postgresql\ncourse=# SELECT sum(p.amount_minor) AS paid, count(*) AS rows\ncourse-# FROM payments p\ncourse-# LEFT JOIN refunds r ON r.payment_id = p.payment_id\ncourse-# WHERE p.merchant_id = 5 AND p.status = 'succeeded';\n  paid  | rows\n--------+------\n 383500 |    7\n(1 row)\n```\n\nPayment 5 has two refunds, so the join returns it twice, and its 48,000 cents are counted twice. `sum(DISTINCT p.amount_minor)` is not a fix: two different payments with the same amount would collapse into one. The fix is to aggregate each child table on its own first, so every payment or merchant becomes one row, and then join those one-row-per-key results. Lesson 4 of this track, on aggregation, builds that pattern.\n\nTwo other join forms are worth knowing by name. `JOIN ... USING (merchant_id)` is shorthand for `ON a.merchant_id = b.merchant_id` that also merges the two columns into one in the output. `NATURAL JOIN` joins on every column with the same name in both tables, which breaks the day someone adds a `created_at` column to both: avoid it. And a **lateral join**, `JOIN LATERAL`, lets the right side refer to the current left row, so it can run a small query per row, such as \"this merchant's three largest payments\". Lesson 9 covers it."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: Table expressions (joined tables)",
+      "url": "https://www.postgresql.org/docs/18/queries-table-expressions.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Subquery expressions",
+      "url": "https://www.postgresql.org/docs/18/functions-subquery.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Using EXPLAIN",
+      "url": "https://www.postgresql.org/docs/18/using-explain.html"
+    },
+    {
+      "title": "PostgreSQL wiki: Don't Do This",
+      "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This"
+    }
+  ]
+}

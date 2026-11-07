@@ -1,0 +1,139 @@
+{
+  "id": "dbi",
+  "intro": "By the end of this track you can follow a payment from your service's `COMMIT` down to the bytes on disk and back out to a replica. You will know when a write is really durable, how a table becomes 8 KB slotted pages, how the buffer pool decides what stays in memory, why an index is a short, wide B+tree and when an LSM tree is the better fit, how the write-ahead log lets a database crash at any moment, how MVCC and locks keep concurrent transactions apart, how a plan runs and how the planner chooses it, why analytics engines store columns, and how Raft keeps copies on several servers in agreement. More useful in practice: you can read `EXPLAIN (ANALYZE, BUFFERS)`, `pg_stats`, `pg_locks` and pageinspect output and say what the database is doing and why.\n\nYou need to read and write Kotlin and know basic SQL (the SQL track helps, but each lesson reminds you of what it uses). Install JDK 25 and Docker. The labs compile with release 21, so JDK 21 or newer runs them.\n\nEach lesson has a lab in `labs/internals`, package `sfz.internals.l01` to `l12`: you build one piece of a storage engine in plain Kotlin, a log-structured store, a slotted page, a buffer pool, a B+tree, an LSM store with Bloom filters, a WAL with crash recovery, an MVCC store, a lock manager, a Volcano executor, a cardinality estimator with a join orderer, a compressed column chunk and the core of Raft. The labs need no Docker and their tests are deterministic, including the crash simulations and the Raft cluster, which runs on a simulated clock and network. Run `./gradlew :internals:test --tests 'sfz.internals.l05.*'` from `labs/` for one lesson; the reference answers live in `src/solution`. The Try its run PostgreSQL 18 from `labs/env/postgres.yml` (and Cassandra in lesson 5), plus small demos, one of which runs DuckDB inside the JVM.",
+  "cheatsheet": "## The track on one page\n\n| # | Lesson | The problem | The mechanism | Remember |\n|---|---|---|---|---|\n| 1 | Bytes, pages and durability | `write` returns before the data is on disk | append-only log, `force` (fsync), a CRC per record, an index in RAM | reply OK only after the force; a crash can tear only the last record |\n| 2 | Pages, tuples and heap files | rows of any length in fixed 8 KB pages | slotted page: line pointers at the front, rows at the back; ctid = (page, slot) | DELETE and plain VACUUM don't shrink the file |\n| 3 | The buffer pool | a disk read costs far more than a memory read | frames, page table, pins, dirty flags, clock sweep, ring buffers for big scans | a pinned page is never evicted; `shared_buffers` near 25% of RAM |\n| 4 | B+trees | one row out of millions in a few reads | wide sorted tree of pages; a split copies or pushes a key up | 3 or 4 levels; equality on leading columns, then one range |\n| 5 | LSM trees | random inserts dirty whole pages | memtable, immutable sorted SSTables, Bloom filters, compaction | about 10 bits per key for 1% false positives; leveled compaction writes data 10 or more times |\n| 6 | Write-ahead logging | pages are written long after the commit | log before page, force the log at commit, page LSN, redo from a checkpoint | `synchronous_commit = off` may lose the last commits; `fsync = off` may corrupt |\n| 7 | MVCC | readers and writers waiting for each other | row versions with `xmin`/`xmax`, snapshots, VACUUM, freezing | one long transaction holds back VACUUM everywhere |\n| 8 | Concurrency control | lost updates, deadlocks, write skew | strict 2PL, waits-for graph, SSI | retry on 40001 and 40P01, from the start of the transaction |\n| 9 | Query execution | running a plan without holding whole results | iterators (`open`, `next`, `close`), nested loop, hash and merge joins, vectors | actual rows x loops = total rows |\n| 10 | Query optimization | dozens of plans for three tables | cost model, cardinality estimates, dynamic programming over sets of tables | a bad plan usually means a bad estimate |\n| 11 | Column stores | an analytics scan reads every column | column layout, dictionary, run-length, bit-packing, zone maps | zone maps need data sorted by the filter column |\n| 12 | Replication and Raft | one server loses data; two primaries split it | terms, votes, AppendEntries, commit on a majority | 3 or 5 servers; a leader commits only entries of its own term by counting |\n\n## Numbers to keep\n\n| What | Value |\n|---|---|\n| PostgreSQL page | 8 KB; heap row header 24 bytes, line pointer 4 bytes |\n| B+tree | hundreds of keys per page, so 3 or 4 levels for any table |\n| Bloom filter | 10 bits per key and 7 hash functions: about 1% false positives |\n| Planner cost units | sequential page 1.0, random page 4.0, row 0.01, operator 0.0025 |\n| ANALYZE | 30,000 sampled rows, 100 MCVs and 100 histogram buckets at the default target of 100 |\n| Join estimate | rows(R) x rows(S) / max(distinct R.x, distinct S.y) |\n| Transaction ids | 32-bit; autovacuum forces freezing at 200 million of age |\n| `deadlock_timeout` | 1 s before PostgreSQL looks for a cycle |\n| Hash table memory | `work_mem` (4 MB) x `hash_mem_multiplier` (2) |\n| DuckDB | row groups of 122,880 rows, vectors of 2,048 values |\n| BRIN | one min and max per 128 pages by default |\n| Raft | random election timeout, 150 to 300 ms in the paper; heartbeats well inside it; 2f + 1 servers survive f failures |\n\n## Easy to confuse\n\n| | One | The other |\n|---|---|---|\n| B+tree vs LSM tree | updates pages in place; a read follows one path down; a random insert dirties a whole page | appends to a memtable and writes sorted files; writes are sequential; a read may check several files, and compaction rewrites data |\n| WAL vs MVCC versions | a log of changes, written before the pages, read after a crash and by replicas, recycled after checkpoints | old copies of rows inside the table, kept for snapshots that may still see them, removed by VACUUM |\n| Buffer pool vs OS page cache | the database's own cache: it knows pins, dirty pages and the WAL rule | the kernel's cache of file data; PostgreSQL reads through it too, so a page can be cached twice |\n| 2PL vs SSI | locks held to commit; conflicting transactions wait; deadlocks are possible | reads take no blocking locks; read-write dependencies are tracked and one transaction fails with 40001 |\n| Nested loop vs hash join | outer x inner work, or one index lookup per outer row; any condition; best for few outer rows | outer + inner work; equality only; needs memory for the build side |\n| Row store vs column store | whole rows together: cheap inserts and single-row reads | each column together: cheap scans of few columns, compresses well, slow single-row changes |\n| Zone map (BRIN) vs B+tree | min and max per block range: tiny, helps only columns that follow the row order | an entry per row: precise in any order, much bigger |\n| Async replication vs Raft | commit first, ship the log later: the last commits can be lost; failover is decided outside | commit after a majority stores it; the leader is elected inside the protocol |\n\n## Looking inside PostgreSQL\n\n| To see | Use |\n|---|---|\n| the rows and line pointers of a page | `SELECT * FROM heap_page_items(get_raw_page('t', 0))` (pageinspect) |\n| what is cached | `pg_buffercache`, and `Buffers: shared hit / read` in `EXPLAIN (ANALYZE, BUFFERS)` |\n| an index's pages | `bt_metap`, `bt_page_items` (pageinspect) |\n| the WAL | `pg_current_wal_lsn()`, `pg_waldump` |\n| versions and snapshots | `xmin`, `xmax`, `pg_current_snapshot()`, `pg_stat_user_tables.n_dead_tup` |\n| who waits for whom | `pg_locks`, `pg_blocking_pids(pid)` |\n| what a plan did | `EXPLAIN (ANALYZE)`: estimated `rows=` against `actual rows=`, times `loops` |\n| what the planner knows | `pg_stats`, `pg_stats_ext`; fix correlated columns with `CREATE STATISTICS` |\n| zone maps | `CREATE INDEX ... USING brin (created_at)` |\n\n## When something goes wrong, ask first\n\n- Data lost after a crash: was the OK sent before a force, or with `synchronous_commit = off`, or from an async replica after failover?\n- Table or index keeps growing: is a long transaction or an `idle in transaction` session holding back VACUUM?\n- Query got slow: in EXPLAIN ANALYZE, which is the lowest node whose estimated and actual rows differ by 10x or more?\n- Errors 40001 or 40P01: does every transaction have a retry loop that starts again from the beginning?\n- Analytics hurts the primary: can the scan move to a copy in a column store, loaded in batches and sorted by the filter column?",
+  "recap": [
+    "A write is durable only after `force` (fsync) returns. Logs make that cheap: append sequentially, force once per batch, and check a CRC per record after a crash.",
+    "Tables are files of 8 KB slotted pages; a row's address is (page, slot). The buffer pool caches pages with pins, dirty flags and a clock sweep, on top of the OS page cache.",
+    "A B+tree reads one page per level, three or four in all, and updates pages in place. An LSM tree turns random writes into sequential files and pays with compaction and multi-file reads.",
+    "The write-ahead log is forced at commit and always reaches disk before the pages it describes. Recovery replays it from the last checkpoint, and page LSNs make replay safe to repeat.",
+    "MVCC keeps old row versions so readers never wait for writers. Writers still lock rows, VACUUM removes versions no snapshot can see, and a long transaction blocks it.",
+    "Strict 2PL holds locks until commit and must break deadlocks. SERIALIZABLE in PostgreSQL is SSI, which aborts with 40001 instead of blocking, so every transaction needs a retry loop.",
+    "A plan is a tree of iterators. Nested loops cost outer x inner (or a lookup per outer row), hash joins outer + inner; vectorized engines pass a thousand or more values per call.",
+    "The planner picks the cheapest plan for its estimates. Estimates come from sampled per-column statistics and assume independence, so correlated columns need `CREATE STATISTICS`.",
+    "Column stores keep each column together, compress it with dictionaries, runs and bit-packing, and skip chunks with zone maps, which only work on columns that follow the row order.",
+    "Raft keeps a log on a majority of 2f + 1 servers: one leader per term, elected by votes that go only to up-to-date logs, and an entry is committed once a majority stores it."
+  ],
+  "quiz": [
+    {
+      "q": "A fraud service inserts 50,000 events a second keyed by random UUIDs and reads them back by key, rarely by range. Why might an LSM tree suit it better than a B+tree, and what does it pay?",
+      "options": [
+        "The LSM tree writes sorted files sequentially instead of dirtying a random page per insert; it pays with compaction rewrites and reads that may check several files",
+        "The B+tree appends random UUIDs at the end of its last leaf, so it wins on writes too",
+        "The LSM tree wins on writes and on reads, with no cost",
+        "The B+tree is better, because Bloom filters make its range scans fast"
+      ],
+      "answer": 0,
+      "why": "Random keys land on random leaf pages, so a B+tree dirties (and logs) a whole 8 KB page for a small insert. An LSM tree buffers writes in a memtable and flushes them as one sorted file, then merges files in the background: write amplification from compaction, and point reads that may look in several files, which Bloom filters make cheaper. Only ascending keys fill a B+tree's last leaf; Bloom filters belong to LSM trees and don't help range scans.",
+      "from": "dbi-05"
+    },
+    {
+      "q": "In PostgreSQL an UPDATE changes a balance from 100 to 70 and commits. Where does the old value 100 live afterwards, and what removes it?",
+      "options": [
+        "Only in the WAL, which keeps it until VACUUM runs",
+        "In the heap page as an old row version with `xmax` set, until VACUUM removes it once no snapshot can see it; the WAL record of the change is recycled after later checkpoints",
+        "Nowhere: the update overwrote it in place, and readers that need it wait",
+        "In an undo log, which purge clears at commit"
+      ],
+      "answer": 1,
+      "why": "PostgreSQL's MVCC writes a new version and stamps the old one's `xmax`; both stay in the table for snapshots that may still see the old one, and VACUUM reclaims it later. The WAL is a different thing: a log of changes for crash recovery and replicas, not a store of old values for readers. Undo logs are how InnoDB and Oracle keep old versions.",
+      "from": "dbi-07"
+    },
+    {
+      "q": "`EXPLAIN (ANALYZE, BUFFERS)` shows `Buffers: shared read=8000` for a query that finished in 30 ms, and the disks show no reads at all. How?",
+      "options": [
+        "EXPLAIN counts reads it planned, not reads it did",
+        "The pages were in the buffer pool after all; `read` is a rounding error",
+        "`read` means the pages weren't in `shared_buffers`; PostgreSQL asked the kernel, which had them in the OS page cache",
+        "The query ran on a replica"
+      ],
+      "answer": 2,
+      "why": "PostgreSQL's buffer pool sits on top of the kernel's page cache, and it reads files through it. A miss in `shared_buffers` is counted as `read` even when the kernel serves the page from memory in microseconds. That double caching is why `shared_buffers` starts near 25% of RAM rather than most of it.",
+      "from": "dbi-03"
+    },
+    {
+      "q": "Two transfers each check that a pair of accounts keeps a combined balance above zero, then each debits a different account. Under REPEATABLE READ both commit and the rule breaks. What does PostgreSQL's SERIALIZABLE do differently?",
+      "options": [
+        "It takes exclusive locks on every row read, so the second transfer waits until the first commits",
+        "It tracks that each transaction read what the other wrote, and aborts one of them with 40001; the reads never block",
+        "It runs transactions one at a time",
+        "Nothing: write skew is allowed at every level"
+      ],
+      "answer": 1,
+      "why": "PostgreSQL's SERIALIZABLE is serializable snapshot isolation: reads leave non-blocking SIREAD notes, and a pattern of read-write dependencies in both directions makes it abort one transaction with 40001, which the application retries. Strict two-phase locking would make readers block writers instead, which is what `SELECT ... FOR UPDATE` gives you by hand.",
+      "from": "dbi-08"
+    },
+    {
+      "q": "A screen shows the 10 newest payments with their merchant names; `merchants.id` has a primary-key index. A nightly report joins all 2 million payments with 10,000 merchants. Which join suits each?",
+      "options": [
+        "Hash join for both",
+        "Nested loop for both",
+        "Index nested loop for the screen (10 index lookups), hash join for the report (each table read once)",
+        "Merge join for both, because the primary key is sorted"
+      ],
+      "answer": 2,
+      "why": "With 10 outer rows, one index lookup per row touches a handful of pages; building a hash table of 10,000 merchants first would cost more. For 2 million rows, a nested loop would do 2 million lookups or 20 billion comparisons, while a hash join builds a table of the merchants once and probes it per payment.",
+      "from": "dbi-09"
+    },
+    {
+      "q": "A ledger service writes each entry with `FileChannel.write` and replies OK at once. The machine loses power a millisecond later. What may have happened to the entry?",
+      "options": [
+        "Nothing: `write` returned, so the bytes are on disk",
+        "It may be lost: `write` only copied it into the kernel's page cache, and only `force` waits for the drive",
+        "It is half-written, and the next start fails",
+        "It is safe if the file was opened in append mode"
+      ],
+      "answer": 1,
+      "why": "`write` returns once the kernel has the bytes in memory. They reach the drive later, unless `force` (fsync) is called and returns first. A torn last record is possible too, which is why logs carry a CRC per record, but the main point is that the OK went out before the data was durable.",
+      "from": "dbi-01"
+    },
+    {
+      "q": "VACUUM compacts a heap page, moving the surviving rows to close the gaps. Why don't the table's indexes need to change?",
+      "options": [
+        "Indexes store the row's values, not where it is",
+        "Index entries point to (page, slot); the slot number stays the same, and only the offset inside the line pointer changes",
+        "VACUUM rebuilds every index at the same time",
+        "Rows never move inside a page"
+      ],
+      "answer": 1,
+      "why": "A slotted page puts an array of line pointers in front of the rows. Indexes and ctids name the line pointer, not the byte offset, so compaction can move a row's bytes and update its line pointer without touching any index. That indirection is the point of the slotted page.",
+      "from": "dbi-02"
+    },
+    {
+      "q": "Settlement records from 40 acquirers are written to Parquet in arrival order. A reconciliation query filters on `acquirer_id = 17` and one settlement day, and the reader still reads every row group. What lets it skip most of them?",
+      "options": [
+        "Bigger row groups, so there are fewer to read",
+        "zstd compression on top of the encodings",
+        "Sorting each file by acquirer and settlement day before writing it, so each row group's min and max cover a narrow range",
+        "A B+tree index stored next to the file"
+      ],
+      "answer": 2,
+      "why": "Readers skip a row group when its column statistics, the min and max, rule out the condition. In arrival order every row group holds most acquirers and days, so nothing can be ruled out. Sorted data gives each row group a narrow range that most queries miss. Compression and bigger groups make reads cheaper but don't skip anything.",
+      "from": "dbi-11"
+    },
+    {
+      "q": "Which statement about PostgreSQL's planner is true?",
+      "options": [
+        "It always finds the fastest plan, given an index",
+        "It runs the candidate plans on a sample and keeps the fastest",
+        "It picks the cheapest plan for its row estimates, which come from sampled per-column statistics and assume conditions on different columns are independent",
+        "It learns correlations between columns from multicolumn indexes"
+      ],
+      "answer": 2,
+      "why": "The planner prices plans with a cost model fed by cardinality estimates, then searches join orders by dynamic programming. The search is exact for its inputs, so when the plan is bad it is usually because an estimate is far off, often from correlated columns. Only `CREATE STATISTICS` gives it cross-column statistics; indexes don't.",
+      "from": "dbi-10"
+    },
+    {
+      "q": "A three-server Raft group is spread over two data centres, two servers in one and one in the other. The data centre with two servers loses power. What happens?",
+      "options": [
+        "The remaining server becomes leader and keeps taking writes",
+        "The remaining server can't win a majority (2 of 3), so no leader is elected and no write commits until a server comes back",
+        "The cluster keeps working read-write, because Raft needs only one copy",
+        "The remaining server commits writes and reconciles them later"
+      ],
+      "answer": 1,
+      "why": "A leader needs votes from a majority, 2 of 3, and an entry commits only on a majority. One server alone can do neither, which is what keeps a cut-off minority from accepting writes that could conflict. Spread three or five servers over three failure domains so that losing one domain still leaves a majority.",
+      "from": "dbi-12"
+    }
+  ]
+}

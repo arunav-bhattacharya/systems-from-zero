@@ -1,0 +1,65 @@
+# Redis 8.10 replication and Sentinel, for lesson 10 of the Redis track: one primary, one replica, and
+# three Sentinels that watch the primary and promote the replica when it stops answering.
+# Run these from the labs folder:
+#   docker compose -f env/redis-ha.yml up -d --wait                 start all five (a few seconds)
+#   docker compose -f env/redis-ha.yml exec primary redis-cli       a prompt on the primary
+#   docker compose -f env/redis-ha.yml exec replica redis-cli       a prompt on the replica (read-only)
+#   docker compose -f env/redis-ha.yml exec sentinel-1 redis-cli -p 26379     a prompt on a Sentinel
+#   docker compose -f env/redis-ha.yml pause replica                freeze a server (unpause brings it back)
+#   docker compose -f env/redis-ha.yml logs -f sentinel-1           watch a Sentinel's decisions
+#   docker compose -f env/redis-ha.yml down -v                      stop everything and delete the data
+# No host ports: everything runs through `exec`, so this file never clashes with env/redis.yml.
+# The servers announce their Compose names (replica-announce-ip), so the Sentinels can reach them
+# by name after a failover. Memory: two 128 MB servers and three 32 MB Sentinels.
+name: sfz-redis-ha
+
+x-server: &server
+  image: redis:8.10.3
+  mem_limit: 128m
+
+x-sentinel: &sentinel
+  image: redis:8.10.3
+  mem_limit: 32m
+  volumes:
+    - ./redis:/seed:ro
+  command: ["sh", "-c", "cp /seed/sentinel.conf /tmp/sentinel.conf && exec redis-sentinel /tmp/sentinel.conf"]
+  depends_on:
+    primary: {condition: service_healthy}
+    replica: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
+services:
+  primary:
+    <<: *server
+    hostname: primary
+    # appendonly so a restarted primary keeps its data (see the lesson's warning about empty restarts)
+    command: ["redis-server", "--appendonly", "yes", "--replica-announce-ip", "primary"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  replica:
+    <<: *server
+    hostname: replica
+    command: ["redis-server", "--appendonly", "yes", "--replicaof", "primary", "6379", "--replica-announce-ip", "replica"]
+    depends_on:
+      primary: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli info replication | grep -q -E 'master_link_status:up|role:master'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  sentinel-1:
+    <<: *sentinel
+    hostname: sentinel-1
+  sentinel-2:
+    <<: *sentinel
+    hostname: sentinel-2
+  sentinel-3:
+    <<: *sentinel
+    hostname: sentinel-3

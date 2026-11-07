@@ -1,0 +1,440 @@
+{
+  "id": "net-07",
+  "title": "TCP connections: handshake, states and TIME_WAIT",
+  "minutes": 40,
+  "goal": "By the end you can read a TCP handshake and close in tcpdump with their sequence numbers, name the state each side is in at every step, tell a refused connect from a timed-out one, and explain why TIME_WAIT exists and how it runs a client out of ports.",
+  "warmup": {
+    "q": "A Quarkus service opens a fresh TCP connection to a card issuer for every authorization and closes it when the response is in. After a busy hour, `ss -tan` on its host shows 9,000 sockets in TIME-WAIT, all to the issuer's address. What does that tell you?",
+    "options": [
+      "The issuer isn't closing its side, so the connections are leaking",
+      "The service closed each connection first, and its kernel keeps every finished one for about a minute, as TCP requires",
+      "FIN segments are being lost, so the connections are stuck half open",
+      "The service's connection pool is full and these connections are waiting for a slot"
+    ],
+    "answer": 1,
+    "why": "TIME-WAIT belongs to the side that closed first, here the service, and Linux keeps it for 60 seconds per connection. 9,000 of them means about 150 new connections a second. That is cheap in memory, but each one holds a local port toward that one address. The first option describes CLOSE-WAIT, the state of a side whose program never called `close()`, which is a real leak. The fix here is to reuse connections instead of opening one per call."
+  },
+  "sections": [
+    {
+      "h": "Two random numbers, agreed in three messages",
+      "body": "Lesson 6 of this track built a reliable protocol on UDP: number every message, ACK it, resend after a timeout, drop duplicates. Its sequence numbers started at 0. TCP does the same work for a byte stream. It numbers every byte, and an ACK means \"I have every byte before this number\". Before the first byte can travel, both sides must agree where the numbering starts. That agreement is the handshake, and the state it leaves in both kernels is what we call a connection.\n\nWhy not always start at 0? Picture a client that opens a connection from port 50744 to port 9000, sends a payment, closes, and a second later opens a new connection between the same two ports. A segment from the first connection that sat in a router queue now arrives. If both connections numbered from 0, the receiver would accept those old bytes as part of the new conversation. So each side picks its own starting number, the **initial sequence number** (ISN). RFC 9293 builds it from a clock that ticks every 4 microseconds plus a hash of the addresses, the ports and a secret. Every connection gets a different one, and an attacker can't guess it, which matters: whoever can guess the numbers can inject data into somebody else's connection.\n\nNow each side must tell the other its ISN and know that it arrived. That takes four messages: the client sends its number, the server acknowledges it, the server sends its number, the client acknowledges that. The server's acknowledgment and its own number fit in one segment, so four become three:\n\n1. SYN (synchronize): the client says \"my bytes start after 244700535\".\n2. SYN-ACK: the server says \"the next byte I expect from you is 244700536, and my bytes start after 4042781690\".\n3. ACK: the client says \"the next byte I expect from you is 4042781691\".\n\nHere are those three segments from the Try it below, printed by tcpdump with `-S` for absolute numbers:\n\n```text\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [S], seq 244700535, win 64240, options [mss 1460,sackOK,TS val 3966452277 ecr 0,nop,wscale 7], length 0\n10.10.1.20.9000 > 10.10.1.10.50744: Flags [S.], seq 4042781690, ack 244700536, win 65160, options [mss 1460,sackOK,TS val 668285845 ecr 3966452277,nop,wscale 7], length 0\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [.], ack 4042781691, win 502, options [nop,nop,TS val 3966452277 ecr 668285845], length 0\n```\n\nNotice the +1. A SYN carries no data, yet it uses up one sequence number, so the ACK for it is ISN + 1. A FIN, the \"I'm done\" flag of the third section, uses one number too. The options are settled once, in the handshake: `mss 1460` is the biggest segment each side accepts (lesson 4's MTU of 1,500 minus 40 bytes of headers), `sackOK` allows acknowledging ranges, `wscale 7` multiplies every window by 128 (lesson 8 of this track explains why), and `TS` are timestamps for measuring round trips.\n\nThe handshake costs one round trip before any data moves. On the lab network that's a tenth of a millisecond. To a card issuer 70 ms away it's 70 ms on every new connection, which is why lesson 1 ended with connection pools.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client and server timelines with the three handshake segments from the capture: SYN with the client&#x27;s initial sequence number, SYN-ACK with the server&#x27;s number and an ACK of the client&#x27;s plus one, and the final ACK\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"40\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"140.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"440\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"540.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"540.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><line class=\"ln-d\" x1=\"140\" y1=\"66\" x2=\"140\" y2=\"290\"/><line class=\"ln-d\" x1=\"540\" y1=\"66\" x2=\"540\" y2=\"290\"/><line class=\"ln-a\" x1=\"142\" y1=\"110\" x2=\"536\" y2=\"110\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"340\" y=\"100\" text-anchor=\"middle\">SYN  seq 244700535</text><text class=\"t-s t-m\" x=\"340\" y=\"130\" text-anchor=\"middle\">my bytes start after 244700535</text><line class=\"ln-a\" x1=\"538\" y1=\"180\" x2=\"144\" y2=\"180\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"340\" y=\"170\" text-anchor=\"middle\">SYN-ACK  seq 4042781690  ack 244700536</text><text class=\"t-s t-m\" x=\"340\" y=\"200\" text-anchor=\"middle\">got yours (+1); mine start after 4042781690</text><line class=\"ln-a\" x1=\"142\" y1=\"250\" x2=\"536\" y2=\"250\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"340\" y=\"240\" text-anchor=\"middle\">ACK  ack 4042781691</text><text class=\"t-s t-m\" x=\"340\" y=\"270\" text-anchor=\"middle\">got yours (+1): both sides agree</text></svg>",
+        "caption": "The handshake from the capture. Each side's first number is random, and each acknowledgment is the other side's number plus one."
+      },
+      "try": {
+        "title": "Capture one whole connection",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start the lab network if it isn't running (`docker compose -f env/net.yml up -d`). The first line below starts an echo server on peer: socat accepts connections on port 9000 and sends back whatever arrives.",
+          "Open a shell on client (`docker compose -f env/net.yml exec client bash`) and run the rest. `nc -N` sends one line, then closes its sending side when its input ends.",
+          "Predict before you read the output: which side sends the first FIN, and which side is left in TIME-WAIT?",
+          "Find the arithmetic: which ACK numbers are the other side's seq plus one, and which are seq plus 17?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "first in labs/, then on client",
+          "src": "docker compose -f env/net.yml exec -d peer socat TCP-LISTEN:9000,fork,reuseaddr SYSTEM:cat\n\n# on client\ntcpdump -i eth0 -nn -S --immediate-mode -w /tmp/tcp.pcap 'tcp port 9000' 2>/dev/null &\nsleep 1\necho 'AUTH 4242 100.00' | nc -N 10.10.1.20 9000\nss -tan '( sport = :9000 or dport = :9000 )'\nsleep 1; kill %1; wait\ntcpdump -r /tmp/tcp.pcap -nn -S\n"
+        },
+        "expect": "From one run (timestamps and TCP options trimmed):\n\n```text\nAUTH 4242 100.00\nState     Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess\nTIME-WAIT 0      0         10.10.1.10:50744   10.10.1.20:9000\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [S], seq 244700535, win 64240, length 0\n10.10.1.20.9000 > 10.10.1.10.50744: Flags [S.], seq 4042781690, ack 244700536, win 65160, length 0\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [.], ack 4042781691, win 502, length 0\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [P.], seq 244700536:244700553, ack 4042781691, win 502, length 17\n10.10.1.20.9000 > 10.10.1.10.50744: Flags [.], ack 244700553, win 509, length 0\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [F.], seq 244700553, ack 4042781691, win 502, length 0\n10.10.1.20.9000 > 10.10.1.10.50744: Flags [P.], seq 4042781691:4042781708, ack 244700554, win 509, length 17\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [.], ack 4042781708, win 502, length 0\n10.10.1.20.9000 > 10.10.1.10.50744: Flags [F.], seq 4042781708, ack 244700554, win 509, length 0\n10.10.1.10.50744 > 10.10.1.20.9000: Flags [.], ack 4042781709, win 502, length 0\n```\n\nTen segments: the handshake, 17 bytes and their ACK, the client's FIN, the echo (which also ACKs that FIN: `ack 244700554` is one past the last data byte), its ACK, the server's FIN and the last ACK. The client closed first, so the client is left in TIME-WAIT. Between its own FIN and the server's, the client still received 17 bytes: closing is one direction at a time. This capture is the test input for this lesson's lab. Your sequence numbers will differ, because ISNs are random."
+      },
+      "refs": [
+        {
+          "title": "RFC 9293: Transmission Control Protocol",
+          "url": "https://www.rfc-editor.org/rfc/rfc9293.html",
+          "kind": "docs"
+        },
+        {
+          "title": "High Performance Browser Networking: Building blocks of TCP",
+          "url": "https://hpbn.co/building-blocks-of-tcp/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Listen, accept, and the three ways a connect fails",
+      "body": "The handshake happens inside the two kernels. Your program only asks for it, and the sockets API from lesson 6 of this track gets three more calls for TCP.\n\nA server calls `socket()`, `bind()` to port 9000, then `listen()`. From then on its kernel answers SYNs for that port by itself. It completes each handshake without asking the program and puts the finished connection in a queue, the accept queue. `accept()` takes one connection off that queue and hands the program a new socket for it. So a server has one listening socket per port, plus one connected socket per client. The kernel tells them apart by four numbers: client IP, client port, server IP, server port. That **4-tuple** is the connection's name. The number you pass to `listen()`, the backlog, caps the accept queue: 50 for a Java `ServerSocket` unless you say otherwise, and Linux caps it at `net.core.somaxconn` (4096 by default since Linux 5.4). When a program stops calling `accept()` and the queue fills, the kernel starts dropping new connection attempts, and clients see slow or failed connects with no clear error.\n\nA client calls `connect()`. Its kernel picks an ephemeral port (a free local port, as in lesson 6), sends the SYN and puts the socket in SYN-SENT. `connect()` returns when the SYN-ACK has arrived and the kernel has sent the ACK. That return is the first moment you know the server's machine is there.\n\nA connect can fail in three ways, and each one points at a different problem:\n\n- Connection refused. The SYN reached the machine, but nothing listens on that port. Its kernel answers at once with an RST (reset), and `connect()` fails within one round trip: `ConnectException: Connection refused`. The host is up and the network works; the service isn't running, or it's on another port.\n- Connect timed out. The SYN got no answer at all. A firewall dropped it, a route sent it nowhere, or the machine is off, and the client can't tell which. Its kernel resends the SYN: in the lab box (Linux 6.12) five times at 1-second gaps, then after 2, 4, 8, 16 and 32 more seconds, and it gives up about 136 seconds after the first SYN. Java's `socket.connect(address, 5_000)` stops waiting after 5 seconds: `SocketTimeoutException: Connect timed out`.\n- No route to host. The address is on your own link, ARP asks who has it (lesson 2), and nobody answers. After three tries, about 3 seconds, the kernel gives up: `NoRouteToHostException`.\n\nAlert on them differently. Refused means the host is alive and the program isn't listening. A timeout means something between you drops packets without a word, and the 136-second default is why every client needs its own connect timeout.",
+      "try": {
+        "title": "Refused, timed out, no route",
+        "minutes": 4,
+        "steps": [
+          "Keep the echo server from the first Try it running on peer. The first line adds a firewall rule on peer that silently drops every packet to port 9002, so that port behaves like a host behind a firewall.",
+          "On client, run the demo. It tries four targets with a 5-second connect timeout: port 9000 (the echo server), 9001 (nothing listens), 9002 (dropped) and 10.10.1.99, an address on the lab's LAN that no machine has. Predict all four outcomes, and roughly how long each takes.",
+          "The last line removes the rule again. Read `Connect.java` afterwards: it is one `Socket.connect` call per target."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "first in labs/, then on client",
+          "src": "docker compose -f env/net.yml exec peer iptables -A INPUT -p tcp --dport 9002 -j DROP\n\n# on client\ntcpdump -i eth0 -nn --immediate-mode -w /tmp/c.pcap 'tcp[tcpflags] & (tcp-syn|tcp-rst) != 0 or arp' 2>/dev/null &\nsleep 1\njava /labs/net/src/demo/java/sfz/net/l07/demo/Connect.java 10.10.1.20:9000 10.10.1.20:9001 10.10.1.20:9002 10.10.1.99:9000\nsleep 1; kill %1; wait\ntcpdump -r /tmp/c.pcap -nn\n\n# back in labs/: remove the rule\ndocker compose -f env/net.yml exec peer iptables -D INPUT -p tcp --dport 9002 -j DROP\n",
+          "file": "labs/net/src/demo/java/sfz/net/l07/demo/Connect.java"
+        },
+        "expect": "From one run (TCP options, ARP replies and repeated ARP lines trimmed):\n\n```text\n10.10.1.20:9000       7 ms  connected from local port 36378\n10.10.1.20:9001       6 ms  ConnectException: Connection refused (connect failed)\n10.10.1.20:9002    5007 ms  SocketTimeoutException: Connect timed out\n10.10.1.99:9000    3187 ms  NoRouteToHostException: No route to host (connect failed)\n19:28:58.325840 IP 10.10.1.10.36378 > 10.10.1.20.9000: Flags [S], seq 2780349350, ...\n19:28:58.325985 IP 10.10.1.20.9000 > 10.10.1.10.36378: Flags [S.], seq 2203917144, ack 2780349351, ...\n19:28:58.364549 IP 10.10.1.10.35864 > 10.10.1.20.9001: Flags [S], seq 3269562699, ...\n19:28:58.364647 IP 10.10.1.20.9001 > 10.10.1.10.35864: Flags [R.], seq 0, ack 3269562700, win 0, length 0\n19:28:58.372729 IP 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036, ...\n19:28:59.390394 IP 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036, ...\n19:29:00.414398 IP 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036, ...\n19:29:01.438638 IP 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036, ...\n19:29:02.467069 IP 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036, ...\n19:29:03.382330 ARP, Request who-has 10.10.1.99 tell 10.10.1.10, length 28\n19:29:04.450591 ARP, Request who-has 10.10.1.99 tell 10.10.1.10, length 28\n19:29:05.470243 ARP, Request who-has 10.10.1.99 tell 10.10.1.10, length 28\n```\n\nThe SYN-ACK and the RST both came back about 0.1 ms after their SYN; the few milliseconds the demo prints are mostly the JVM's own work. Port 9002 got the same SYN, with the same sequence number, five times a second apart, and no answer until the demo gave up at 5 seconds. Toward 10.10.1.99 no SYN left at all: client asked ARP three times, nobody answered, and the kernel reported no route after about 3 seconds. In the RST, `seq 0` and `ack` = the SYN's seq + 1 are what RFC 9293 prescribes for a SYN to a closed port, and the lab builds exactly that segment. A first run after the lab network starts can be a few milliseconds slower while ARP fills in."
+      },
+      "refs": [
+        {
+          "title": "JDK 25: java.net.Socket",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/Socket.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Beej's Guide to Network Programming",
+          "url": "https://beej.us/guide/bgnet/html/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Closing is one direction at a time",
+      "body": "A TCP connection is two byte streams, one each way, and each side ends its own. When your program calls `close()` (or `shutdownOutput()` to end only the sending half), its kernel sends a **FIN**: \"I have nothing more to send\". The other kernel ACKs it at once and tells its program by making `read()` return -1, end of stream. The other direction stays open. The peer can keep sending until it calls `close()` too and sends its own FIN. So a clean close is two FINs and two ACKs, and often an ACK rides on a FIN or on data, as in the capture.\n\nEach step leaves the socket in a named state, and `ss -tan` shows it. Follow the side that closes first, the active closer:\n\n- FIN-WAIT-1: it sent its FIN and waits for the ACK.\n- FIN-WAIT-2: the FIN was ACKed, and it waits for the peer's FIN. It can still receive data: in the capture, the client got its 17-byte echo here.\n- TIME-WAIT: the peer's FIN arrived and was ACKed. The connection is over, but the kernel keeps the socket for a while. The last section explains why.\n\nThe other side, the passive closer:\n\n- CLOSE-WAIT: the peer's FIN arrived. The kernel ACKed it, and now waits for its own program to call `close()`.\n- LAST-ACK: the program closed, its FIN went out, and the kernel waits for that FIN's ACK. Then the socket is gone.\n\nAdd CLOSED, LISTEN, SYN-SENT, SYN-RECEIVED, ESTABLISHED and the rare CLOSING (both sides send a FIN at the same moment) and you have all eleven states of RFC 9293. Step through the whole connection from the first Try it, with both sides' states.\n\nCLOSE-WAIT is the state to remember, because it is always your program's doing. The peer has closed and the kernel has done its part. The socket waits for a `close()` that never comes: a response body nobody read to the end, an exception path that skips the `finally`, a pool that never evicts a dead connection. Each one keeps a socket and its file descriptor (the number the program knows it by) until the process exits. A CLOSE-WAIT count that only grows is a leak, and the fix is in the code that owns the socket.\n\nThere is also a rude way to end a connection: the RST. A kernel sends one when a segment arrives for a connection it doesn't have, like the SYN to port 9001. A program can ask for one by closing with `SO_LINGER` set to 0, which also throws away any data not yet sent. The peer's next `read()` or `write()` fails with \"Connection reset by peer\". An RST skips every state above, TIME-WAIT included.",
+      "stepper": {
+        "title": "One connection, from LISTEN to TIME-WAIT",
+        "intro": "The ten segments of the first Try it, with the state of both sockets after each one.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">CLOSED</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">LISTEN</text><text class=\"t-s t-m\" x=\"340\" y=\"160\" text-anchor=\"middle\">nothing on the wire yet</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">about to call connect()</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">listen(): kernel answers SYNs now</text></svg>",
+            "say": "The server program called `listen()` on port 9000, so its kernel will answer SYNs for that port by itself. The client has no socket for this connection yet: **CLOSED**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">SYN-SENT</text><rect class=\"box\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">LISTEN</text><line class=\"ln-a\" x1=\"228\" y1=\"160\" x2=\"452\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">SYN</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">seq 244700535</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">connect() is blocked, waiting</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">nothing has reached the program</text></svg>",
+            "say": "The client calls `connect()`. Its kernel picks port 50744 and a random ISN, 244700535, sends the **SYN** and moves to **SYN-SENT**. The SYN carries no data but uses one sequence number."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">SYN-SENT</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">SYN-RECEIVED</text><line class=\"ln-a\" x1=\"452\" y1=\"160\" x2=\"228\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">SYN-ACK</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">seq 4042781690 ack 244700536</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">still waiting</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">no accept() needed for this part</text></svg>",
+            "say": "The server's kernel answers on its own with a **SYN-ACK**: its own ISN, 4042781690, and `ack 244700536`, the client's number plus one. The server socket is half open: **SYN-RECEIVED**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">ESTABLISHED</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">ESTABLISHED</text><line class=\"ln-a\" x1=\"228\" y1=\"160\" x2=\"452\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">ACK</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">ack 4042781691</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">connect() returns</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">accept() can return it now</text></svg>",
+            "say": "The client's kernel ACKs the server's number plus one, and `connect()` returns: **ESTABLISHED**. When that ACK arrives, the server side is ESTABLISHED too and waits in the accept queue. One round trip spent, no data yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">ESTABLISHED</text><rect class=\"box\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">ESTABLISHED</text><line class=\"ln-a\" x1=\"228\" y1=\"160\" x2=\"452\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">data, 17 bytes</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">seq 244700536:244700553</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">write(&quot;AUTH 4242 100.00\\n&quot;)</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">read() returns the 17 bytes</text></svg>",
+            "say": "The client writes 17 bytes. They are numbered 244700536 to 244700552, so the server's ACK says `ack 244700553`: the next byte it expects. Both sides stay ESTABLISHED for as long as they talk."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">FIN-WAIT-1</text><rect class=\"box\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">ESTABLISHED</text><line class=\"ln-a\" x1=\"228\" y1=\"160\" x2=\"452\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">FIN</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">seq 244700553</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">close(): nothing more to send</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">hasn&#x27;t noticed anything yet</text></svg>",
+            "say": "The client calls `close()`. Its kernel sends a **FIN** at the next sequence number and moves to **FIN-WAIT-1**: it waits for the FIN to be ACKed. The FIN uses one number, like the SYN."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">FIN-WAIT-2</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">CLOSE-WAIT</text><line class=\"ln-a\" x1=\"452\" y1=\"160\" x2=\"228\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">echo, 17 bytes, and the ACK</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">ack 244700554</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">can still read: gets the echo</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">read() returns -1, may still write</text></svg>",
+            "say": "The server's kernel ACKs the FIN (`ack 244700554`, riding on the 17-byte echo) and moves to **CLOSE-WAIT**: the peer is done, its own program isn't. The client, ACKed, moves to **FIN-WAIT-2**, and it still receives the echo. Closing is one direction at a time."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">FIN-WAIT-2</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">LAST-ACK</text><line class=\"ln-a\" x1=\"452\" y1=\"160\" x2=\"228\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">FIN</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">seq 4042781708</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">waiting for the server&#x27;s FIN</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">close()</text></svg>",
+            "say": "The server program calls `close()`. Its kernel sends its own **FIN** and moves to **LAST-ACK**. If this program never called `close()`, the socket would sit in CLOSE-WAIT for good."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">TIME-WAIT</text><rect class=\"box-a\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">CLOSED</text><line class=\"ln-a\" x1=\"228\" y1=\"160\" x2=\"452\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"148\" text-anchor=\"middle\">ACK</text><text class=\"t-s t-code\" x=\"340\" y=\"182\" text-anchor=\"middle\">ack 4042781709</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">close() finished long ago</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">the socket is gone</text></svg>",
+            "say": "The client ACKs the server's FIN and moves to **TIME-WAIT**. When that ACK arrives the server side is **CLOSED** and forgotten. Ten segments in all, the same ten the Try it captured."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Client on the left and server on the right, each with its TCP state and what its program sees, and the segment travelling between them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"37\" text-anchor=\"middle\">client</text><text class=\"t-s t-code\" x=\"120.0\" y=\"56\" text-anchor=\"middle\">10.10.1.10:50744</text><rect class=\"box\" x=\"460\" y=\"16\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"560.0\" y=\"37\" text-anchor=\"middle\">server</text><text class=\"t-s t-code\" x=\"560.0\" y=\"56\" text-anchor=\"middle\">10.10.1.20:9000</text><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"120.0\" y=\"105\" text-anchor=\"middle\">CLOSED</text><rect class=\"box\" x=\"460\" y=\"80\" width=\"200\" height=\"40\" rx=\"8\"/><text class=\"t t-code\" x=\"560.0\" y=\"105\" text-anchor=\"middle\">LISTEN</text><text class=\"t-s t-m\" x=\"340\" y=\"160\" text-anchor=\"middle\">60 seconds later</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"236\" text-anchor=\"start\">the client program</text><text class=\"t-s\" x=\"36\" y=\"262\" text-anchor=\"start\">port 50744 can be used again</text><rect class=\"box\" x=\"360\" y=\"214\" width=\"300\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"376\" y=\"236\" text-anchor=\"start\">the server program</text><text class=\"t-s\" x=\"376\" y=\"262\" text-anchor=\"start\">listening for the next client</text></svg>",
+            "say": "Sixty seconds later (Linux's TIME-WAIT) the client's kernel drops the socket, and the 4-tuple 10.10.1.10:50744 to 10.10.1.20:9000 may be used again. The listening socket was never part of the connection; it is still there."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch the states with ss",
+        "minutes": 3,
+        "steps": [
+          "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`.",
+          "Read `labs/net/src/demo/java/sfz/net/l07/demo/States.java`. It opens one connection on 127.0.0.1 and stops after each step to ask `ss` for the state of every socket on the server's port. The client closes first. The server program waits before it closes, like one that forgot.",
+          "Predict before you run it: after step 2, has the server program got the connection yet? After step 4, which side is in CLOSE-WAIT?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l07/demo/States.java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l07/demo/States.java"
+        },
+        "expect": "From one run (the `Process` column trimmed):\n\n```text\n1. server called listen()\n   State  Recv-Q Send-Q      Local Address:Port  Peer Address:Port\n   LISTEN 0      50     [::ffff:127.0.0.1]:44169            *:*\n\n2. client connect() returned; the server has not called accept() yet\n   State  Recv-Q Send-Q      Local Address:Port        Peer Address:Port\n   LISTEN 1      50     [::ffff:127.0.0.1]:44169                  *:*\n   ESTAB  0      0      [::ffff:127.0.0.1]:44169 [::ffff:127.0.0.1]:48106\n   ESTAB  0      0      [::ffff:127.0.0.1]:48106 [::ffff:127.0.0.1]:44169\n\n3. server accept() returned a second socket for this one connection\n   (the same three sockets, LISTEN's Recv-Q back to 0)\n\n4. client close(): its FIN was ACKed, but the server program has not closed\n   State      Recv-Q Send-Q      Local Address:Port        Peer Address:Port\n   LISTEN     0      50     [::ffff:127.0.0.1]:44169                  *:*\n   CLOSE-WAIT 1      0      [::ffff:127.0.0.1]:44169 [::ffff:127.0.0.1]:48106\n   FIN-WAIT-2 0      0      [::ffff:127.0.0.1]:48106 [::ffff:127.0.0.1]:44169\n\n   server read() returned -1: end of stream, the peer has closed\n\n5. server close(): the client side, which closed first, waits in TIME-WAIT\n   State     Recv-Q Send-Q      Local Address:Port        Peer Address:Port\n   LISTEN    0      50     [::ffff:127.0.0.1]:44169                  *:*\n   TIME-WAIT 0      0      [::ffff:127.0.0.1]:48106 [::ffff:127.0.0.1]:44169\n```\n\nIn step 2 both ends are ESTAB before `accept()` was called: the kernel finished the handshake alone. On a listening socket, Send-Q is the backlog (50) and Recv-Q is the number of connections waiting in the accept queue (1). After the client's close, the server sits in CLOSE-WAIT until its program closes; its Recv-Q of 1 is the FIN, waiting to be read as end of stream. The side that closed first ends in TIME-WAIT. `[::ffff:127.0.0.1]` is the IPv4-mapped address from lesson 5: the JVM opens dual-stack sockets. On a Mac the demo runs without `ss`; watch `netstat -an -p tcp` there instead."
+      },
+      "refs": [
+        {
+          "title": "ss(8) man page",
+          "url": "https://man7.org/linux/man-pages/man8/ss.8.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Cloudflare: When TCP sockets refuse to die",
+          "url": "https://blog.cloudflare.com/when-tcp-sockets-refuse-to-die/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "TIME-WAIT holds the 4-tuple, and that can use up a client's ports",
+      "body": "The side that closes first keeps the connection in TIME-WAIT for twice the maximum segment lifetime (MSL), the longest a segment is assumed to survive in the network. RFC 9293 takes the MSL as 2 minutes, which makes 4. Linux hard-codes 60 seconds; macOS uses 30, because its MSL is 15 seconds. The wait does two jobs.\n\nThe last ACK may be lost. Then the peer, still in LAST-ACK, sends its FIN again. If the closer had already forgotten the connection, its kernel would answer that FIN with an RST, and the peer would log an error for a connection that closed cleanly. In TIME-WAIT the closer recognizes the FIN and ACKs it again.\n\nOld segments may still be in the network. A delayed copy of a segment from this connection could arrive after a new connection with the same 4-tuple has started, and land inside its sequence numbers. Keeping the 4-tuple out of use until any straggler must have died prevents that. The random ISNs from the first section make such a collision unlikely; TIME-WAIT makes it safe.\n\nA TIME-WAIT socket is cheap: no buffers, no program attached. What it holds is the 4-tuple. On a server that costs nothing, because its own side is always the same IP and port while the client side varies. On a client it is a limit. Every connection to one server IP and port needs its own local port, and Linux hands out ephemeral ports from 32768 to 60999, which is 28,232 of them. If each is held for 60 seconds after use, a client that opens and closes connections to one destination can sustain about 28,232 / 60 = 470 new connections a second. The next one fails at once with \"Cannot assign requested address\", a `java.net.BindException` in the JVM. The Try it shows this with the range cut to 10 ports.\n\nThe fix is to stop throwing connections away: keep them open and reuse them. That is what HTTP keep-alive and a connection pool do. Don't confuse that with TCP keepalive, which has nothing to do with reuse. With `SO_KEEPALIVE` on, the kernel sends an empty probe on a connection that has been idle (after 2 hours by default on Linux, then every 75 seconds, 9 times) to find out whether the peer is still there, or to keep lesson 3's NAT mapping alive. And the two settings people reach for don't fix churn. Linux's `tcp_tw_reuse`, which lets a new outgoing connection take a TIME-WAIT port when timestamps make it safe, is on only for loopback by default. `SO_REUSEADDR` only lets a restarted server bind its port while old connections linger.",
+      "try": {
+        "title": "Run out of ports on purpose",
+        "minutes": 4,
+        "steps": [
+          "Start the privileged lab box: `docker compose -f env/labbox.yml run --rm box-priv`. The everyday box can't change kernel settings. The first line cuts its ephemeral range to 10 ports and turns off `tcp_tw_reuse`, which would otherwise rescue loopback connections. Both settings disappear with the box.",
+          "Start an echo server and open 12 connections in a row, each one closed by the client first. Predict which connection fails first, and what the 13th attempt prints.",
+          "Then the box waits 70 seconds while TIME-WAIT runs out, and sends 12 messages over one connection instead."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the privileged lab box",
+          "src": "sysctl -w net.ipv4.ip_local_port_range=\"40000 40009\" net.ipv4.tcp_tw_reuse=0\nsocat TCP-LISTEN:9000,fork,reuseaddr SYSTEM:cat &\nsleep 1\nfor i in $(seq 1 12); do echo \"AUTH $i\" | nc -N 127.0.0.1 9000 > /dev/null || echo \"connection $i failed\"; done\necho \"AUTH 13\" | nc -v -N 127.0.0.1 9000\nss -tano state time-wait | head -3\nss -Htan state time-wait | wc -l\nsleep 70\nss -Htan state time-wait | wc -l\nfor i in $(seq 1 12); do echo \"AUTH $i\"; done | nc -N 127.0.0.1 9000 | wc -l\nss -Htan state time-wait | wc -l\n"
+        },
+        "expect": "From one run:\n\n```text\nnet.ipv4.ip_local_port_range = 40000 40009\nnet.ipv4.tcp_tw_reuse = 0\nconnection 11 failed\nconnection 12 failed\nnc: connect to 127.0.0.1 port 9000 (tcp) failed: Cannot assign requested address\nRecv-Q Send-Q Local Address:Port  Peer Address:PortProcess\n0      0          127.0.0.1:40005    127.0.0.1:9000 timer:(timewait,59sec,0)\n0      0          127.0.0.1:40003    127.0.0.1:9000 timer:(timewait,59sec,0)\n10\n0\n12\n1\n```\n\nTen connections used the ten ports, and each port stayed in TIME-WAIT with a 60-second timer (`-o` shows it counting down). Connections 11 and 12 failed without sending a single packet: the kernel had no free port to put in the SYN. After the wait the count was 0, and one connection carried all 12 messages and left just 1 TIME-WAIT socket behind. The timer can fire a few seconds late (the kernel's timer for such long waits is coarse), which is why the box waits 70 seconds and not 60. The same arithmetic at full size: 28,232 ports for 60 seconds is about 470 new connections a second to one destination."
+      },
+      "refs": [
+        {
+          "title": "Vincent Bernat: Coping with the TCP TIME-WAIT state on busy Linux servers",
+          "url": "https://vincent.bernat.ch/en/blog/2014-tcp-time-wait-state-linux",
+          "kind": "read"
+        },
+        {
+          "title": "Cloudflare: How to stop running out of ephemeral ports",
+          "url": "https://blog.cloudflare.com/how-to-stop-running-out-of-ephemeral-ports-and-start-to-love-long-lived-connections/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Two clerks settle accounts by courier. Before the first parcel, each tells the other the number her pages will start from and confirms the other's number, so a stray page from last week's exchange can never be filed into this week's. When one clerk has nothing more to send, she sends a note saying so, and keeps reading whatever the other still sends. When both have sent their notes, the one who finished first keeps her desk reserved for a few minutes, in case the other's last note arrives again and needs a reply, and so that no late courier from this exchange delivers into the next one. The analogy breaks on scale: a kernel does all of this for thousands of connections at once, in microseconds, and the reserved desk costs it a few hundred bytes of memory and one port number, not a clerk.",
+  "in_your_world": "Every outbound call your Quarkus services make to a card issuer starts with a handshake and ends with two FINs. With a pooled client, such as the Vert.x client under the Quarkus REST Client or one long-lived JDK `HttpClient`, the handshake happens once per connection and you rarely see TIME-WAIT. Build a client per request, or send `Connection: close`, and every authorization pays an extra round trip and leaves a TIME-WAIT socket on your pod for 60 seconds. Behind an egress proxy, where every connection goes to the same IP and port, 500 authorizations a second is enough to run out of ports, and the error, `Cannot assign requested address`, looks like a configuration problem. CLOSE-WAIT is the opposite bug: the issuer or a load balancer closed idle connections, and your code never closed its end, often because a response body was never consumed. Check both with `ss -s` and `ss -tan state close-wait` on the pod. And give every client a connect timeout: a firewall change that silently drops SYNs to the issuer becomes a two-minute hang per call on Linux's defaults.",
+  "mistake": "The common mistake is fighting TIME-WAIT instead of its cause. Someone sees thousands of TIME-WAIT sockets, finds an old blog post, and turns on `tcp_tw_recycle` (it broke clients behind NAT and was removed in Linux 4.12), or sets `SO_LINGER` to 0 so `close()` sends an RST and skips TIME-WAIT, which throws away unsent data and makes the peer log resets. Others raise `tcp_fin_timeout`, which doesn't even control TIME-WAIT: it limits how long an orphaned connection stays in FIN-WAIT-2. TIME-WAIT on a client is the symptom of opening a new connection for every request. Fix it in the application: one long-lived client per destination with a connection pool and HTTP keep-alive. If you really need more parallel connections to one destination, add 4-tuples (more destination addresses or source addresses), not fewer seconds.",
+  "compare": {
+    "title": "Refused and timed out, as tcpdump shows them",
+    "a": {
+      "label": "Connection refused",
+      "lang": "text",
+      "title": "nothing listens on 9001",
+      "src": "19:28:58.364549 10.10.1.10.35864 > 10.10.1.20.9001: Flags [S], seq 3269562699\n19:28:58.364647 10.10.1.20.9001 > 10.10.1.10.35864: Flags [R.], seq 0, ack 3269562700\n\nconnect() fails in one round trip: 0.1 ms here\nConnectException: Connection refused\n"
+    },
+    "b": {
+      "label": "Connect timed out",
+      "lang": "text",
+      "title": "a firewall drops packets to 9002",
+      "src": "19:28:58.372729 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036\n19:28:59.390394 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036\n19:29:00.414398 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036\n19:29:01.438638 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036\n19:29:02.467069 10.10.1.10.58430 > 10.10.1.20.9002: Flags [S], seq 2304921036\n\nsilence; the kernel retries for about 136 s unless the program gives up\nSocketTimeoutException: Connect timed out (after the 5 s the demo allowed)\n"
+    },
+    "note": "Both captures come from the second Try it. A refusal is an answer: the RST proves the machine is up and reachable, so look for a stopped service or a wrong port. A timeout is the absence of any answer, so look at firewalls, security groups, routes and whether the host exists. The same SYN goes out each time, with the same sequence number, because it is a retransmission of one connection attempt, not a new attempt."
+  },
+  "worked": {
+    "title": "Read the handshake by hand",
+    "steps": [
+      {
+        "say": "The SYN from the first Try it is 74 bytes. Ethernet takes 14 and the IPv4 header 20 (it starts `45`), so TCP starts at byte 34, `0x22`. The first four bytes there are the ports.",
+        "code": "0x0000:  c633 0a50 9635 3e37 64a6 ccad 0800 4500\n0x0010:  003c 8807 4000 4006 9c83 0a0a 010a 0a0a\n0x0020:  0114 c638 2328 0e95 d577 0000 0000 a002\n\nc6 38       source port 50744, the client's ephemeral port\n23 28       destination port 9000",
+        "lang": "text"
+      },
+      {
+        "say": "Next come the sequence number, the acknowledgment number, the header length and the flags. The ack is zero because there is nothing to acknowledge yet.",
+        "code": "0e95 d577   seq 244700535: the client's ISN\n0000 0000   ack 0\na0          high 4 bits: 10 words = 40 bytes of TCP header, so 20 bytes of options\n02          flags: SYN only\nfaf0        window 64240",
+        "lang": "text"
+      },
+      {
+        "say": "The options fill bytes 54 to 73. Walk them by kind: 1 is a one-byte NOP, every other kind is followed by its length. The lab's parser does the same walk to find the MSS.",
+        "code": "0x0030:  faf0 1660 0000 0204 05b4 0402 080a ec6b\n0x0040:  4235 0000 0000 0103 0307\n\n02 04 05b4        MSS, length 4: 1460\n04 02             SACK permitted, length 2\n08 0a ...         timestamps, length 10\n01                NOP: padding\n03 03 07          window scale, length 3: shift by 7, multiply by 128",
+        "lang": "text"
+      },
+      {
+        "say": "The SYN-ACK starts its TCP header at the same place. Its seq is the server's ISN, and its ack is the client's ISN plus one, because the SYN used one number.",
+        "code": "0x0020:  010a 2328 c638 f0f7 f3fa 0e95 d578 a012\n\nf0f7 f3fa   seq 4042781690: above 2^31, so read it as unsigned\n0e95 d578   ack 244700536 = 244700535 + 1\n12          flags: SYN + ACK",
+        "lang": "text"
+      },
+      {
+        "say": "The data segment shows where the payload length comes from: the IP total length minus both headers, not the frame's size. Its 17 bytes are numbered from 244700536, so the server's ACK of them is 244700553.",
+        "code": "0x0010:  0045 ...                IP total length 0x45 = 69\n0x0020:  ... 8018                header 0x80: 8 words = 32 bytes; flags 18 = PSH + ACK\n\n69 - 20 (IP) - 32 (TCP) = 17 bytes: \"AUTH 4242 100.00\\n\"\nbytes 244700536 .. 244700552, next expected: 244700553",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A TCP state machine that replays a real connection",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/net/src/main/kotlin/sfz/net/l07/TcpHeader.kt",
+      "labs/net/src/main/kotlin/sfz/net/l07/TcpEndpoint.kt",
+      "labs/net/src/main/kotlin/sfz/net/l07/Segment.kt",
+      "labs/net/src/main/kotlin/sfz/net/l07/TcpState.kt"
+    ],
+    "run": "./gradlew :net:test --tests 'sfz.net.l07.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 14 fail. `Segment.kt` and `TcpState.kt` are finished. `src/test/kotlin/sfz/net/l07/Captured.kt` lists the ten segments of the first Try it's connection, copied from tcpdump's lines.",
+      "In `TcpHeader.kt`, write `parse`: the walk from the worked example, plus the options loop that finds the MSS. `TcpHeaderTest` feeds it the ten real frames.",
+      "In `TcpEndpoint.kt`, write `connect`, `send` and `close`. Each returns one segment and moves `sndNxt` on.",
+      "Write `receive`, one state at a time, in the order its KDoc gives, and then `tick`. `TcpEndpointTest` replays the captured connection: your client and server endpoints must send the segments the two kernels sent, and pass through the same states.",
+      "Then the last tests: the refused SYN, a FIN repeated in TIME-WAIT, both sides closing at once, and a segment that arrives out of order. Run the tests until all 14 pass."
+    ],
+    "hints": [
+      "`ByteBuffer.wrap(frame).getInt(at).toLong() and 0xFFFF_FFFFL` reads an unsigned 32-bit number. The SYN-ACK's seq, 4042781690, is bigger than `Int.MAX_VALUE`.",
+      "The options loop: `when (kind) { 0 -> break; 1 -> at += 1; else -> { read the length byte; if kind is 2, read the MSS; at += length } }`.",
+      "Every ACK you send is `Segment(localPort, remotePort, sndNxt, rcvNxt, setOf(Flag.ACK), window)`. One private helper for it saves most of the typing.",
+      "In LISTEN, set `sndNxt = isn + 1` when you return the SYN-ACK, so the ACK that completes the handshake arrives with `ack == sndNxt`.",
+      "Keep a private `finSent` flag. An ACK moves FIN-WAIT-1 to FIN-WAIT-2 only if it covers your FIN, `seg.ack == sndNxt`, and only after you sent one."
+    ],
+    "done_when": "All 14 tests in `TcpHeaderTest` and `TcpEndpointTest` pass."
+  },
+  "drill": {
+    "title": "Both sides' states, from memory",
+    "minutes": 5,
+    "prompt": "No tools. A client connects to a server, sends one request, gets one response and closes first; the server closes right after. Write the segments in order (who sends each one, and its flags), then the state of both sides after each segment arrives. Finish with three answers: which side holds TIME-WAIT and for how long on Linux, which state would pile up if the server program never called `close()`, and what the client sees if nothing listens on the port.",
+    "answer": {
+      "lang": "text",
+      "src": "segment                      client          server\n                             CLOSED          LISTEN\n1 client  -> SYN              SYN-SENT        SYN-RECEIVED\n2 server  -> SYN-ACK          ESTABLISHED     SYN-RECEIVED\n3 client  -> ACK              ESTABLISHED     ESTABLISHED   (accept() can return)\n4 client  -> request [P.]     ESTABLISHED     ESTABLISHED\n5 server  -> response [P.]    ESTABLISHED     ESTABLISHED   (ACKs ride along)\n6 client  -> FIN              FIN-WAIT-1      CLOSE-WAIT    (server read() returns -1)\n7 server  -> ACK              FIN-WAIT-2      CLOSE-WAIT\n8 server  -> FIN              FIN-WAIT-2      LAST-ACK      (server program called close())\n9 client  -> ACK              TIME-WAIT       CLOSED\n  60 s later                  CLOSED\n\nTIME-WAIT: the client, because it closed first; 60 s on Linux (30 s on macOS, 4 min in the RFC).\nNo close() on the server: CLOSE-WAIT piles up.\nNothing listening: an RST [R.] comes back at once, ConnectException: Connection refused.\n"
+    }
+  },
+  "recap": [
+    "The handshake (SYN, SYN-ACK, ACK) exchanges two random initial sequence numbers and costs one round trip. A SYN and a FIN each use one sequence number, so their ACK is seq + 1.",
+    "The kernel does the handshake. `listen()` makes it answer SYNs, `accept()` takes a finished connection off the queue, and every connection is named by its 4-tuple.",
+    "Refused is an RST within one round trip: the host is up and nothing listens. A timeout is silence: the SYN is resent for about 136 s on Linux unless your program sets a connect timeout.",
+    "Closing is per direction. The first to close goes FIN-WAIT-1, FIN-WAIT-2, TIME-WAIT; the other goes CLOSE-WAIT, LAST-ACK. A growing CLOSE-WAIT count means your code never calls `close()`.",
+    "TIME-WAIT (60 s on Linux) covers a lost last ACK and stray old segments. It holds the 4-tuple, so a client that churns connections to one address runs out of ports. Reuse connections."
+  ],
+  "quiz": [
+    {
+      "q": "A client's `connect()` to `10.20.0.15:5432` fails after exactly the 3-second timeout the application set. Which explanation fits?",
+      "options": [
+        "Nothing listens on port 5432 on that host",
+        "A firewall or a route is silently dropping the SYN, or the host is down",
+        "The database server's accept queue is empty",
+        "The database sent an RST because it is overloaded"
+      ],
+      "answer": 1,
+      "why": "Only silence lasts until a timeout. If nothing listened on 5432, the host's kernel would answer the SYN with an RST at once, and the connect would fail within one round trip with \"Connection refused\", not after 3 seconds. An RST, for whatever reason, ends the connect early too. An empty accept queue is the normal state of a server that keeps up."
+    },
+    {
+      "q": "`ss -tan` on a payment service shows 2,400 sockets in CLOSE-WAIT to a fraud-check API, and the number grows every hour. What is happening?",
+      "options": [
+        "The fraud API's kernel never acknowledged the service's FINs",
+        "The service closed first and is waiting out the 60-second TIME-WAIT",
+        "The network is dropping the final ACKs of each close",
+        "The fraud API closed those connections, and the service's code never called `close()` on its side"
+      ],
+      "answer": 3,
+      "why": "CLOSE-WAIT means the peer's FIN arrived and was ACKed, and the kernel is waiting for the local program to close. It never times out on its own, so a growing count is a leak in the service: typically a response body not consumed or a connection not returned to the pool. The second option describes TIME-WAIT, which belongs to the side that closed first and goes away by itself after 60 seconds."
+    },
+    {
+      "q": "A client's SYN has `seq 1000` and the server's SYN-ACK has `seq 5000`. After the handshake the client sends 300 bytes in one segment. What are that segment's seq and ack?",
+      "options": [
+        "seq 1000, ack 5000",
+        "seq 1001, ack 5000",
+        "seq 1301, ack 5001",
+        "seq 1001, ack 5001"
+      ],
+      "answer": 3,
+      "why": "Each SYN used one sequence number. The client's first data byte is therefore 1001, and the byte it expects next from the server is 5001. After these 300 bytes the server will ACK 1301, which is the tempting third option: that is the next segment's seq, not this one's."
+    },
+    {
+      "q": "A batch job opens a new TCP connection to the ledger service at `10.10.4.40:8080` for each of 2,000 postings a second and closes each one first, after the answer. Linux defaults. What happens?",
+      "options": [
+        "Within about 15 seconds, new connects start failing with `Cannot assign requested address`, because every local port toward that address is in TIME-WAIT",
+        "Nothing: TIME-WAIT sockets cost almost no memory",
+        "The ledger service runs out of ports, because its port 8080 is used 2,000 times a second",
+        "The connections queue in the ledger's backlog until it catches up"
+      ],
+      "answer": 0,
+      "why": "Each connection needs a distinct client port toward the same IP and port, and each closed one holds its port for 60 seconds. 28,232 ports run out after about 14 seconds at 2,000 a second. Memory is not the problem, which makes the second option tempting. The server side is fine, because its port 8080 is part of every 4-tuple and the client ports differ."
+    },
+    {
+      "q": "In lesson 3, after a connection through the NAT router had closed, `conntrack -L` on the router listed it in TIME_WAIT with 119 seconds left, while the client's own kernel keeps TIME-WAIT for 60. What is that router entry?",
+      "options": [
+        "The router's own TCP socket, which closed first",
+        "A leak: the router missed the final ACK",
+        "The router's record of the NAT mapping, which follows the TCP states it sees in passing segments and keeps the mapping for 120 seconds after the close",
+        "A copy of the server's TIME-WAIT socket"
+      ],
+      "answer": 2,
+      "why": "The router has no socket on this connection; it only forwards segments. Its connection tracker watches the SYN, FIN and RST flags going past, names its entries after TCP's states and keeps its own timers, 120 seconds in TIME_WAIT by default (`nf_conntrack_tcp_timeout_time_wait`), so the public port isn't handed to a new connection while stragglers might still arrive. Two machines, two independent TIME-WAIT clocks.",
+      "from": "net-03"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Why does a TCP connection start from a random sequence number instead of 0?",
+      "back": "So that segments left over from an earlier connection on the same 4-tuple don't fit into the new one, and so an attacker can't guess the numbers to inject data."
+    },
+    {
+      "front": "Which flags use up a sequence number without carrying data?",
+      "back": "SYN and FIN, one number each. Their ACK is seq + 1."
+    },
+    {
+      "front": "Connection refused vs connect timed out?",
+      "back": "Refused: an RST came back at once, so the host is up and nothing listens on the port. Timed out: no answer at all; something drops the SYN, or the host is down."
+    },
+    {
+      "front": "Which side ends up in TIME-WAIT, and for how long on Linux?",
+      "back": "The side that closed first. 60 seconds on Linux, 30 on macOS; the RFC's 2 x MSL is 4 minutes."
+    },
+    {
+      "front": "What does a growing number of CLOSE-WAIT sockets mean?",
+      "back": "The peer closed, and your program never called `close()` on its side. It is a leak in your code, and it never times out."
+    },
+    {
+      "front": "Why do clients, not servers, run out of ports because of TIME-WAIT?",
+      "back": "Each connection to one server IP and port needs its own client port, held 60 s after close: about 470 new connections a second with Linux's 28,232 ephemeral ports."
+    },
+    {
+      "front": "TCP keepalive vs HTTP keep-alive?",
+      "back": "TCP keepalive: empty probes on an idle connection (after 2 hours by default) to check the peer is alive. HTTP keep-alive: reusing one connection for many requests."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Initial sequence number (ISN)",
+      "plain": "The random number a side's byte numbering starts from, sent in its SYN."
+    },
+    {
+      "term": "Three-way handshake",
+      "plain": "SYN, SYN-ACK, ACK: the exchange that agrees both ISNs and opens a connection."
+    },
+    {
+      "term": "4-tuple",
+      "plain": "Client IP, client port, server IP, server port: the name of one connection."
+    },
+    {
+      "term": "Accept queue",
+      "plain": "Finished connections waiting for the program's `accept()`; its size is the backlog."
+    },
+    {
+      "term": "RST",
+      "plain": "A reset segment: \"no such connection here\". It refuses a connect or aborts a connection."
+    },
+    {
+      "term": "CLOSE-WAIT",
+      "plain": "The peer has closed; the kernel waits for your program to call `close()`."
+    },
+    {
+      "term": "TIME-WAIT",
+      "plain": "The state the side that closed first keeps after the close, 60 s on Linux, holding the 4-tuple."
+    },
+    {
+      "term": "Ephemeral port",
+      "plain": "The client port the kernel picks for a connection, from 32768 to 60999 on Linux."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague says: \"Our payment gateway has 20,000 sockets in TIME-WAIT, so we're leaking connections. Let's set SO_LINGER to 0 so close() skips TIME-WAIT.\" Explain what TIME-WAIT is, which side has it and why, when it really hurts, and what you would do instead.",
+    "answer": "TIME-WAIT isn't a leak. It's the state the side that closed first keeps after a clean close: our gateway closes its connections, so the TIME-WAIT sockets are on our side, and Linux drops each one by itself after 60 seconds. It exists for two reasons: if our last ACK gets lost, the other side resends its FIN and we can still answer it instead of sending a reset, and stray old segments from the connection can't end up in a new connection on the same four addresses and ports. The sockets are cheap in memory, but each one holds a local port toward that destination, and Linux has about 28,000 of them, so with one destination we hit a wall around 470 new connections a second, with \"Cannot assign requested address\". 20,000 means we open about 330 connections a second, which tells me we aren't reusing them. SO_LINGER 0 would replace the clean close with a reset, throw away unsent data and make the other side log errors. I'd fix the cause: one long-lived HTTP client per destination with a pool and keep-alive, so connections get reused and rarely closed."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**SYN floods and SYN cookies.** A SYN that arrives for a listening socket creates a half-open entry in the kernel's SYN queue until the handshake's last ACK comes. An attacker who sends SYNs from fake addresses fills that queue, and real clients can't get in. Linux answers with SYN cookies once the queue overflows (`net.ipv4.tcp_syncookies = 1`): it stores nothing and encodes what it needs about the connection inside its own ISN, then rebuilds it from the ACK. That is one more reason the ISN isn't just a counter.\n\n**Half-close from Java.** `socket.shutdownOutput()` sends a FIN but keeps the socket readable, exactly what `nc -N` did in the first Try it. A protocol can use it to say \"that's the whole request\" without a length field; old HTTP/1.0 clients did. Most code never needs it, but it explains why a peer can be in FIN-WAIT-2 and still receive data.\n\n**Which timer is which.** `tcp_fin_timeout` (60 s) is often mistaken for TIME-WAIT's length. It limits FIN-WAIT-2 for orphaned sockets, ones whose program has already closed. TIME-WAIT's 60 seconds is the constant `TCP_TIMEWAIT_LEN` in the kernel source, and there is no setting for it. `ss -tano` shows both timers counting down.\n\n**The SYN retry schedule.** Kernels since mid-2023 resend a SYN at linear 1-second gaps first (`net.ipv4.tcp_syn_linear_timeouts`, 4 by default), then double the gap, up to `tcp_syn_retries` (6). The 136 seconds in the lab box come from that schedule plus a last wait; older kernels show 1, 2, 4, 8, 16, 32 seconds and about 127 s. Either way, the default is far too long for a payment path.\n\n**TIME-WAIT on the server.** A server that closes first (an HTTP server that sends `Connection: close`, or one that closes idle keep-alive connections) collects TIME-WAIT itself. That is the side that copes best: the 4-tuples vary by client, so they never collide. Some protocol designers let the server close first for exactly that reason."
+  },
+  "sources": [
+    {
+      "title": "RFC 9293: Transmission Control Protocol",
+      "url": "https://www.rfc-editor.org/rfc/rfc9293.html"
+    },
+    {
+      "title": "Vincent Bernat: Coping with the TCP TIME-WAIT state on busy Linux servers",
+      "url": "https://vincent.bernat.ch/en/blog/2014-tcp-time-wait-state-linux"
+    },
+    {
+      "title": "Cloudflare: How to stop running out of ephemeral ports and start to love long-lived connections",
+      "url": "https://blog.cloudflare.com/how-to-stop-running-out-of-ephemeral-ports-and-start-to-love-long-lived-connections/"
+    },
+    {
+      "title": "tcp(7) man page",
+      "url": "https://man7.org/linux/man-pages/man7/tcp.7.html"
+    },
+    {
+      "title": "Linux kernel documentation: IP sysctl",
+      "url": "https://www.kernel.org/doc/html/latest/networking/ip-sysctl.html"
+    }
+  ]
+}

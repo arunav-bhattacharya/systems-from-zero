@@ -1,0 +1,72 @@
+# Redis 8.10 Cluster with three primaries (no replicas), for lesson 11 of the Redis track.
+# Run these from the labs folder:
+#   docker compose -f env/redis-cluster.yml up -d --wait       start the nodes and create the cluster (a few seconds)
+#   docker compose -f env/redis-cluster.yml exec node-1 redis-cli -p 7001       a prompt on node 1, not cluster-aware
+#   docker compose -f env/redis-cluster.yml exec node-1 redis-cli -c -p 7001    the same, following MOVED and ASK
+#   docker compose -f env/redis-cluster.yml down -v            stop everything and delete the data
+#
+# Why it looks unusual: a cluster node tells clients where to go next ("MOVED 3999 127.0.0.1:7002"),
+# so the address it announces must work from your Mac and from inside Docker. Here all three nodes
+# share node-1's network namespace (network_mode: service:node-1), listen on 7001, 7002 and 7003,
+# and announce 127.0.0.1. Ports 7001-7003 are published on 127.0.0.1 only, so a program on your Mac
+# (the lesson's ClusterDemo) reaches every node at the same address the nodes announce.
+# Memory: three small servers, 96 MB each. No persistence: this cluster is for looking, not keeping.
+name: sfz-redis-cluster
+
+x-node: &node
+  image: redis:8.10.3
+  mem_limit: 96m
+
+services:
+  node-1:
+    <<: *node
+    command: ["redis-server", "--port", "7001", "--cluster-enabled", "yes", "--cluster-config-file", "nodes-7001.conf",
+              "--cluster-node-timeout", "5000", "--cluster-announce-ip", "127.0.0.1", "--save", "", "--appendonly", "no"]
+    ports: ["127.0.0.1:7001-7003:7001-7003"]
+    healthcheck:
+      # healthy once the cluster is created and this node sees all 16,384 slots served
+      test: ["CMD-SHELL", "redis-cli -p 7001 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  node-2:
+    <<: *node
+    network_mode: "service:node-1"
+    command: ["redis-server", "--port", "7002", "--cluster-enabled", "yes", "--cluster-config-file", "nodes-7002.conf",
+              "--cluster-node-timeout", "5000", "--cluster-announce-ip", "127.0.0.1", "--save", "", "--appendonly", "no"]
+    depends_on: [node-1]
+    healthcheck:
+      # healthy once the cluster is created and this node sees all 16,384 slots served
+      test: ["CMD-SHELL", "redis-cli -p 7002 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  node-3:
+    <<: *node
+    network_mode: "service:node-1"
+    command: ["redis-server", "--port", "7003", "--cluster-enabled", "yes", "--cluster-config-file", "nodes-7003.conf",
+              "--cluster-node-timeout", "5000", "--cluster-announce-ip", "127.0.0.1", "--save", "", "--appendonly", "no"]
+    depends_on: [node-1]
+    healthcheck:
+      # healthy once the cluster is created and this node sees all 16,384 slots served
+      test: ["CMD-SHELL", "redis-cli -p 7003 cluster info | grep -q cluster_state:ok"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  # runs once: waits for the three servers, splits the 16,384 slots between them, then waits until they agree.
+  # It skips the create step if the cluster already exists, so a second `up -d` is harmless.
+  create:
+    image: redis:8.10.3
+    mem_limit: 32m
+    network_mode: "service:node-1"
+    depends_on: [node-1, node-2, node-3]
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        for p in 7001 7002 7003; do until redis-cli -p $$p ping > /dev/null 2>&1; do sleep 0.2; done; done
+        redis-cli -p 7001 cluster info | grep -q cluster_state:ok ||
+          redis-cli --cluster create 127.0.0.1:7001 127.0.0.1:7002 127.0.0.1:7003 --cluster-yes
+        until redis-cli -p 7003 cluster info | grep -q cluster_state:ok; do sleep 0.5; done
+        echo cluster is ready

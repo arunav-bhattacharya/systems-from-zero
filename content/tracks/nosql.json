@@ -1,0 +1,127 @@
+{
+  "id": "nosql",
+  "intro": "This track takes you from \"NoSQL is the database without SQL\" to a working model of how distributed stores keep data. You start with the two papers almost every store descends from, Google's Bigtable and Amazon's Dynamo, and then build the ideas under them one at a time: keys designed from access patterns, partitioning on a hash ring, replication with N, R and W, consistency models and conflicts, and transactions across partitions. Along the way you meet one lead store per data model (DynamoDB, Cassandra, MongoDB, Neo4j) and the specialized stores for search, time-series and vectors. At the end you can design keys for a payments service in any of them, predict what a read sees while replicas disagree, and choose a store, or no new store, for a new access pattern.\n\nYou need to program, and you need nothing else, but two earlier tracks make this one easier. The database internals track explains the pieces these stores are made of: B+trees, LSM trees, MVCC, locking and Raft. The SQL track's lessons on isolation levels and recursive queries come back in lessons 9 to 11. Every lesson reminds you of what it borrows in a sentence.\n\nThe labs live in `labs/nosql`, in Kotlin. About half of them are models you build in plain Kotlin and test in a second: a mini Bigtable, a hash ring, a quorum store, vector clocks and CRDTs, Paxos, an inverted index. The others run against real stores that Testcontainers starts for you (DynamoDB Local, MongoDB 9.0, Neo4j 2026.10), so they need Docker. The Try-its use Compose files in `labs/env`, one store at a time: start it, try it, and stop it with `down -v`. Run everything from the `labs` folder, and `./gradlew :nosql:test --tests 'sfz.nosql.lNN.*'` runs one lesson's lab.",
+  "cheatsheet": "## Families: what you store decides what you can ask\n\n| Family | You find data by | Lead store | Built in |\n|---|---|---|---|\n| Key-value | its key, or a sorted run in one partition | DynamoDB | lessons 3, 4 |\n| Wide-column | partition key, then a slice of clustering columns | Cassandra 5.0 | lesson 7 |\n| Document | any indexed field of a JSON-like document | MongoDB 9.0 | lesson 8 |\n| Graph | a start node, then a walk along relationships | Neo4j 2026.10 | lesson 11 |\n| Search | words, through an inverted index, ranked by BM25 | OpenSearch 3.9 | lesson 12 |\n| Time-series | a time range, through chunks and rolled-up buckets | TimescaleDB 2.31 | lesson 12 |\n| Vector | nearest neighbours of an embedding, through HNSW | pgvector 0.8.7 | lesson 12 |\n\nTwo placement answers sit under them (lesson 1): Bigtable sorts keys and cuts them into ranges; Dynamo hashes keys onto a ring and copies each to N nodes. Cassandra is Dynamo's ring with Bigtable's storage. DynamoDB is not Dynamo: each partition has a Multi-Paxos leader.\n\n## Keys come from the questions (lessons 2, 3, 7)\n\n- Write every access pattern down with its rate before choosing a key.\n- Partition key: `=` on all its parts; it picks the partition (hashed). Sort key or clustering columns: sorted inside the partition; `=` on leading parts, then one range, no gaps.\n- Every query is a key lookup, a range read or a scan. A filter runs after the read and pays for everything read.\n- A question the key can't answer gets another copy: a GSI, another Cassandra table, another MongoDB index. Each copy costs a write on every insert, and a DynamoDB GSI lags and can't be read strongly consistently.\n\n## Numbers worth remembering\n\n| What | Value |\n|---|---|\n| DynamoDB per partition | 3,000 reads and 1,000 writes a second; read unit 4 KB, write unit 1 KB |\n| DynamoDB transaction | up to 100 items, 4 MB, two writes per item, client token remembered 10 min |\n| Cassandra hints | kept for `max_hint_window`, 3 h |\n| Cassandra tombstones | kept `gc_grace_seconds`, 10 days; warn at 1,000 per read, fail at 100,000 |\n| MongoDB election | after `electionTimeoutMillis`, 10 s; typically done within 12 s |\n| MongoDB transaction | 60 s default lifetime; needs a replica set |\n| Cassandra LWT (Paxos v1) | 4 round trips per write; v2 needs 2 |\n| BM25 defaults | k1 = 1.2, b = 0.75 |\n| pgvector HNSW defaults | m = 16, ef_construction = 64, ef_search = 40 |\n\n## Replication and quorums (lessons 6, 8)\n\n- Leader-based (DynamoDB, MongoDB): one copy orders writes; failover needs an election. Leaderless (Dynamo, Cassandra): every write goes to all N replicas, W must acknowledge, a read asks R.\n- R + W > N: every read set overlaps every acknowledged write set. N = 3, QUORUM = 2.\n- Catch-up: hinted handoff (short outages), read repair (keys that get read), anti-entropy with Merkle trees (everything else).\n- `Unavailable`: too few replicas alive, nothing tried. `WriteTimeout` or a `wtimeout`: tried, outcome unknown, may have landed.\n- MongoDB `w: 1` can be rolled back after a failover; `w: \"majority\"`, the default since 5.0, survives it.\n\n## Consistency and conflicts (lesson 9)\n\n- Ladder: linearizable, sequential, causal, session guarantees (read your writes, monotonic reads, monotonic writes, writes follow reads), eventual.\n- CAP: during a partition, a replica answers (A) or refuses (C). PACELC: else, latency or consistency, every day.\n- Last write wins keeps one concurrent write and drops the other by clock. Vector clocks detect concurrency and return siblings. CRDTs merge in any order (G-Counter: max per slot; OR-Set: remove the tags you saw).\n\n## Transactions (lessons 4, 10)\n\n- Across partitions: every participant promises (prepare), one decision is recorded durably, then commit. That's two-phase commit.\n- DynamoDB: a rejected prepare is `TransactionConflict`; nothing waits; retry with backoff and the same idempotency key.\n- MongoDB: snapshot per transaction; first writer wins; `TransientTransactionError` means rerun the whole transaction; set `snapshot` and `majority`.\n- Cassandra LWT: Paxos on one partition (prepare, read, propose, commit), `[applied]` in the reply. Accord in 6.0 (alpha): `BEGIN TRANSACTION` across partitions.\n- Prefer one document, one conditional write, or a saga of single-partition steps when the business can see \"pending\".\n\n## Graphs and specialized stores (lessons 11, 12)\n\n- Cypher: `MATCH (a:Account {id: $id})-[:USES]->(x)<-[:USES]-(b)`; repeat with `((...)){1,3}`; `-[:TRANSFERRED_TO]->{3,6}` for cycles. Start from an index, bound every walk, keep supernodes out.\n- Search: analyzer, posting lists, BM25. Time-series: chunks, `time_bucket`, keep count and sum, drop old chunks. Vectors: exact is a full comparison; HNSW walks layers with a beam of `ef_search`; measure recall@k.\n- Every extra store is a copy: feed it from an outbox through Kafka, never by dual writes, and watch its lag.\n\n## Pairs people mix up\n\n| This | Is not | The difference |\n|---|---|---|\n| CAP | PACELC | CAP is only about a network partition; PACELC adds the latency or consistency trade on normal days |\n| Quorum (R + W > N) | Consensus (Paxos, Raft) | a quorum makes reads overlap writes; consensus makes replicas agree on one order or one value |\n| Last write wins | Vector clocks | LWW silently keeps the later timestamp; vector clocks notice concurrent writes and hand both back |\n| Embed | Reference | embed what is read and changed together and bounded; reference what grows without limit |\n| Partition key | Clustering column | the partition key picks the machine and needs `=`; clustering columns order rows inside it and allow one range |\n| Base table read | GSI read | the table can be read strongly consistently; a GSI lags and can't be |\n| `Unavailable` | `WriteTimeout` | not attempted, against attempted with an unknown outcome |\n| Lightweight transaction | Accord transaction | one partition, Paxos, Cassandra 5.0; many partitions and tables, 6.0 alpha |\n| Exact nearest neighbours | Approximate (HNSW) | always right and reads everything; reads a little and may miss a neighbour |",
+  "recap": [
+    "Bigtable sorts keys into ranges, Dynamo hashes them onto a ring with N copies; nearly every NoSQL store uses one, the other or both. DynamoDB kept Dynamo's name, not its leaderless design.",
+    "Design keys from the access patterns: the partition key picks the partition and needs `=`, the sort key or clustering columns give cheap slices. Anything the key can't answer needs another copy of the data, which costs a write and may lag.",
+    "Consistent hashing with virtual nodes spreads keys evenly and moves few of them when nodes join, but it balances keys, not requests: hot keys need write sharding or a cache.",
+    "Leaderless replicas agree only as far as R + W > N makes reads and writes overlap. Hints, read repair and Merkle-tree repair converge them; timeouts mean \"unknown\", not \"failed\".",
+    "Cassandra appends cells and merges on read; deletes are tombstones that must be repaired within `gc_grace_seconds`. MongoDB writes one document atomically, and `w: \"majority\"` is what survives a failover.",
+    "Name the consistency you need per piece of data. CAP covers partitions, PACELC the daily latency trade. Last write wins drops a concurrent write; vector clocks detect it; CRDTs merge without losing one.",
+    "Transactions exist in every store now, at a price: prepare and commit across partitions, write conflicts and retries, four Paxos round trips. A better data model often removes the need.",
+    "Graph stores walk relationships from an indexed start node; search, time-series and vector stores each build one index shaped like one question. Each extra store is a copy to feed from a log and to operate."
+  ],
+  "quiz": [
+    {
+      "q": "A teammate says DynamoDB will hand your code two conflicting versions of an item to merge, as the Dynamo paper describes. What actually happens in a single-Region table?",
+      "options": [
+        "DynamoDB returns siblings tagged with vector clocks",
+        "Each partition's replicas follow one leader, which orders writes, so there are no siblings to merge",
+        "The write with the newest client timestamp wins silently",
+        "DynamoDB rejects the second write with a conflict error"
+      ],
+      "answer": 1,
+      "why": "DynamoDB shares Dynamo's name and hash partitioning, but each partition is a Multi-Paxos replication group with a leader that orders writes (lessons 1 and 6). Siblings and vector clocks belong to Dynamo and Riak; last write wins by timestamp is Cassandra's rule."
+    },
+    {
+      "q": "A Cassandra table has `PRIMARY KEY ((account_id), created_at, payment_id)`. Which query does Cassandra refuse without `ALLOW FILTERING`?",
+      "options": [
+        "`WHERE account_id = 'A-1001' AND created_at > '2026-11-01'`",
+        "`WHERE account_id = 'A-1001' LIMIT 20`",
+        "`WHERE created_at > '2026-11-01'`",
+        "`WHERE account_id = 'A-1001' AND created_at = '2026-11-07 09:00' AND payment_id = 'pay-81723'`"
+      ],
+      "answer": 2,
+      "why": "The partition key, `account_id`, picks the machine and must be given with `=`; without it Cassandra would have to read every partition on every node. Clustering columns only order rows inside a partition, so a range on `created_at` is cheap once the partition is known (lessons 2 and 7)."
+    },
+    {
+      "q": "A payment create must run once per idempotency key, even when two retries arrive together. In DynamoDB, what is the smallest tool that makes it safe?",
+      "options": [
+        "A `TransactWriteItems` with the claim and nothing else",
+        "A GetItem to check for the key, then a PutItem if it's absent",
+        "One PutItem of the claim with `attribute_not_exists(pk)`",
+        "A strongly consistent read before the write"
+      ],
+      "answer": 2,
+      "why": "A condition expression makes the check and the write one atomic step on one item (lesson 3), and a second claim fails with `ConditionalCheckFailedException`. A read followed by a write races, whatever the read's consistency. A transaction works but costs two writes per item; you need one when the claim and the payment must be written together (lesson 4)."
+    },
+    {
+      "q": "A cluster grows from 4 to 5 nodes. Roughly what share of keys move with `hash(key) mod nodes`, and with consistent hashing and many virtual nodes?",
+      "options": [
+        "About 80% with mod; about a fifth with consistent hashing",
+        "About a fifth with both",
+        "About 80% with both",
+        "None with mod; about half with consistent hashing"
+      ],
+      "answer": 0,
+      "why": "With mod, a key keeps its node only if `h mod 4 = h mod 5`, which happens for 4 of every 20 hashes, so about 80% move. On a ring the new node takes only its share of the arcs, about 1/5, from its neighbours, and virtual nodes spread that share across many nodes (lessons 1 and 5)."
+    },
+    {
+      "q": "Cassandra, N = 3, every read and write at `QUORUM`. Two requests claim the same idempotency key at the same moment with plain inserts. What does the quorum guarantee, and what does it not?",
+      "options": [
+        "It guarantees only one insert succeeds",
+        "It guarantees reads overlap acknowledged writes, but both inserts succeed and last write wins keeps one silently; agreement on one winner needs Paxos (a lightweight transaction)",
+        "It guarantees nothing, because QUORUM is eventual consistency",
+        "It guarantees both claims are kept as siblings"
+      ],
+      "answer": 1,
+      "why": "A quorum is an overlap guarantee (lesson 6): any read of 2 sees any acknowledged write of 2. It doesn't order two writers. Consensus does: an LWT's Paxos rounds make replicas agree on one value before anyone writes (lesson 10). Siblings are Dynamo's, not Cassandra's."
+    },
+    {
+      "q": "A team keeps pending payouts in a Cassandra table, inserting each payout and deleting it once paid, all in one partition per merchant. After a few weeks, reads of the next 10 payouts slow down and then fail. Why?",
+      "options": [
+        "The partition grew past 100 MB of live data",
+        "Every delete left a tombstone, kept for 10 days, and each read from the start of the partition steps over all of them",
+        "Deleted rows are rewritten on every compaction",
+        "The table needs an SAI index on the payout id"
+      ],
+      "answer": 1,
+      "why": "Deletes don't erase in Cassandra; they write tombstones that must live `gc_grace_seconds` (10 days) so repair can spread them (lesson 7). A queue in one partition piles them up at the front, reads warn at 1,000 and fail at 100,000. Put queues in Kafka, or bucket by time with TTLs and read after a saved position."
+    },
+    {
+      "q": "In MongoDB, should a payment's refunds be embedded in the payment, and an account's payments embedded in the account?",
+      "options": [
+        "Embed both: one document per account is fastest",
+        "Reference both: documents should stay small",
+        "Embed the refunds (read and changed with the payment, a handful at most); reference the payments (they grow without limit)",
+        "Reference the refunds; embed the payments"
+      ],
+      "answer": 2,
+      "why": "Embed what is read and changed together and stays bounded: one guarded update can then check the refund rule atomically (lessons 2 and 8). An account's payments grow without limit and would run into the 16 MB document limit and rewrite a huge document on every payment, so they get their own collection, with at most a capped summary embedded."
+    },
+    {
+      "q": "With no failures at all, switching a MongoDB write from `w: 1` to `w: \"majority\"` makes it about 4 ms slower. Which statement places that correctly?",
+      "options": [
+        "CAP: choosing consistency over availability",
+        "PACELC's else branch: with no partition, trading latency for consistency",
+        "PACELC's partition branch: choosing consistency during a partition",
+        "Neither: it's a performance bug"
+      ],
+      "answer": 1,
+      "why": "CAP only speaks about what happens during a network partition, and there is none here. PACELC's second half covers normal days: waiting for more replicas buys a stronger guarantee (the write survives a failover) at the price of latency (lesson 9)."
+    },
+    {
+      "q": "During a partition, one region voids a payment while the other captures it. Which conflict rule notices that the two writes were concurrent instead of silently keeping one?",
+      "options": [
+        "Last write wins with synchronized clocks",
+        "A quorum read at `ALL`",
+        "Vector clocks: neither version's clock is behind the other's, so both are kept as siblings for the application",
+        "Read repair"
+      ],
+      "answer": 2,
+      "why": "Last write wins keeps the higher timestamp and drops the other write without a trace, and with skewed clocks the earlier decision can win (lesson 9). Vector clocks compare per-node counters: when each is ahead somewhere, the writes are concurrent and both come back. For payment status, the better answer is to stop the second write before it happens, with a single leader or a transaction (lesson 10)."
+    },
+    {
+      "q": "The fraud team asks for accounts within three shared devices of a flagged account; support asks for disputes \"like this one\"; finance asks for merchants named like \"Nrthwind\". Which stores fit, in that order?",
+      "options": [
+        "Search, graph, vector",
+        "Graph, vector, search",
+        "Vector, search, graph",
+        "Key-value for all three, with more indexes"
+      ],
+      "answer": 1,
+      "why": "A walk along shared identifiers is a graph question (lesson 11). Similar meaning is nearest neighbours of embeddings, a vector index (lesson 12). Typo-tolerant word matching ranked by relevance is an inverted index with fuzzy matching, a search engine (lesson 12). Each one can start inside a store you already run (pgvector, PostgreSQL full-text search) before you add a new one."
+    }
+  ]
+}

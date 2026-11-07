@@ -1,0 +1,138 @@
+# A small network for the networking lessons: ARP, subnets, NAT, routing, MTU, IPv6 and UDP.
+#
+#   lan 10.10.1.0/24                                   wan 10.10.2.0/24
+#   client 10.10.1.10 ---+                         +--- server 10.10.2.20 (web server on :8080)
+#                        +--- router ----------------+
+#   peer   10.10.1.20 ---+    10.10.1.2  10.10.2.2
+#                                 10.10.3.2
+#                                     |
+#                                     |  tunnel 10.10.3.0/24, MTU 1400 (like a VPN link between two sites)
+#                                     |
+#                                 10.10.3.3
+#                              router2 10.10.4.3 ------ dc 10.10.4.0/24 ------ ledger 10.10.4.40 (web server on :8080)
+#
+#   dual 10.10.6.0/24 and fd00:10:6::/64 (dual stack, IPv4 and IPv6 on one link)
+#   app 10.10.6.10 fd00:10:6::10 ------ api 10.10.6.20 fd00:10:6::20 (web server on :8080, IPv4 and IPv6)
+#
+#   docker compose -f env/net.yml up -d                     start every host
+#   docker compose -f env/net.yml exec client bash          a shell on one host (client, peer, router, server,
+#                                                           router2, ledger, app, api)
+#   docker compose -f env/net.yml logs server               a web server's access log (who connected)
+#   docker compose -f env/net.yml down                      stop and remove everything
+#
+# Docker owns the .1 address on each network (its own gateway to the internet), and fd00:10:6::1.
+# The router forwards packets (ip_forward=1) but does no NAT until you add a rule yourself.
+# client and peer have a route to wan through the router. The server has no default route,
+# so it can reach wan addresses only, and has no way back to lan.
+# The router knows nothing about dc yet: lesson 4 has you add that route. router2 already routes
+# lan back through the router, and ledger's default route points at router2.
+# Every host runs the lab box image, so ip, ss, tcpdump, tshark, curl and conntrack are there.
+# env/net/send-ra.py sends one IPv6 Router Advertisement (lesson 5).
+# env/net/dns.py is a tiny DNS server in plain Python (lesson 9): run it on router as the authoritative
+# server for the made-up zone in env/net/pay.test.zone, and on peer as a caching resolver. Nothing
+# starts it by default, so the hosts above behave exactly as before.
+# env/net/pki.sh makes a small certificate authority with openssl (lesson 10). Lessons 10 to 12 run
+# their Java demos from labs/net/src/demo/java on these hosts or in the lab box; nothing starts them here.
+name: sfz-net
+
+x-host: &host
+  image: sfz-labbox:1
+  working_dir: /labs
+  volumes:
+    - ..:/labs
+  cap_add: [NET_ADMIN, NET_RAW]
+  mem_limit: 256m
+  init: true
+  stop_grace_period: 2s
+
+services:
+  client:
+    <<: *host
+    hostname: client
+    networks:
+      lan: { ipv4_address: 10.10.1.10 }
+    command: ["bash", "-c", "ip route add 10.10.2.0/24 via 10.10.1.2 && exec sleep infinity"]
+
+  peer:
+    <<: *host
+    hostname: peer
+    networks:
+      lan: { ipv4_address: 10.10.1.20 }
+    command: ["bash", "-c", "ip route add 10.10.2.0/24 via 10.10.1.2 && exec sleep infinity"]
+
+  router:
+    <<: *host
+    hostname: router
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      lan: { ipv4_address: 10.10.1.2 }
+      wan: { ipv4_address: 10.10.2.2 }
+      tunnel: { ipv4_address: 10.10.3.2 }
+    command: ["sleep", "infinity"]
+
+  server:
+    <<: *host
+    hostname: server
+    networks:
+      wan: { ipv4_address: 10.10.2.20 }
+    command: ["bash", "-c", "ip route del default; mkdir -p /srv && echo 'hello from server' > /srv/index.html && exec python3 -u -m http.server 8080 --directory /srv"]
+
+  router2:
+    <<: *host
+    hostname: router2
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      tunnel: { ipv4_address: 10.10.3.3 }
+      dc: { ipv4_address: 10.10.4.3 }
+    command: ["bash", "-c", "ip route add 10.10.1.0/24 via 10.10.3.2 && exec sleep infinity"]
+
+  ledger:
+    <<: *host
+    hostname: ledger
+    networks:
+      dc: { ipv4_address: 10.10.4.40 }
+    # a 300 KB settlement file, big enough to need full-size packets
+    command: ["bash", "-c", "ip route replace default via 10.10.4.3 && mkdir -p /srv && echo 'hello from ledger' > /srv/index.html && yes 'TX,4242,EUR,100.00' | head -c 300000 > /srv/settlement.csv; exec python3 -u -m http.server 8080 --directory /srv"]
+
+  app:
+    <<: *host
+    hostname: app
+    networks:
+      dual: { ipv4_address: 10.10.6.10, ipv6_address: "fd00:10:6::10" }
+    command: ["sleep", "infinity"]
+
+  api:
+    <<: *host
+    hostname: api
+    networks:
+      dual: { ipv4_address: 10.10.6.20, ipv6_address: "fd00:10:6::20" }
+    # --bind :: listens on IPv6 and IPv4 at once (IPv4 clients show up as ::ffff:10.10.6.x)
+    command: ["bash", "-c", "mkdir -p /srv && echo 'hello from api' > /srv/index.html && exec python3 -u -m http.server 8080 --bind :: --directory /srv"]
+
+networks:
+  lan:
+    ipam:
+      config:
+        - subnet: 10.10.1.0/24
+  wan:
+    ipam:
+      config:
+        - subnet: 10.10.2.0/24
+  tunnel:
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"
+    ipam:
+      config:
+        - subnet: 10.10.3.0/24
+  dc:
+    ipam:
+      config:
+        - subnet: 10.10.4.0/24
+  dual:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.10.6.0/24
+        - subnet: "fd00:10:6::/64"

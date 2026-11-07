@@ -1,0 +1,421 @@
+{
+  "id": "os-09",
+  "title": "The page cache, writeback and fsync",
+  "minutes": 40,
+  "goal": "By the end you can say where a read and a write go in the kernel, why a successful write() isn't a durable one, what fsync costs and how group commit pays it once for many records, and how to replace a file so that a crash leaves either the old version or the new one.",
+  "warmup": {
+    "q": "A payment service appends an authorization record to its log with `write()`, gets back the full byte count, and replies \"approved\". The machine loses power two seconds later. Is the record in the file after the reboot?",
+    "options": [
+      "Yes: `write()` returned success",
+      "Probably not: it was most likely still only in RAM",
+      "Yes: the file system's journal protects it",
+      "Only if the file was opened with `O_APPEND`"
+    ],
+    "answer": 1,
+    "why": "`write()` copies the bytes into the page cache and returns. The kernel writes dirty pages to disk about 30 seconds later, or when something calls `fsync`. A journal (ext4's default mode) keeps the file system's structure consistent after a crash; it doesn't make un-fsynced data durable. `O_APPEND` only decides where the bytes go in the file."
+  },
+  "sections": [
+    {
+      "h": "The kernel keeps file data in RAM, and reads come from there",
+      "body": "`cat` reads a 512 MB file in 1.0 s the first time and in 0.16 s the second. Nothing about `cat` changed between the runs. The second time, every page of the file was already in RAM.\n\nStorage is slow next to memory. A read from an SSD takes around 0.1 ms, while copying the same 4 KB within RAM takes about a microsecond. And programs read the same data over and over: the JVM opens the same JAR files at every start, every request handler reads the same config file, and a Kafka consumer reads a log segment seconds after the producer wrote it.\n\nThe simplest fix is for each program to cache what it reads. It falls short fast. Ten processes reading one file keep ten copies. The cache dies with its process, so a restarted service starts cold. And a program caching a file can't know when another process changes it.\n\nSo the kernel keeps one cache of file pages for the whole machine: the **page cache**. Every `read()` goes through it. On a miss, the kernel reads the page from storage into a free frame (a 4 KB piece of RAM, lesson 6), keeps it there, and copies the bytes into your buffer. On a hit it only copies. When it sees a file being read in order, it reads ahead and fetches the next pages before you ask for them. `mmap` of a file (lesson 7 of this track) maps these same frames into your address space, so a mapped file and a `read()` of it share one copy.\n\nThe page cache lives in RAM that nobody else is using. In one run in the lab box, `free -m` showed 3,120 MB of `buff/cache`, only 4,097 MB `free`, and 6,873 MB `available`. That last number is the one to read: free memory plus cache the kernel can drop. A clean cached page, identical to what's on disk, can be dropped the moment a program needs the frame. Linux fills idle RAM with cache on purpose. Memory the cache \"uses\" is still there when a program asks for it.\n\nIn a container, the cgroup is charged for the page cache its processes bring in, next to their anonymous memory. `memory.stat` splits the two: writing a 512 MB file added 512 MB under `file` and nothing under `anon`. The container's memory usage counts both, so a service that writes or reads big files can look close to its limit while holding little memory of its own. Before the OOM killer (lesson 7) is called, the kernel drops clean file pages first.",
+      "try": {
+        "title": "Read a file cold, then warm",
+        "minutes": 4,
+        "steps": [
+          "`os/c/l09/pcache.c` counts how many pages of a file are in the page cache (with `mincore`), and with `evict` drops that one file's pages. It touches no other file, which matters in the shared Docker VM.",
+          "The block writes a 512 MB file, evicts it, then reads it twice with `cat`. Predict both `real` times and what `memory.stat` does after the write.",
+          "Run it in the lab box. It deletes the file at the end."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -o /tmp/pcache os/c/l09/pcache.c\ngrep -E '^(anon|file) ' /sys/fs/cgroup/memory.stat\ndd if=/dev/zero of=/tmp/segment.log bs=1M count=512 status=none\ngrep -E '^(anon|file) ' /sys/fs/cgroup/memory.stat\n/tmp/pcache /tmp/segment.log evict\ntime cat /tmp/segment.log > /dev/null\n/tmp/pcache /tmp/segment.log\ntime cat /tmp/segment.log > /dev/null\nfree -m\nrm /tmp/segment.log"
+        },
+        "expect": "The times depend on how busy the VM is (another run took 1.0 s and 0.16 s):\n\n```text\nanon 393216\nfile 28450816\nanon 397312\nfile 565391360\n/tmp/segment.log: 0 of 131072 pages cached (0 MB of 512 MB)\n\nreal\t0m3.313s\nuser\t0m0.015s\nsys\t0m0.525s\n/tmp/segment.log: 131072 of 131072 pages cached (512 MB of 512 MB)\n\nreal\t0m0.423s\nuser\t0m0.003s\nsys\t0m0.420s\n               total        used        free      shared  buff/cache   available\nMem:            7935        3520         690          28        3942        4415\nSwap:           1023           3        1020\n```\n\nWriting the file added 512 MB to the container's `file` count and nothing to `anon`: the written pages are page cache. After `evict`, none of it was cached, and the first `cat` waited for the disk. That read put all 131,072 pages back in the cache, and the second `cat` was all `sys` time, the kernel copying from RAM. `free -m` is the whole VM's view; `available` is what programs could still get. On a Linux machine of your own, `fincore` from util-linux does what `pcache` does."
+      },
+      "refs": [
+        {
+          "title": "Concepts overview: page cache and reclaim (Linux kernel documentation)",
+          "url": "https://docs.kernel.org/admin-guide/mm/concepts.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Linux ate my RAM!",
+          "url": "https://www.linuxatemyram.com/",
+          "kind": "read"
+        },
+        {
+          "title": "mincore(2)",
+          "url": "https://man7.org/linux/man-pages/man2/mincore.2.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A write lands in the page cache, and the disk gets it later",
+      "body": "`dd` writes 64 MB to a file in `/tmp` in a fraction of a second. Right after, the container's `memory.stat` shows `file_dirty 67108864`: 64 MB that's in RAM and not on disk.\n\n`write()` doesn't wait for storage. It copies your bytes into page-cache pages, marks each page **dirty** (newer than the copy on disk), and returns. Waiting for the disk on every call would make every small write pay a device round trip, and many writes never need to reach the disk one by one: a page rewritten a hundred times in a second can be written once, and pages written in order can go out as one large request.\n\nThe kernel's flusher threads do the writing later. This is **writeback**, and four things start it:\n\n- A page that has been dirty longer than `vm.dirty_expire_centisecs` (3000, so 30 s) is written at the flusher's next wake-up. The flusher wakes every `vm.dirty_writeback_centisecs`: 500 (5 s) by default, 1500 (15 s) in this VM.\n- When dirty data passes `vm.dirty_background_ratio` (10%) of the memory the kernel could use for it, the flusher starts writing in the background without waiting for age. In this VM that line sat between 390 and 690 MB, depending on how much memory was free.\n- Past `vm.dirty_ratio` (20%), a process that writes more is made to wait and help with the writing. That's when `write()` suddenly gets slow.\n- A program asks: `fsync` for one file, `sync` for everything.\n\nThe stepper follows one log file through writes, writeback, `fsync` and a power cut.\n\nUntil writeback happens, the newest data exists only in RAM. Programs that read the file see it, because they read the page cache. If the machine loses power, it's gone, although every `write()` returned success. If only your process dies, say from `kill -9`, nothing is lost: the dirty pages belong to the kernel, not to your process, and they still go to disk.\n\nIn the shared Docker VM the timing is noisy. In my runs, 64 MB of dirty data waited 30 to 34 s when nothing else happened, and was written after anywhere from 0.2 to 20 s when another container called `sync` or pushed the VM past its background threshold. On a quiet Linux machine of your own you'd see the 30 s rule every time.",
+      "stepper": {
+        "title": "Three records, one fsync, one power cut",
+        "intro": "A service appends 4 KB records to a log. Yellow pages are dirty: newer in RAM than on disk. The bottom line says what a power cut at that moment would leave.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"write copies record 1 into a page-cache page and returns; the disk has nothing yet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">write(rec 1)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">returns 4096 at once</text><rect class=\"box-b\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">dirty</text><rect class=\"box-dim\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">empty</text><rect class=\"box-dim\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">empty</text><rect class=\"box-dim\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 0 s</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: record 1 is lost</text></svg>",
+            "say": "The payment service appends record 1 with `write()`. The kernel copies the 4 KB into a page-cache page, marks it **dirty** (newer than the disk), and returns. That took microseconds. The disk has nothing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"A read of the file is served from the cached page, dirty or not\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">read(0, 4096)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">gets rec 1</text><rect class=\"box-b\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">dirty</text><rect class=\"box-dim\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">empty</text><rect class=\"box-dim\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">empty</text><rect class=\"box-dim\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 0.1 s</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: record 1 is lost</text></svg>",
+            "say": "Any process that reads the file now gets record 1, because reads go through the same page cache. To every program the write has happened. Only the disk disagrees."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"30 seconds later the flusher writes the dirty page back; the page is clean\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">(busy elsewhere)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\"></text><rect class=\"box-a\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">clean</text><line class=\"ln-a\" x1=\"452\" y1=\"59\" x2=\"498\" y2=\"59\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">empty</text><rect class=\"box-dim\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">empty</text><rect class=\"box-a\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0: rec 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-dim\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 30 s: the flusher wakes; page 0 has been dirty for 30 s</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: record 1 survives</text></svg>",
+            "say": "The page has been dirty for 30 s (`dirty_expire_centisecs`), so the flusher thread writes it at its next wake-up. Now the disk has record 1 and the page is **clean**: the kernel could drop it from RAM at any time and read it back later."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"write record 2: page 1 is dirty\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">write(rec 2)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">returns at once</text><rect class=\"box\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">clean</text><rect class=\"box-b\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1: rec 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">dirty</text><rect class=\"box-dim\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">empty</text><rect class=\"box-ok\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0: rec 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-dim\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">nothing yet</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 31 s</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: record 1 survives, record 2 is lost</text></svg>",
+            "say": "Record 2 is a refund the service must not lose. `write()` puts it in page 1 and returns, exactly like record 1. If the power went out now, record 2 would be gone, and the service may already have told a caller it was saved."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"fsync writes page 1 and the file size, asks the device to flush, and waits\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">fsync(fd)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">returns in about 3 ms</text><rect class=\"box\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">clean</text><rect class=\"box-a\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1: rec 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">clean</text><line class=\"ln-a\" x1=\"452\" y1=\"119\" x2=\"498\" y2=\"119\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">empty</text><rect class=\"box-ok\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0: rec 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-a\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1: rec 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 31 s: one fsync, a few milliseconds of waiting</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: records 1 and 2 survive</text></svg>",
+            "say": "So the service calls `fsync(fd)` before it answers. The kernel writes the file's dirty page and its new size, tells the device to flush its own cache, and returns only when the device confirms. That's milliseconds instead of microseconds, and now record 2 is safe."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"write record 3 without fsync: page 2 is dirty\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">write(rec 3)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">returns at once</text><rect class=\"box\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">clean</text><rect class=\"box\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1: rec 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">clean</text><rect class=\"box-b\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2: rec 3</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">dirty</text><rect class=\"box-ok\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0: rec 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-ok\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1: rec 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 32 s</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">if the power went out now: records 1 and 2 survive, record 3 is lost</text></svg>",
+            "say": "Record 3 is written and not forced. It sits dirty in page 2, and will reach the disk on its own around t = 62 s, if the machine lives that long."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 270\" role=\"img\" aria-label=\"Power cut: everything in RAM is gone; the disk keeps records 1 and 2\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"110\" y=\"24\" text-anchor=\"middle\">program</text><text class=\"t-s t-m\" x=\"345\" y=\"24\" text-anchor=\"middle\">page cache (RAM)</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">disk</text><rect class=\"box-bad\" x=\"20\" y=\"34\" width=\"180\" height=\"170\" rx=\"8\"/><text class=\"t t-code\" x=\"110.0\" y=\"114.0\" text-anchor=\"middle\">(gone)</text><text class=\"t-s t-m\" x=\"110.0\" y=\"134.0\" text-anchor=\"middle\">power cut</text><rect class=\"box-bad\" x=\"240\" y=\"34\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"54.0\" text-anchor=\"middle\">page 0: rec 1</text><text class=\"t-s t-m\" x=\"345.0\" y=\"74.0\" text-anchor=\"middle\">lost</text><rect class=\"box-bad\" x=\"240\" y=\"94\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"114.0\" text-anchor=\"middle\">page 1: rec 2</text><text class=\"t-s t-m\" x=\"345.0\" y=\"134.0\" text-anchor=\"middle\">lost</text><rect class=\"box-bad\" x=\"240\" y=\"154\" width=\"210\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"345.0\" y=\"174.0\" text-anchor=\"middle\">page 2: rec 3</text><text class=\"t-s t-m\" x=\"345.0\" y=\"194.0\" text-anchor=\"middle\">lost</text><rect class=\"box-ok\" x=\"500\" y=\"34\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"54.0\" text-anchor=\"middle\">block 0: rec 1</text><text class=\"t-s t-m\" x=\"600.0\" y=\"74.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-ok\" x=\"500\" y=\"94\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"114.0\" text-anchor=\"middle\">block 1: rec 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"134.0\" text-anchor=\"middle\">on disk</text><rect class=\"box-dim\" x=\"500\" y=\"154\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600.0\" y=\"174.0\" text-anchor=\"middle\">block 2</text><text class=\"t-s t-m\" x=\"600.0\" y=\"194.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">t = 33 s: power cut, then a reboot</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">after the reboot the file holds: records 1 and 2, nothing else</text></svg>",
+            "say": "The power goes out. The page cache was RAM, so all three pages vanish. After the reboot the file holds records 1 and 2: one written back by age, one by `fsync`. Record 3 is gone, though its `write()` returned success. Note what didn't matter: if only the service's process had died, with `kill -9`, all three records would still have reached the disk, because dirty pages belong to the kernel."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch 64 MB of dirty pages wait",
+        "minutes": 2,
+        "steps": [
+          "The block prints the writeback settings and the kernel's current dirty thresholds (in pages), writes 64 MB without any `fsync`, and prints the container's `file_dirty` every 5 seconds.",
+          "Predict when `file_dirty` drops to 0. Then run it in the lab box; it takes about 50 seconds."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "cat /proc/sys/vm/dirty_expire_centisecs /proc/sys/vm/dirty_writeback_centisecs\ngrep -E 'nr_dirty_(background_)?threshold' /proc/vmstat\ndd if=/dev/zero of=/tmp/batch.csv bs=1M count=64 status=none\nfor s in $(seq 0 5 45); do\n  echo \"$s s: $(grep -E '^file_dirty ' /sys/fs/cgroup/memory.stat)\"\n  sleep 5\ndone\nrm /tmp/batch.csv"
+        },
+        "expect": "The Docker VM is shared, so your timeline will differ:\n\n```text\n3000\n1500\nnr_dirty_threshold 326762\nnr_dirty_background_threshold 163181\n0 s: file_dirty 67108864\n5 s: file_dirty 67108864\n10 s: file_dirty 67108864\n15 s: file_dirty 8388608\n20 s: file_dirty 8388608\n25 s: file_dirty 8388608\n30 s: file_dirty 8388608\n35 s: file_dirty 0\n40 s: file_dirty 0\n45 s: file_dirty 0\n```\n\nThe first two lines are the rules: pages expire after 3000 centiseconds (30 s), and the flusher wakes every 1500 (15 s). The thresholds count pages across the whole VM: background writeback starts at 163,181 dirty pages (about 640 MB) and writers get throttled at 326,762 (about 1.3 GB). In this run most of the 64 MB went out at the 15 s mark, early, because writeback was already running for other containers' data, and the last 8 MB waited until it was 30 s old. In quiet runs all 64 MB stayed dirty until 30 to 34 s; in busy ones it was gone within seconds. Until it reaches 0, a power cut loses whatever is still dirty."
+      },
+      "refs": [
+        {
+          "title": "Documentation for /proc/sys/vm: dirty_* settings",
+          "url": "https://docs.kernel.org/admin-guide/sysctl/vm.html",
+          "kind": "docs"
+        },
+        {
+          "title": "proc_meminfo(5): Dirty and Writeback",
+          "url": "https://man7.org/linux/man-pages/man5/proc_meminfo.5.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "fsync waits until the device has the data, and that's slow",
+      "body": "`ForceCost` appends 4 KB authorization records to a log. A plain `write()` costs 7 to 14 µs a record. Calling `FileChannel.force` after every record costs 2 to 9 ms a record in the lab box, several hundred times more. Forcing once per 100 records brings it down to tens of microseconds a record.\n\n`fsync(fd)` is the call that closes the gap between written and stored. The kernel writes the file's dirty pages and its metadata (the size, which blocks hold the data, the timestamps), then tells the device to flush its own write cache, and returns only when the device says the data is stored. Most of the time is that round trip, so it depends on the hardware: a few milliseconds in this VM on a Mac, and on servers anywhere from tens of microseconds for an NVMe drive with power-loss protection to a millisecond or more for a network disk. `fdatasync` skips metadata that isn't needed to read the data back, such as the modification time. In Java, `FileChannel.force(false)` asks for the content only, which on Linux is `fdatasync`; `force(true)` is `fsync`. And `close()` doesn't write anything to disk on a local file system.\n\nA service that must not lose an acknowledged record has to `fsync` before it answers. Done for every record, one thread manages a few hundred records a second here. The way out is **group commit**: collect the records that arrive while one `fsync` is running, write them all, `fsync` once, then answer every caller in the group. Each caller waits a little longer, and throughput grows with the batch size. Databases work this way. PostgreSQL flushes its write-ahead log when a transaction commits, and concurrent commits can share one flush. In Oracle, the `log file sync` wait event is a session waiting at commit for the redo log to be written.\n\nKafka chose differently, on purpose. Its design document says a write to the log just means the data \"is transferred into the kernel's pagecache\", and by default a broker doesn't `fsync` each message. A record survives because it's in the page cache of several brokers (`acks=all` with `min.insync.replicas`), a bet that they won't all lose power in the same second.\n\nOne more trap: if writeback fails, for example on a disk error, `fsync` reports the error once. In 2018 PostgreSQL found that retrying `fsync` after a failure could succeed although the data was lost, because the kernel had already marked the pages clean. Since then PostgreSQL treats a failed `fsync` as fatal and recovers from its log.",
+      "try": {
+        "title": "Price a force per record against a force per batch",
+        "minutes": 3,
+        "steps": [
+          "`ForceCost` writes 20,000 records with no force, 1,000 records with `force(false)` after each, and 20,000 with one `force(false)` per 100. Then `strace -c` counts the system calls the forces turn into.",
+          "Predict the cost per record of each mode, and which system call `force(false)` makes. Then run it in the lab box."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l09/demo/ForceCost.java\njava -cp /tmp/out sfz.os.l09.demo.ForceCost\nstrace -f -c -e trace=fdatasync,fsync java -cp /tmp/out sfz.os.l09.demo.ForceCost > /dev/null",
+          "file": "labs/os/src/demo/java/sfz/os/l09/demo/ForceCost.java"
+        },
+        "expect": "The force times swing a lot in the shared VM (2.0 to 8.7 ms per force across my runs):\n\n```text\nmode                 records   total ms   us per record\nwrite only             20000        259            13.0\nforce every record      1000       3201          3201.4\nforce every 100        20000       1592            79.6\nstrace: Process 59 attached\n...\n% time     seconds  usecs/call     calls    errors syscall\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.273127         227      1200           fdatasync\n------ ----------- ----------- --------- --------- ----------------\n100.00    0.273127         227      1200           total\n```\n\nA force per record is about 250 times the cost of a write. Batching by 100 divides the force's cost by 100. `strace` counts 1,200 `fdatasync` calls (1,000 plus 20,000 / 100) and no `fsync`: `force(false)` is `fdatasync`. Its `usecs/call` column is CPU time in the kernel, not the time spent waiting for the device, which is why it's far below the 3 ms per force."
+      },
+      "refs": [
+        {
+          "title": "fsync(2) and fdatasync",
+          "url": "https://man7.org/linux/man-pages/man2/fsync.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "FileChannel.force (JDK 25)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Kafka 4.4 design: Don't fear the filesystem",
+          "url": "https://kafka.apache.org/44/design/design/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "To replace a file safely, write a copy, fsync it, rename it, fsync the directory",
+      "body": "`SafeWrite` replaces `routing.json` with five system calls: it creates a temporary file, writes it, `fsync`s it, renames it over the old name, and `fsync`s the directory. Each call closes a different way a crash could leave a broken file.\n\nThe tempting way is to overwrite in place: open the file with `O_TRUNC`, write the new content, close. A power cut after the truncate and before writeback leaves an empty file, or the right length full of zeros, and the old content is gone as well. ext4's documentation calls the empty result the zero-length problem, and it carries a workaround aimed at applications that skip `fsync`. Even with an `fsync` at the end, there's a window between the truncate and the `fsync` when the disk holds neither version.\n\nSo never touch the old file. Write the new content to `routing.json.tmp`, then `rename()` it to `routing.json`. Rename replaces the name in one step: `rename(2)` promises that no other process ever finds the name missing. A reader opens either the old file or the new one.\n\nThat's atomic for running programs, and not yet for a crash. The rename is a change to the directory, and nothing in POSIX makes it reach the disk after the temporary file's data. ext4 commits metadata to its journal every 5 seconds while data waits up to 30 s for writeback; it even has a special case (`auto_da_alloc`) for this pattern because so many programs got it wrong, but other file systems and mount options promise nothing. Without care, a power cut can leave the name pointing at a file whose bytes never arrived. Hence the `fsync` of the temporary file before the rename: the name can then only ever point at data that's already on disk.\n\nThe last call is about durability. After `rename`, the new name exists in the cached copy of the directory. The `fsync(2)` manual says that fsyncing a file doesn't make sure its directory entry is on disk; for that, you `fsync` the directory itself. Skip it and a crash can bring back the old file, intact but out of date, after you told the caller the update was saved.\n\nIn Java: `FileChannel.force(true)` on the temporary file, `Files.move(tmp, target, ATOMIC_MOVE)`, then open the directory with `FileChannel.open(dir, READ)` and call `force(true)` on that. Opening a directory as a channel works on Linux. The lab makes you prove the whole pattern: its tests cut the power after every single step.",
+      "try": {
+        "title": "Trace a safe replace",
+        "minutes": 3,
+        "steps": [
+          "`SafeWrite` replaces `/tmp/cfg/routing.json` with the four steps in this section and prints the result.",
+          "Before you run it, write down the system calls you expect, in order. Then run it in the lab box under `strace`; the `grep` keeps the lines for the config directory, the forces and the rename."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l09/demo/SafeWrite.java\nstrace -f -o /tmp/sw.txt -e trace=openat,write,fsync,renameat java -cp /tmp/out sfz.os.l09.demo.SafeWrite\ngrep -E '\"/tmp/cfg|fsync|renameat|write\\(4, \"\\{' /tmp/sw.txt",
+          "file": "labs/os/src/demo/java/sfz/os/l09/demo/SafeWrite.java"
+        },
+        "expect": "Thread IDs differ between runs:\n\n```text\n{\"issuer\": \"acme-bank\", \"timeoutMs\": 120}\n37    openat(AT_FDCWD, \"/tmp/cfg/routing.json.tmp\", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 4\n37    write(4, \"{\\\"issuer\\\": \\\"acme-bank\\\", \\\"timeout\"..., 42) = 42\n37    fsync(4)                          = 0\n37    renameat(AT_FDCWD, \"/tmp/cfg/routing.json.tmp\", AT_FDCWD, \"/tmp/cfg/routing.json\") = 0\n37    openat(AT_FDCWD, \"/tmp/cfg\", O_RDONLY) = 4\n37    fsync(4)                          = 0\n37    openat(AT_FDCWD, \"/tmp/cfg/routing.json\", O_RDONLY) = 4\n```\n\nThe four steps, in order: write the temporary file, `fsync` it, `renameat` it over the old name, then open the directory itself and `fsync` it. `Files.move` with `ATOMIC_MOVE` is a single `renameat`. The last `openat` is the program reading the file back to print it."
+      },
+      "refs": [
+        {
+          "title": "rename(2): atomic replacement",
+          "url": "https://man7.org/linux/man-pages/man2/rename.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "ext4 mount options: commit and auto_da_alloc",
+          "url": "https://docs.kernel.org/admin-guide/ext4.html",
+          "kind": "docs"
+        },
+        {
+          "title": "OSTEP chapter 39: Files and Directories (fsync, rename)",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "The page cache is a write-behind cache in front of the disk, shared by every process on the machine, like a Caffeine cache with an asynchronous writer behind it. `read()` is a cache lookup, `write()` updates the cached entry and returns, the flusher pushes entries that have been dirty for 30 seconds, and `fsync` is \"flush this entry now and wait for the acknowledgement\". The analogy breaks on what kills the cache. A Caffeine cache lives in your JVM and dies with it. The page cache lives in the kernel, so it survives your process crashing, even with `kill -9`, and is lost only when the machine itself goes down.",
+  "in_your_world": "Every database you use pays for `fsync` at commit, which is why commit latency tracks disk latency. PostgreSQL flushes its write-ahead log before `COMMIT` returns (with the default `synchronous_commit = on`), and an Oracle session waiting on `log file sync` is waiting for exactly that flush of the redo log. Kafka skips the per-message `fsync` and relies on `acks=all` and `min.insync.replicas` to have the record in several brokers' page caches. Your own services hit this whenever they write files: a settlement job that writes a CSV for the bank's pickup and then reports \"file ready\" should write a temporary file, force it, rename it and force the directory first, or a node failure can leave the bank an empty or half-written file under the final name. And in Kubernetes, a pod that writes or reads big files shows the page cache in its memory usage; most of it is reclaimable, so read `memory.stat` (`file` against `anon`) before you raise the limit.",
+  "mistake": "Treating a successful `write()`, or `close()`, as a saved record, and trusting the file system's journal to cover the rest. `write()` returns once the bytes are in RAM, `close()` writes nothing to disk, and ext4's journal keeps the file system's structure consistent but makes no promise about data you didn't `fsync`. People make the mistake because nothing ever goes wrong in testing: processes crash, and the data still arrives, because the kernel writes it later. Only a power cut, a kernel panic or a VM being killed loses it. The fix is to `fsync` (in Java, `FileChannel.force`) before you acknowledge, to batch records so many callers share one force, and to replace whole files with temp file, force, rename and directory force instead of rewriting them in place.",
+  "compare": {
+    "title": "Overwriting in place against replacing by rename",
+    "a": {
+      "label": "Overwrite in place",
+      "lang": "c",
+      "title": "a crash anywhere before fsync returns can leave neither version",
+      "src": "int fd = open(\"routing.json\", O_WRONLY | O_TRUNC);   // the old content is gone from here on\nwrite(fd, buf, len);                                    // the new content is only in the page cache\nfsync(fd);                                              // until this returns: empty, zeros or old bytes\nclose(fd);"
+    },
+    "b": {
+      "label": "Replace by rename",
+      "lang": "c",
+      "title": "a crash anywhere leaves the old file or the new one",
+      "src": "int fd = open(\"routing.json.tmp\", O_WRONLY | O_CREAT | O_TRUNC, 0644);\nwrite(fd, buf, len);\nfsync(fd);                                  // the new bytes are on disk\nclose(fd);\nrename(\"routing.json.tmp\", \"routing.json\"); // the switch: one directory entry changes\nint dir = open(\".\", O_RDONLY);\nfsync(dir);                                 // the switch is on disk too\nclose(dir);"
+    },
+    "note": "Both versions write the same bytes and both call `fsync`. The difference is what exists on disk at every moment in between. On the left, the old file is destroyed by the first line and the new one is complete only after the third. On the right, the old file is untouched until a single rename swaps the name, and the new file's data is already on disk when it does. The right side costs one more `fsync`, on the directory, and a file name for the temporary copy."
+  },
+  "worked": {
+    "title": "Write a settlement file that survives a crash, in Kotlin",
+    "steps": [
+      {
+        "say": "Write the whole file under a temporary name in the same directory as the target. Rename only works within one file system, so `/tmp` won't do. Loop on `write`, since a channel may write less than the whole buffer, then force the content and metadata.",
+        "code": "val tmp = target.resolveSibling(\"${target.fileName}.tmp\")\nFileChannel.open(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE).use { ch ->\n    val buf = ByteBuffer.wrap(csv.toByteArray())\n    while (buf.hasRemaining()) ch.write(buf)\n    ch.force(true)                       // fsync: the bytes are on disk before any name points at them\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Swap the name. `ATOMIC_MOVE` makes `Files.move` a single `rename(2)`, or fail with `AtomicMoveNotSupportedException` instead of falling back to copy and delete.",
+        "code": "Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE)   // readers see the old file or the new one",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Make the rename itself durable by forcing the directory. On Linux a directory opens as a read-only channel.",
+        "code": "FileChannel.open(target.parent, StandardOpenOption.READ).use { it.force(true) }   // fsync of the directory",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Only now report the file as ready. Check the order once under `strace`; it should match the `SafeWrite` trace from this lesson.",
+        "code": "strace -f -o /tmp/export.txt -e trace=openat,write,fsync,renameat java ...\ngrep -E 'settlement|fsync|renameat' /tmp/export.txt\n# the order to look for, as in the SafeWrite trace:\n# openat(tmp, O_WRONLY|O_CREAT|O_TRUNC), write, fsync(tmp), renameat(tmp, target), openat(dir, O_RDONLY), fsync(dir)",
+        "lang": "bash"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a page cache that can lose your data, then make it safe",
+    "minutes": 15,
+    "files": [
+      "labs/os/src/main/kotlin/sfz/os/l09/PageCache.kt"
+    ],
+    "run": "./gradlew :os:test --tests 'sfz.os.l09.*'",
+    "steps": [
+      "Read `PageCache.kt`. `Disk` is what survives a crash. `Kernel` holds the page cache, a clock, a journal that commits metadata every 5 s, and `crash()`. `create`, `read`, `truncate`, `rename`, `fsyncDir`, `commitMetadata` and `writeBackAll` are written for you, and so is `Config.overwrite`, the unsafe way.",
+      "Run the tests from the `labs` folder. All eleven fail.",
+      "Write `write`: copy the bytes into cached pages, mark them dirty, note when each page went from clean to dirty, and grow the size.",
+      "Write `fsync` for one file only, then `tick`: the journal commits at every multiple of `commitMs`, and the flusher writes back pages dirty for at least `expireMs` at every multiple of `wakeMs`.",
+      "Write `Config.replace` in four calls. Then read the two crash tests: they cut the power after every step, with four different things the kernel might have written just before."
+    ],
+    "hints": [
+      "A write can cross page boundaries: walk it with `index = at / Disk.PAGE` and `inPage = at % Disk.PAGE`, copying `minOf(Disk.PAGE - inPage, remaining)` bytes each time.",
+      "Only set `dirtiedAt` when a page goes from clean to dirty. A page rewritten every second would otherwise never get old enough to write back.",
+      "In `tick`, jump the clock straight to the next multiple of `commitMs` or `wakeMs` with `(now / step + 1) * step`, rather than counting milliseconds.",
+      "If the crash test fails on the step after `rename`, check that `fsync` of the temporary file came before the rename."
+    ],
+    "done_when": "All eleven tests in `PageCacheTest` pass."
+  },
+  "drill": {
+    "title": "Size a group commit",
+    "minutes": 4,
+    "prompt": "An audit log must force every record before the caller gets an answer. One force takes 2 ms; writing a record into the page cache costs almost nothing. Callers arrive at 5,000 records a second. Write Kotlin that prints the throughput of one force per record, the smallest batch that keeps up with 5,000 a second, and the longest a caller then waits.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "val forceMs = 2.0\nval arrivalsPerSec = 5_000\n\nval perRecord = 1_000 / forceMs                          // 500 records/s: one force each\nval forcesPerSec = 1_000 / forceMs                       // 500 forces a second at most\nval batch = Math.ceil(arrivalsPerSec / forcesPerSec).toInt()   // 10 records per force\n\n// worst case: arrive just as a force starts, wait for it (2 ms), then for your own batch's force (2 ms)\nval worstWaitMs = 2 * forceMs                             // about 4 ms\nprintln(\"$perRecord/s per record, batch of $batch, worst wait $worstWaitMs ms\")"
+    }
+  },
+  "recap": [
+    "All file reads and writes go through the page cache, one shared copy of file pages in RAM. A miss reads from storage; a hit only copies. `mmap` maps the same pages.",
+    "`available`, not `free`, is the memory programs can still get: clean cache pages are dropped on demand. In a cgroup, cache is charged as `file` next to `anon`.",
+    "`write()` copies into the cache, marks pages dirty and returns. The flusher writes them about 30 s later, sooner past `dirty_background_ratio`; writers are throttled past `dirty_ratio`.",
+    "A power cut loses dirty pages; a process crash doesn't. `fsync` (Java `force(true)`) or `fdatasync` (`force(false)`) writes one file's pages and waits for the device: milliseconds, so batch with group commit.",
+    "Replace a file with: write a temporary file, `fsync` it, `rename` it over the target, `fsync` the directory. A crash then leaves the old file or the new one, and the new one once the last step returns."
+  ],
+  "quiz": [
+    {
+      "q": "From lesson 7: a service maps a file with `MapMode.READ_WRITE`, puts a record into the mapping, and the machine loses power a second later. Is the record in the file after the reboot?",
+      "options": [
+        "Yes: a shared mapping writes straight to the disk",
+        "Probably not: the store went into a page-cache page, which is dirty until writeback or `MappedByteBuffer.force()`",
+        "Yes, because mapped files are never cached",
+        "No, never: a shared mapping's writes are discarded when the process ends"
+      ],
+      "answer": 1,
+      "from": "os-07",
+      "why": "A shared file mapping points the process's page table at the page-cache frame, so a store dirties that frame exactly as `write()` would. Writeback or an explicit `force()` (`msync`) puts it on disk. If only the process ended, the dirty page would still be written back; a power cut loses it."
+    },
+    {
+      "q": "A JVM is killed with `kill -9` a moment after `write()` returned for a record. The machine stays up. Is the record in the file?",
+      "options": [
+        "No: it was never forced",
+        "Only if the JVM's shutdown hook ran",
+        "Yes: the dirty page belongs to the kernel, which writes it back as usual",
+        "Only if the file was opened with `O_SYNC`"
+      ],
+      "answer": 2,
+      "why": "After `write()` returns, the bytes are in the kernel's page cache, not in the process. Killing the process doesn't touch the cache, and writeback still happens. `fsync` protects against losing the machine; a dead process loses only what it hadn't yet passed to `write()`, such as a `BufferedOutputStream`'s buffer."
+    },
+    {
+      "q": "A pod's memory usage is 3.5 GB of its 4 GB limit. `memory.stat` shows `anon` 900 MB and `file` 2.5 GB, mostly clean. Is the pod about to be OOM-killed?",
+      "options": [
+        "Yes: it's at 88% of its limit",
+        "Not from this: clean file pages are reclaimed when the pod needs memory, before the OOM killer runs",
+        "Yes, unless the page cache is dropped by hand",
+        "No: page cache isn't charged to the pod at all"
+      ],
+      "answer": 1,
+      "why": "In cgroup v2 the page cache is charged to the group, so it counts in usage, but clean pages can be dropped at any time and read again from the file. The kernel reclaims them before it gives up and kills. The number to watch is `anon` (plus dirty pages, which must be written first), here 900 MB."
+    },
+    {
+      "q": "A ledger writer forces every record on one thread, and each force takes 3 ms. About how many records a second can it write, and what's the cheapest change that keeps every record durable before its answer?",
+      "options": [
+        "About 330 a second; force once per batch of the records that arrived during the previous force (group commit)",
+        "About 330,000 a second; nothing needs to change",
+        "About 330 a second; switch from `force(true)` to `close()`",
+        "About 3,000 a second; use `force(false)` and skip the batching"
+      ],
+      "answer": 0,
+      "why": "1,000 ms / 3 ms is about 333 forces a second, so one record per force caps throughput there. Group commit forces once for everything that arrived meanwhile and answers all those callers after it, so throughput grows with the batch while each record is still durable before its answer. `close()` forces nothing, and `fdatasync` saves a little metadata work but still waits for the device."
+    },
+    {
+      "q": "A config writer does temp file, `fsync`, `rename`, and skips the `fsync` of the directory. What can a crash right after it returns leave?",
+      "options": [
+        "A half-written config file under the real name",
+        "An empty file under the real name",
+        "Two files with the real name",
+        "The old config, intact, as if the update never happened"
+      ],
+      "answer": 3,
+      "why": "The new file's data is on disk before the rename, so the real name can only point at the complete old file or the complete new one. Without the directory `fsync` the rename may not be on disk yet, so a crash can roll back to the old file. Nothing is corrupted, but an update the caller was told about is lost."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is a dirty page?",
+      "back": "A page-cache page that's newer than the copy on disk, because a write or a shared mapping changed it and writeback hasn't run yet."
+    },
+    {
+      "front": "When does Linux write dirty pages back?",
+      "back": "When they're older than `dirty_expire_centisecs` (30 s) at a flusher wake-up, when dirty data passes `dirty_background_ratio`, on `fsync`/`sync`, and from throttled writers past `dirty_ratio`."
+    },
+    {
+      "front": "`force(true)` or `force(false)` in Java?",
+      "back": "`force(true)` is `fsync`: content and metadata. `force(false)` is `fdatasync` on Linux: content plus only the metadata needed to read it back."
+    },
+    {
+      "front": "Does `kill -9` lose data that `write()` already accepted?",
+      "back": "No. The page cache belongs to the kernel and is written back as usual. A power cut or kernel crash loses it."
+    },
+    {
+      "front": "The four steps of a crash-safe file replace?",
+      "back": "Write a temp file in the same directory, `fsync` it, `rename` it over the target, `fsync` the directory."
+    },
+    {
+      "front": "Why `fsync` the directory after `rename`?",
+      "back": "The rename changes the directory, and fsyncing the file doesn't make the directory entry durable. Without it a crash can bring back the old file."
+    },
+    {
+      "front": "What is group commit?",
+      "back": "Forcing once for all records that arrived during the previous force, then answering all their callers: one device round trip shared by many."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Page cache",
+      "plain": "The kernel's in-RAM copy of file pages, shared by every process; reads and writes go through it."
+    },
+    {
+      "term": "Dirty page",
+      "plain": "A cached page that has changed since it was last written to disk."
+    },
+    {
+      "term": "Writeback",
+      "plain": "The kernel writing dirty pages to disk in the background, by age or by volume."
+    },
+    {
+      "term": "fsync",
+      "plain": "The system call that writes one file's dirty data and metadata and waits until the device has stored it."
+    },
+    {
+      "term": "fdatasync",
+      "plain": "Like fsync, but skips metadata that isn't needed to read the data back, such as timestamps."
+    },
+    {
+      "term": "Atomic rename",
+      "plain": "rename() swapping a name to a new file in one step, so no reader sees it missing or half-changed."
+    },
+    {
+      "term": "Group commit",
+      "plain": "Sharing one fsync among many records and answering all their callers after it."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"our settlement export calls write() and close(), and ext4 is journaled, so the file is safe once the method returns.\" Explain what can go wrong and what the method should do instead.",
+    "answer": "When `write()` returns, the bytes are only in the page cache: dirty pages in RAM that the kernel writes to disk about 30 seconds later, or sooner under memory pressure. `close()` doesn't change that. If the process crashes, the kernel still writes the pages, so tests never show a problem. But if the node loses power or the kernel panics in that window, the data is gone, even though every call succeeded. The journal doesn't help: ext4 journals metadata so the file system stays consistent, and it can commit the new file's size or name before the data, so after a crash we could find an empty file or one full of zeros under the final name. The method should write the CSV to a temporary file in the same directory, call `force(true)` on it so the data is on disk, `Files.move` it over the real name with `ATOMIC_MOVE`, and then force the directory so the rename itself is durable. After a crash the bank then sees either the previous file or the complete new one, and once the method returns, the new one is there for sure. It costs a couple of device flushes, a few milliseconds, once per file."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "On a Linux machine of your own you can watch the page cache without the care this lesson takes in the shared Docker VM. `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches` writes back everything and then drops every clean cached page on the machine, so the next read of any file is cold. `fincore FILE` (util-linux) prints how much of a file is cached, and `grep -E 'Dirty|Writeback' /proc/meminfo` shows the machine-wide dirty and in-flight totals. Don't drop caches on a shared or production host: every process pays for the cold reads afterwards.\n\nSome programs skip the page cache. Opening a file with `O_DIRECT` makes reads and writes go between your buffer and the device, with alignment rules for buffers and offsets. Databases that manage their own buffer pool, such as Oracle and MySQL's InnoDB in common setups, use it so pages aren't cached twice. `O_DIRECT` alone still isn't durable: the device has a write cache too, so the database still calls `fsync` or `fdatasync` at commit.\n\nThe fsync error story is worth reading in full in LWN's \"PostgreSQL's fsync() surprise\" (2018). When writeback of a page fails, the kernel reports the error to the next `fsync` on that file and may then treat the page as clean. A program that logs the error and retries can get success while the data never reached the disk. Patches in kernel 4.13 improved how these errors reach applications, but a process that opens the file after the error can still miss it entirely, as the article explains. The lesson for applications didn't change: a failed `fsync` means data may be lost, and the only safe reaction is to stop and recover from something you know is on disk, which is what PostgreSQL does now."
+  },
+  "sources": [
+    {
+      "title": "OSTEP chapter 39: Files and Directories",
+      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf"
+    },
+    {
+      "title": "fsync(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/fsync.2.html"
+    },
+    {
+      "title": "Documentation for /proc/sys/vm (Linux kernel documentation)",
+      "url": "https://docs.kernel.org/admin-guide/sysctl/vm.html"
+    },
+    {
+      "title": "ext4 General Information (Linux kernel documentation)",
+      "url": "https://docs.kernel.org/admin-guide/ext4.html"
+    },
+    {
+      "title": "LWN: PostgreSQL's fsync() surprise",
+      "url": "https://lwn.net/Articles/752063/"
+    }
+  ]
+}

@@ -1,0 +1,430 @@
+{
+  "id": "net-08",
+  "title": "TCP performance: windows, congestion control and Nagle",
+  "minutes": 40,
+  "goal": "By the end you can predict a TCP connection's throughput from its window and round-trip time, tell flow control from congestion control, read a congestion window growing and halving in `ss`, and spot and fix the 40 ms stall that Nagle's algorithm and delayed ACKs cause together.",
+  "warmup": {
+    "q": "A settlement job copies a 2 GB file between two data centres over an otherwise idle 1 Gbit/s link with a 70 ms round trip. The copy runs at a steady 7.5 Mbit/s. What is the most likely limit?",
+    "options": [
+      "The link loses packets, and TCP keeps halving its speed",
+      "The receiver's window is stuck at 64 KB, and a sender can't have more than one window in flight per round trip",
+      "The receiving disk is too slow",
+      "The MTU is too small, so headers use up most of the bandwidth"
+    ],
+    "answer": 1,
+    "why": "64 KB every 70 ms is 0.94 MB/s, which is 7.5 Mbit/s: the number matches window / round trip exactly. Filling 1 Gbit/s at 70 ms needs 8.75 MB in flight. Loss also slows TCP down, but it makes the speed saw up and down rather than sit flat at one value. Headers are 40 of every 1,500 bytes, under 3%."
+  },
+  "sections": [
+    {
+      "h": "Throughput is one window per round trip",
+      "body": "Lesson 6 of this track ended on the cost of stop and wait: one message per round trip, about 14 messages a second across a 70 ms path, however fast the link. TCP's answer is to let many bytes be in flight at once. The sender may send up to one window of bytes that haven't been acknowledged yet. As ACKs come back, the window slides forward over the byte stream, and more bytes may go. That is the **sliding window**.\n\nSo the speed limit of one connection is easy to write down:\n\n```text\nthroughput <= window / round-trip time\n```\n\nA 64 KB window across 70 ms moves at most 64 KB every 70 ms: 0.94 MB/s, or 7.5 Mbit/s, on a link that could carry 1 Gbit/s. Turn the formula around and you get how big the window must be to fill a link: bandwidth times round-trip time, the **bandwidth-delay product** (BDP). 1 Gbit/s times 70 ms is 8.75 MB that must be in flight, sent and not yet acknowledged, all the time. Inside one data centre, with a 0.5 ms round trip, the same link needs only 62 KB. Long, fast paths need big windows; short paths hardly care.\n\nWho decides the window? Two parties, for two different reasons, and the next two sections take one each. The receiver says how much room it has: the receive window. The sender guesses how much the network can carry without overflowing: the congestion window. At every moment the sender uses the smaller of the two.\n\nOne field of the TCP header got in the way. The window field is 16 bits, so it can say at most 65,535 bytes, which was plenty in 1981. Window scaling (RFC 7323) fixes that with an option in the SYN: `wscale 7` in lesson 7's capture means \"multiply every window I advertise by 2^7 = 128\". The `win 502` in that capture's ACKs is really 502 x 128 = 64,256 bytes. The option only counts if both SYNs carry it, which is why a firewall that strips TCP options can cap a connection at 64 KB for good.\n\nThe receive window can never be bigger than the receiver's socket buffer, so a program can cap it by setting that buffer (`SO_RCVBUF`, the socket's receive queue from lesson 6). The Try it below does that across a 50 ms round trip, and throughput follows the window.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 236\" role=\"img\" aria-label=\"A sender and a receiver with one window of data segments in flight toward the receiver and acknowledgments coming back, and the rule that throughput is the window divided by the round-trip time\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"64\" width=\"110\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"75.0\" y=\"101\" text-anchor=\"middle\">sender</text><rect class=\"box\" x=\"550\" y=\"64\" width=\"110\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"605.0\" y=\"101\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-a\" x=\"340\" y=\"40\" text-anchor=\"middle\">one window of data in flight, not yet acknowledged</text><rect class=\"box-a\" x=\"150\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"198\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"246\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"294\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"342\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"390\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"438\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><rect class=\"box-a\" x=\"486\" y=\"56\" width=\"36\" height=\"22\" rx=\"8\"/><line class=\"ln-a\" x1=\"140\" y1=\"90\" x2=\"540\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"180\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><rect class=\"box\" x=\"236\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><rect class=\"box\" x=\"292\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><rect class=\"box\" x=\"348\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><rect class=\"box\" x=\"404\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><rect class=\"box\" x=\"460\" y=\"106\" width=\"22\" height=\"14\" rx=\"8\"/><line class=\"ln\" x1=\"540\" y1=\"132\" x2=\"140\" y2=\"132\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"152\" text-anchor=\"middle\">ACKs coming back; each one lets the window slide on</text><text class=\"t t-a\" x=\"340\" y=\"190\" text-anchor=\"middle\">throughput = window / round-trip time</text><text class=\"t-s\" x=\"190\" y=\"216\" text-anchor=\"middle\">64 KB / 70 ms = 0.94 MB/s</text><text class=\"t-s\" x=\"490\" y=\"216\" text-anchor=\"middle\">to fill 1 Gbit/s at 70 ms: 8.75 MB in flight</text></svg>",
+        "caption": "The sender may have one window of bytes unacknowledged; each ACK slides the window on. Bytes per round trip can't exceed the window."
+      },
+      "try": {
+        "title": "Throughput follows the window",
+        "minutes": 4,
+        "steps": [
+          "Start the lab box from the `labs` folder (`docker compose -f env/labbox.yml run --rm box`). The first two lines make its loopback behave like a long Ethernet path: an MTU of 1,500 bytes, and 25 ms of delay each way from netem. `ping` should show a round trip of about 50 ms.",
+          "`Window.java` sends as fast as it can for 2 seconds, four times: with receive buffers of 16 KB, 64 KB and 1 MB, and once with the kernel left to size the buffer. Predict the first two speeds from window / round trip before you run it.",
+          "On a Mac, `./gradlew :net:demo -Pmain=sfz.net.l08.demo.Window -Pargs='16 64 0'` runs it without the added delay. The round trip is then microseconds, so even the 16 KB window moved about 100 MB/s in one run: a small window only hurts on a long path."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "ip link set lo mtu 1500\ntc qdisc add dev lo root netem delay 25ms\nping -c 3 -q 127.0.0.1 | tail -1\njava /labs/net/src/demo/java/sfz/net/l08/demo/Window.java 16 64 1024 0\nsysctl net.core.rmem_max net.ipv4.tcp_rmem\n",
+          "file": "labs/net/src/demo/java/sfz/net/l08/demo/Window.java"
+        },
+        "expect": "From one run:\n\n```text\nrtt min/avg/max/mdev = 51.992/55.165/57.534/2.332 ms\nreceive buffer 16 KB:     0.98 MB in 2.4 s =   0.42 MB/s\nreceive buffer 64 KB:     3.67 MB in 2.3 s =   1.62 MB/s\nreceive buffer 1024 KB:   9.11 MB in 2.3 s =   3.88 MB/s\nreceive buffer auto:     93.32 MB in 2.1 s =  45.52 MB/s\nnet.core.rmem_max = 212992\nnet.ipv4.tcp_rmem = 4096\t131072\t6291456\n```\n\n16 KB and 64 KB grow in step: about 23 KB and 90 KB per 55 ms round trip. They aren't exactly 16 and 64, because Linux doubles the buffer you ask for and keeps part of it for its own bookkeeping. 1 MB is not 16 times faster than 64 KB, because Linux quietly caps an explicit `SO_RCVBUF` at `net.core.rmem_max`, 212,992 bytes here. Left alone, the kernel grows the buffer while the transfer runs (autotuning, up to the 6 MB in the last number of `tcp_rmem`) and reaches 45 MB/s. Setting the buffer by hand turned autotuning off. Speeds vary with the machine; the ratios don't."
+      },
+      "refs": [
+        {
+          "title": "RFC 7323: TCP Extensions for High Performance (window scaling)",
+          "url": "https://www.rfc-editor.org/rfc/rfc7323.html",
+          "kind": "docs"
+        },
+        {
+          "title": "High Performance Browser Networking: Building blocks of TCP",
+          "url": "https://hpbn.co/building-blocks-of-tcp/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Flow control: the receiver says how much room it has",
+      "body": "Every ACK carries a window field, and the receiver fills it with the free space in its socket's receive buffer. Arriving bytes go into that buffer and stay there until the program calls `read()`. So the receive window is a running message about the receiving program's speed: \"I can take this many more bytes\".\n\nIf the program reads as fast as data arrives, the buffer stays nearly empty and the window stays wide open. If the program stops reading, because of a long GC pause, a consumer stuck on a slow database call, or a thread pool that's full, the buffer fills. The window shrinks with every ACK, and finally the receiver advertises `win 0`. The sender must stop. Its own bytes pile up in its send buffer, and once that is full too, the sending program's `write()` blocks. This chain is **flow control**, and it is the backpressure you rely on whenever a fast producer feeds a slow consumer over TCP: the slow side's kernel slows down the fast side's program, without a line of your code.\n\nA stopped sender has to find out when the window opens again. The receiver does send a window update once its program reads, but that update could be lost, and then both sides would wait forever. So the sender keeps a persist timer and sends a tiny probe now and then; the answer carries the current window.\n\nTwo columns of `ss -tn` show where the bytes are waiting. On a connected socket, Recv-Q is bytes the kernel has received that the program hasn't read yet. Send-Q is bytes the program has written that the peer hasn't acknowledged. A big Recv-Q means a slow reader on this host. A big Send-Q means the peer reads slowly, or the network delivers slowly. In the Try it below a paused reader's kernel holds about 6 MB, and the sender's kernel holds another 2.7 MB: almost 9 MB that the sending program wrote successfully and nobody has read. That is lesson 1's warning about `write()`, with a size attached.\n\nFlow control protects the receiver. It knows nothing about the links and routers in between, which is the next section's problem.",
+      "try": {
+        "title": "Pause the reader",
+        "minutes": 3,
+        "steps": [
+          "Start a fresh lab box. The first lines start a receiver (`nc -l`, throwing everything away) and a sender that writes 100 MB of zeros to it over 127.0.0.1.",
+          "`kill -STOP` freezes the receiving process, the way a long GC pause freezes a JVM, but its socket stays open. Predict Recv-Q and Send-Q three seconds later.",
+          "`kill -CONT` lets it run again, and the transfer finishes."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "nc -l 127.0.0.1 9000 > /dev/null &\nreader=$!\nsleep 0.5\nhead -c 100000000 /dev/zero | nc -N 127.0.0.1 9000 &\nsleep 0.3; kill -STOP $reader; echo \"reader paused\"\nsleep 3\nss -tn '( sport = :9000 or dport = :9000 )'\nss -tin dport = :9000 | grep -oE 'rwnd_limited:[^ ]+|notsent:[0-9]+'\nkill -CONT $reader; echo \"reader resumed\"\nsleep 0.5\nss -tn '( sport = :9000 or dport = :9000 )'\n"
+        },
+        "expect": "From one run:\n\n```text\nreader paused\nState Recv-Q  Send-Q  Local Address:Port  Peer Address:Port Process\nESTAB 6208110 0           127.0.0.1:9000     127.0.0.1:47022\nESTAB 0       2770322     127.0.0.1:47022    127.0.0.1:9000\nrwnd_limited:2960ms(92.5%)\nnotsent:2770322\nreader resumed\nState Recv-Q Send-Q Local Address:Port Peer Address:PortProcess\n```\n\nThe receiving socket (local port 9000) holds 6.2 MB its program hasn't read, the most its autotuned buffer allows. The sending socket holds 2.7 MB of Send-Q, none of it even sent (`notsent`), because the window is 0. `rwnd_limited` is the kernel's own diagnosis: for 92.5% of the connection's life the sender was held back by the receive window. Behind that, `nc`'s `write()` was blocked. Half a second after the reader resumed, everything had drained and both sockets were gone."
+      },
+      "refs": [
+        {
+          "title": "RFC 9293, section 3.8.6: managing the window",
+          "url": "https://www.rfc-editor.org/rfc/rfc9293.html",
+          "kind": "docs"
+        },
+        {
+          "title": "ss(8) man page",
+          "url": "https://man7.org/linux/man-pages/man8/ss.8.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Congestion control: the sender guesses what the network can take",
+      "body": "The receive window says nothing about the path. Somewhere between the two hosts is the slowest link, the bottleneck, with a router in front of it that has a queue. Say the link carries 20 Mbit/s and the queue holds 100 packets. Send faster than 20 Mbit/s and the queue fills; once it's full, the router drops every packet that doesn't fit. A sender that answers loss by resending at the same speed only makes the queue worse. In October 1986 the early internet did exactly that, and throughput between two Berkeley sites fell from 32 kbit/s to 40 bit/s, a \"congestion collapse\". Van Jacobson's fix, congestion control, has been part of TCP since the late 1980s.\n\nThe sender keeps a second window, the **congestion window** (cwnd): its own estimate of how much the path can carry. It never has more than the smaller of cwnd and the receive window in flight. Nobody tells it the right number, so it probes, and treats loss as the signal:\n\n- Slow start. A new connection starts small, at 10 segments on Linux (RFC 6928), about 14 KB. Each ACK adds one segment, so the window doubles every round trip: 10, 20, 40, 80.\n- Congestion avoidance. Above a threshold, ssthresh, growth turns linear: one more segment per round trip.\n- Loss. Three duplicate ACKs say one segment is missing while later ones still arrive. The sender resends it at once (fast retransmit) and halves the window. If nothing at all comes back for a whole retransmission timeout (lesson 6's resend timer), that is worse news: the window drops to 1 and slow start begins again.\n\nAdditive increase, multiplicative decrease. Over time the window draws a sawtooth: it climbs until the queue overflows, halves, and climbs again. Step through it below on a path that holds 100 segments.\n\nLinux doesn't run this plain version, called Reno. Its default since 2006 is CUBIC (RFC 9438), also the default on Windows and Apple systems. After a loss CUBIC cuts the window to 70%, not 50%, then grows it as a cubic function of the time since the loss: fast at first, flat near the window where the loss happened, then faster again to look for more. Because it counts in seconds rather than round trips, a long-distance connection isn't left behind by a short one. BBR, from Google, works differently: it measures the bottleneck's bandwidth and the shortest round trip and paces its sending to match, instead of waiting for loss. Its current version, BBRv3, is still an Internet-Draft, not an RFC, and the lab box's kernel offers only `reno` and `cubic`.\n\nLoss costs throughput fast. With 50 ms of delay on the lab network, a 10 MB download took about 2 seconds with no loss and about 20 seconds with 1% of packets dropped, in three runs of each.",
+      "stepper": {
+        "title": "The congestion window, one round trip at a time",
+        "intro": "Reno on a path that holds 100 segments in flight and in queues. Each bar is the window at the start of one round trip.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 10   ssthresh none   slow start</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box-a\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s t-a\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text></svg>",
+            "say": "A new connection starts with a congestion window of 10 segments, about 14 KB (RFC 6928). The sender sends 10 and waits. Each of the 10 ACKs that come back adds one segment."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 40   ssthresh none   slow start</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box-a\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s t-a\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box-a\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s t-a\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text></svg>",
+            "say": "10 ACKs make 20, and 20 ACKs make 40. The window **doubles every round trip**. That is slow start; the name is older than the behaviour."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 80   ssthresh none   slow start</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box-a\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s t-a\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text></svg>",
+            "say": "80 is still below the 100 segments this path can hold: what is in flight across the link (bandwidth times round trip) plus what the bottleneck router can queue. No loss means no signal, so the sender keeps doubling."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 160: 60 more than the path holds</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"288\" y=\"280\" text-anchor=\"middle\">5</text><rect class=\"box-bad\" x=\"272\" y=\"62.0\" width=\"32\" height=\"200.0\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"288\" y=\"56.0\" text-anchor=\"middle\">160</text></svg>",
+            "say": "Round 5 sends 160 segments. The router's queue overflows and it drops what doesn't fit. Later segments still arrive, so the receiver keeps repeating its last ACK: **three duplicate ACKs** tell the sender exactly one thing went missing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 80   ssthresh 80   avoidance</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"288\" y=\"280\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"272\" y=\"62.0\" width=\"32\" height=\"200.0\" rx=\"8\"/><text class=\"t-s\" x=\"288\" y=\"56.0\" text-anchor=\"middle\">160</text><text class=\"t-s t-m\" x=\"336\" y=\"280\" text-anchor=\"middle\">6</text><rect class=\"box-a\" x=\"320\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s t-a\" x=\"336\" y=\"156.0\" text-anchor=\"middle\">80</text></svg>",
+            "say": "Reno resends the lost segment at once (fast retransmit), sets ssthresh to half the window, 80, and carries on from there. Above ssthresh it is in **congestion avoidance**: one more segment per round trip, not double."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 100   ssthresh 80   avoidance</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"288\" y=\"280\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"272\" y=\"62.0\" width=\"32\" height=\"200.0\" rx=\"8\"/><text class=\"t-s\" x=\"288\" y=\"56.0\" text-anchor=\"middle\">160</text><text class=\"t-s t-m\" x=\"336\" y=\"280\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"320\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"336\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"384\" y=\"280\" text-anchor=\"middle\">7</text><rect class=\"box-a\" x=\"368\" y=\"160.8\" width=\"32\" height=\"101.2\" rx=\"8\"/><text class=\"t-s t-a\" x=\"384\" y=\"154.8\" text-anchor=\"middle\">81</text><text class=\"t-s t-m\" x=\"432\" y=\"280\" text-anchor=\"middle\">...</text><text class=\"t\" x=\"432\" y=\"202\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"480\" y=\"280\" text-anchor=\"middle\">26</text><rect class=\"box-a\" x=\"464\" y=\"137.0\" width=\"32\" height=\"125.0\" rx=\"8\"/><text class=\"t-s t-a\" x=\"480\" y=\"131.0\" text-anchor=\"middle\">100</text></svg>",
+            "say": "81, 82, and so on: twenty round trips of +1 later the window is back at 100. Additive increase: slow and careful, because the sender now knows roughly where the limit is."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">cwnd 50   ssthresh 50   avoidance</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"288\" y=\"280\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"272\" y=\"62.0\" width=\"32\" height=\"200.0\" rx=\"8\"/><text class=\"t-s\" x=\"288\" y=\"56.0\" text-anchor=\"middle\">160</text><text class=\"t-s t-m\" x=\"336\" y=\"280\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"320\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"336\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"384\" y=\"280\" text-anchor=\"middle\">7</text><rect class=\"box\" x=\"368\" y=\"160.8\" width=\"32\" height=\"101.2\" rx=\"8\"/><text class=\"t-s\" x=\"384\" y=\"154.8\" text-anchor=\"middle\">81</text><text class=\"t-s t-m\" x=\"432\" y=\"280\" text-anchor=\"middle\">...</text><text class=\"t\" x=\"432\" y=\"202\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"480\" y=\"280\" text-anchor=\"middle\">26</text><rect class=\"box\" x=\"464\" y=\"137.0\" width=\"32\" height=\"125.0\" rx=\"8\"/><text class=\"t-s\" x=\"480\" y=\"131.0\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"528\" y=\"280\" text-anchor=\"middle\">27</text><rect class=\"box-bad\" x=\"512\" y=\"135.8\" width=\"32\" height=\"126.2\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"528\" y=\"129.8\" text-anchor=\"middle\">101</text><text class=\"t-s t-m\" x=\"576\" y=\"280\" text-anchor=\"middle\">28</text><rect class=\"box-a\" x=\"560\" y=\"199.5\" width=\"32\" height=\"62.5\" rx=\"8\"/><text class=\"t-s t-a\" x=\"576\" y=\"193.5\" text-anchor=\"middle\">50</text></svg>",
+            "say": "101 overflows the path again, and the window halves to 50. Multiplicative decrease. Many senders sharing one link all back off this way, which is what keeps the internet from collapsing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A bar chart of the congestion window in segments for each round trip, with a dashed line where the path&#x27;s capacity of 100 segments is, and the current window and threshold above it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"330\" y=\"8\" width=\"330\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"495\" y=\"30\" text-anchor=\"middle\">50 to 101, average about 75</text><line class=\"ln\" x1=\"66\" y1=\"262\" x2=\"660\" y2=\"262\"/><line class=\"ln-d\" x1=\"66\" y1=\"137.0\" x2=\"660\" y2=\"137.0\"/><text class=\"t-s t-m\" x=\"72\" y=\"130.0\" text-anchor=\"start\">the path holds 100 segments</text><text class=\"t-s t-m\" x=\"40\" y=\"280\" text-anchor=\"middle\">round</text><text class=\"t-s t-m\" x=\"96\" y=\"280\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"80\" y=\"249.5\" width=\"32\" height=\"12.5\" rx=\"8\"/><text class=\"t-s\" x=\"96\" y=\"243.5\" text-anchor=\"middle\">10</text><text class=\"t-s t-m\" x=\"144\" y=\"280\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"128\" y=\"237.0\" width=\"32\" height=\"25.0\" rx=\"8\"/><text class=\"t-s\" x=\"144\" y=\"231.0\" text-anchor=\"middle\">20</text><text class=\"t-s t-m\" x=\"192\" y=\"280\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"176\" y=\"212.0\" width=\"32\" height=\"50.0\" rx=\"8\"/><text class=\"t-s\" x=\"192\" y=\"206.0\" text-anchor=\"middle\">40</text><text class=\"t-s t-m\" x=\"240\" y=\"280\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"224\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"240\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"288\" y=\"280\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"272\" y=\"62.0\" width=\"32\" height=\"200.0\" rx=\"8\"/><text class=\"t-s\" x=\"288\" y=\"56.0\" text-anchor=\"middle\">160</text><text class=\"t-s t-m\" x=\"336\" y=\"280\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"320\" y=\"162.0\" width=\"32\" height=\"100.0\" rx=\"8\"/><text class=\"t-s\" x=\"336\" y=\"156.0\" text-anchor=\"middle\">80</text><text class=\"t-s t-m\" x=\"384\" y=\"280\" text-anchor=\"middle\">7</text><rect class=\"box\" x=\"368\" y=\"160.8\" width=\"32\" height=\"101.2\" rx=\"8\"/><text class=\"t-s\" x=\"384\" y=\"154.8\" text-anchor=\"middle\">81</text><text class=\"t-s t-m\" x=\"432\" y=\"280\" text-anchor=\"middle\">...</text><text class=\"t\" x=\"432\" y=\"202\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"480\" y=\"280\" text-anchor=\"middle\">26</text><rect class=\"box\" x=\"464\" y=\"137.0\" width=\"32\" height=\"125.0\" rx=\"8\"/><text class=\"t-s\" x=\"480\" y=\"131.0\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"528\" y=\"280\" text-anchor=\"middle\">27</text><rect class=\"box\" x=\"512\" y=\"135.8\" width=\"32\" height=\"126.2\" rx=\"8\"/><text class=\"t-s\" x=\"528\" y=\"129.8\" text-anchor=\"middle\">101</text><text class=\"t-s t-m\" x=\"576\" y=\"280\" text-anchor=\"middle\">28</text><rect class=\"box\" x=\"560\" y=\"199.5\" width=\"32\" height=\"62.5\" rx=\"8\"/><text class=\"t-s\" x=\"576\" y=\"193.5\" text-anchor=\"middle\">50</text><text class=\"t-s t-m\" x=\"624\" y=\"280\" text-anchor=\"middle\">29</text><rect class=\"box-a\" x=\"608\" y=\"198.2\" width=\"32\" height=\"63.8\" rx=\"8\"/><text class=\"t-s t-a\" x=\"624\" y=\"192.2\" text-anchor=\"middle\">51</text></svg>",
+            "say": "And so on, forever: 50 up to 101 and back, every 51 round trips. On average Reno uses about **three quarters** of what the path holds. The lab's `sawtooth()` reproduces exactly these numbers. Linux's CUBIC draws a flatter sawtooth that wastes less."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch the kernel's congestion window",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, with the lab network up (`docker compose -f env/net.yml up -d`), start a receiver on client that throws data away. Then open a shell on peer: `docker compose -f env/net.yml exec peer bash`.",
+          "On peer, the netem rule turns its link into a bottleneck: 50 ms of delay, 20 Mbit/s, and a queue of 100 packets. The path holds about 186 segments: 86 in flight (20 Mbit/s times 50 ms is 125 KB) plus 100 queued. `ip tcp_metrics flush all` makes Linux forget what it learned about this path from earlier connections.",
+          "Send 15 MB and read `cwnd` and `ssthresh` from `ss -ti` every 250 ms. Predict where the first loss happens, and what CUBIC does after it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "first in labs/, then on peer",
+          "src": "docker compose -f env/net.yml exec -d client sh -c 'nc -l -p 9100 > /dev/null'\n\n# on peer\nip tcp_metrics flush all\ntc qdisc add dev eth0 root netem delay 50ms rate 20mbit limit 100\nhead -c 15000000 /dev/zero | nc -N 10.10.1.10 9100 &\nfor i in $(seq 0 24); do printf '%5d ms ' $((i*250)); ss -tin dst 10.10.1.10:9100 | grep -oE ' (cwnd|ssthresh):[0-9]+' | tr -d '\\n'; echo; sleep 0.25; done\nwait\ntc -s qdisc show dev eth0 | head -2\ntc qdisc del dev eth0 root\n"
+        },
+        "expect": "From one run (some rows trimmed):\n\n```text\n    0 ms  cwnd:10\n  250 ms  cwnd:86\n  500 ms  cwnd:359 ssthresh:352\n  750 ms  cwnd:187 ssthresh:176\n 1000 ms  cwnd:179 ssthresh:176\n 1500 ms  cwnd:190 ssthresh:176\n 1750 ms  cwnd:194 ssthresh:176\n 2000 ms  cwnd:165 ssthresh:138\n 2250 ms  cwnd:142 ssthresh:138\n 3000 ms  cwnd:154 ssthresh:138\n 4000 ms  cwnd:164 ssthresh:138\n 5000 ms  cwnd:168 ssthresh:138\n 6000 ms  cwnd:168 ssthresh:138\nqdisc netem 8002: root refcnt 13 limit 100 delay 50ms rate 20Mbit\n Sent 15683942 bytes 10363 pkt (dropped 130, overlimits 0 requeues 0)\n```\n\nSlow start took the window from 10 to 359 in half a second, far past the 186 segments the path holds, so the queue overflowed and losses brought ssthresh down to 176. CUBIC then grew the window again, lost a few more segments near 194, and cut to 138, about 70% of that. After that it climbed quickly and then flattened out at 168, just below where it last lost packets: CUBIC's plateau, the flat top of its curve. netem dropped 130 of 10,363 packets, and `nc` never noticed: TCP resent every one. Your numbers will differ from run to run, but the shape stays."
+      },
+      "refs": [
+        {
+          "title": "RFC 5681: TCP Congestion Control",
+          "url": "https://www.rfc-editor.org/rfc/rfc5681.html",
+          "kind": "docs"
+        },
+        {
+          "title": "RFC 9438: CUBIC for Fast and Long-Distance Networks",
+          "url": "https://www.rfc-editor.org/rfc/rfc9438.html",
+          "kind": "docs"
+        },
+        {
+          "title": "IETF draft: BBR congestion control (BBRv3)",
+          "url": "https://datatracker.ietf.org/doc/draft-ietf-ccwg-bbr/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Small writes: Nagle's algorithm meets the delayed ACK",
+      "body": "The last problem is the opposite of a big transfer: many tiny segments. Type one character into a remote shell, and TCP could send a 41-byte packet to carry 1 byte of it. In 1984 John Nagle proposed a simple rule (RFC 896): while some sent data is still unacknowledged, don't send another small segment. Collect the small writes and send them together when the ACK arrives. Full-size segments still go at once. A burst of tiny writes then costs one packet per round trip instead of one per write.\n\nThe receiving side has its own saving, the delayed ACK (RFC 1122). Instead of acknowledging each segment at once, the receiver waits a little, hoping to put the ACK on data it is about to send anyway, such as the response. RFC 1122 caps the wait at 500 ms. Linux waits at least 40 ms.\n\nEach rule is sensible. Together they stall for 40 ms on a pattern request-response code uses all the time: write, write, read. A client writes a 12-byte header, then a 100-byte body, then waits for the reply.\n\n1. The header goes out at once: nothing was unacknowledged.\n2. The body is small and the header isn't ACKed yet, so Nagle holds the body back.\n3. The server has half a request and nothing to send, so it delays its ACK, hoping for something to put it on.\n4. 40 ms later the delayed-ACK timer fires. The ACK reaches the client, Nagle releases the body, and the server answers.\n\nEvery request now takes 40 ms plus its round trips. The Try it measures a median of 42 ms per request with Nagle on and well under 1 ms with it off, on a path whose round trip is a few microseconds.\n\nThere are two fixes. Write each message with one `write()`: build it in a buffer, or wrap the stream in a `BufferedOutputStream` and flush once, so there is never a second small segment to hold back. Or turn Nagle off with `TCP_NODELAY`: `socket.tcpNoDelay = true`, or `StandardSocketOptions.TCP_NODELAY` on a channel. Netty, and with it Vert.x and Quarkus, turns `TCP_NODELAY` on by default, and so do the Kafka client and the PostgreSQL JDBC driver. A plain `java.net.Socket` doesn't.\n\nOne more delay hides inside every TCP connection: head-of-line blocking. TCP hands bytes to the program only in order. If segment 7 is lost and segments 8 to 40 arrive, the receiver's kernel holds all of them back until the resent 7 arrives, at least one round trip later, even when 8 to 40 belong to other requests sharing the connection. HTTP/2 sends many requests over one connection, so one lost packet stalls all of them. Lesson 11 of this track shows how HTTP/3 over QUIC avoids that.",
+      "try": {
+        "title": "Measure the 40 ms stall",
+        "minutes": 3,
+        "steps": [
+          "In the lab box, read `labs/net/src/demo/java/sfz/net/l08/demo/Nagle.java`. A client sends 50 requests over one connection on 127.0.0.1, each as two writes (a 12-byte header, then a 100-byte body), and reads a 2-byte reply after each. It runs once with Nagle on, the JVM's default, and once with `TCP_NODELAY`.",
+          "Loopback's round trip is a few microseconds. Predict the median latency of both runs anyway, then run it.",
+          "On a Mac, `./gradlew :net:demo -Pmain=sfz.net.l08.demo.Nagle` runs the same code, but the stall may not show at all: macOS has its own delayed-ACK rules, and in one run both medians were under 1 ms. Linux servers are where you'll meet it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l08/demo/Nagle.java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l08/demo/Nagle.java"
+        },
+        "expect": "From one run:\n\n```text\nTCP_NODELAY false median  41.67 ms   slowest  48.52 ms   all 50 took  2065 ms\nTCP_NODELAY true  median   0.29 ms   slowest   0.82 ms   all 50 took    14 ms\n```\n\nWith Nagle on, nearly every request waited one delayed-ACK timer, about 40 ms, on a path with a round trip of microseconds: 50 requests took 2 seconds instead of 14 ms. The first request of a connection is usually fast, because Linux ACKs at once for a while after a connection opens (quick-ACK mode); from the second request on, the stall is regular. The exact milliseconds vary a little from run to run; the 40 ms floor doesn't."
+      },
+      "refs": [
+        {
+          "title": "RFC 896: Congestion Control in IP/TCP Internetworks (Nagle)",
+          "url": "https://www.rfc-editor.org/rfc/rfc896.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Julia Evans: Why you should understand (a little) about TCP",
+          "url": "https://jvns.ca/blog/2015/11/21/why-you-should-understand-a-little-about-tcp/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of a TCP sender as a dispatcher sending vans to a warehouse along one road. The receive window is how much free floor space the warehouse reports on each delivery note; if the staff stop unpacking, the space runs out and the dispatcher must stop. The congestion window is the dispatcher's own guess of how much traffic the road takes: send a few vans, then twice as many, and when one gets stuck in a jam, send half as many and add one van per trip. Nagle is a dispatcher who won't send a half-empty van while the last one hasn't reported back, and the delayed ACK is a warehouse that waits to sign for a delivery until it has something to send back with the driver; with a small order split in two, each waits for the other. The analogy breaks on what the dispatcher can see: a real one could look at the traffic, while TCP sees nothing of the road and learns only that a van never arrived.",
+  "in_your_world": "Three places in a payment stack where this lesson decides the numbers. Cross-region links: a Kafka consumer asks for a 64 KB receive buffer by default (`receive.buffer.bytes = 65536`), which switches off Linux's autotuning, so a MirrorMaker or a ledger replica reading from a region 70 ms away gets about 1 MB/s per connection however big the link is; `-1` lets the kernel size the buffer. Batching: Kafka's `linger.ms` and `batch.size` are Nagle done deliberately, at the application level: wait a few milliseconds on purpose to fill a batch. The client then sets `TCP_NODELAY` on its sockets, so the kernel doesn't add a second wait. And your own small protocols: a fraud-scoring call over a raw socket, or a link to a card network that frames each authorization as a length header plus a body, needs one write per message or `TCP_NODELAY`, or every authorization pays 40 ms. When a call is mysteriously slow by a round 40 ms, look at the write pattern before you look at the server.",
+  "mistake": "The common mistake is treating a steady extra 40 ms (or 200 ms on some other systems) per request as \"the network\" or \"the server\". The server's logs show it answering in 1 ms, the network team shows sub-millisecond round trips, and both are right: the time is spent with the client's second write sitting in its own kernel, waiting for an ACK the server's kernel is holding back. It happens when code writes a message in pieces, such as `out.write(header); out.write(body)` on an unbuffered stream, over a socket with Nagle on, which is the JVM's default. The fix is in the client: build the whole message and write it once, or set `TCP_NODELAY`. Don't fix it by making the server send early replies or by tuning delayed-ACK timers on every host.",
+  "compare": {
+    "title": "One request on the wire, with Nagle on and with TCP_NODELAY",
+    "a": {
+      "label": "Nagle on (the default)",
+      "lang": "text",
+      "title": "tcpdump -ttt, request 2 of 50",
+      "src": " 00:00:00.000080 client > server: [P.] seq 113:125     12-byte header\n 00:00:00.040677 server > client: [.]  ack 125         delayed ACK, 40 ms later\n 00:00:00.000041 client > server: [P.] seq 125:225     100-byte body, released\n 00:00:00.000011 server > client: [.]  ack 225\n 00:00:00.000138 server > client: [P.] seq 3:5         the 2-byte reply\n"
+    },
+    "b": {
+      "label": "TCP_NODELAY",
+      "lang": "text",
+      "title": "tcpdump -ttt, request 2 of 50",
+      "src": " 00:00:00.000135 client > server: [P.] seq 113:125     12-byte header\n 00:00:00.000036 client > server: [P.] seq 125:225     100-byte body, right behind it\n 00:00:00.000071 server > client: [.]  ack 225\n 00:00:00.000063 server > client: [P.] seq 3:5         the 2-byte reply\n"
+    },
+    "note": "Both come from capturing the Nagle demo on loopback (`-ttt` prints the time since the previous line; addresses shortened and options trimmed). The segments are the same in both columns; only the order changes. With Nagle the body waits behind the header's ACK, and that ACK waits 40 ms on the server's delayed-ACK timer. With `TCP_NODELAY` the body follows 36 microseconds after the header, the server has the whole request, and its ACK and reply go at once."
+  },
+  "worked": {
+    "title": "Find the stall in a capture",
+    "steps": [
+      {
+        "say": "Capture the demo on loopback and print one connection with `-ttt`, which shows the time since the previous line. Pick any request after the first. Here the client's header, bytes 113 to 124, goes out the moment the program writes it: nothing was unacknowledged.",
+        "code": "tcpdump -r n.pcap -nn -ttt port 55374\n\n00:00:00.000080 55374 > 40069: [P.] seq 113:125, ack 3, length 12",
+        "lang": "text"
+      },
+      {
+        "say": "The next line is the server's ACK of the header, 40.7 ms later. The server's kernel had 12 bytes of a 112-byte request and nothing to send back, so it held the ACK for the delayed-ACK timer, hoping to put it on a reply.",
+        "code": "00:00:00.040677 40069 > 55374: [.] ack 125, length 0      <- 40 ms of nothing",
+        "lang": "text"
+      },
+      {
+        "say": "41 microseconds after that ACK, the body leaves. It was written long before; Nagle kept it in the client's kernel because the header was unacknowledged. Then the server has the whole request, ACKs it at once and replies.",
+        "code": "00:00:00.000041 55374 > 40069: [P.] seq 125:225, ack 3, length 100\n00:00:00.000011 40069 > 55374: [.] ack 225, length 0\n00:00:00.000138 40069 > 55374: [P.] seq 3:5, ack 225, length 2",
+        "lang": "text"
+      },
+      {
+        "say": "Check the arithmetic against the demo's own numbers. 49 requests stalled for about 41 ms each, which is 2 seconds, and the run reported 2,065 ms for 50. The same pattern across a 20 ms round trip costs two round trips plus the timer, 80 ms instead of 20: the lab's `writeWriteRead` computes exactly that.",
+        "code": "49 x 41 ms ~= 2,010 ms    measured: all 50 took 2065 ms\nwith TCP_NODELAY:          all 50 took 14 ms\n\nacross 20 ms RTT:  Nagle 2 x 20 + 40 = 80 ms   TCP_NODELAY 20 ms",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A congestion window simulator and a Nagle model",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/net/src/main/kotlin/sfz/net/l08/Reno.kt",
+      "labs/net/src/main/kotlin/sfz/net/l08/Sawtooth.kt",
+      "labs/net/src/main/kotlin/sfz/net/l08/NagleSender.kt",
+      "labs/net/src/main/kotlin/sfz/net/l08/WriteWriteRead.kt"
+    ],
+    "run": "./gradlew :net:test --tests 'sfz.net.l08.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 15 fail. `WriteWriteRead.kt` is finished: it times one write-write-read request using your `NagleSender`.",
+      "In `Reno.kt`, write `onAck`, `onTripleDuplicateAck` and `onTimeout`, a few lines each. The first five tests in `RenoTest` check slow start, halving, the exact +1 per round trip and the restart after a timeout.",
+      "In `Sawtooth.kt`, write `sawtooth`: the stepper's rules as a loop. The test expects the stepper's numbers, 10, 20, 40, 80, 160, 80, 81 and so on, and an average near 75. Then write `cubicWindow`, one line from the formula in its KDoc.",
+      "In `NagleSender.kt`, write `write` and `onAck`. Run `NagleTest` until all its tests pass, including the 40 ms stall on loopback and the 80 ms one across a 20 ms round trip."
+    ],
+    "hints": [
+      "Slow start is just `cwnd += 1` per ACK. The doubling comes from getting `cwnd` ACKs every round trip, not from anything in `onAck`.",
+      "For congestion avoidance, count ACKs in the private `acked` field and add one segment when the count reaches `cwnd`. `cwnd += 1.0 / cwnd` on a `Double` drifts, and the tests expect exact integers.",
+      "In `sawtooth`, read `reno.cwnd` once at the start of a round, record it, and use that same value for both the loss check and the number of ACKs.",
+      "`kotlin.math.cbrt` and `pow` are all `cubicWindow` needs. `(-2.0).pow(3)` is -8.0, so the curve works before `k` too.",
+      "Give `NagleSender` one private `flush()` that both `write` and `onAck` call, so the rule lives in one place: with `noDelay` or nothing unacknowledged, send everything in pieces of at most `mss`; otherwise only full `mss` pieces."
+    ],
+    "done_when": "All 15 tests in `RenoTest` and `NagleTest` pass."
+  },
+  "drill": {
+    "title": "Three numbers in your head",
+    "minutes": 5,
+    "prompt": "No tools. (a) How many bytes must be in flight to move 200 Mbit/s across a 40 ms round trip, and how many 1,448-byte segments is that? (b) A Reno sender on a path that holds 120 segments has settled into its sawtooth. Between which windows does it swing, and what is its average? (c) A client does write-write-read with Nagle on, across a 10 ms round trip, to a server with a 40 ms delayed ACK. How long does one request take, and how long with `TCP_NODELAY`? Then name the two places the bytes wait during the stall.",
+    "answer": {
+      "lang": "text",
+      "src": "(a) BDP = 200,000,000 / 8 x 0.040 = 1,000,000 bytes, about 1 MB\n    1,000,000 / 1,448 = about 690 segments in flight\n\n(b) it loses at 121 (one more than the path holds), halves to 60,\n    then +1 per round trip back to 121: swings 60..121, average about 90\n    (three quarters of the top, the same as 75 out of 100 in the stepper)\n\n(c) Nagle on:  header out at 0, delayed ACK leaves the server at 5 + 40 ms,\n               reaches the client at 50, body arrives at 55, reply at 60 ms\n               = 2 x RTT + 40 = 60 ms\n    TCP_NODELAY: header and body together, reply after one round trip = 10 ms\n\n    The body waits in the client's kernel (Nagle);\n    the ACK it needs waits in the server's kernel (delayed ACK).\n"
+    }
+  },
+  "recap": [
+    "A sender can have at most one window of bytes unacknowledged, so throughput is at most window / round trip. Filling a link needs bandwidth x round trip in flight, the bandwidth-delay product.",
+    "Flow control: the receive window is the free space in the receiver's buffer. A slow reader shrinks it to zero, and the sender's `write()` blocks. Recv-Q and Send-Q in `ss` show where bytes wait.",
+    "Congestion control: the sender's own window starts at 10 segments, doubles per round trip in slow start, grows by one above ssthresh, and halves on loss. Linux uses CUBIC, which cuts to 70%.",
+    "Loss is expensive: 1% loss made a 10 MB download over a 50 ms path take about 20 s instead of 2.",
+    "Nagle holds small writes while data is unacknowledged; the delayed ACK holds ACKs for at least 40 ms on Linux. Write-write-read hits both: write once, or set `TCP_NODELAY`."
+  ],
+  "quiz": [
+    {
+      "q": "A ledger replica in another region, 80 ms away, reads over a 500 Mbit/s link. How many bytes must be in flight on its connection to use the whole link?",
+      "options": [
+        "About 625 KB",
+        "About 5 MB",
+        "About 40 MB",
+        "About 64 KB, the largest TCP window"
+      ],
+      "answer": 1,
+      "why": "Bandwidth times round trip: 500,000,000 bits a second is 62.5 MB/s, times 0.08 s is 5 MB. 625 KB is the same sum with 8 ms instead of 80. 64 KB is only the limit of the window field without window scaling; with `wscale` a window can reach 1 GB."
+    },
+    {
+      "q": "A Kafka consumer's JVM pauses for 10 seconds while the broker keeps sending a large fetch response to it. What stops the broker from sending more than the consumer can hold?",
+      "options": [
+        "The broker's congestion window, which halves when packets are lost",
+        "Routers between them drop the extra packets",
+        "The consumer's receive window, which shrinks to zero as its kernel buffer fills, so the broker's kernel stops sending",
+        "Nothing: the bytes wait in the network until the consumer reads"
+      ],
+      "answer": 2,
+      "why": "This is flow control. The consumer's kernel keeps accepting bytes into the socket buffer and advertises less room with every ACK, until `win 0`. The broker's kernel stops, its send buffer fills, and its writes wait. The congestion window protects the network, not the receiver, and nothing waits \"in the network\": routers only queue briefly, and a sender that ignored the window would just cause drops."
+    },
+    {
+      "q": "A connection in congestion avoidance has cwnd = 60 segments when three duplicate ACKs arrive. What is cwnd afterwards under Reno, and under Linux's default, CUBIC?",
+      "options": [
+        "30 and 42",
+        "1 and 1",
+        "59 and 59",
+        "30 and 30"
+      ],
+      "answer": 0,
+      "why": "Three duplicate ACKs mean one segment was lost while the rest flowed, so the sender cuts but keeps going: Reno halves to 30, CUBIC multiplies by 0.7 to 42. Dropping to 1 segment is what happens after a retransmission timeout, when nothing came back at all."
+    },
+    {
+      "q": "A Kotlin client writes a 20-byte header and a 300-byte body with two `write()` calls on a plain `Socket`, then reads the reply from a server 1 ms away. Every request takes about 42 ms. Which change fixes it without touching the server?",
+      "options": [
+        "Raise the socket's receive buffer to 1 MB",
+        "Turn on `SO_KEEPALIVE`",
+        "Open a new connection for each request",
+        "Set `tcpNoDelay = true`, or build the header and body into one buffer and write it once"
+      ],
+      "answer": 3,
+      "why": "The header goes out, Nagle holds the body until the header is ACKed, and the server's kernel delays that ACK for 40 ms because it has nothing to send yet. Removing the second small write, or turning Nagle off, removes the wait. A bigger buffer changes the window, not this stall, and a new connection per request adds a handshake and still has the same two writes."
+    },
+    {
+      "q": "In lesson 7's capture both SYNs carried `wscale 7`, and the client's later ACKs say `win 502`. How many bytes may the server have in flight toward the client at that moment?",
+      "options": [
+        "502 bytes",
+        "About 64 KB: 502 x 128 = 64,256 bytes",
+        "502 segments of 1,448 bytes",
+        "65,535 bytes, the most a window can say"
+      ],
+      "answer": 1,
+      "why": "With window scaling agreed in the handshake, the 16-bit field is multiplied by 2^7 = 128. 502 bytes would be the unscaled reading, which is what you'd get if one SYN had lacked the option. Windows count bytes, never segments, and 65,535 is the limit only without scaling.",
+      "from": "net-07"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "The speed limit of one TCP connection?",
+      "back": "Window / round-trip time. A 64 KB window across 70 ms gives at most 0.94 MB/s."
+    },
+    {
+      "front": "What is the bandwidth-delay product?",
+      "back": "Bandwidth x round-trip time: how many bytes must be in flight to fill a link. 1 Gbit/s x 70 ms = 8.75 MB."
+    },
+    {
+      "front": "Receive window vs congestion window?",
+      "back": "Receive window: free space at the receiver (flow control, protects the receiver). Congestion window: the sender's guess of what the path carries (protects the network). The sender uses the smaller."
+    },
+    {
+      "front": "How does slow start grow the window, and from where?",
+      "back": "From 10 segments on Linux, +1 per ACK, so it doubles every round trip until a loss or ssthresh."
+    },
+    {
+      "front": "Three duplicate ACKs vs a retransmission timeout?",
+      "back": "Duplicate ACKs: one segment lost, the rest flowing; resend it and cut the window (half for Reno, 70% for CUBIC). Timeout: nothing came back; window to 1 and slow start again."
+    },
+    {
+      "front": "Why does write-write-read stall for about 40 ms?",
+      "back": "Nagle holds the second small write until the first is ACKed, and the receiver delays that ACK (at least 40 ms on Linux) hoping to send it with a reply. Fix: one write per message, or TCP_NODELAY."
+    },
+    {
+      "front": "What do Recv-Q and Send-Q mean for a connected socket in `ss`?",
+      "back": "Recv-Q: bytes received that the program hasn't read. Send-Q: bytes written that the peer hasn't acknowledged."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Sliding window",
+      "plain": "The range of bytes a sender may have unacknowledged; it slides forward as ACKs arrive."
+    },
+    {
+      "term": "Bandwidth-delay product",
+      "plain": "Bandwidth times round-trip time: the bytes in flight needed to keep a link full."
+    },
+    {
+      "term": "Receive window",
+      "plain": "The free space in the receiver's buffer, advertised in every ACK."
+    },
+    {
+      "term": "Congestion window (cwnd)",
+      "plain": "The sender's own limit on bytes in flight, its estimate of what the path can carry."
+    },
+    {
+      "term": "Slow start",
+      "plain": "The startup phase where the congestion window doubles every round trip."
+    },
+    {
+      "term": "Fast retransmit",
+      "plain": "Resending a segment as soon as three duplicate ACKs show it is missing, without waiting for a timeout."
+    },
+    {
+      "term": "Nagle's algorithm",
+      "plain": "Don't send a small segment while earlier data is still unacknowledged; TCP_NODELAY turns it off."
+    },
+    {
+      "term": "Delayed ACK",
+      "plain": "A receiver waiting briefly before acknowledging, hoping to send the ACK along with data."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks why a nightly settlement file transfer to a partner bank 90 ms away crawls at 5 Mbit/s on a 1 Gbit/s link, while the same transfer inside the data centre is fast. Explain what limits a single TCP connection, what the receive window and the congestion window each do, and what you'd check first.",
+    "answer": "A TCP sender can only have one window of bytes unacknowledged at a time, so a connection moves at most one window per round trip. Inside the data centre the round trip is under a millisecond, so even a small window is fast. At 90 ms, 5 Mbit/s means about 56 KB per round trip, which smells like a 64 KB window. Two things set the window. The receiver advertises how much free buffer it has, which is flow control: if the bank's side, or our client, set a small socket buffer, or window scaling got stripped by a firewall so the window can't go past 64 KB, we're stuck there. The sender also keeps a congestion window, its guess of what the path can carry: it starts at 10 segments, doubles each round trip, and halves when packets are lost, so loss on the link would also keep it low, but that usually shows as a speed that jumps around. I'd check the SYNs in a capture for `wscale` on both sides, run `ss -ti` during the transfer to see the window, `rwnd_limited` and retransmits, and look for any code that sets SO_RCVBUF. To fill 1 Gbit/s at 90 ms we'd need about 11 MB in flight."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Don't set socket buffers by hand.** An explicit `SO_RCVBUF` or `SO_SNDBUF` turns off Linux's autotuning for that socket and is capped by `net.core.rmem_max` and `wmem_max` (212,992 bytes by default), as the first Try it showed. Autotuning grows the receive buffer up to the last number in `tcp_rmem` (6 MB in the lab box) as the measured bandwidth-delay product requires. Kafka's 64 KB `receive.buffer.bytes` default is the classic case; `-1` hands the choice back to the kernel.\n\n**A pooled connection forgets its speed.** With `net.ipv4.tcp_slow_start_after_idle = 1`, the default, Linux shrinks the congestion window of a connection that has been idle for longer than its retransmission timeout, so the first burst after a quiet minute starts slowly again. Linux also remembers the last ssthresh and round trip per destination between connections (`ip tcp_metrics show`), which is why the third Try it flushes them first.\n\n**How a sender times out.** The retransmission timeout (RFC 6298) starts at 1 second and is then computed from measured round trips: a smoothed average plus four times their variation, with a floor (200 ms on Linux). Every timeout in a row doubles it. That is the same back-off lesson 6 built by hand.\n\n**BBR in one paragraph.** Loss-based algorithms such as CUBIC only back off once a queue overflows, so on links with big buffers they keep the queue full and add latency, called bufferbloat. BBR estimates the bottleneck bandwidth (the best delivery rate recently seen) and the minimum round trip, and sends at about that rate, cycling slightly above and below to keep probing. Its first version could take more than its share of a link from CUBIC flows and ignored loss up to a point; later versions react to loss too, and the third is still an IETF draft. On a kernel built with it, `sysctl -w net.ipv4.tcp_congestion_control=bbr` switches new connections, or a program can choose per socket.\n\n**Corking and low-water marks.** Linux has `TCP_CORK`, the opposite of `TCP_NODELAY` (hold everything until the cork is pulled, used by servers that send headers and a file), and autocorking, which merges small writes on a socket while its earlier packets are still queued inside the host. `TCP_NOTSENT_LOWAT` limits how much unsent data sits in the send buffer, which keeps latency low for HTTP/2 servers that want to reprioritise streams."
+  },
+  "sources": [
+    {
+      "title": "RFC 5681: TCP Congestion Control",
+      "url": "https://www.rfc-editor.org/rfc/rfc5681.html"
+    },
+    {
+      "title": "RFC 9438: CUBIC for Fast and Long-Distance Networks",
+      "url": "https://www.rfc-editor.org/rfc/rfc9438.html"
+    },
+    {
+      "title": "RFC 7323: TCP Extensions for High Performance",
+      "url": "https://www.rfc-editor.org/rfc/rfc7323.html"
+    },
+    {
+      "title": "RFC 1122: Requirements for Internet Hosts (delayed ACK)",
+      "url": "https://www.rfc-editor.org/rfc/rfc1122.html"
+    },
+    {
+      "title": "High Performance Browser Networking: Building blocks of TCP",
+      "url": "https://hpbn.co/building-blocks-of-tcp/"
+    }
+  ]
+}

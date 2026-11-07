@@ -1,0 +1,407 @@
+{
+  "id": "data-12",
+  "title": "Choosing an engine: DuckDB, Spark, Trino and friends",
+  "minutes": 40,
+  "goal": "By the end you can size a query by the bytes it reads after pruning and route it to one machine or the right kind of cluster with numbers, explain why DuckDB beats Spark on one machine and where that flips, place Trino, ClickHouse and Flink, and sketch a lakehouse for a payments company.",
+  "warmup": {
+    "q": "A payments table holds 4 TB of Parquet: 3 years of daily partitions, 60 columns of similar size. The finance report reads 4 columns for the last 30 days. Roughly how many bytes does it read?",
+    "options": [
+      "4 TB: a query reads the table",
+      "About 110 GB: the last 30 days",
+      "About 7 GB: 30 of 1,095 days, and 4 of 60 columns",
+      "Almost nothing: the answer is cached"
+    ],
+    "answer": 2,
+    "why": "Partition pruning keeps 30 of 1,095 days, 110 GB, and Parquet's column layout then reads 4 of 60 columns: about 7.3 GB. That number, not the 4 TB, decides the engine, and at a few GB/s it's seconds on one machine. 110 GB forgets the columns, which lesson 4 showed are stored apart."
+  },
+  "sections": [
+    {
+      "h": "Size the query by the bytes it reads, not by the lake",
+      "body": "\"The payments table is 4 TB, so we need Spark\" sizes the wrong thing. Lesson 1 (Why big data systems exist, and when you don't need one) gave the formula that answers it: a scan costs the bytes it reads divided by the bandwidth of its slowest stage. Lessons 3, 4 and 9 then showed how much a good layout shrinks \"the bytes it reads\". Put the two together and you get a rubric you can run before you pick an engine. The stepper walks it for one query, then two others on the same table.\n\nStep 1, prune partitions. Count only the partitions the filter can match. A report on the last 30 days of a table partitioned by day reads 30 of 1,095 days: 110 GB of the 4 TB.\n\nStep 2, prune columns. Parquet stores columns apart, so count only the columns the query uses. 4 of 60 similar columns: 7.3 GB.\n\nStep 3, divide by one machine's scan speed. That's the slower of two numbers: the cores decoding Parquet (cores times the per-core rate) and the storage feeding them (a laptop's NVMe disk, or a VM's network to object storage). The Try it measures your laptop: while busy with other jobs, this one decoded 300 to 360 MB/s on one core and about 2 GB/s on all 12. A big cloud VM reading S3 gets about 1.5 GB/s. If several people run the query at once, they share that speed. 7.3 GB at 3 GB/s is about 2.4 seconds.\n\nStep 4, check memory. The **working set** is what the query must hold at once: the hash table of a join's build side, or one running total per group. For the report that's a few MB. For a join of two years of payments against two years of chargebacks it can be hundreds of GB. DuckDB can spill to disk when it runs out, at a cost, so treat RAM as the comfortable limit.\n\nThen route. If one machine meets the time budget and holds the working set, use one machine: DuckDB on a laptop, or on one VM next to the data. If not, use a cluster, sized to the larger of the two needs. A seconds-scale budget for many users calls for an engine that answers fast: Trino. An hours-long job calls for one that retries failed tasks: Spark. Work that never ends, like the fraud counts of lesson 11, goes to a streaming engine. The lab turns these rules into code, and the numbers decide, not the size of the lake.",
+      "stepper": {
+        "title": "Routing a query by size",
+        "intro": "One query on a 4 TB table, pruned and timed step by step, then two other workloads on the same table.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"The payments table is 4 TB; nothing is decided yet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">a monthly finance report on a 4 TB payments table</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box-a\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box-dim\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"215\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box-dim\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"350\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box-dim\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"485\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-dim\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"620\" y=\"109\" text-anchor=\"middle\">?</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">start from the table, not from the answer</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">3 years of payments, 1,095 daily partitions, 60 columns of similar size</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">the report needs 4 columns for the last 30 days, within a minute</text></svg>",
+            "say": "Finance wants a monthly report from the payments table: 4 TB of Parquet, 3 years of daily partitions, 60 columns. The tempting first thought is \"4 TB, so Spark\". The rubric starts from the table, but it sizes the **query**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"Partition pruning keeps 30 of 1,095 days: 110 GB\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">step 1: keep only the partitions the filter can match</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box-a\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">110 GB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">30 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box-dim\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"350\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box-dim\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"485\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-dim\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"620\" y=\"109\" text-anchor=\"middle\">?</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">4 TB x 30 / 1,095 = 110 GB</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">hidden partitioning on days(created_at) skips the other 1,065 days</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">without that filter on the partition column, the scan starts at 4 TB</text></svg>",
+            "say": "The report filters on 30 days, and the table is partitioned by day (lesson 9's hidden partitioning). The engine skips the other 1,065 days' files without opening them. 4 TB becomes 110 GB."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"Column pruning keeps 4 of 60 columns: 7.3 GB\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">step 2: read only the columns the query uses</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">110 GB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">30 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box-a\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"350\" y=\"101\" text-anchor=\"middle\">7.3 GB</text><text class=\"t-s t-m\" x=\"350\" y=\"117\" text-anchor=\"middle\">4 of 60</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box-dim\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"485\" y=\"109\" text-anchor=\"middle\">?</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-dim\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"620\" y=\"109\" text-anchor=\"middle\">?</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">110 GB x 4 / 60 = 7.3 GB</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">Parquet stores each column apart, so the other 56 are never read</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">this is the number to size an engine by, not the 4 TB</text></svg>",
+            "say": "Parquet stores each column separately (lesson 4), so the 4 columns the report uses are all it reads: 7.3 GB. That is the number that decides the engine, and it's 550 times smaller than the table."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"On one laptop the scan takes about 2.4 seconds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">step 3: divide by one machine's scan speed</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">110 GB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">30 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"350\" y=\"101\" text-anchor=\"middle\">7.3 GB</text><text class=\"t-s t-m\" x=\"350\" y=\"117\" text-anchor=\"middle\">4 of 60</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box-a\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"485\" y=\"101\" text-anchor=\"middle\">2.4 s</text><text class=\"t-s t-m\" x=\"485\" y=\"117\" text-anchor=\"middle\">at 3 GB/s</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-dim\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"620\" y=\"109\" text-anchor=\"middle\">?</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">a laptop: 10 cores decode 5 GB/s, the NVMe disk feeds 3 GB/s: 3 GB/s</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">7.3 GB / 3 GB/s = 2.4 s, well inside the 60-second budget</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">the working set (a group per merchant and day) is a few MB</text></svg>",
+            "say": "Divide by the slowest stage of one machine (lesson 1): a laptop's 10 cores could decode 5 GB/s, but its disk feeds 3 GB/s, so 3 GB/s it is. 2.4 seconds. The memory the query needs, its **working set**, is one running total per merchant and day: a few MB."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"Route: one machine, DuckDB\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">step 4: one machine fits, so use one machine</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">110 GB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">30 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"350\" y=\"101\" text-anchor=\"middle\">7.3 GB</text><text class=\"t-s t-m\" x=\"350\" y=\"117\" text-anchor=\"middle\">4 of 60</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"485\" y=\"101\" text-anchor=\"middle\">2.4 s</text><text class=\"t-s t-m\" x=\"485\" y=\"117\" text-anchor=\"middle\">at 3 GB/s</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-a\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"620\" y=\"101\" text-anchor=\"middle\">one machine</text><text class=\"t-s t-m\" x=\"620\" y=\"117\" text-anchor=\"middle\">DuckDB</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">route: DuckDB on a laptop or one VM</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">no cluster to start, no shuffle over a network, no scheduler</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">a 4 TB table, and the question is small</text></svg>",
+            "say": "One machine meets the budget and holds the working set, so the answer is one machine: DuckDB on the analyst's laptop, or on one VM next to the data. A cluster would add startup, scheduling and network hops to a 2-second job."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"Forty concurrent users of 22 GB queries need an interactive cluster\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">same table: a merchant dashboard, 40 people at once</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">329 GB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">90 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"350\" y=\"101\" text-anchor=\"middle\">22 GB</text><text class=\"t-s t-m\" x=\"350\" y=\"117\" text-anchor=\"middle\">4 of 60</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"485\" y=\"101\" text-anchor=\"middle\">584 s</text><text class=\"t-s t-m\" x=\"485\" y=\"117\" text-anchor=\"middle\">40 at 1.5 GB/s</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-a\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"620\" y=\"101\" text-anchor=\"middle\">20 machines</text><text class=\"t-s t-m\" x=\"620\" y=\"117\" text-anchor=\"middle\">Trino</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">route: an interactive cluster</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">each query reads 22 GB, and 40 of them share one VM's 1.5 GB/s from S3</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">a 30-second budget needs about 20 such machines: Trino</text></svg>",
+            "say": "Same table, different workload: 40 people open a merchant dashboard that reads 90 days of 4 columns, 22 GB each, with a 30-second budget. On a VM reading object storage at 1.5 GB/s, 40 concurrent queries take about 584 seconds. Splitting that over about 20 machines, with an engine that answers in seconds, means Trino."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 260\" role=\"img\" aria-label=\"A backfill whose join needs 600 GB goes to a batch cluster\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"24\" text-anchor=\"middle\">same table: a 3-year fraud feature backfill</text><text class=\"t-s t-m\" x=\"80\" y=\"62\" text-anchor=\"middle\">the table</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"80\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"80\" y=\"117\" text-anchor=\"middle\">3 years</text><line class=\"ln\" x1=\"140\" y1=\"104\" x2=\"154\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">partitions</text><rect class=\"box\" x=\"155\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"101\" text-anchor=\"middle\">4 TB</text><text class=\"t-s t-m\" x=\"215\" y=\"117\" text-anchor=\"middle\">1,095 of 1,095</text><line class=\"ln\" x1=\"275\" y1=\"104\" x2=\"289\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"62\" text-anchor=\"middle\">columns</text><rect class=\"box\" x=\"290\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"350\" y=\"101\" text-anchor=\"middle\">2 TB</text><text class=\"t-s t-m\" x=\"350\" y=\"117\" text-anchor=\"middle\">30 of 60</text><line class=\"ln\" x1=\"410\" y1=\"104\" x2=\"424\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"485\" y=\"62\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"425\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"485\" y=\"101\" text-anchor=\"middle\">1,333 s</text><text class=\"t-s t-m\" x=\"485\" y=\"117\" text-anchor=\"middle\">at 1.5 GB/s</text><line class=\"ln\" x1=\"545\" y1=\"104\" x2=\"559\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"620\" y=\"62\" text-anchor=\"middle\">route</text><rect class=\"box-a\" x=\"560\" y=\"74\" width=\"120\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"620\" y=\"101\" text-anchor=\"middle\">3+ machines</text><text class=\"t-s t-m\" x=\"620\" y=\"117\" text-anchor=\"middle\">Spark</text><text class=\"t-s t-a\" x=\"350\" y=\"176\" text-anchor=\"middle\">route: a batch cluster</text><text class=\"t-s\" x=\"350\" y=\"198\" text-anchor=\"middle\">1,333 s fits a 2-hour budget, but the join must hold 600 GB at once</text><text class=\"t-s\" x=\"350\" y=\"220\" text-anchor=\"middle\">256 GB per VM means 3 or more machines, and an hours-long job needs task retries: Spark</text></svg>",
+            "say": "A backfill of fraud features over all 3 years reads 2 TB. One VM could scan it in 22 minutes, inside a 2-hour budget, but its join must hold 600 GB at once and a VM has 256 GB. That needs at least 3 machines, and a job that runs for an hour needs to survive a lost task (lesson 5): Spark."
+          }
+        ]
+      },
+      "try": {
+        "title": "Measure your laptop, then size five workloads",
+        "minutes": 4,
+        "steps": [
+          "Run `LaptopNumbersDemo`. It writes 10 million payments as Parquet with DuckDB, times a two-column aggregation on 1 thread and on all cores, and then works out five workloads on a 4 TB payments table: the bytes each reads, and the seconds on your laptop and on a cloud VM that reads object storage at 1.5 GB/s.",
+          "Before reading the table, guess which of the five need more than one machine.",
+          "Your numbers depend on your CPU, on other load, and on the page cache: the files were just written, so they're in memory. From a cold disk or from S3, the storage stage sets the speed instead."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "LaptopNumbersDemo.kt",
+          "src": "package sfz.bigdata.l12.demo\n\nimport com.sun.management.OperatingSystemMXBean\nimport java.io.File\nimport java.lang.management.ManagementFactory\n\n/**\n * Measures the two numbers the engine rubric needs from this laptop: how fast DuckDB decodes\n * Parquet on one core and on all of them. Then works out, for five workloads of a payments\n * company, the bytes each reads after pruning and the seconds it would take here and on a\n * 64-core cloud VM that reads object storage at 1.5 GB/s.\n */\nfun main() {\n    freshDemoDir()\n    val cores = Runtime.getRuntime().availableProcessors()\n    val memory = (ManagementFactory.getOperatingSystemMXBean() as OperatingSystemMXBean).totalMemorySize\n    println(\"this machine: $cores cores, %.0f GiB of memory\".format(memory / (1L shl 30).toDouble()))\n\n    val c = duck()\n    val payments = File(DEMO_DIR, \"payments\")\n    writePayments(c, 10_000_000, payments, File(DEMO_DIR, \"merchants\"))\n    val glob = \"${payments.absolutePath}/*.parquet\"\n    // the compressed bytes of the two columns the query needs, from the Parquet footers (lesson 4)\n    val bytes = (c.rows(\"SELECT sum(total_compressed_size) FROM parquet_metadata('$glob') \" +\n        \"WHERE path_in_schema IN ('amount_cents', 'status')\").first()[0] as Number).toLong()\n    val query = \"SELECT status, sum(amount_cents) FROM read_parquet('$glob') GROUP BY status\"\n    fun bestMillis(threads: Int): Double {\n        c.run(\"SET threads = $threads\")\n        return (1..5).minOf {\n            val t0 = System.nanoTime()\n            c.rows(query)\n            (System.nanoTime() - t0) / 1e6\n        }\n    }\n    val one = bestMillis(1)\n    val all = bestMillis(cores)\n    val perCore = bytes / (one / 1000)\n    val allCores = bytes / (all / 1000)\n    println(\"DuckDB, sum by status over 10,000,000 payments (2 columns, %.0f MB compressed, files in the page cache):\".format(bytes / 1e6))\n    println(\"   1 thread:  %5.0f ms, so about %.0f MB/s per core\".format(one, perCore / 1e6))\n    println(\"  %2d threads: %5.0f ms, so about %.1f GB/s\".format(cores, all, allCores / 1e9))\n\n    // four TB of payments over 3 years (1,095 days), 60 columns of similar size\n    data class W(val name: String, val days: Int, val columns: Int, val users: Int)\n    val workloads = listOf(\n        W(\"monthly finance report\", 30, 4, 1),\n        W(\"one merchant's disputes, ad hoc\", 365, 6, 1),\n        W(\"merchant dashboard, 40 users\", 90, 4, 40),\n        W(\"nightly settlement over a week\", 7, 12, 1),\n        W(\"fraud feature backfill, 3 years\", 1095, 30, 1),\n    )\n    val vm = 1.5e9\n    println(\"%-34s %10s %12s %12s\".format(\"workload (4 TB table)\", \"reads\", \"this laptop\", \"cloud VM\"))\n    for (w in workloads) {\n        val read = 4e12 * w.days / 1095 * w.columns / 60\n        println(\"%-34s %7.1f GB %10.1f s %10.1f s\".format(w.name, read / 1e9, read / allCores * w.users, read / vm * w.users))\n    }\n    c.close()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.bigdata.l12.demo.LaptopNumbersDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/bigdata/l12/demo/LaptopNumbersDemo.kt"
+        },
+        "expect": "```text\nthis machine: 12 cores, 32 GiB of memory\nDuckDB, sum by status over 10,000,000 payments (2 columns, 50 MB compressed, files in the page cache):\n   1 thread:    140 ms, so about 357 MB/s per core\n  12 threads:    22 ms, so about 2.3 GB/s\nworkload (4 TB table)                   reads  this laptop     cloud VM\nmonthly finance report                 7.3 GB        3.2 s        4.9 s\none merchant's disputes, ad hoc      133.3 GB       58.0 s       88.9 s\nmerchant dashboard, 40 users          21.9 GB      381.5 s      584.5 s\nnightly settlement over a week         5.1 GB        2.2 s        3.4 s\nfraud feature backfill, 3 years     2000.0 GB      870.2 s     1333.3 s\n```\n\nOn this 12-core laptop, busy with other jobs, one core decoded about 360 MB/s and all 12 about 2.3 GB/s; an idle laptop is faster. The finance report and the nightly settlement read a few GB and take seconds anywhere. The ad hoc dispute search reads 133 GB, about a minute: fine for one analyst. The dashboard reads only 22 GB per query, but 40 people at once turn that into 6 to 10 minutes on one machine, far over a 30-second budget. The backfill reads 2 TB: 14 to 22 minutes of scanning, which might fit its time budget, and the rubric then asks about its working set."
+      },
+      "refs": [
+        {
+          "title": "MotherDuck: Big Data is Dead",
+          "url": "https://motherduck.com/blog/big-data-is-dead/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "On one machine, DuckDB beats Spark at Spark's own query",
+      "body": "Here is the rubric's first route, measured. Ten million payments, 106 MB of Parquet in 8 files, and one question: per day and merchant category, how many captured payments and how much money? It's a filter, a join to 500 merchants and a group-by. DuckDB answered it in 50 to 180 ms. Spark, in local mode on the same 12 cores, took about 1.4 seconds on its best of three runs and 8 to 10 seconds on its first, plus 3 to 4 seconds to start the session. Both returned the same 140 rows. Across runs on this busy machine, Spark's best was 10 to 30 times DuckDB's best. The gap comes from what Spark is built for.\n\nLook at what each engine does for that query. DuckDB is a library inside your process. It reads the Parquet column chunks it needs, decodes them into vectors of a couple of thousand values, and runs the filter, the hash join and the aggregation over those vectors in compiled C++ code, with all threads sharing one hash table in memory. Nothing leaves the process.\n\nSpark does what lessons 5 to 7 described, because it's built for many machines. The driver parses and optimizes the plan, plans stages around the shuffle, and schedules tasks. Each task reads its split, builds partial aggregates, and writes shuffle files for the reduce stage to fetch, even when the \"network\" is the same laptop. The rows pass through the JVM, with code generated per query and garbage collected. Each of those costs buys something on a cluster: tasks that can be retried on another machine, shuffles that spread across hundreds of disks, executors that survive a lost node. On one machine they buy nothing, and they're paid on every query.\n\nThe fair summary: per-query overhead dominates small queries, and parallel bandwidth dominates big ones. Somewhere in between is a crossover where one machine can't scan the bytes in time, and Spark's overheads become a small tax on a job that couldn't run anywhere else. With this laptop's 2 GB/s and a budget of a few minutes, that point is a few hundred GB read, or a working set bigger than its 32 GiB of memory. Spark is closing the gap from its side: Spark 4.3 added an opt-in setting, `spark.sql.optimizer.singleTaskExecution.enabled`, that runs small queries as one task without a shuffle, and native engines such as Apache Gluten with Velox replace the JVM's row processing with vectorized C++.",
+      "try": {
+        "title": "One question, two engines",
+        "minutes": 4,
+        "steps": [
+          "Run `SameQueryDemo`. It writes 10 million payments and 500 merchants as Parquet with DuckDB, runs the same filter, join and aggregation three times in DuckDB and three times in Spark (`local[*]`), and checks that the answers match.",
+          "Before it runs, predict the ratio of Spark's best time to DuckDB's best.",
+          "Why is Spark's first run so much slower than its third? Think of what lesson 7 said Spark does at the start of every query, and what the JVM does the first time it runs code."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SameQueryDemo.kt",
+          "src": "package sfz.bigdata.l12.demo\n\nimport org.apache.spark.sql.functions.col\nimport org.apache.spark.sql.functions.count\nimport org.apache.spark.sql.functions.lit\nimport org.apache.spark.sql.functions.sum\nimport java.io.File\n\n/**\n * Ten million payments as Parquet, and one question asked of two engines on this laptop: per day\n * and merchant category, how many captured payments and how much money? Times DuckDB and Spark\n * (local[*], every core) and checks that the answers match.\n */\nfun main() {\n    freshDemoDir()\n    val payments = File(DEMO_DIR, \"payments\")\n    val merchants = File(DEMO_DIR, \"merchants\")\n    val c = duck()\n    writePayments(c, 10_000_000, payments, merchants)\n    println(\"payments: 10,000,000 rows in ${payments.list()!!.size} Parquet files, %.0f MB\".format(megabytes(payments)))\n\n    fun timed(runs: Int, block: () -> List<List<Any?>>): Pair<List<List<Any?>>, List<Long>> {\n        var result: List<List<Any?>> = emptyList()\n        val times = (1..runs).map {\n            val t0 = System.nanoTime()\n            result = block()\n            (System.nanoTime() - t0) / 1_000_000\n        }\n        return result to times\n    }\n\n    val (duckAnswer, duckTimes) = timed(3) {\n        c.rows(\"\"\"\n            SELECT p.dt::VARCHAR, m.mcc, count(*), sum(p.amount_cents)\n            FROM read_parquet('${payments.absolutePath}/*.parquet') p\n            JOIN read_parquet('${merchants.absolutePath}/*.parquet') m ON p.merchant_id = m.merchant_id\n            WHERE p.status = 'CAPTURED'\n            GROUP BY ALL\n            ORDER BY 1, 2\"\"\")\n    }\n    println(\"DuckDB: ${duckTimes.joinToString(\", \") { \"$it ms\" }}\")\n\n    val t0 = System.nanoTime()\n    val spark = demoSpark()\n    val startup = (System.nanoTime() - t0) / 1_000_000\n    val (sparkAnswer, sparkTimes) = timed(3) {\n        spark.read().parquet(payments.absolutePath).where(col(\"status\").equalTo(lit(\"CAPTURED\")))\n            .join(spark.read().parquet(merchants.absolutePath), \"merchant_id\")\n            .groupBy(col(\"dt\").cast(\"string\").alias(\"day\"), col(\"mcc\"))\n            .agg(count(lit(1)), sum(\"amount_cents\"))\n            .orderBy(\"day\", \"mcc\")\n            .collectAsList()\n            .map { r -> (0 until 4).map { r.get(it) } }\n    }\n    println(\"Spark:  ${sparkTimes.joinToString(\", \") { \"$it ms\" }} (plus $startup ms to start the session)\")\n\n    val same = duckAnswer.map { it.map(Any?::toString) } == sparkAnswer.map { it.map(Any?::toString) }\n    println(\"answers: ${duckAnswer.size} rows each, identical: $same\")\n    println(\"first row: ${duckAnswer.first()}\")\n    println(\"best run, Spark / DuckDB: about %.0fx\".format(sparkTimes.min().toDouble() / duckTimes.min()))\n    spark.stop()\n    c.close()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.bigdata.l12.demo.SameQueryDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/bigdata/l12/demo/SameQueryDemo.kt"
+        },
+        "expect": "```text\npayments: 10,000,000 rows in 8 Parquet files, 106 MB\nDuckDB: 177 ms, 154 ms, 127 ms\nSpark:  8405 ms, 1571 ms, 1385 ms (plus 3659 ms to start the session)\nanswers: 140 rows each, identical: true\nfirst row: [2026-11-01, 5000, 28705, 3600754178]\nbest run, Spark / DuckDB: about 11x\n```\n\nBoth engines return the same 140 rows (7 days times 20 merchant categories). DuckDB answers in about a tenth of a second. Spark's first run takes several seconds: class loading, the JIT compiling Spark's own code, and the first whole-stage code generation. Its later runs settle around one and a half seconds, about 11 times DuckDB's best on this run (27 times on another), plus nearly 4 seconds to start the session. These numbers came from a machine busy with other jobs, so expect yours to differ; the ratio is the point."
+      },
+      "refs": [
+        {
+          "title": "DuckDB 2.0 announcement",
+          "url": "https://duckdb.org/2026/10/21/announcing-duckdb-200",
+          "kind": "read"
+        },
+        {
+          "title": "Spark 4.3.0 release notes (single-task execution)",
+          "url": "https://spark.apache.org/releases/spark-release-4-3-0.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Trino, ClickHouse and Flink cover the other routes",
+      "body": "The rubric has two more routes, and both point at engines this track didn't run: Trino and a streaming engine. ClickHouse sits off to the side. What makes all of them usable together is lessons 9 and 10: the table lives once, in Iceberg, behind a catalog, and any engine that speaks Iceberg reads the same files. The Try it shows the smallest case: Spark writes a table, and DuckDB reads it through Iceberg's metadata without copying anything, then sees Spark's next commit as a new snapshot.\n\nTrino is a distributed SQL engine. A coordinator plans each query and workers run its stages in parallel, passing data between stages in memory as it flows, without Spark's shuffle files. That makes it fast to answer: on a big enough cluster, a query over tens of GB returns in seconds, and many users can share the cluster. The trade is that a failed worker fails its queries by default; Trino has a fault-tolerant mode (`retry-policy=TASK`) that spools intermediate data, at a cost. It reads Iceberg through a REST catalog with a few lines of configuration (`connector.name=iceberg`, `iceberg.catalog.type=rest`, and the catalog's URI), and it can join those tables with Postgres, Kafka or other sources through other connectors. Trino 484 is current and needs Java 25. Use it as the shared SQL engine for analysts and BI tools: the dashboard route.\n\nClickHouse is a column-oriented database server with its own storage, the MergeTree engine, which sorts data on disk by a key you choose and merges small parts in the background. It's built for sub-second queries over fresh event data: a merchant-facing dashboard that must show the last minute of payments. It can read Kafka topics directly and query Iceberg tables, but it shines on data it owns, so it adds a second copy of the data. Use it when \"seconds\" isn't fast enough.\n\nFlink you met in lesson 11: the engine for streaming as the main product, with large keyed state and per-event latency. Spark's Real-time Mode is narrowing the gap for simpler pipelines.\n\nThe pattern: the lakehouse turned \"which engine stores our data\" into \"which engine runs this workload\", and that's the question the rubric answers.",
+      "try": {
+        "title": "One Iceberg table, two engines",
+        "minutes": 4,
+        "steps": [
+          "Run `TwoEnginesOneTableDemo`. Spark creates an Iceberg table in a Hadoop catalog and inserts a million payments. DuckDB then answers the same question with `iceberg_scan` on the table's folder. Spark appends 500,000 more, and both answer again. DuckDB downloads its Iceberg extension the first time, so this demo needs internet once.",
+          "Predict what DuckDB's `iceberg_snapshots` shows before and after the second append.",
+          "DuckDB never talked to Spark. What did it read to find the table's files?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "TwoEnginesOneTableDemo.kt",
+          "src": "package sfz.bigdata.l12.demo\n\nimport java.io.File\n\n/**\n * One Iceberg table, two engines. Spark creates and appends to the table; DuckDB reads the same\n * files through Iceberg's metadata, with no copy and no Spark. Then Spark appends again and DuckDB\n * sees the new snapshot. DuckDB's Iceberg extension is downloaded once on first use.\n */\nfun main() {\n    freshDemoDir()\n    val spark = demoSpark()\n    spark.sql(\"CREATE TABLE lake.pay.payments (payment_id BIGINT, merchant_id INT, status STRING, amount_cents BIGINT, \" +\n        \"created_at TIMESTAMP) USING iceberg PARTITIONED BY (days(created_at))\")\n    fun append(from: Long, n: Long) = spark.sql(\"\"\"\n        INSERT INTO lake.pay.payments\n        SELECT id, CAST(pmod(hash(id), 500) AS INT), CASE WHEN id % 5 = 0 THEN 'REFUNDED' ELSE 'CAPTURED' END,\n               CAST(pmod(hash(id, 2), 250000) + 100 AS BIGINT),\n               timestamp_seconds(1793491200 + (id % 3) * 86400 + pmod(hash(id, 4), 86400))\n        FROM range($from, ${from + n})\"\"\")\n    append(0, 1_000_000)\n    val table = File(DEMO_DIR, \"warehouse/pay/payments\").absolutePath\n    val question = \"SELECT count(*) AS payments, sum(amount_cents) AS amount FROM %s WHERE status = 'CAPTURED'\"\n\n    fun sparkSays() = spark.sql(question.format(\"lake.pay.payments\")).first().let { \"${it.getLong(0)} payments, ${it.getLong(1)} cents\" }\n    println(\"Spark reads:  ${sparkSays()}\")\n    duck().use { c ->\n        c.run(\"INSTALL iceberg\")\n        c.run(\"LOAD iceberg\")\n        fun duckSays() = c.rows(question.format(\"iceberg_scan('$table')\")).first().let { \"${it[0]} payments, ${it[1]} cents\" }\n        println(\"DuckDB reads: ${duckSays()}\")\n        println(\"DuckDB sees snapshots: \" + c.rows(\"SELECT sequence_number, snapshot_id FROM iceberg_snapshots('$table') ORDER BY 1\").map { it[0] })\n\n        append(1_000_000, 500_000)\n        println(\"after Spark appends 500,000 more:\")\n        println(\"Spark reads:  ${sparkSays()}\")\n        println(\"DuckDB reads: ${duckSays()}\")\n        println(\"DuckDB sees snapshots: \" + c.rows(\"SELECT sequence_number, snapshot_id FROM iceberg_snapshots('$table') ORDER BY 1\").map { it[0] })\n    }\n    spark.stop()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.bigdata.l12.demo.TwoEnginesOneTableDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/bigdata/l12/demo/TwoEnginesOneTableDemo.kt"
+        },
+        "expect": "```text\nSpark reads:  800000 payments, 100031813901 cents\nDuckDB reads: 800000 payments, 100031813901 cents\nDuckDB sees snapshots: [1]\nafter Spark appends 500,000 more:\nSpark reads:  1200000 payments, 150159692959 cents\nDuckDB reads: 1200000 payments, 150159692959 cents\nDuckDB sees snapshots: [1, 2]\n```\n\nBoth engines return the same count and sum, before and after the second append. DuckDB reads the table's metadata the way lesson 9 described: `version-hint.text`, the current metadata JSON, the manifest list and the manifests, then only the Parquet files they list. After Spark's second commit it sees two snapshots and the new rows. No export, no copy, and no Spark process involved in DuckDB's read. With a REST catalog instead of a folder, DuckDB would `ATTACH` the catalog and could also write."
+      },
+      "refs": [
+        {
+          "title": "Trino Iceberg connector",
+          "url": "https://trino.io/docs/current/connector/iceberg.html",
+          "kind": "docs"
+        },
+        {
+          "title": "DuckDB Iceberg extension",
+          "url": "https://duckdb.org/docs/2.0/core_extensions/iceberg/overview.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Big data is dead for most queries, not for every job",
+      "body": "Jordan Tigani's \"Big Data is Dead\", which lesson 1 quoted, argues that most companies never had big data: most BigQuery customers stored under 1 TB, and 90% of queries processed under 100 MB. It's worth taking seriously, and worth reading critically. Tigani was a founding engineer of BigQuery and now runs MotherDuck, which sells DuckDB in the cloud, so the conclusion also suits his business. His numbers come from one product and he calls them approximate. And they describe queries, not jobs. The ingest that writes a few TB a day, the backfill that recomputes three years of fraud features, the join of two years of payments against two years of disputes: those are the 1% that still need a cluster, and every payments company has a few of them.\n\nBoth sides are right about different workloads, which is the rubric's point. Run it per workload, and the payments company in this track ends up with the architecture in the figure.\n\nThe payment services and the Oracle ledger's change stream publish to Kafka, the replayable log. A Spark Structured Streaming job appends to Iceberg tables every minute, exactly once (lesson 11). The tables live as Parquet on object storage, and a REST catalog such as Polaris holds their pointers and access rules (lesson 10). Spark batch runs the heavy jobs: nightly settlement over the week's corrections, backfills, model features. Trino serves analysts and BI tools that share the same tables. Finance and engineers answer ad hoc questions with DuckDB on a laptop or one VM. If merchants need a sub-second dashboard, a ClickHouse copy of recent events is added, and nothing else changes.\n\nSomething must run the jobs in order and keep the tables healthy. Apache Airflow 3 (3.4 is current) schedules work on **assets**: a task declares the asset it updates (`outlets=[Asset(\"lake.pay.payments\")]`), and a DAG scheduled on that asset runs whenever it changes. The nightly flow is a chain of them: when the day's payments land, compact yesterday's partitions and expire old snapshots (lesson 10), then run settlement, then refresh the reports that depend on it.\n\nStart small and let the numbers move you. A team with 300 GB of payments can run this whole picture with Iceberg on object storage, a REST catalog, and DuckDB, and add Spark the day the rubric says a job no longer fits one machine.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"The payments lakehouse: services and the Oracle ledger feed Kafka, a Spark stream appends to Iceberg tables registered in a REST catalog, Spark batch, Trino and DuckDB read the same tables, and Airflow 3 schedules maintenance and reports when tables change\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"90\" y=\"24\" text-anchor=\"middle\">producers</text><text class=\"t-s t-m\" x=\"235\" y=\"24\" text-anchor=\"middle\">log</text><text class=\"t-s t-m\" x=\"395\" y=\"24\" text-anchor=\"middle\">lakehouse</text><text class=\"t-s t-m\" x=\"600\" y=\"24\" text-anchor=\"middle\">engines, per workload</text><rect class=\"box\" x=\"20\" y=\"44\" width=\"140\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"90\" y=\"67\" text-anchor=\"middle\">payment services</text><text class=\"t-s t-m\" x=\"90\" y=\"83\" text-anchor=\"middle\">Quarkus, events</text><rect class=\"box\" x=\"20\" y=\"134\" width=\"140\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"90\" y=\"157\" text-anchor=\"middle\">Oracle ledger</text><text class=\"t-s t-m\" x=\"90\" y=\"173\" text-anchor=\"middle\">CDC: corrections</text><rect class=\"box-b\" x=\"185\" y=\"84\" width=\"100\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"235\" y=\"112\" text-anchor=\"middle\">Kafka</text><text class=\"t-s t-m\" x=\"235\" y=\"128\" text-anchor=\"middle\">replayable</text><line class=\"ln\" x1=\"160\" y1=\"70\" x2=\"183\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"160\" y1=\"160\" x2=\"183\" y2=\"132\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"320\" y=\"44\" width=\"150\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"395\" y=\"67\" text-anchor=\"middle\">Spark streaming</text><text class=\"t-s t-m\" x=\"395\" y=\"83\" text-anchor=\"middle\">1-minute batches</text><line class=\"ln\" x1=\"285\" y1=\"100\" x2=\"318\" y2=\"76\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"320\" y=\"134\" width=\"150\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"395\" y=\"162\" text-anchor=\"middle\">Iceberg tables</text><text class=\"t-s t-m\" x=\"395\" y=\"178\" text-anchor=\"middle\">Parquet on S3</text><line class=\"ln\" x1=\"395\" y1=\"96\" x2=\"395\" y2=\"132\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"320\" y=\"236\" width=\"150\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"395\" y=\"259\" text-anchor=\"middle\">REST catalog</text><text class=\"t-s t-m\" x=\"395\" y=\"275\" text-anchor=\"middle\">Polaris: pointers</text><line class=\"ln-d\" x1=\"395\" y1=\"198\" x2=\"395\" y2=\"234\"/><rect class=\"box-ok\" x=\"510\" y=\"44\" width=\"170\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"595\" y=\"67\" text-anchor=\"middle\">Spark batch</text><text class=\"t-s t-m\" x=\"595\" y=\"83\" text-anchor=\"middle\">settlement, backfills</text><rect class=\"box-ok\" x=\"510\" y=\"116\" width=\"170\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"595\" y=\"139\" text-anchor=\"middle\">Trino</text><text class=\"t-s t-m\" x=\"595\" y=\"155\" text-anchor=\"middle\">shared SQL, BI</text><rect class=\"box-ok\" x=\"510\" y=\"188\" width=\"170\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"595\" y=\"211\" text-anchor=\"middle\">DuckDB</text><text class=\"t-s t-m\" x=\"595\" y=\"227\" text-anchor=\"middle\">ad hoc, one laptop</text><line class=\"ln\" x1=\"470\" y1=\"165\" x2=\"508\" y2=\"70\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"470\" y1=\"165\" x2=\"508\" y2=\"142\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"470\" y1=\"165\" x2=\"508\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"236\" width=\"265\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"152.5\" y=\"259\" text-anchor=\"middle\">Airflow 3: runs on table updates</text><text class=\"t-s t-m\" x=\"152.5\" y=\"275\" text-anchor=\"middle\">compact, expire, settle, report</text><line class=\"ln-d\" x1=\"285\" y1=\"262\" x2=\"318\" y2=\"262\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">one copy of the data; each workload picks its engine through the same catalog</text></svg>",
+        "caption": "The payments lakehouse: one copy of the data in Iceberg, behind one REST catalog, read by the engine each workload needs."
+      },
+      "refs": [
+        {
+          "title": "Airflow 3: asset definitions",
+          "url": "https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/assets.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MotherDuck: Big Data is Dead",
+          "url": "https://motherduck.com/blog/big-data-is-dead/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Choosing an engine is like choosing how to move goods for a payments company's offices. Most days you send an envelope, and a courier on a bike (one machine, DuckDB) beats any truck: no loading dock, no scheduling, door to door in minutes. When forty offices each want a box by noon, you need a fleet of vans that leave right away (Trino). When the whole archive moves to a new building, you hire lorries with a plan for a breakdown on the way (Spark, with its task retries). And the stream of daily mail is a postal route that never ends (a streaming engine). Nobody buys lorries because the archive is big; they look at what moves today. The analogy breaks because data, unlike goods, can be read by all of them at once: with Iceberg, the bike, the vans and the lorries pick up from the same shelf, and nothing needs to be moved first.",
+  "in_your_world": "Before your team asks the platform group for a Spark cluster, run the rubric on the real queries. The reconciliation job that compares yesterday's captures in Oracle with the acquirer's settlement files reads a few GB; DuckDB on the Temporal worker that already runs it is enough, and it can read the Iceberg tables directly. The fraud team's three-year feature backfill is a real Spark job. The analysts' dashboards belong on a shared Trino. Your Quarkus services keep publishing to Kafka as they do today, and the lakehouse picks it up from there. The part that's easy to forget is maintenance and order: an Airflow 3 asset-triggered DAG (or your existing Temporal schedules) that compacts, expires and runs settlement after each day lands, so the tables stay fast and the reports read finished data.",
+  "mistake": "The common mistake is choosing the engine by the size of the data at rest, or by what the last company used. \"The ledger is 4 TB\" gets a Spark cluster, and then every report pays seconds of scheduling, shuffle files and a JVM per query to read 7 GB; or the reverse, a laptop DuckDB setup is pushed to run the three-year backfill whose join needs 600 GB and never finishes. People do it because table size is the number everyone knows, while the bytes a query reads after pruning take a minute of arithmetic. The fix is that minute: for each important workload, write down partitions read, columns read, the slowest stage's speed, the working set, the number of concurrent users and the time budget, and route each one on its own. Keep the data in one open table format so each workload can move engines when its numbers change.",
+  "compare": {
+    "title": "The same question in DuckDB SQL and in Spark's DataFrame API",
+    "a": {
+      "label": "DuckDB",
+      "lang": "sql",
+      "title": "in process, reading Parquet in place",
+      "src": "SELECT p.dt, m.mcc, count(*) AS payments,\n       sum(p.amount_cents) AS amount_cents\nFROM read_parquet('payments/*.parquet') p\nJOIN read_parquet('merchants/*.parquet') m\n  ON p.merchant_id = m.merchant_id\nWHERE p.status = 'CAPTURED'\nGROUP BY p.dt, m.mcc\nORDER BY p.dt, m.mcc;"
+    },
+    "b": {
+      "label": "Spark",
+      "lang": "kotlin",
+      "title": "a driver, stages and tasks, even in local mode",
+      "src": "spark.read().parquet(\"payments\")\n    .where(col(\"status\").equalTo(lit(\"CAPTURED\")))\n    .join(spark.read().parquet(\"merchants\"), \"merchant_id\")\n    .groupBy(\"dt\", \"mcc\")\n    .agg(count(lit(1)).alias(\"payments\"),\n         sum(\"amount_cents\").alias(\"amount_cents\"))\n    .orderBy(\"dt\", \"mcc\")\n    .collectAsList()"
+    },
+    "note": "The logical plan is the same: scan two sets of Parquet files, filter, hash join on `merchant_id` with the small side as the build side, aggregate, sort. The difference is everything around it. DuckDB runs the plan inside your process with all threads sharing one hash table. Spark plans stages, broadcasts the merchants to its executors, writes shuffle files for the aggregation, schedules a task per split and collects the result back to the driver. Those steps make Spark scale past one machine and survive failures; on one machine they're overhead you pay on every query."
+  },
+  "worked": {
+    "title": "Route the payments company's workloads",
+    "steps": [
+      {
+        "say": "Write down the machines you can use. A laptop with a fast local disk, and the standard cloud VM your platform runs, reading object storage.",
+        "code": "val laptop = Machine(cores = 10, memoryBytes = 16 * GB, decodeBytesPerSecondPerCore = 500 * MB, ioBytesPerSecond = 3 * GB)\nval vm = Machine(cores = 64, memoryBytes = 256 * GB, decodeBytesPerSecondPerCore = 500 * MB, ioBytesPerSecond = 1_500 * MB)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Describe each workload by what it reads and needs, not by the table. The finance report reads 4 of 60 columns for 30 of 1,095 days.",
+        "code": "val report = Workload(\"monthly finance report\", tableBytes = 4 * TB,\n    partitionsRead = 30.0 / 1095, columnsRead = 4.0 / 60,\n    workingSetBytes = 2 * GB, timeBudgetSeconds = 60.0)\nEngineChoice.choose(report, laptop)\n// Route(engine=SINGLE_NODE, bytesRead=7305936073, singleNodeSeconds=2.43, machines=1)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "The dashboard reads 22 GB, but 40 people run it at once with a 30-second budget, so they share one VM's scan speed. The rubric sends it to an interactive cluster.",
+        "code": "val dashboard = report.copy(name = \"merchant dashboard\", partitionsRead = 90.0 / 1095,\n    timeBudgetSeconds = 30.0, concurrent = 40)\nEngineChoice.choose(dashboard, vm)\n// 21.9 GB x 40 / 1.5 GB/s = 584 s on one VM -> INTERACTIVE_CLUSTER with ceil(584 / 30) = 20 machines",
+        "lang": "kotlin"
+      },
+      {
+        "say": "The backfill's scan fits a 2-hour budget on one VM, but its join must hold 600 GB at once. Memory, not time, sizes the cluster, and an hours-long job needs task retries: a batch cluster.",
+        "code": "val backfill = Workload(\"fraud feature backfill\", tableBytes = 4 * TB, partitionsRead = 1.0,\n    columnsRead = 0.5, workingSetBytes = 600 * GB, timeBudgetSeconds = 2 * 3600.0)\nEngineChoice.choose(backfill, vm)\n// 2 TB / 1.5 GB/s = 1,333 s (fits), 600 GB / 256 GB -> BATCH_CLUSTER with 3 machines",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Write the results into the architecture: DuckDB for the report and ad hoc questions, Trino for the dashboard, Spark for the backfill and settlement, a streaming job for fraud velocity, all over the same Iceberg tables. Revisit the numbers when a workload grows.",
+        "code": "workload                  reads      route\nmonthly finance report    7.3 GB     DuckDB, one machine\nmerchant dashboard        22 GB x40  Trino, about 20 workers\nfraud feature backfill    2 TB       Spark, 3+ executors (600 GB join)\nfraud velocity counts     stream     Spark Structured Streaming or Flink",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "An engine-choice calculator, then one query in two engines",
+    "minutes": 15,
+    "needs": [
+      "JDK 21"
+    ],
+    "files": [
+      "labs/bigdata/src/main/kotlin/sfz/bigdata/l12/EngineChoice.kt",
+      "labs/bigdata/src/main/kotlin/sfz/bigdata/l12/SameQuery.kt"
+    ],
+    "run": "./gradlew :bigdata:test --tests 'sfz.bigdata.l12.*'",
+    "steps": [
+      "Run the tests. All eleven fail on `TODO`s. `EngineChoiceTest` is plain Kotlin with the numbers from this lesson; `SameQueryTest` writes 20,000 payments and 500 merchants as Parquet in a temp folder.",
+      "Write `bytesRead`, `scanBytesPerSecond` and `singleNodeSeconds`: the arithmetic of steps 1 to 3 in section 1, with concurrent users sharing the machine.",
+      "Write `choose`: streaming first, then one machine if it meets the time budget and holds the working set, else a cluster sized by the larger of time and memory, at least 2 machines, interactive if the budget is 60 seconds or less.",
+      "Write `SameQuery.duckdb` as one SQL statement over `read_parquet`, and `SameQuery.spark` with the DataFrame API. The tests compare both with an answer computed in plain Kotlin, and check that Spark broadcast the merchants side (lesson 6).",
+      "Change one test workload's numbers (more users, a bigger working set) and predict the new route before you run it."
+    ],
+    "hints": [
+      "`(w.tableBytes * w.partitionsRead * w.columnsRead).roundToLong()` and `minOf(m.cores * m.decodeBytesPerSecondPerCore, m.ioBytesPerSecond)`.",
+      "Cluster size: `maxOf(2, ceil(seconds / budget).toInt(), ceil(workingSet.toDouble() / memory).toInt())`.",
+      "DuckDB: `read_parquet('$paymentsDir/*.parquet')`; read each row with `rs.getString(1)`, `rs.getInt(2)`, `rs.getLong(3)`, `rs.getLong(4)`.",
+      "Spark: `payments.where(col(\"status\").equalTo(lit(\"CAPTURED\"))).join(merchants, \"merchant_id\").groupBy(\"dt\", \"mcc\").agg(count(lit(1)), sum(\"amount_cents\")).orderBy(\"dt\", \"mcc\")`."
+    ],
+    "done_when": "All eleven tests in `EngineChoiceTest` and `SameQueryTest` pass."
+  },
+  "drill": {
+    "title": "Size a query in four lines",
+    "minutes": 4,
+    "prompt": "From memory, size this query and route it. A 9 TB table of card authorizations covers 2 years (730 daily partitions) and has 45 columns of similar size. A fraud analyst wants 3 columns for the last 14 days, within 30 seconds, alone. Her laptop's scan runs at 2 GB/s and has 32 GB of memory; the working set is small. Then: what if 25 analysts run it at the same moment against one cloud VM at 1.5 GB/s?",
+    "answer": {
+      "lang": "text",
+      "src": "partitions: 9 TB x 14 / 730          = 173 GB\ncolumns:    173 GB x 3 / 45           = 11.5 GB\ntime:       11.5 GB / 2 GB/s          = 5.8 s   (budget 30 s)\nmemory:     small                     -> one machine: DuckDB on her laptop\n\n25 analysts on one VM at 1.5 GB/s:\n            11.5 GB x 25 / 1.5 GB/s   = 192 s   (budget 30 s)\n            ceil(192 / 30)            = 7 machines -> an interactive cluster: Trino"
+    }
+  },
+  "recap": [
+    "Size a query, not a lake: bytes read = table bytes x partitions read x columns read. A 4 TB table often answers from a few GB.",
+    "Time on one machine = bytes read / the slower of (cores x decode speed) and storage speed, times the number of users sharing it. Check the working set against memory too.",
+    "If one machine meets the budget and holds the working set, use one machine (DuckDB). Otherwise size a cluster by the larger of time and memory: Trino for seconds-scale interactive SQL, Spark for long batch jobs that need task retries, a streaming engine for work that never ends.",
+    "On one machine DuckDB answers small queries 10 to 30 times faster than local Spark, because Spark pays for scheduling, shuffle files and the JVM on every query. Those costs buy scale and fault tolerance on a cluster.",
+    "Iceberg and a REST catalog make engine choice per workload: Spark, Trino, DuckDB, Flink and ClickHouse can read the same tables without copies.",
+    "A payments lakehouse: Kafka, a Structured Streaming ingest into Iceberg, a REST catalog, Spark for heavy batch, Trino for shared SQL, DuckDB for ad hoc, and Airflow 3 assets running maintenance and reports when tables change."
+  ],
+  "quiz": [
+    {
+      "q": "A 6 TB payments table covers 2 years (730 daily partitions) with 50 similar columns. A report reads 5 columns of the last 7 days. One laptop scans at 2 GB/s. Roughly how long does the scan take?",
+      "options": [
+        "About 50 minutes: 6 TB at 2 GB/s",
+        "About 30 seconds: one week of the table",
+        "About 3 seconds: 5.8 GB at 2 GB/s",
+        "Less than a millisecond, because Parquet has an index"
+      ],
+      "answer": 2,
+      "why": "6 TB x 7 / 730 = 57.5 GB for a week, x 5 / 50 = 5.8 GB for the columns, / 2 GB/s = about 3 seconds. The 50 minutes ignores pruning entirely; 30 seconds prunes partitions but reads all 50 columns. Parquet's statistics skip row groups, but nothing turns a scan of 5.8 GB into a lookup."
+    },
+    {
+      "q": "Thirty analysts open the same dashboard at 9:00. Each query reads 10 GB, and the budget is 20 seconds. One VM scans 1.5 GB/s. What does the rubric say?",
+      "options": [
+        "One VM: each query takes under 7 seconds",
+        "A Spark batch cluster, because there are many users",
+        "A streaming engine, because the dashboard refreshes",
+        "An interactive cluster of about 10 machines, because 30 queries share the VM's speed: 200 s of scanning against a 20 s budget"
+      ],
+      "answer": 3,
+      "why": "One query alone takes 10 / 1.5 = 6.7 s, but 30 at once share the machine: 200 s. ceil(200 / 20) = 10 machines, and a seconds-scale budget for many users is Trino's job. Spark's per-query scheduling and shuffle overhead suits long batch jobs, and refreshing a dashboard on demand isn't a stream."
+    },
+    {
+      "q": "On a laptop, the same 10-million-row join and aggregation takes about 0.1 s in DuckDB and 1.4 s in Spark local mode. What's the best explanation?",
+      "options": [
+        "Spark reads the Parquet files row by row",
+        "DuckDB caches query results",
+        "Spark pays for planning stages, scheduling tasks, writing and fetching shuffle files and running in the JVM; on one machine those buy nothing",
+        "DuckDB skips the join because the merchants table is small"
+      ],
+      "answer": 2,
+      "why": "Spark reads Parquet by column too, and both engines really run the join. Spark's fixed costs (the driver, stages split at the shuffle, tasks, shuffle files even locally, JVM code generation) exist so that work can spread across machines and survive failures. On one machine they're pure overhead; on 100 machines reading terabytes they're a small tax. DuckDB's three repeated runs didn't return a cached result; each one scanned the files."
+    },
+    {
+      "q": "Which statement about Trino, ClickHouse and Flink is right?",
+      "options": [
+        "ClickHouse keeps data in its own MergeTree storage for sub-second queries on fresh events; Trino queries data where it lives, such as Iceberg tables through a REST catalog",
+        "Trino stores tables in its own format, so data must be loaded into it first",
+        "Flink is a batch SQL engine for dashboards",
+        "All three need HDFS"
+      ],
+      "answer": 0,
+      "why": "Trino has no storage of its own; it reads through connectors, including Iceberg with a REST catalog. ClickHouse is a database server that owns its storage, which is what makes it so fast on recent events, at the price of a second copy. Flink is a streaming-first engine for continuous, stateful processing. None of them needs HDFS; object storage is the usual home."
+    },
+    {
+      "q": "From lesson 1: a team says \"our ledger is 4 TB, we need a cluster\". Its reports read 4 of 60 columns for the last 30 days of 3 years. What does lesson 1's formula say first?",
+      "options": [
+        "Yes: 4 TB at 500 MB/s is over 2 hours",
+        "Compute the bytes the query reads after skipping partitions and columns (about 7 GB), then divide by the slowest stage's bandwidth: seconds on one machine",
+        "Use more machines until the time is under a minute",
+        "The answer depends only on the number of rows"
+      ],
+      "answer": 1,
+      "why": "Lesson 1's levers were \"more readers\" and \"fewer bytes\", and it said to pull the fewer-bytes lever first. 4 TB x 30 / 1,095 x 4 / 60 is about 7.3 GB, a few seconds at a few GB/s. Sizing by the table's bytes at rest is exactly the mistake lesson 1 warned about.",
+      "from": "data-01"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "How do you size a query before choosing an engine?",
+      "back": "Bytes read = table bytes x share of partitions read x share of column bytes read. Then divide by one machine's scan speed."
+    },
+    {
+      "front": "What sets one machine's scan speed?",
+      "back": "The slower of all cores decoding (cores x per-core rate) and the storage feeding them (local disk or network to object storage)."
+    },
+    {
+      "front": "When does a query belong on one machine?",
+      "back": "When one machine meets the time budget, with concurrent users sharing it, and holds the working set in memory."
+    },
+    {
+      "front": "Trino or Spark for a cluster?",
+      "back": "Trino for interactive SQL with seconds-scale budgets and many users; Spark for long batch jobs that need task retries and big shuffles."
+    },
+    {
+      "front": "Why is Spark slower than DuckDB on a laptop?",
+      "back": "Spark pays for the driver, stage planning, task scheduling, shuffle files and the JVM on every query. On one machine those buy nothing."
+    },
+    {
+      "front": "What does ClickHouse add that Trino doesn't?",
+      "back": "Its own storage (MergeTree), sorted and merged in the background, for sub-second queries on fresh events, at the cost of a second copy."
+    },
+    {
+      "front": "What is an Airflow 3 asset?",
+      "back": "A named piece of data, such as a table. Tasks declare the assets they update, and DAGs can be scheduled to run when an asset changes."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Bytes read",
+      "plain": "The bytes a query must actually scan after skipping partitions and columns."
+    },
+    {
+      "term": "Scan speed",
+      "plain": "How many bytes per second one machine can read and decode; the slower of CPU and storage."
+    },
+    {
+      "term": "Working set",
+      "plain": "The data a query must hold in memory at once, such as a join's hash table or the groups of an aggregation."
+    },
+    {
+      "term": "Single-node engine",
+      "plain": "An engine that runs a query inside one process on one machine, such as DuckDB."
+    },
+    {
+      "term": "MPP engine",
+      "plain": "Massively parallel processing: an engine like Trino that splits each query across many workers and pipelines data between them."
+    },
+    {
+      "term": "Crossover",
+      "plain": "The query size where a cluster's parallel bandwidth starts to beat its own per-query overhead."
+    },
+    {
+      "term": "Asset (Airflow 3)",
+      "plain": "A named piece of data that tasks declare they update and that can trigger other DAGs."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your director asks why the data platform proposal uses DuckDB, Trino and Spark instead of \"one engine for everything\". Explain it with the finance report, the merchant dashboard and the fraud backfill, and say what keeps three engines from meaning three copies of the data.",
+    "answer": "We sized each workload by what it reads, not by the 4 TB table. The finance report reads 4 of 60 columns for 30 of 1,095 days: about 7 GB. One machine scans that in a few seconds and its working set is tiny, so DuckDB on one machine answers it with no cluster to run; Spark would spend more time scheduling than reading. The merchant dashboard reads about 22 GB per query, but 40 people open it at once with a 30-second budget, and one VM reading object storage at 1.5 GB/s would need almost 10 minutes for all of them. That needs about 20 machines working in parallel and answering in seconds, which is what Trino is for. The fraud backfill reads 2 TB and joins three years of history: its scan would fit a two-hour window on one VM, but the join needs about 600 GB of memory at once and the job runs for an hour, so it needs a cluster that spreads the state and retries failed tasks: Spark. All three read the same Iceberg tables through one REST catalog, so there's one copy of the data, one set of access rules, and each workload can move to another engine later if its numbers change."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "The rubric leaves out three things that matter in practice. Cost: a cluster that sits idle between nightly jobs costs money, while serverless engines charge per byte scanned, which rewards exactly the pruning this track taught. Operations: every engine is something to upgrade, monitor and secure, so a small team should count engines like dependencies. And concurrency of writers: the catalog's compare-and-swap (lesson 10) lets several engines write the same table, but frequent conflicting writers, such as a streaming ingest and a compaction job on the same partitions, still need scheduling.\n\nDuckDB keeps growing toward shared use. DuckDB 2.0 added Quack, a client-server protocol: one DuckDB process can serve others over the network (`-serve` and `-connect` in the CLI, `CONNECT` in SQL), so a small team can share one warm database instead of each analyst loading data. MotherDuck runs DuckDB as a cloud service, and DuckLake (lesson 10) gives DuckDB a multi-user table format.\n\nSpark is moving the other way, toward fast small queries. Besides single-task execution in 4.3, projects such as Apache Gluten (with Velox) and Apache DataFusion Comet plug native, vectorized C++ or Rust execution into Spark's plans, and Databricks runs its own native engine, Photon. The gap measured in this lesson is mostly per-query overhead and row-by-row JVM processing, and both are being attacked.\n\nFor orchestration, Airflow 3 also versions DAGs (a run finishes on the version it started with) and can schedule on external events, not just on time and assets. If your services already run Temporal, it can orchestrate data jobs too; Airflow's advantage is the ecosystem of operators for Spark, Trino, dbt and the clouds."
+  },
+  "sources": [
+    {
+      "title": "MotherDuck: Big Data is Dead (Jordan Tigani)",
+      "url": "https://motherduck.com/blog/big-data-is-dead/"
+    },
+    {
+      "title": "DuckDB 2.0 announcement",
+      "url": "https://duckdb.org/2026/10/21/announcing-duckdb-200"
+    },
+    {
+      "title": "Trino: Iceberg REST catalog configuration",
+      "url": "https://trino.io/docs/current/object-storage/metastores.html"
+    },
+    {
+      "title": "Airflow 3: asset definitions",
+      "url": "https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/assets.html"
+    },
+    {
+      "title": "Apache Airflow 3.0 announcement",
+      "url": "https://airflow.apache.org/blog/airflow-three-point-oh-is-here/"
+    }
+  ]
+}

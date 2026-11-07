@@ -1,0 +1,446 @@
+{
+  "id": "sql-11",
+  "title": "Indexes and reading EXPLAIN",
+  "minutes": 40,
+  "goal": "By the end you can explain why an index turns a lookup into a few page reads, choose the column order of a multicolumn index, read EXPLAIN (ANALYZE, BUFFERS) node by node from the bottom up, spot the function, cast or low selectivity that makes PostgreSQL ignore an index, and weigh what each index costs on writes.",
+  "warmup": {
+    "q": "payments has 1,000,000 rows in 23,818 pages of 8 KB. Card 4242 has 14 payments, spread over the table. With an index on card_id, about how many pages does PostgreSQL read to fetch them?",
+    "options": [
+      "About 14: one per payment",
+      "About 17: a few index pages, then one table page per payment",
+      "About 1,100: the index is a twentieth of the table",
+      "All 23,818: an index helps sorting, not searching"
+    ],
+    "answer": 1,
+    "why": "The index is a tree three levels deep: one root page, one inner page and one leaf page lead to all 14 row addresses. Then each payment sits on its own table page. In the first Try it that is 3 + 14 = 17 buffers. The first option forgets the index's own pages; the third assumes the whole index is read, which only happens when the index cannot be searched."
+  },
+  "sections": [
+    {
+      "h": "Without an index, finding 14 payments means reading 23,818 pages",
+      "body": "The support screen looks up one card's payments: `SELECT ... FROM payments WHERE card_id = 4242`. On the large data set, payments has 1,000,478 rows in 23,818 pages of 8 KB, 186 MB. Card 4242 has 14 payments. Without an index, PostgreSQL has one way to find them: read every page and test every row. `EXPLAIN (ANALYZE)` runs the query and reports what it did (trimmed, estimates removed):\n\n```postgresql\n Gather (actual time=22.943..249.431 rows=14.00 loops=1)\n   Buffers: shared hit=13203 read=10615\n   ->  Parallel Seq Scan on payments (actual time=15.929..233.812 rows=4.67 loops=3)\n         Filter: (card_id = 4242)\n         Rows Removed by Filter: 333488\n```\n\nEach line with a name is a node, one step of the plan. The sequential scan read the table from the first page to the last. Two helper processes and the main one shared the pages (`loops=3`; `rows=4.67` is the average per process, 14 in all), and each threw away 333,488 rows. A buffer is one 8 KB page: `hit` pages were already in PostgreSQL's memory, `read` pages came from the operating system. 23,818 pages for 14 rows: a quarter of a second here, and the cost grows with the table.\n\nThe fix you would invent: a second copy of just the `card_id` column, sorted, each entry holding the address of its row. The address is the row's page and its slot in the page, the `ctid`; card 4242's first payment lives at `(339,35)`. In a sorted list a binary search needs 20 comparisons to find one card among a million.\n\nTwo problems remain. The copy lives in 8 KB pages too, over a thousand of them, and a binary search across pages still reads about 11 of them. Worse, a new payment's entry belongs somewhere in the middle, and keeping the list sorted would mean shifting every entry after it.\n\nSo leave free space in each page, so that a new entry usually fits where it belongs, and put a small directory on top: one entry per page, saying where its keys start. The directory needs pages too, so it gets a directory of its own, until a single page, the root, covers everything. When a page fills up, it splits in two and its parent gets one more entry. Every lookup walks from the root down to one leaf. That is a **B-tree**, PostgreSQL's default index, more exactly a B+tree; the database internals track builds one in \"B+trees\".\n\n`CREATE INDEX payments_card_idx ON payments (card_id)` builds one in about two seconds: a root page with 4 entries, 4 inner pages and 1,130 leaf pages. Card 4242 now costs 3 index pages plus the 14 table pages its rows are on, 17 buffers and a quarter of a millisecond. In Kotlin terms:\n\n```kotlin\nval byCard = TreeMap<Long, MutableList<RowAddress>>()   // the index: sorted keys, row addresses\nbyCard[4242L]                                            // a seek: 3 pages, then 14 addresses\npayments.filter { it.cardId == 4242L }                   // no index: test all 1,000,478 rows\n```\n\nThat is the picture for this lesson: an index is a sorted copy of a few columns, each entry pointing to its row, and a query is fast when it can find **one short run of entries** in that copy.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A lookup of card 4242 in a three-level B-tree: the root, one of four inner pages, one of 1,130 leaf pages, then 14 pages of the table\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"38\" text-anchor=\"start\">root: 1 page</text><text class=\"t-s t-m\" x=\"20\" y=\"108\" text-anchor=\"start\">inner: 4 pages</text><text class=\"t-s t-m\" x=\"20\" y=\"178\" text-anchor=\"start\">leaves: 1,130 pages</text><text class=\"t-s t-m\" x=\"20\" y=\"250\" text-anchor=\"start\">payments: 23,818 pages</text><rect class=\"box-a\" x=\"300\" y=\"20\" width=\"200\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"400\" y=\"39.5\" text-anchor=\"middle\">root</text><rect class=\"box\" x=\"190\" y=\"90\" width=\"90\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"235\" y=\"109.5\" text-anchor=\"middle\">inner</text><rect class=\"box-a\" x=\"300\" y=\"90\" width=\"90\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"109.5\" text-anchor=\"middle\">inner</text><rect class=\"box\" x=\"410\" y=\"90\" width=\"90\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"455\" y=\"109.5\" text-anchor=\"middle\">inner</text><rect class=\"box\" x=\"520\" y=\"90\" width=\"90\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"109.5\" text-anchor=\"middle\">inner</text><line class=\"ln-d\" x1=\"400\" y1=\"50\" x2=\"235\" y2=\"90\"/><line class=\"ln-a\" x1=\"400\" y1=\"50\" x2=\"345\" y2=\"90\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"400\" y1=\"50\" x2=\"455\" y2=\"90\"/><line class=\"ln-d\" x1=\"400\" y1=\"50\" x2=\"565\" y2=\"90\"/><rect class=\"box\" x=\"170\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"225\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box-a\" x=\"280\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"335\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"445\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"500\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"555\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"610\" y=\"160\" width=\"44\" height=\"30\" rx=\"8\"/><text class=\"t-s t-m\" x=\"412\" y=\"180\" text-anchor=\"middle\">...</text><line class=\"ln-a\" x1=\"345\" y1=\"120\" x2=\"302\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"302\" y=\"210\" text-anchor=\"middle\">card 4242: 14 row addresses</text><rect class=\"box\" x=\"180\" y=\"236\" width=\"460\" height=\"26\" rx=\"8\"/><rect class=\"box-ok\" x=\"184.547\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"200.654\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"212.88\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"231.034\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"273.291\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"276.709\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"302.917\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"335.595\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"343.629\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"414.489\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"488.632\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"588.713\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"611.908\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><rect class=\"box-ok\" x=\"630.642\" y=\"236\" width=\"4\" height=\"26\" rx=\"1\"/><line class=\"ln-a\" x1=\"302\" y1=\"216\" x2=\"302\" y2=\"234\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"180\" y=\"284\" text-anchor=\"start\">page 0</text><text class=\"t-s t-m\" x=\"640\" y=\"284\" text-anchor=\"end\">page 23,817</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">3 index pages + 14 table pages = 17 buffers. A sequential scan reads all 23,818.</text></svg>",
+        "caption": "The real shape of payments_card_idx and the real table pages of card 4242's rows: three index pages to find 14 addresses, then 14 table pages."
+      },
+      "try": {
+        "title": "A seek instead of a scan",
+        "minutes": 5,
+        "steps": [
+          "This Try it uses the large data set. If an earlier lesson did not load it, load it now from the `labs` folder (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute), then open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the block. Read the first plan: how many rows did the scan remove, and how many buffers did it touch?",
+          "The `CREATE INDEX` takes a few seconds. Compare the second plan's buffers with the first's, then check the number of levels and the sizes."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nEXPLAIN (ANALYZE)\nSELECT payment_id, merchant_id, amount_minor, created_at\nFROM payments\nWHERE card_id = 4242;\n\nCREATE INDEX payments_card_idx ON payments (card_id);\n\nEXPLAIN (ANALYZE)\nSELECT payment_id, merchant_id, amount_minor, created_at\nFROM payments\nWHERE card_id = 4242;\n\nSELECT level + 1 AS levels FROM bt_metap('payments_card_idx');\nSELECT relname, relpages, pg_size_pretty(pg_relation_size(oid)) AS size\nFROM pg_class\nWHERE relname IN ('payments', 'payments_card_idx') AND relnamespace = 'big'::regnamespace;"
+        },
+        "expect": "Before the index (times vary with your machine and with what else Docker is doing):\n\n```postgresql\n Gather  (cost=1000.00..30029.92 rows=11 width=32) (actual time=22.943..249.431 rows=14.00 loops=1)\n   Workers Planned: 2\n   Workers Launched: 2\n   Buffers: shared hit=13203 read=10615\n   ->  Parallel Seq Scan on payments  (cost=0.00..29028.82 rows=5 width=32) (actual time=15.929..233.812 rows=4.67 loops=3)\n         Filter: (card_id = 4242)\n         Rows Removed by Filter: 333488\n Execution Time: 249.862 ms\n```\n\nAfter it (trimmed):\n\n```postgresql\n Bitmap Heap Scan on payments  (cost=4.51..47.94 rows=11 width=32) (actual time=0.171..0.214 rows=14.00 loops=1)\n   Recheck Cond: (card_id = 4242)\n   Heap Blocks: exact=14\n   Buffers: shared hit=17 read=3\n   ->  Bitmap Index Scan on payments_card_idx  (cost=0.00..4.51 rows=11 width=0) (actual time=0.145..0.145 rows=14.00 loops=1)\n         Index Cond: (card_id = 4242)\n         Index Searches: 1\n Execution Time: 0.249 ms\n```\n\n`levels` is 3, and the index is 1,136 pages (9 MB) against the table's 23,818 (186 MB). The first run in a session reads a few more index pages than the 3 of the descent; run the EXPLAIN again and the index scan shows `Buffers: shared hit=3`. Leave the index in place for the next Try it."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Index types (B-tree)",
+          "url": "https://www.postgresql.org/docs/18/indexes-types.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Read EXPLAIN from the innermost node out",
+      "body": "A plan is a tree. Each node produces rows and hands them to the node above it, and the top node hands them to you. So read a plan from the most indented node upward, in the direction the rows flow. The stepper walks through the plan for card 4242's payments joined to their merchants, newest first. Four kinds of numbers tell you nearly everything:\n\n- `rows` is what the node produced per loop, and `loops` is how many times it ran. Multiply them: the merchants Index Scan ran 14 times and found one row each time.\n- `Buffers` counts pages for the node and everything under it. The Nested Loop's 59 is the payments side's 17 plus the merchants side's 42. The top node's buffers are the query's total.\n- `cost=4.51..47.94 rows=11` is the planner's estimate, made before the query ran, in arbitrary units. Compare its rows with the actual rows. A miss by ten times or more means the plan was chosen from wrong numbers.\n- `Index Cond` is a condition used to search the index. `Filter` is checked row by row after the rows were read, and `Rows Removed by Filter` counts the wasted work.\n\nThree scan nodes come up all the time. An Index Scan follows each index entry to its row at once, in index order, which is how it can return rows already sorted. A Bitmap Index Scan first collects all the matching row addresses; the Bitmap Heap Scan above it sorts them by page and reads each table page once. PostgreSQL picks the bitmap when it expects more than a few rows, or rows spread over many pages: here, 14 rows on 14 different pages. An Index Only Scan answers from the index without touching the table; the next section builds one.\n\nPostgreSQL 18 changed EXPLAIN in small ways you will see everywhere: `EXPLAIN ANALYZE` includes buffer counts without being asked, rows have two decimals because they are averages over loops, and each index scan reports `Index Searches`, the number of times it descended the tree.\n\nPlain `EXPLAIN` prints the estimates without running anything, so it is safe on any statement. `EXPLAIN ANALYZE` really runs it: on an `UPDATE` it updates the rows, so wrap it in `BEGIN` and `ROLLBACK`.",
+      "stepper": {
+        "title": "One plan, read from the bottom up",
+        "intro": "Click Next. Each frame highlights one node and shows its line from `EXPLAIN (ANALYZE)` (second run, everything in memory).",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"The plan tree for the join: Sort over Nested Loop over two scans\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-m\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">EXPLAIN (ANALYZE): card 4242's payments with merchant names, newest first</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Arrows show rows flowing up. Read from the most indented node to the top.</text></svg>",
+            "say": "The plan of `SELECT p.payment_id, m.name, ... FROM payments p JOIN merchants m ... WHERE p.card_id = 4242 ORDER BY p.created_at DESC`, as a tree. Every node pulls rows from the nodes under it. The most indented node in the text output is the bottom of the tree, and it runs first."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Step 1: the bitmap index scan descends the card index and finds 14 row addresses\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-m\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-a\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-a\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln-a\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Bitmap Index Scan on payments_card_idx (actual rows=14.00 loops=1)</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Index Cond: (card_id = 4242)  |  Index Searches: 1  |  Buffers: shared hit=3</text></svg>",
+            "say": "Start at the bottom. The Bitmap Index Scan descends `payments_card_idx` once (`Index Searches: 1`): root, inner page, leaf, so 3 buffers. It returns no rows yet, only a set of 14 row addresses. `Index Cond` means the condition was used to search the index."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Step 2: the bitmap heap scan reads the 14 table pages, 17 buffers with the index pages\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-a\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-a\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-ok\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Bitmap Heap Scan on payments p (actual rows=14.00 loops=1)</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Recheck Cond: (card_id = 4242)  |  Heap Blocks: exact=14  |  Buffers: shared hit=17</text></svg>",
+            "say": "The Bitmap Heap Scan sorts those addresses by page and reads each table page once, in page order: `Heap Blocks: exact=14`. Its `Buffers` is 17 because a node counts its children too: 14 table pages plus the index scan's 3."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Step 3: the merchant index scan runs once per payment, 14 loops of 3 pages\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-ok\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-m\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box-a\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-a\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-ok\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Index Scan using merchants_pkey on merchants m (actual rows=1.00 loops=14)</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Index Cond: (merchant_id = p.merchant_id)  |  Index Searches: 14  |  Buffers: shared hit=42</text></svg>",
+            "say": "The inner side of the join runs once per payment: `loops=14`. `rows=1.00` is per loop, so it produced 14 rows in all. Each loop descends the merchants primary key and reads one table page, 3 buffers, so 42 in all."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Step 4: the nested loop pairs each payment with its merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-a\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-a\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-ok\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-m\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box-ok\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-ok\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Nested Loop (actual rows=14.00 loops=1)</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Buffers: shared hit=59  (= 17 from payments + 42 from merchants)</text></svg>",
+            "say": "The Nested Loop takes each payment from its first child, runs the second child with that payment's `merchant_id`, and emits the pair. Its 59 buffers are its children's 17 and 42. A Nested Loop is the right join here because the outer side is tiny and the inner side is an index lookup."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Step 5: the sort orders 14 rows in memory; 59 buffers for the whole query\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-a\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-ok\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-ok\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-m\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box-ok\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-ok\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Sort (actual rows=14.00 loops=1)  Sort Key: p.created_at DESC</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">Sort Method: quicksort  Memory: 25kB  |  Buffers: shared hit=59</text></svg>",
+            "say": "The Sort orders the 14 pairs by `created_at DESC` in 25 kB of memory. The top node's numbers are the query's totals: 14 rows, 59 pages of 8 KB, about 0.16 ms when the pages are in memory."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"The estimate next to the actual: 11 rows expected, 14 found\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"235\" y=\"12\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"31\" text-anchor=\"middle\">Sort</text><text class=\"t-s t-m\" x=\"340\" y=\"49\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-ok\" x=\"235\" y=\"84\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"103\" text-anchor=\"middle\">Nested Loop</text><text class=\"t-s t-m\" x=\"340\" y=\"121\" text-anchor=\"middle\">rows=14 loops=1 buffers=59</text><rect class=\"box-a\" x=\"100\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"183\" text-anchor=\"middle\">Bitmap Heap Scan: payments</text><text class=\"t-s t-a\" x=\"205\" y=\"201\" text-anchor=\"middle\">rows=14 loops=1 buffers=17</text><rect class=\"box-ok\" x=\"370\" y=\"164\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"475\" y=\"183\" text-anchor=\"middle\">Index Scan: merchants_pkey</text><text class=\"t-s t-m\" x=\"475\" y=\"201\" text-anchor=\"middle\">rows=1 loops=14 buffers=42</text><rect class=\"box-ok\" x=\"100\" y=\"238\" width=\"210\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"205\" y=\"257\" text-anchor=\"middle\">Bitmap Index Scan: card_id</text><text class=\"t-s t-m\" x=\"205\" y=\"275\" text-anchor=\"middle\">rows=14 loops=1 buffers=3</text><line class=\"ln\" x1=\"205\" y1=\"238\" x2=\"205\" y2=\"213\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"205\" y1=\"164\" x2=\"295\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"475\" y1=\"164\" x2=\"385\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"340\" y1=\"84\" x2=\"340\" y2=\"61\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"296\" width=\"640\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"318\" text-anchor=\"start\">Bitmap Heap Scan on payments p (cost=4.51..47.94 rows=11 width=32)</text><text class=\"t-s\" x=\"32\" y=\"340\" text-anchor=\"start\">estimated before running: 11 rows  |  measured: rows=14.00</text></svg>",
+            "say": "Every node also carries the planner's guess, made before the query ran: `cost=4.51..47.94 rows=11`. Cost is in arbitrary units (start-up..total). It guessed 11 rows and got 14, close enough. When a guess is off by ten times or more, the planner chose this plan from wrong numbers. Look there first: the cause is usually stale statistics, fixed by `ANALYZE`."
+          }
+        ]
+      },
+      "try": {
+        "title": "Read a plan node by node",
+        "minutes": 4,
+        "steps": [
+          "This uses the large data set and the index from the previous Try it.",
+          "Run the block. `\\g` runs the EXPLAIN a second time. In the second plan, check that each parent's `Buffers` is the sum of its children's, and multiply `rows` by `loops` on the merchants scan.",
+          "Compare with the plain `EXPLAIN`. The last statement drops the index."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nEXPLAIN (ANALYZE)\nSELECT p.payment_id, m.name, p.amount_minor, p.created_at\nFROM payments p\nJOIN merchants m ON m.merchant_id = p.merchant_id\nWHERE p.card_id = 4242\nORDER BY p.created_at DESC;\n\\g\n\nEXPLAIN\nSELECT p.payment_id, m.name, p.amount_minor, p.created_at\nFROM payments p\nJOIN merchants m ON m.merchant_id = p.merchant_id\nWHERE p.card_id = 4242\nORDER BY p.created_at DESC;\n\nDROP INDEX payments_card_idx;"
+        },
+        "expect": "The second run, with everything in memory (I/O lines trimmed):\n\n```postgresql\n Sort  (cost=115.41..115.43 rows=11 width=37) (actual time=0.121..0.123 rows=14.00 loops=1)\n   Sort Key: p.created_at DESC\n   Sort Method: quicksort  Memory: 25kB\n   Buffers: shared hit=59\n   ->  Nested Loop  (cost=4.79..115.22 rows=11 width=37) (actual time=0.065..0.111 rows=14.00 loops=1)\n         Buffers: shared hit=59\n         ->  Bitmap Heap Scan on payments p  (cost=4.51..47.94 rows=11 width=32) (actual time=0.043..0.061 rows=14.00 loops=1)\n               Recheck Cond: (card_id = 4242)\n               Heap Blocks: exact=14\n               Buffers: shared hit=17\n               ->  Bitmap Index Scan on payments_card_idx  (cost=0.00..4.51 rows=11 width=0) (actual time=0.013..0.013 rows=14.00 loops=1)\n                     Index Cond: (card_id = 4242)\n                     Index Searches: 1\n                     Buffers: shared hit=3\n         ->  Index Scan using merchants_pkey on merchants m  (cost=0.28..6.12 rows=1 width=21) (actual time=0.003..0.003 rows=1.00 loops=14)\n               Index Cond: (merchant_id = p.merchant_id)\n               Index Searches: 14\n               Buffers: shared hit=42\n Execution Time: 0.161 ms\n```\n\nThe first run shows the same tree with some `read=` counts and a few milliseconds instead of 0.16 ms: those pages came from disk. Plain `EXPLAIN` prints the same nodes with only the `cost=...` estimates and no `actual` part, because it did not run the query."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/18/using-explain.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Column order decides which queries a multicolumn index serves",
+      "body": "The merchant dashboard shows one merchant's newest payments in a month:\n\n```sql\nSELECT payment_id, amount_minor, created_at FROM payments\nWHERE merchant_id = 1000 AND created_at >= '2026-09-01' AND created_at < '2026-10-01'\nORDER BY created_at DESC LIMIT 20;\n```\n\nWithout an index, PostgreSQL reads all 23,818 pages and sorts merchant 1000's 22 September payments: about 0.7 seconds. An index on both columns fixes it, but the order of the columns matters. A multicolumn index sorts by its first column, and by the second only among entries with the same first column, like a phone book sorted by surname and then by first name.\n\nWith `(created_at, merchant_id)`, September is one long run of about 100,000 entries from every merchant, sorted by time. Merchant 1000's entries are scattered through it. PostgreSQL walks the run backward from 1 October and checks each entry's merchant until it has 20: 397 pages, 11 ms.\n\nWith `(merchant_id, created_at)`, all of merchant 1000's entries sit together, already in time order, and its September is one short stretch. PostgreSQL descends to the last of them and reads 20 entries backward: 23 pages, a tenth of a millisecond. Both plans list both columns under `Index Cond`, so judge them by their buffers. The rule: **equality columns first, then the column you range over or sort by**. In Kotlin terms it is a `TreeMap` keyed by `compareBy({ it.merchantId }, { it.createdAt })`, where the range from (1000, 1 September) to (1000, 1 October) is one contiguous `subMap`. Swap the key's parts and no contiguous slice holds just merchant 1000.\n\nPostgreSQL 18 softens the rule with skip scan. An index on `(status, created_at)` used to be useless for a query on `created_at` alone, because `created_at` is sorted only inside each status. Now PostgreSQL jumps into each status's part of the index and searches `created_at` there. For five minutes of payments it reported `Index Searches: 7` and read 27 pages, where a sequential scan reads 23,818. It pays off only when the leading column has few distinct values: through `(merchant_id, created_at)` the same query took 1,616 searches and 5,243 pages.\n\nAn index can also carry columns it does not sort by. `INCLUDE (status, amount_minor)` stores them in the leaf entries, so a query that needs nothing else, such as merchant 1000's September gross, runs as an Index Only Scan and never reads the table: 4 pages. PostgreSQL may skip the table only for pages its visibility map marks as all-visible, and VACUUM keeps that map up to date. `Heap Fetches` counts the rows it still had to check in the table.",
+      "try": {
+        "title": "Swap the columns",
+        "minutes": 5,
+        "steps": [
+          "This uses the large data set.",
+          "Before running, predict which of the first two plans reads more pages, and by how much.",
+          "Run the block. Then find `Heap Fetches` in the third plan and `Index Searches` in the fourth."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nCREATE INDEX payments_created_merchant_idx ON payments (created_at, merchant_id);\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, amount_minor, created_at\nFROM payments\nWHERE merchant_id = 1000 AND created_at >= '2026-09-01' AND created_at < '2026-10-01'\nORDER BY created_at DESC\nLIMIT 20;\nDROP INDEX payments_created_merchant_idx;\n\nCREATE INDEX payments_merchant_created_idx ON payments (merchant_id, created_at)\n    INCLUDE (status, amount_minor);\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, amount_minor, created_at\nFROM payments\nWHERE merchant_id = 1000 AND created_at >= '2026-09-01' AND created_at < '2026-10-01'\nORDER BY created_at DESC\nLIMIT 20;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT count(*), sum(amount_minor)\nFROM payments\nWHERE merchant_id = 1000 AND status = 'succeeded'\n  AND created_at >= '2026-09-01' AND created_at < '2026-10-01';\nDROP INDEX payments_merchant_created_idx;\n\nCREATE INDEX payments_status_created_idx ON payments (status, created_at);\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE created_at >= '2026-09-01 12:00' AND created_at < '2026-09-01 12:05';\nDROP INDEX payments_status_created_idx;"
+        },
+        "expect": "Four plans (trimmed to the scan and its counters):\n\n```postgresql\n-- (created_at, merchant_id)\n ->  Index Scan Backward using payments_created_merchant_idx on payments (actual time=0.226..11.030 rows=20.00 loops=1)\n       Index Cond: ((created_at >= ...) AND (created_at < ...) AND (merchant_id = 1000))\n       Buffers: shared hit=35 read=362\n-- (merchant_id, created_at) INCLUDE (status, amount_minor)\n ->  Index Scan Backward using payments_merchant_created_idx on payments (actual time=0.065..0.099 rows=20.00 loops=1)\n       Index Cond: ((merchant_id = 1000) AND (created_at >= ...) AND (created_at < ...))\n       Buffers: shared hit=20 read=3\n-- the monthly gross, from the same index\n ->  Index Only Scan using payments_merchant_created_idx on payments (actual time=0.038..0.042 rows=17.00 loops=1)\n       Filter: (status = 'succeeded'::text)\n       Rows Removed by Filter: 5\n       Heap Fetches: 0\n       Buffers: shared hit=4\n-- (status, created_at), queried on created_at alone\n Index Scan using payments_status_created_idx on payments (actual time=0.217..0.418 rows=12.00 loops=1)\n   Index Cond: ((created_at >= ...) AND (created_at < ...))\n   Index Searches: 7\n   Buffers: shared hit=15 read=12\n```\n\n397 pages against 23, for the same 20 rows and the same `Index Cond` columns. The gross never touched the table. The skip scan made 7 descents, about two per status, and read 27 pages. Each index takes a few seconds to build; the block drops them all."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Multicolumn indexes",
+          "url": "https://www.postgresql.org/docs/18/indexes-multicolumn.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Index-only scans and covering indexes",
+          "url": "https://www.postgresql.org/docs/18/indexes-index-only-scans.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Use The Index, Luke: Concatenated indexes",
+          "url": "https://use-the-index-luke.com/sql/where-clause/the-equals-operator/concatenated-keys",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "PostgreSQL cannot search an index for a value it has to compute",
+      "body": "An index on `created_at` is sorted by `created_at`. It is not sorted by `created_at::date`, or `lower(email)`, or anything else computed from the column, so PostgreSQL cannot search it for those values. Queries that look harmless hit this all the time.\n\n`WHERE created_at::date = '2026-09-01'` read the whole index on `created_at`, 2,739 pages, casting each value and filtering: the plan says `Filter`, not `Index Cond`. The same day as a range on the bare column, `created_at >= '2026-09-01' AND created_at < '2026-09-02'`, read 13 pages. A condition that can search an index is called sargable, from \"search argument\". Keep the column alone on one side and put the computation on the constants.\n\nThe cast can come from your own code. PostgreSQL compares a `bigint` with a `numeric` by converting the bigint, so `WHERE payment_id = $1` with a numeric parameter, which is what JDBC's `setBigDecimal` sends, runs as `(payment_id)::numeric = $1`. The primary key goes unused and one lookup by id reads all 23,818 pages. Bind ids with `setLong`. Oracle has the same trap when a `VARCHAR2` column meets an `NVARCHAR` bind.\n\nWhen you cannot change the query, index the expression. `CREATE INDEX ON customers (lower(email))` turns the case-insensitive login lookup from 532 pages into 4. The expression must be immutable, always the same result for the same input. `created_at::date` is not, since its result depends on the session's `TimeZone`, so PostgreSQL refuses to index it.\n\nSometimes the planner skips an index on purpose. 93% of payments are `succeeded`, so `WHERE status = 'succeeded'` needs almost every table page anyway. Reading the table straight through beats jumping between index and table 930,000 times, and the plan is a sequential scan even with an index on `status`. The same index is used for `status = 'pending'`, 1% of rows. If only the rare value is ever queried, a partial index stores only those rows: `CREATE INDEX ON payments (created_at) WHERE status = 'pending'` is 232 kB, against 21 MB for an index on `created_at` over every payment.",
+      "try": {
+        "title": "Five ways to miss an index",
+        "minutes": 6,
+        "steps": [
+          "This uses the large data set.",
+          "Run the block one statement at a time. For each plan, say whether the condition is an `Index Cond` or a `Filter`, and why.",
+          "The `CREATE INDEX ... ((created_at::date))` fails on purpose: read the error.",
+          "The last statement drops every index the block made."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nCREATE INDEX payments_created_idx ON payments (created_at);\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT count(*) FROM payments WHERE created_at::date = '2026-09-01';\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT count(*) FROM payments WHERE created_at >= '2026-09-01' AND created_at < '2026-09-02';\nCREATE INDEX payments_day_idx ON payments ((created_at::date));\n\nPREPARE by_id(numeric) AS SELECT payment_id, amount_minor FROM payments WHERE payment_id = $1;\nEXPLAIN (ANALYZE, COSTS OFF) EXECUTE by_id(500000);\nDEALLOCATE by_id;\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT customer_id FROM customers WHERE lower(email) = 'user42@example.com';\nCREATE INDEX customers_lower_email_idx ON customers (lower(email));\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT customer_id FROM customers WHERE lower(email) = 'user42@example.com';\n\nCREATE INDEX payments_status_idx ON payments (status);\nEXPLAIN (COSTS OFF) SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded';\nEXPLAIN (COSTS OFF) SELECT sum(amount_minor) FROM payments WHERE status = 'pending';\nCREATE INDEX payments_pending_idx ON payments (created_at) WHERE status = 'pending';\nSELECT pg_size_pretty(pg_relation_size('payments_created_idx')) AS every_payment,\n       pg_size_pretty(pg_relation_size('payments_status_idx')) AS status_idx,\n       pg_size_pretty(pg_relation_size('payments_pending_idx')) AS pending_only;\nDROP INDEX payments_created_idx, payments_status_idx, payments_pending_idx, customers_lower_email_idx;"
+        },
+        "expect": "From one run (trimmed; times vary):\n\n```postgresql\n-- created_at::date = ...: the whole index, value by value\n ->  Parallel Index Only Scan using payments_created_idx on payments (actual time=279.320..310.918 rows=1111.67 loops=3)\n       Filter: ((created_at)::date = '2026-09-01'::date)\n       Rows Removed by Filter: 332381\n       Buffers: shared hit=3 read=2736\n-- the same day as a range: a seek\n ->  Index Only Scan using payments_created_idx on payments (actual time=0.119..0.519 rows=3335.00 loops=1)\n       Index Cond: ((created_at >= '2026-09-01 00:00:00+00'::timestamp with time zone) AND (created_at < '2026-09-02 00:00:00+00'::timestamp with time zone))\n       Buffers: shared hit=12 read=1\nERROR:  functions in index expression must be marked IMMUTABLE\n-- a numeric parameter against a bigint key\n ->  Parallel Seq Scan on payments (actual time=99.076..131.579 rows=0.33 loops=3)\n       Filter: ((payment_id)::numeric = '500000'::numeric)\n       Buffers: shared hit=12320 read=11498\n```\n\n`lower(email)` reads all 532 pages of customers before its index exists and 4 after. The status index is used for `pending` (an Index Scan) and ignored for `succeeded` (a Parallel Seq Scan). The sizes are `21 MB`, `6904 kB` and `232 kB`: the partial index holds only the 1% of payments that are pending."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Indexes on expressions",
+          "url": "https://www.postgresql.org/docs/18/indexes-expressional.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Partial indexes",
+          "url": "https://www.postgresql.org/docs/18/indexes-partial.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Use The Index, Luke: Functions in the WHERE clause",
+          "url": "https://use-the-index-luke.com/sql/where-clause/functions",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Every index costs something on every write",
+      "body": "An index is a second copy, so every write pays for it. An `INSERT` adds an entry to every index. An `UPDATE` adds entries too, unless it changes no indexed column and the new row version fits on the same page. Dead entries stay until VACUUM removes them. Copying 200,000 payments into a table with no index wrote 42 MB of write-ahead log; into the same table with a primary key and three more indexes it wrote 99 MB, and the indexes took 22 MB next to the 37 MB table. On a quiet run the copy took about 3 seconds bare and 8 with the four indexes, and 13 once a GIN index on `metadata` (lesson 10) was added.\n\nSo index what the queries need, and find out what they need with `pg_stat_statements`, which the course's Compose service preloads. It records each statement with its constants replaced by `$1`, how often it ran, its total and mean time, and the pages it touched. Twenty card lookups become one line with `calls = 20` and 23,818 pages per call. Sort the view by `total_exec_time`: a query that takes 2 ms but runs a million times a day costs more than a slow nightly report. Take the top one, `EXPLAIN (ANALYZE)` it, find the sequential scan or the `Filter` that removes most rows, and build the index whose leading columns are its equality conditions.\n\nCheck the other direction too. `pg_stat_user_indexes.idx_scan` counts how often each index has been used; one still at 0 after a month of production traffic only costs writes. Foreign keys deserve a look of their own: PostgreSQL never indexes the referencing column for you, and the course schema deliberately left those indexes for this lesson. Without an index on `payments.merchant_id`, deleting a merchant makes PostgreSQL scan payments for rows that still point to it.",
+      "try": {
+        "title": "What an index costs, and which query needs one",
+        "minutes": 5,
+        "steps": [
+          "This uses the large data set.",
+          "Run the block. It copies 200,000 payments twice, once into a bare table and once into the same table with four indexes, and prints how much write-ahead log each copy wrote.",
+          "Then it resets pg_stat_statements, runs 20 card lookups with `\\gexec` (one line of output each), and asks which query cost the most."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nCREATE TABLE pay_copy (LIKE payments);\nSELECT count(*) FROM payments WHERE payment_id <= 200000;    -- warm the source pages\n\\timing on\nSELECT pg_current_wal_lsn() AS before \\gset\nINSERT INTO pay_copy SELECT * FROM payments WHERE payment_id <= 200000;\nSELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before')) AS wal_written;\nTRUNCATE pay_copy;\nALTER TABLE pay_copy ADD PRIMARY KEY (payment_id);\nCREATE INDEX ON pay_copy (card_id);\nCREATE INDEX ON pay_copy (merchant_id, created_at);\nCREATE INDEX ON pay_copy (created_at);\nSELECT pg_current_wal_lsn() AS before \\gset\nINSERT INTO pay_copy SELECT * FROM payments WHERE payment_id <= 200000;\nSELECT pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), :'before')) AS wal_written;\n\\timing off\nSELECT pg_size_pretty(pg_table_size('pay_copy')) AS table_size,\n       pg_size_pretty(pg_indexes_size('pay_copy')) AS four_indexes;\nDROP TABLE pay_copy;\n\nSELECT pg_stat_statements_reset() IS NOT NULL AS reset;\nSELECT format('SELECT count(*) FROM payments WHERE card_id = %s', 4000 + g)\nFROM generate_series(1, 20) AS g \\gexec\nSELECT calls, round(mean_exec_time) AS mean_ms,\n       (shared_blks_hit + shared_blks_read) / calls AS pages_per_call, query\nFROM pg_stat_statements\nWHERE query LIKE '%card_id%'\nORDER BY total_exec_time DESC\nLIMIT 3;"
+        },
+        "expect": "`wal_written` is about `42 MB` for the copy without indexes and `99 MB` with four, and the four indexes take `22 MB` next to the `37 MB` table. The two insert times are less steady: on a busy Docker VM they swing by seconds from run to run, so trust the WAL and the sizes. The `\\gexec` line runs 20 card lookups (20 one-row results, trimmed here), and pg_stat_statements folds them into one line:\n\n```postgresql\n calls | mean_ms | pages_per_call |                      query\n-------+---------+----------------+--------------------------------------------------\n    20 |     240 |          23818 | SELECT count(*) FROM payments WHERE card_id = $1\n(1 row)\n```\n\n`mean_ms` varies with the machine. `pages_per_call` is the whole table, every time: this query wants the index from the first Try it."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: pg_stat_statements",
+          "url": "https://www.postgresql.org/docs/18/pgstatstatements.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "An index is the index at the back of a book. To find every page that mentions \"chargeback\" you do not read the book; you look the word up in the alphabetical list, which sends you to pages 12, 87 and 340. A multicolumn index is a list sorted by chapter and then by word: it finds \"chargeback in chapter 4\" at once, but not \"chargeback in any chapter\", because that word is scattered through every chapter's section. A partial index covers only the words of one chapter, an index on an expression lists the words in lower case, and a covering index also prints the sentence next to each entry so you never open the page. The analogy breaks on cost: a printed index is written once, while a database index is rewritten on every INSERT and every UPDATE of its columns, and PostgreSQL decides for itself, by estimates, whether looking something up is cheaper than reading straight through.",
+  "in_your_world": "Most slow endpoints in a payments service are one missing or misordered index away from fast: the merchant dashboard (merchant_id, created_at), the card history (card_id, created_at), the idempotency lookup on payment_uid, the outbox poller on (status, created_at) WHERE status = 'pending'. pg_stat_statements is the place to start, and on Oracle the same question is answered by AWR's SQL ordered by elapsed time. Watch the JVM side for the hidden cast: a Kotlin BigDecimal id bound with setBigDecimal, or a Hibernate mapping of a NUMBER column to BigDecimal, makes PostgreSQL convert the column and skip the primary key. Every index also slows the Kafka consumer that inserts payments at 5,000 a second and grows the WAL that your replicas must replay and your CDC pipeline (Debezium) must read through, so drop indexes that pg_stat_user_indexes says nobody uses. In production, build them with CREATE INDEX CONCURRENTLY, which does not block writes, in a Flyway migration that does not run inside a transaction.",
+  "mistake": "Adding an index and assuming the query uses it, without reading the plan. People do it because the index exists, the column is in the WHERE clause, and the query got faster in development on a few hundred rows, where every plan is fast. In production the condition casts the column (created_at::date, a numeric bind on a bigint key), the columns are in the wrong order for the equality and range conditions, or the value matches most of the table, and the plan is still a sequential scan or a full index scan behind a Filter. The fix is to read EXPLAIN (ANALYZE) on production-sized data: the condition should appear as an Index Cond, the buffers should be in the tens rather than the thousands, and rows removed by filter should be near zero.",
+  "compare": {
+    "title": "Actual rows and buffers for one query: Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle: run with statistics, then DISPLAY_CURSOR",
+      "src": "-- run the query once, collecting row-source statistics\nSELECT /*+ gather_plan_statistics */\n       payment_id, amount_minor, created_at\nFROM payments\nWHERE merchant_id = 1000\n  AND created_at >= TIMESTAMP '2026-09-01 00:00:00 +00:00'\n  AND created_at <  TIMESTAMP '2026-10-01 00:00:00 +00:00'\nORDER BY created_at DESC\nFETCH FIRST 20 ROWS ONLY;\n\n-- the plan of this session's last statement, with\n-- E-Rows (estimated), A-Rows (actual) and Buffers\nSELECT *\nFROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));"
+    },
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL: EXPLAIN (ANALYZE)",
+      "src": "-- runs the query and prints the plan with estimated\n-- and actual rows, loops and buffers on every node\n-- (BUFFERS is included by default since PostgreSQL 18)\nEXPLAIN (ANALYZE)\nSELECT payment_id, amount_minor, created_at\nFROM payments\nWHERE merchant_id = 1000\n  AND created_at >= '2026-09-01'\n  AND created_at <  '2026-10-01'\nORDER BY created_at DESC\nLIMIT 20;\n\n-- plain EXPLAIN: estimates only, nothing runs"
+    },
+    "note": "Both databases separate the estimate from the measurement. Oracle's EXPLAIN PLAN, like PostgreSQL's plain EXPLAIN, shows only what the optimizer expects; the actual rows and buffers come from running the statement with statistics collection on and reading the cursor's plan with DBMS_XPLAN.DISPLAY_CURSOR, where E-Rows against A-Rows plays the role of PostgreSQL's rows=11 against actual rows=14.00. Both print a tree as indented operations, read from the innermost outward. The index rules carry over: Oracle B-tree indexes follow the same column-order rule, Oracle has had an INDEX SKIP SCAN for many releases, its function-based indexes are PostgreSQL's expression indexes, and since Oracle has no INCLUDE clause, a covering index there simply adds the extra columns to the key."
+  },
+  "worked": {
+    "title": "An index for the account statement, from a slow query to an Index Only Scan",
+    "steps": [
+      {
+        "say": "The statement page lists one account's ledger entries for a month, oldest first. pg_stat_statements puts it near the top by total time. On the large data set the ledger has 3,398,299 rows in 33,630 pages, and the plan reads all of them to return 4:",
+        "code": "-- 1. the query and its plan (EXPLAIN (ANALYZE, COSTS OFF), trimmed)\nSELECT created_at, entry_type, amount_minor\nFROM ledger_entries\nWHERE account_id = 4242\n  AND created_at >= '2026-09-01' AND created_at < '2026-10-01'\nORDER BY created_at;\n\n--  Sort (actual time=224.879..229.448 rows=4.00 loops=1)\n--    Buffers: shared hit=285 read=33348\n--    ->  Gather\n--          ->  Parallel Seq Scan on ledger_entries (... rows=1.33 loops=3)\n--                Filter: ((created_at >= ...) AND (created_at < ...) AND (account_id = 4242))\n--                Rows Removed by Filter: 1132826",
+        "lang": "sql"
+      },
+      {
+        "say": "Choose the key from the conditions. `account_id` is an equality, so it goes first. `created_at` is both the range and the sort order, so it goes second: then the month is one contiguous run, already in the order the page wants, and the Sort disappears.",
+        "code": "-- 2. equality column first, then the range and sort column\nCREATE INDEX ledger_account_created_idx\n    ON ledger_entries (account_id, created_at);",
+        "lang": "sql"
+      },
+      {
+        "say": "The query also returns `entry_type` and `amount_minor`. Each one found through the index would still cost a visit to a table page. Carry them in the leaf entries with INCLUDE, so the index alone answers the query.",
+        "code": "-- 3. the same key, plus the returned columns in the leaves\nCREATE INDEX ledger_account_created_idx\n    ON ledger_entries (account_id, created_at)\n    INCLUDE (entry_type, amount_minor);",
+        "lang": "sql"
+      },
+      {
+        "say": "Check the plan, not the clock: an Index Only Scan with both conditions in `Index Cond`, no Sort, no Filter, `Heap Fetches: 0` and 7 buffers instead of 33,633. The bill comes with it: on the large data set the index is 161 MB next to a 263 MB table, written on every ledger insert. For a page every customer opens, that is a fair price. For a report run once a month, it is not.",
+        "code": "-- 4. the new plan (EXPLAIN (ANALYZE, COSTS OFF), trimmed)\n--  Index Only Scan using ledger_account_created_idx on ledger_entries (actual time=7.463..7.468 rows=4.00 loops=1)\n--    Index Cond: ((account_id = 4242) AND (created_at >= ...) AND (created_at < ...))\n--    Heap Fetches: 0\n--    Index Searches: 1\n--    Buffers: shared hit=4 read=3\n\nSELECT pg_size_pretty(pg_relation_size('ledger_account_created_idx')) AS idx,   -- 161 MB\n       pg_size_pretty(pg_relation_size('ledger_entries')) AS tbl;              -- 263 MB",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Three indexes and one rewrite, checked against the plan",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l11/merchant_month_index.sql",
+      "labs/sql/src/main/resources/sfz/sql/l11/payments_on_day.sql",
+      "labs/sql/src/main/resources/sfz/sql/l11/merchant_gross_index.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l11.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder. Five of the seven fail. The two that check the rows of `payments_on_day` already pass: its placeholder returns the right rows, the slow way.",
+      "The tests build a 200,000-row copy of payments once (schema `lab11`, vacuumed), run your statement on it inside a transaction that is rolled back, and read `EXPLAIN (ANALYZE, BUFFERS)`. A failure prints the whole plan.",
+      "`merchant_month_index.sql` builds an index with the right columns in the wrong order. Fix the order so the dashboard query reads at most 40 buffers, with no Sort.",
+      "`payments_on_day.sql` casts `created_at` to a date. Rewrite the condition so an index on `created_at` can search it, keeping both edges of the day right.",
+      "`merchant_gross_index.sql` builds an index that finds the rows but cannot answer the query alone. Make the monthly statement an Index Only Scan with `Heap Fetches: 0`. Run the tests until all seven pass."
+    ],
+    "hints": [
+      "Equality first: `CREATE INDEX payments_merchant_month_idx ON payments (merchant_id, created_at);`. Read the failing plan's buffers before and after.",
+      "`WHERE created_at >= timestamptz '2026-03-12 00:00+00' AND created_at < timestamptz '2026-03-13 00:00+00'`: half-open, so midnight is in, 23:59:59.5 is in, and the 13th is out.",
+      "The query reads `merchant_id`, `created_at`, `status` and `amount_minor`. Keep the first two as the key and add `INCLUDE (status, amount_minor)`. The second test adds five rows on a page VACUUM has not seen, so a few heap fetches are expected there."
+    ],
+    "done_when": "All seven tests in `IndexesTest` pass."
+  },
+  "drill": {
+    "title": "Pick the index, from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write the index for each query and say which plan node you expect. (1) `WHERE card_id = ? ORDER BY created_at DESC LIMIT 10`. (2) `WHERE lower(email) = lower(?)` on customers. (3) `WHERE status = 'pending' AND created_at < now() - interval '15 minutes'`, where 1% of payments are pending. (4) `SELECT sum(amount_minor) FROM payments WHERE merchant_id = ? AND created_at >= ? AND created_at < ?`. Then rewrite `WHERE date_trunc('day', created_at) = '2026-03-12'` so an index on created_at can serve it.",
+    "answer": {
+      "lang": "sql",
+      "src": "-- (1) equality, then the sort column: Index Scan Backward, no Sort, stops after 10\nCREATE INDEX ON payments (card_id, created_at);\n\n-- (2) index the expression the query uses: Index Scan (or Bitmap) with Index Cond on lower(email)\nCREATE INDEX ON customers (lower(email));\n\n-- (3) a partial index holds only the 1% that is ever queried: small, and an Index Scan\nCREATE INDEX ON payments (created_at) WHERE status = 'pending';\n\n-- (4) key for the search, INCLUDE for the sum: Index Only Scan, Heap Fetches near 0 after VACUUM\nCREATE INDEX ON payments (merchant_id, created_at) INCLUDE (amount_minor);\n\n-- the rewrite: the bare column, a half-open range\nWHERE created_at >= timestamptz '2026-03-12 00:00+00'\n  AND created_at <  timestamptz '2026-03-13 00:00+00'"
+    }
+  },
+  "recap": [
+    "An index is a sorted copy of some columns with each row's address. A B-tree of three levels finds a key in 3 page reads, then one table page per row; without it, PostgreSQL reads the whole table.",
+    "Read EXPLAIN from the most indented node up. rows is per loop, so multiply by loops; Buffers include the children; compare estimated rows with actual rows; Index Cond searches, Filter only discards.",
+    "In a multicolumn index, equality columns come first, then the range or sort column. PostgreSQL 18's skip scan helps when the leading column has few values. INCLUDE columns make an Index Only Scan possible.",
+    "A function or cast on the column (created_at::date, a numeric bind on a bigint) stops the index search: keep the bare column on one side, or index the expression. Low-selectivity conditions are rightly scanned; partial indexes cover the rare values.",
+    "Every index is written on every insert and most updates: more WAL, more space. Choose indexes from pg_stat_statements and drop the ones pg_stat_user_indexes says are unused."
+  ],
+  "quiz": [
+    {
+      "q": "A query has `WHERE merchant_id = 42 AND created_at >= '2026-09-01' ORDER BY created_at LIMIT 50`. Which index serves it best?",
+      "options": [
+        "(created_at, merchant_id)",
+        "(merchant_id, created_at)",
+        "Two separate indexes, one on each column",
+        "(merchant_id) INCLUDE (created_at)"
+      ],
+      "answer": 1,
+      "why": "With merchant_id first, merchant 42's entries are contiguous and already in created_at order, so the scan seeks to 1 September and reads 50 entries with no Sort. With created_at first, the scan reads every merchant's entries from 1 September on and checks each. INCLUDE columns are not sorted, so (merchant_id) INCLUDE (created_at) still needs a Sort. Two single-column indexes can be combined with a bitmap, but the result must still be sorted."
+    },
+    {
+      "q": "EXPLAIN shows `Index Scan using merchants_pkey on merchants m (actual rows=1.00 loops=2500)` with `Buffers: shared hit=7500`. What did the node do?",
+      "options": [
+        "It read 1 row in 7,500 pages",
+        "It ran 2,500 times, found one row each time and read 3 pages per run",
+        "It ran once and returned 2,500 rows",
+        "It estimated 2,500 rows and found 1"
+      ],
+      "answer": 1,
+      "why": "rows is an average per loop, so the node produced 2,500 rows in 2,500 runs: the inner side of a nested loop. Buffers are a total over all loops, 3 pages per run, one descent of a small B-tree plus one table page. Estimates appear in the cost=... part, not in actual rows."
+    },
+    {
+      "q": "The login service runs `WHERE lower(email) = lower(?)` and customers has a UNIQUE index on email. The plan is a Seq Scan. What is the fix?",
+      "options": [
+        "ANALYZE customers, so the planner sees the index",
+        "Rewrite it as `WHERE email = ?`",
+        "CREATE INDEX ON customers (lower(email))",
+        "Raise work_mem"
+      ],
+      "answer": 2,
+      "why": "The index is sorted by email, not by lower(email), so it cannot be searched for the lowered value; fresh statistics change nothing. Rewriting to email = ? changes the meaning, since stored emails may have capital letters. An index on the expression is sorted by exactly the value the query compares."
+    },
+    {
+      "q": "You add an index on payments(status). `SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded'` still runs as a sequential scan. Why?",
+      "options": [
+        "93% of rows match, so reading the table straight through is cheaper than following 930,000 index entries",
+        "Indexes cannot be used on text columns",
+        "The planner needs a hint to use a new index",
+        "sum() always needs a sequential scan"
+      ],
+      "answer": 0,
+      "why": "The planner compares estimated costs. Fetching nearly every row through the index means visiting nearly every page anyway, in a worse order, so the Seq Scan wins. The same index is used for status = 'pending', 1% of rows, and a partial index on the rare value is the better tool. PostgreSQL has no optimizer hints, and B-trees work on text."
+    },
+    {
+      "q": "Lesson 9's keyset query `WHERE (created_at, payment_id) < (:t, :id) ORDER BY created_at DESC, payment_id DESC LIMIT 20` read 5 buffers with an index on (created_at, payment_id). With the index on (payment_id, created_at) instead, what would you expect?",
+      "options": [
+        "The same 5 buffers: both columns are in the index",
+        "Fewer buffers, because payment_id is unique",
+        "Many more: rows in (created_at, payment_id) order are not contiguous in that index, so no single seek finds the page",
+        "An error: row comparisons need a matching index"
+      ],
+      "answer": 2,
+      "why": "The row comparison and the ORDER BY follow created_at first, so only an index that sorts by created_at first holds the next page as one contiguous run behind the cursor. Sorted by payment_id first, the next 20 rows by time are scattered through the index, and PostgreSQL falls back to reading far more of it, or the table, and sorting. Row comparisons work without an index; they are just slow.",
+      "from": "sql-09"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is in a B-tree index entry?",
+      "back": "The indexed column values (the key) and the address of the row: its page and slot in the table (ctid)."
+    },
+    {
+      "front": "In EXPLAIN ANALYZE, what is rows=1.00 loops=14?",
+      "back": "One row per run, 14 runs: 14 rows in all. rows is always an average per loop."
+    },
+    {
+      "front": "Index Cond or Filter: which one uses the index to search?",
+      "back": "Index Cond. A Filter is tested row by row after the rows were read; Rows Removed by Filter counts the waste."
+    },
+    {
+      "front": "Column order rule for a multicolumn B-tree index?",
+      "back": "Equality columns first, then the one column you range over or sort by. PostgreSQL 18 skip scan relaxes it only when the leading column has few distinct values."
+    },
+    {
+      "front": "Why does `WHERE created_at::date = '2026-09-01'` miss an index on created_at?",
+      "back": "The index is sorted by created_at, not by the computed date. Write a half-open range on the bare column instead."
+    },
+    {
+      "front": "What makes an Index Only Scan possible?",
+      "back": "Every column the query needs is in the index (key or INCLUDE), and the visibility map marks the pages all-visible. Heap Fetches counts the exceptions."
+    },
+    {
+      "front": "Where do you find the queries that most need an index?",
+      "back": "pg_stat_statements, ordered by total_exec_time: calls, mean time and pages per normalized query."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Index",
+      "plain": "A separate structure holding a sorted copy of some columns, each entry pointing to its row."
+    },
+    {
+      "term": "B-tree",
+      "plain": "PostgreSQL's default index: sorted leaf pages with free space, and a few levels of directory pages above them, so a lookup reads one page per level."
+    },
+    {
+      "term": "Sequential scan",
+      "plain": "Reading a table's pages from first to last and testing every row."
+    },
+    {
+      "term": "Buffer",
+      "plain": "One 8 KB page as EXPLAIN counts it: hit if it was already in PostgreSQL's memory, read if it came from the operating system."
+    },
+    {
+      "term": "Sargable",
+      "plain": "A condition the database can use to search an index: the bare column compared with values computed beforehand."
+    },
+    {
+      "term": "Covering index",
+      "plain": "An index that holds every column a query needs, often through INCLUDE, so the query can run as an Index Only Scan."
+    },
+    {
+      "term": "Partial index",
+      "plain": "An index over only the rows that match its WHERE clause, such as status = 'pending'."
+    },
+    {
+      "term": "Skip scan",
+      "plain": "PostgreSQL 18's way to use a multicolumn index without a condition on its leading column, by searching once per leading value."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate added an index on payments(created_at) for the daily settlement report, which filters with `WHERE created_at::date = :day`, and the report is as slow as before. Explain what is happening and what you would change, and how you would prove the fix with EXPLAIN.",
+    "answer": "The index is a sorted copy of created_at values. The report compares created_at::date, a value computed from each row, and the index is not sorted by that, so PostgreSQL cannot seek to the day's first entry. It either scans the table or reads the entire index and casts every value, and the plan shows the condition as a Filter with hundreds of thousands of rows removed: on the course's large data set that was 2,739 pages for one day. An index on the expression would fix the search, but created_at::date depends on the session time zone, so PostgreSQL refuses to index it. The clean fix is to rewrite the condition as a half-open range on the bare column: created_at >= :day and created_at < :day + 1, with the boundaries computed in UTC or the business time zone in the application. EXPLAIN (ANALYZE) then shows an Index Scan or Index Only Scan with both bounds under Index Cond, no Filter on created_at, and buffers in the tens: 13 pages in the course's run. I would check it on production-sized data, because on a small table every plan looks fast."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "BRIN is a different kind of index for tables whose physical order follows a column. It stores only the minimum and maximum of each range of pages, 128 pages by default, so a BRIN index on `payments(created_at)`, whose rows were inserted in time order, is 24 kB instead of 21 MB, and a time-range query skips every page range that cannot match. It is useless when the order is mixed, as it is for `ledger_entries.created_at` in the large data set, which was loaded by entry type. `pg_stats.correlation` tells you which case you are in: 0.999 for payments.created_at, 0.314 for the ledger's. Near 1 or -1 suits BRIN.\n\nGIN, from lesson 10, is an inverted index: one entry per key or value found inside a document or array, each with the list of rows that contain it. It answers `@>` and friends, and it pays for that on writes; its fastupdate buffer of pending entries hides part of the cost until VACUUM or a full buffer merges them.\n\nThe planner's estimates come from statistics that `ANALYZE` (and autovacuum) collect: a sample of each column's values, its most common values, a histogram, the number of distinct values. When two columns are correlated, say merchant_id and country, the planner multiplies their selectivities as if they were independent and underestimates. `CREATE STATISTICS` on the pair fixes that. The database internals track's \"Query optimization and cardinality estimates\" builds the estimator itself.\n\nIn production, `CREATE INDEX` blocks writes to the table for as long as it runs. `CREATE INDEX CONCURRENTLY` does not, at the price of two passes over the table and the rule that it cannot run inside a transaction block, so a Flyway migration that uses it must be marked non-transactional. If it fails halfway, it leaves an INVALID index behind that you must drop.\n\n`auto_explain` logs the plan of every statement slower than a threshold, with `auto_explain.log_analyze` for actual rows. It is the way to catch the plan of a query that is only slow in production, at 3 a.m., with that day's data."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: Using EXPLAIN",
+      "url": "https://www.postgresql.org/docs/18/using-explain.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Multicolumn indexes",
+      "url": "https://www.postgresql.org/docs/18/indexes-multicolumn.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Index-only scans and covering indexes",
+      "url": "https://www.postgresql.org/docs/18/indexes-index-only-scans.html"
+    },
+    {
+      "title": "PostgreSQL 18 release notes (B-tree skip scan, EXPLAIN changes)",
+      "url": "https://www.postgresql.org/docs/18/release-18.html"
+    },
+    {
+      "title": "Use The Index, Luke! by Markus Winand",
+      "url": "https://use-the-index-luke.com/"
+    }
+  ]
+}

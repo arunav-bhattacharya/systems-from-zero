@@ -1,0 +1,484 @@
+{
+  "id": "sql-12",
+  "title": "Transactions and isolation levels",
+  "minutes": 40,
+  "goal": "By the end you can say what a transaction guarantees and the moment it takes effect, produce a lost update and a write skew in two psql sessions, predict what Read Committed, Repeatable Read and Serializable do about each in PostgreSQL, and write the retry loop that Serializable needs.",
+  "warmup": {
+    "q": "Ivy has two accounts with 5,000 each, and her total must stay at or above zero. Two withdrawals of 8,000, one from each account, run at the same moment. Each is a REPEATABLE READ transaction that reads her total, then updates its own account. What does PostgreSQL do?",
+    "options": [
+      "The second transaction waits for the first, then sees the new total and refuses",
+      "The second COMMIT fails with a serialization error",
+      "Both commit, and her total ends at -6,000",
+      "The second UPDATE fails because the first one changed the total"
+    ],
+    "answer": 2,
+    "why": "Each transaction reads its own snapshot, taken before either wrote, so both see 10,000. They update different rows, so neither waits for a row lock, and Repeatable Read only reports two transactions that change the same row. Both commit: write skew. A serialization error would come at SERIALIZABLE, which tracks what each transaction read."
+  },
+  "sections": [
+    {
+      "h": "A transaction makes several changes count as one",
+      "body": "Moving 2,000 from Ivy's account 109 to her account 209 takes two statements:\n\n```sql\nUPDATE accounts SET balance_minor = balance_minor - 2000 WHERE account_id = 109;\nUPDATE accounts SET balance_minor = balance_minor + 2000 WHERE account_id = 209;\n```\n\nIf the service dies between them, because a pod restarts, a connection drops or a timeout fires, 109 has lost 2,000 and 209 never got it. The window is a few milliseconds per transfer. A service that makes a million transfers a day will land in it now and then.\n\nA **transaction** closes that window. `BEGIN` starts one. Every change after it is provisional: `COMMIT` makes all of them permanent at once, and `ROLLBACK` throws all of them away. If the connection drops or the server crashes before `COMMIT`, PostgreSQL rolls back for you. Either both updates happen or neither does. That is atomicity, the A in ACID.\n\nThe commit is a single event. When you send `COMMIT`, PostgreSQL writes one commit record to its write-ahead log and, with the default `synchronous_commit = on`, waits for it to reach the disk before it replies. Until that record is on disk, the transaction never happened. After it, every change in it is permanent, however many rows it touched. The database internals track builds this log in \"Write-ahead logging and crash recovery\".\n\nAn error inside a transaction fails the whole transaction. PostgreSQL refuses every later statement with `current transaction is aborted`, and a `COMMIT` at the end turns into a `ROLLBACK`. You cannot keep the half that worked.\n\nOutside `BEGIN`, every statement is its own transaction. psql works that way, and so does JDBC: a new `Connection` has `autoCommit = true`. Two updates on such a connection have exactly the crash window above. One transaction in Kotlin:\n\n```kotlin\nconn.autoCommit = false                 // statements now join one transaction\ntry {\n    debit.executeUpdate()               // 109 - 2000\n    credit.executeUpdate()              // 209 + 2000\n    conn.commit()                       // both become permanent together\n} catch (e: SQLException) {\n    conn.rollback()                     // neither does\n    throw e\n}\n```\n\nKeep one picture for the rest of the lesson. A transaction works on a private draft. It reads the database as it was at some moment, its writes go into the draft, and `COMMIT` publishes the whole draft in one step. That leaves two questions, and isolation levels are the answers: which moment does a transaction read, and what happens when two drafts touch the same data?",
+      "try": {
+        "title": "A transfer that fails halfway",
+        "minutes": 3,
+        "steps": [
+          "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder). Open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the block one statement at a time. The second UPDATE sets a status the CHECK constraint forbids, so the transfer fails halfway.",
+          "Before the last SELECT, predict: does 109 show 3,000 or 5,000?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id;\nBEGIN;\nUPDATE accounts SET balance_minor = balance_minor - 2000 WHERE account_id = 109;\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id;\nUPDATE accounts SET balance_minor = balance_minor + 2000, status = 'open' WHERE account_id = 209;\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id;\nCOMMIT;\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id;"
+        },
+        "expect": "Inside the transaction, 109 already shows 3,000. Then the second UPDATE fails, and from that moment the transaction refuses everything (output trimmed):\n\n```postgresql\nUPDATE 1\n account_id | balance_minor\n------------+---------------\n        109 |          3000\n        209 |          5000\n(2 rows)\n\nERROR:  new row for relation \"accounts\" violates check constraint \"accounts_status_check\"\nDETAIL:  Failing row contains (209, customer, 9, null, USD, open, 7000, 2026-01-20 11:06:00+00).\nERROR:  current transaction is aborted, commands ignored until end of transaction block\nROLLBACK\n account_id | balance_minor\n------------+---------------\n        109 |          5000\n        209 |          5000\n(2 rows)\n```\n\n`COMMIT` printed `ROLLBACK`: PostgreSQL will not commit a transaction that had an error. The debit of 109 is gone with it, so no money vanished. Nothing needs cleaning up."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18 tutorial: Transactions",
+          "url": "https://www.postgresql.org/docs/18/tutorial-transactions.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Two transactions that read, then write, lose an update",
+      "body": "`accounts.balance_minor` caches each account's balance (lesson 2). Two services debit Ivy's account 109 at the same moment: a card payment of 1,000 and a monthly fee of 1,000. Each one reads the balance, subtracts in Kotlin, and writes the result:\n\n```kotlin\nval balance = selectBalance(109)        // 5000\nupdateBalance(109, balance - 1000)      // SET balance_minor = 4000\n```\n\nRun them one after the other and the balance ends at 3,000. Now let them overlap. Both read 5,000. The payment writes 4,000 and commits. The fee writes 4,000 and commits. The balance is 4,000: two debits ran, and one left no trace. This is a **lost update**. Nothing failed, so no log line tells you.\n\nPostgreSQL saw the overlap, and it did not help. An `UPDATE` locks every row it changes until its transaction ends. The fee's `UPDATE` reached row 109 while the payment held that lock, so it waited. When the payment committed, the fee's `UPDATE` went ahead with the value it had been given, 4,000, computed from a balance that was no longer true. The lock put the two writes in order. It could not fix a number the application had computed from an old read.\n\nThree fixes, simplest first:\n\n1. Let the database do the arithmetic: `SET balance_minor = balance_minor - 1000`. When the second `UPDATE` gets the lock, PostgreSQL rereads row 109 as the first transaction committed it, 4,000, and subtracts from that. The balance ends at 3,000.\n2. Lock the row when you read it: `SELECT balance_minor ... FOR UPDATE`. The second transaction's read now waits until the first commits, and then returns 4,000. Lesson 13 covers row locks properly.\n3. Detect the conflict with a version column, the way JPA's `@Version` does: `UPDATE ... SET balance_minor = ?, version = version + 1 WHERE account_id = 109 AND version = ?`. The loser updates 0 rows, and the application reloads and tries again.\n\nThe simulator runs the broken version. Each transaction's `UPDATE` and `COMMIT` are one step there, so, as in PostgreSQL, nobody ever reads a value that is not committed yet.",
+      "sim": {
+        "title": "Two debits of 1,000 on account 109",
+        "intro": "Each transaction reads the balance, subtracts 1,000 in Kotlin, then writes the result and commits in one step. Pick who runs next. Can you end with balance = 4000?",
+        "vars": {
+          "balance": 5000
+        },
+        "threads": [
+          {
+            "name": "Tx A (card payment)",
+            "steps": [
+              {
+                "op": "read",
+                "var": "balance",
+                "reg": "b",
+                "code": "SELECT balance_minor ... WHERE account_id = 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -1000,
+                "code": "b = b - 1000                // in Kotlin"
+              },
+              {
+                "op": "write",
+                "var": "balance",
+                "reg": "b",
+                "code": "UPDATE ... SET balance_minor = :b; COMMIT;"
+              }
+            ]
+          },
+          {
+            "name": "Tx B (monthly fee)",
+            "steps": [
+              {
+                "op": "read",
+                "var": "balance",
+                "reg": "b",
+                "code": "SELECT balance_minor ... WHERE account_id = 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -1000,
+                "code": "b = b - 1000                // in Kotlin"
+              },
+              {
+                "op": "write",
+                "var": "balance",
+                "reg": "b",
+                "code": "UPDATE ... SET balance_minor = :b; COMMIT;"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "balance",
+          "eq": 4000,
+          "say": "Lost update: two debits ran and the balance fell by 1,000. Both read 5,000 before either wrote. In PostgreSQL the second UPDATE would also have waited for the first one's row lock, and that changes nothing: its value was computed from the old read. Let one transaction finish before the other reads, and you get 3,000."
+        }
+      },
+      "try": {
+        "title": "Lose an update, then keep it",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the first block, switching terminals where the comments say. B's UPDATE hangs: it waits for A's row lock. Run A's COMMIT and watch B's UPDATE finish.",
+          "Read the balance. Then run the atomic version below it the same way, and read the balance again."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- A\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- A: the payment writes 5000 - 1000\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- B: the fee writes 5000 - 1000 too (this one waits)\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- A\nCOMMIT;\n-- B\nCOMMIT;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;\n\n-- the atomic version: A, then B, then A's COMMIT, then B's COMMIT\nBEGIN;                                                                      -- A\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;  -- A\nBEGIN;                                                                      -- B\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;  -- B (waits)\nCOMMIT;                                                                     -- A\nCOMMIT;                                                                     -- B\nSELECT balance_minor FROM accounts WHERE account_id = 109;                  -- A\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;           -- A: put it back"
+        },
+        "expect": "Both SELECTs show 5000. B's first UPDATE prints nothing: it waits for the lock A took on row 109. The moment A commits, B's UPDATE finishes:\n\n```postgresql\n-- B, after A's COMMIT\nUPDATE 1\nCOMMIT\n-- A\n balance_minor\n---------------\n          4000\n(1 row)\n```\n\nTwo debits, and the balance went down by 1,000. B waited for A and still overwrote A's work, because the value 4000 was decided before the wait. In the atomic version B waits the same way, then PostgreSQL rereads the row A committed and subtracts from it: the final SELECT shows 3000. The last statement puts 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Explicit locking (row-level locks)",
+          "url": "https://www.postgresql.org/docs/18/explicit-locking.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Read Committed takes a snapshot per statement, Repeatable Read one per transaction",
+      "body": "A transaction never reads another transaction's draft. PostgreSQL manages that without making readers wait, because an `UPDATE` never overwrites a row in place: it writes a new version and keeps the old one for a while (lesson 1 watched a row move). A **snapshot** decides which versions a statement sees: everything committed before the snapshot was taken, nothing committed after, and nothing uncommitted. So PostgreSQL never gives you a dirty read, a value from a transaction that has not committed. You can ask for `READ UNCOMMITTED`; you get Read Committed.\n\nThe isolation level decides when the snapshot is taken.\n\nRead Committed, PostgreSQL's default, takes a new snapshot at the start of every statement, so each statement sees everything committed so far. Inside one transaction, two identical SELECTs can disagree: read 109's balance (5,000), another session debits it and commits, read again (4,000). That is a non-repeatable read. When the set of rows changes instead, say a new ledger entry appears in a `sum(amount_minor)`, it is called a phantom. A month-end report that runs ten queries at Read Committed mixes ten slightly different moments.\n\nRepeatable Read takes one snapshot, at the first statement of the transaction, and keeps it to the end. Every read sees the same past moment, so every read agrees. This is **snapshot isolation**.\n\nWrites are the hard part. A Repeatable Read transaction wants to update row 109, but another transaction changed 109 and committed after the snapshot. Read Committed would reread the newest version and carry on. Repeatable Read cannot: that version is not in its snapshot, so it would be writing over data it has never seen. PostgreSQL refuses instead, with `could not serialize access due to concurrent update` and SQLSTATE `40001`. At Repeatable Read the lost update of the previous section becomes an error, and the application must retry the whole transaction.\n\n| | Read Committed | Repeatable Read | Serializable |\n|---|---|---|---|\n| dirty read | never | never | never |\n| non-repeatable read, phantom | yes | no | no |\n| lost update | yes | error 40001 | error 40001 |\n| write skew | yes | yes | error 40001 |\n\nWrite skew, the last row, is the next section. How PostgreSQL stores the versions and decides what a snapshot contains is in the database internals track, \"MVCC: versions, snapshots and VACUUM\".",
+      "try": {
+        "title": "The same SELECT twice, at two levels",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the Read Committed block: A reads, B debits (B is in autocommit, so its UPDATE commits at once), A reads again. Do A's two reads agree?",
+          "Run the Repeatable Read block. Predict A's second SELECT, then A's UPDATE."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- A, at Read Committed (the default)\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nCOMMIT;\n\n-- A, now at Repeatable Read\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = balance_minor - 500 WHERE account_id = 109;\n\\echo :SQLSTATE\nROLLBACK;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;"
+        },
+        "expect": "At Read Committed, A's two SELECTs disagree inside one transaction: 5000, then 4000, because B's debit committed in between. At Repeatable Read both SELECTs return 4000, though B has moved the balance to 3000, and A's own UPDATE is refused:\n\n```postgresql\n-- A\n balance_minor\n---------------\n          4000\n(1 row)\n\nERROR:  could not serialize access due to concurrent update\n40001\nROLLBACK\n```\n\n`\\echo :SQLSTATE` prints the error code of the last statement, the code your Kotlin code would see in `SQLException.sqlState`. After A's ROLLBACK the balance is 3000 (both of B's debits); the last statement puts 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Transaction isolation",
+          "url": "https://www.postgresql.org/docs/18/transaction-iso.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Write skew breaks a rule that spans two rows",
+      "body": "Ivy (customer 9) has accounts 109 and 209 with 5,000 each. The bank lets one account go negative as long as her total stays at or above zero. Two withdrawals of 8,000 arrive at the same moment, one on each account. Each transaction checks the rule and then writes:\n\n```sql\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;                    -- 10000: allowed\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 109;  -- B: 209\nCOMMIT;\n```\n\nBoth read 10,000 from snapshots taken before either wrote. A updates 109, B updates 209. They change different rows, so neither waits for a row lock, and Repeatable Read finds no row that both changed. Both commit. Ivy's total is -6,000.\n\nThis is **write skew**. Each transaction read rows that the other one then changed, and each write was correct for the data its transaction saw. Run in either order, the second withdrawal would have seen 2,000 and refused. Run together, they produced a state that no order of the two could produce. Any rule that reads rows it does not write has this hole: two refunds that each check that the refunds so far stay within the payment (the rule lesson 2 said no CHECK can express), two bookings of one meeting room, a merchant's daily limit enforced across several terminals.\n\nRepeatable Read does not catch it, and Oracle's `SERIALIZABLE` does not either. Oracle's highest level is snapshot isolation, the same guarantee as PostgreSQL's Repeatable Read: the Hermitage test suite shows it stops lost updates and lets write skew through. Oracle code that enforces a limit across rows with a read and then a write needs an explicit lock, whatever the isolation level says.\n\nThe stepper runs the two withdrawals at each level, then shows the two fixes of the next section.",
+      "stepper": {
+        "title": "Two withdrawals of 8,000, at each isolation level",
+        "intro": "Click Next. The middle column is committed data; each side is one transaction's view and draft.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Ivy's two accounts hold 5,000 each; two transactions each want to withdraw 8,000\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">any isolation level</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  5,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  10,000</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Two withdrawals of 8,000 start at the same moment, one on each account.</text></svg>",
+            "say": "Ivy's accounts 109 and 209 hold 5,000 each, 10,000 in all. Tx A withdraws 8,000 from 109 and Tx B withdraws 8,000 from 209. Either one alone is allowed. Both together would leave her at -6,000, so one of them must be refused."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Both transactions read a total of 10,000 from their snapshots\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Repeatable Read</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s t-a\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s t-a\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s t-a\" x=\"482\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  5,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  10,000</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Each reads 10,000 from its own snapshot. Neither has written yet.</text></svg>",
+            "say": "Both run `BEGIN`, then the check. Each takes its snapshot at its first statement, before anyone has written, so both see 10,000. Both decide the withdrawal is allowed."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Tx A updates account 109 in its own draft; committed data is unchanged\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Repeatable Read</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box-a\" x=\"28\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"160.5\" text-anchor=\"middle\">draft: 109 = -3,000</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s t-a\" x=\"482\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  5,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  10,000</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">A's new 109 sits in A's draft. B's snapshot still shows 5,000 for 109.</text></svg>",
+            "say": "A updates 109 to -3,000 and takes the row lock on 109. The new version is uncommitted, so it is invisible to B and to everyone else. The committed data has not changed."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Tx B updates account 209 in its own draft without waiting\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Repeatable Read</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box-a\" x=\"28\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"160.5\" text-anchor=\"middle\">draft: 109 = -3,000</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"482\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box-a\" x=\"478\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"160.5\" text-anchor=\"middle\">draft: 209 = -3,000</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  5,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  10,000</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Different rows: B waits for no lock, and no row was changed by both.</text></svg>",
+            "say": "B updates 209. A holds the lock on 109, not on 209, so B does not wait. Repeatable Read only complains when two transactions change the same row, and here they did not."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Both commit and the total ends at minus 6,000\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Read Committed, Repeatable Read</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box\" x=\"28\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"160.5\" text-anchor=\"middle\">draft: 109 = -3,000</text><text class=\"t-s t-ok\" x=\"32\" y=\"186\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"482\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box\" x=\"478\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"160.5\" text-anchor=\"middle\">draft: 209 = -3,000</text><text class=\"t-s t-ok\" x=\"482\" y=\"186\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box-bad\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  -3,000</text><rect class=\"box-bad\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  -3,000</text><rect class=\"box-bad\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  -6,000</text><text class=\"t-s t-bad\" x=\"20\" y=\"322\" text-anchor=\"start\">Both commit. The total is -6,000: write skew. Oracle's SERIALIZABLE does the same.</text></svg>",
+            "say": "Both `COMMIT` succeed and Ivy ends at -6,000. Read Committed gives the same result, since neither transaction could see the other's uncommitted write, and so does Oracle's `SERIALIZABLE`, which is snapshot isolation. Each write was valid against the data its transaction read. Together they broke the rule: **write skew**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"At Serializable, PostgreSQL detects the read and write dependencies and aborts Tx B\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Serializable</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box\" x=\"28\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"160.5\" text-anchor=\"middle\">draft: 109 = -3,000</text><text class=\"t-s t-ok\" x=\"32\" y=\"186\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"482\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box\" x=\"478\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"160.5\" text-anchor=\"middle\">draft: 209 = -3,000</text><rect class=\"box-bad\" x=\"478\" y=\"171\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"186.5\" text-anchor=\"middle\">COMMIT: ERROR 40001</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box-a\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  -3,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  2,000</text><rect class=\"box\" x=\"20\" y=\"232\" width=\"640\" height=\"58\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"254\" text-anchor=\"start\">PostgreSQL noted the reads: A read 209, which B then wrote; B read 109, which A then wrote.</text><text class=\"t-s\" x=\"32\" y=\"276\" text-anchor=\"start\">Each read what the other changed: no serial order gives this result, so B is aborted.</text><text class=\"t-s t-bad\" x=\"20\" y=\"322\" text-anchor=\"start\">Serializable: A commits, B's COMMIT fails with 40001 and B's draft is thrown away.</text></svg>",
+            "say": "The same steps at `SERIALIZABLE`. PostgreSQL ran them from snapshots as before, but it also recorded what each transaction read. A read 209 and B wrote it; B read 109 and A wrote it. That cycle means no serial order explains the outcome, so B's `COMMIT` fails: `could not serialize access due to read/write dependencies among transactions`, SQLSTATE 40001."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"Tx B retries from the start, sees a total of 2,000 and refuses the withdrawal\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Serializable, retry</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 10,000</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">10,000 &gt;= 8,000: go on</text><rect class=\"box\" x=\"28\" y=\"145\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"160.5\" text-anchor=\"middle\">draft: 109 = -3,000</text><text class=\"t-s t-ok\" x=\"32\" y=\"186\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"482\" y=\"82\" text-anchor=\"start\">retry: BEGIN</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT sum(...): 2,000</text><text class=\"t-s t-a\" x=\"482\" y=\"134\" text-anchor=\"start\">2,000 &lt; 8,000: refuse</text><text class=\"t-s\" x=\"482\" y=\"160\" text-anchor=\"start\">ROLLBACK</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  -3,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box-ok\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  2,000</text><text class=\"t-s t-ok\" x=\"20\" y=\"322\" text-anchor=\"start\">B runs again from BEGIN. Its new snapshot includes A's commit, so it refuses.</text></svg>",
+            "say": "The application retries B from the start. Its new snapshot includes A's commit: 109 is -3,000, the total is 2,000, and the check refuses the second withdrawal. The total stays at 2,000, as if the two had run one after the other."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"With SELECT FOR UPDATE on both accounts, Tx B waits for Tx A and then refuses\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">Rule: Ivy's total over all her accounts stays at or above 0</text><rect class=\"box-b\" x=\"420\" y=\"8\" width=\"240\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"540\" y=\"23.5\" text-anchor=\"middle\">Read Committed + FOR UPDATE</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Tx A: 8,000 from 109</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s t-a\" x=\"32\" y=\"108\" text-anchor=\"start\">SELECT ... FOR UPDATE</text><text class=\"t-s\" x=\"32\" y=\"134\" text-anchor=\"start\">UPDATE 109: -3,000</text><text class=\"t-s t-ok\" x=\"32\" y=\"160\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Tx B: 8,000 from 209</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">BEGIN</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">SELECT ... FOR UPDATE</text><text class=\"t-s t-m\" x=\"482\" y=\"134\" text-anchor=\"start\">waits for A's locks</text><text class=\"t-s\" x=\"482\" y=\"160\" text-anchor=\"start\">then sees -3,000, 5,000</text><text class=\"t-s t-ok\" x=\"482\" y=\"186\" text-anchor=\"start\">2,000 &lt; 8,000: refuse</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">committed data</text><rect class=\"box\" x=\"250\" y=\"66\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"85.5\" text-anchor=\"middle\">account 109:  -3,000</text><rect class=\"box\" x=\"250\" y=\"104\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"123.5\" text-anchor=\"middle\">account 209:  5,000</text><rect class=\"box-ok\" x=\"250\" y=\"148\" width=\"180\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"167.5\" text-anchor=\"middle\">total:  2,000</text><text class=\"t-s t-ok\" x=\"20\" y=\"322\" text-anchor=\"start\">Locking both rows makes B wait for A, then read A's committed result.</text></svg>",
+            "say": "The fix without retries: both transactions lock all of Ivy's accounts with `SELECT ... FOR UPDATE` before they check. B's lock request waits until A commits. At Read Committed it then returns the newest versions, -3,000 and 5,000, and B refuses. The withdrawals now run one at a time per customer."
+          }
+        ]
+      },
+      "try": {
+        "title": "Overdraw Ivy at Repeatable Read",
+        "minutes": 4,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the block, switching terminals at each comment. Before the COMMITs, predict whether either one fails.",
+          "Read both balances at the end."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- A\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\n-- B\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\n-- A: 10000 >= 8000, so withdraw from 109\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 109;\n-- B: 10000 >= 8000, so withdraw from 209\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 209;\n-- A\nCOMMIT;\n-- B\nCOMMIT;\n-- A\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id;\nUPDATE accounts SET balance_minor = 5000 WHERE customer_id = 9;"
+        },
+        "expect": "Both checks print 10000. Neither UPDATE waits, both print `UPDATE 1`, and both COMMITs succeed:\n\n```postgresql\n account_id | balance_minor\n------------+---------------\n        109 |         -3000\n        209 |         -3000\n(2 rows)\n```\n\nIvy's total is -6,000, at Repeatable Read, with no error anywhere. The last statement puts both accounts back at 5,000."
+      },
+      "refs": [
+        {
+          "title": "Hermitage: testing transaction isolation levels (PostgreSQL, Oracle, MySQL and others)",
+          "url": "https://github.com/ept/hermitage",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Serializable catches write skew, and you retry the whole transaction",
+      "body": "At `SERIALIZABLE`, PostgreSQL runs Serializable Snapshot Isolation (SSI). A transaction reads from one snapshot, as at Repeatable Read. On top of that, PostgreSQL records what each transaction read, as predicate locks, and checks every write against those records. \"A read a row that B then wrote\" is a dependency between them. The two withdrawals make two: A read 209, which B wrote, and B read 109, which A wrote. That cycle means no serial order explains the result, so PostgreSQL aborts one of them with SQLSTATE `40001` and `could not serialize access due to read/write dependencies among transactions`. Often the error comes at `COMMIT`.\n\nThe abort is only half the fix. The other half is yours: **run the whole transaction again**, from `BEGIN`, reads included. On its second run, B's snapshot shows 109 at -3,000, the check sees 2,000, and B refuses. Retrying only the statement that failed would reuse the old read and repeat the mistake. The loop wraps the whole unit of work. Its core, which you complete in the lab:\n\n```kotlin\nfun <T> retrying(conn: Connection, maxAttempts: Int, work: () -> T): T {\n    var attempt = 1\n    while (true) {\n        try {\n            return work().also { conn.commit() }        // COMMIT can fail too: keep it inside\n        } catch (e: SQLException) {\n            conn.rollback()                             // throw the whole attempt away\n            val retryable = e.sqlState == \"40001\" || e.sqlState == \"40P01\"\n            if (!retryable || attempt++ == maxAttempts) throw e\n        }\n    }\n}\n```\n\nPredicate locks never block anyone. What Serializable costs is the bookkeeping and the aborted transactions, and some aborts are false alarms. A query that reads a table with a sequential scan records a read of the whole table. On the small accounts table, Ben's withdrawal of 1,000 from account 202, run at the same moment as Ivy's, was aborted too, though it touched none of her rows. An index scan records only the parts of the index and the rows it read, so the indexes of lesson 11 cut false alarms. Keep transactions short and mark reporting ones `READ ONLY`, and retries stay rare.\n\nThe other fix needs no retry: lock the rows the rule reads. With `SELECT ... FROM accounts WHERE customer_id = 9 FOR UPDATE` at Read Committed, the second withdrawal waits for the first one's `COMMIT`. Its next statement takes a new snapshot, sees 2,000 and refuses. That works when you can name the rows. When the rule is about rows that may not exist yet, such as new refunds of a payment, lock a parent row that does exist, or use Serializable.",
+      "try": {
+        "title": "Serializable with a retry, and a lock instead",
+        "minutes": 6,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run part 1, switching at each comment. Which COMMIT fails, and with what SQLSTATE? Run B's retry and read its total.",
+          "Run part 2 at the default level. B's `SELECT ... FOR UPDATE` hangs until A commits. What does it return then?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- 1. the same withdrawals at SERIALIZABLE\n-- A\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\n-- B\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\n-- A\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 109;\n-- B\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 209;\n-- A\nCOMMIT;\n-- B\nCOMMIT;\n\\echo :SQLSTATE\n-- B retries from the start\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\nROLLBACK;\n-- A\nUPDATE accounts SET balance_minor = 5000 WHERE customer_id = 9;\n\n-- 2. Read Committed, locking the rows the rule reads\n-- A\nBEGIN;\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id FOR UPDATE;\n-- B (waits)\nBEGIN;\nSELECT account_id, balance_minor FROM accounts WHERE customer_id = 9 ORDER BY account_id FOR UPDATE;\n-- A\nUPDATE accounts SET balance_minor = balance_minor - 8000 WHERE account_id = 109;\nCOMMIT;\n-- B\nSELECT sum(balance_minor) FROM accounts WHERE customer_id = 9;\nROLLBACK;\n-- A\nUPDATE accounts SET balance_minor = 5000 WHERE customer_id = 9;"
+        },
+        "expect": "In part 1, everything up to A's COMMIT looks exactly like the Repeatable Read run. Then B's COMMIT fails:\n\n```postgresql\n-- B\nERROR:  could not serialize access due to read/write dependencies among transactions\nDETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.\nHINT:  The transaction might succeed if retried.\n40001\n-- B, retrying\n  sum\n------\n 2000\n(1 row)\n```\n\nThe retry sees A's withdrawal and the total of 2,000, so B refuses (ROLLBACK). In part 2, B's `SELECT ... FOR UPDATE` prints nothing until A commits, then returns 109 at -3000 and 209 at 5000, and B's sum is 2000. No error, no retry: B waited instead. Each part ends by putting the balances back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Serialization failure handling",
+          "url": "https://www.postgresql.org/docs/18/mvcc-serialization-failure-handling.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of two accountants who each photocopy the ledger in the morning and work from their copy all day. That is Repeatable Read: each sees one fixed moment, and neither sees the other's work until it is filed. Read Committed is an accountant who makes a fresh copy before every calculation. Filing is COMMIT: the whole day's changes go into the real ledger at once, or none do. Write skew is both accountants approving a withdrawal against the same morning copy. Serializable adds a supervisor who notes which pages each accountant read and refuses to file a day's work that relied on a page the other one changed, so that accountant redoes the day from a new copy. The analogy breaks on cost: PostgreSQL copies nothing. A snapshot is a short list of transaction ids, the old row versions stay in the table until VACUUM removes them, and taking a snapshot costs microseconds.",
+  "in_your_world": "Oracle at work runs at READ COMMITTED by default, and its SERIALIZABLE is snapshot isolation, so a limit check that reads a SUM and then inserts (a merchant's daily cap, a refund ceiling, a card's velocity rule) can be broken by two concurrent requests at either level; lock a row both requests must touch with SELECT ... FOR UPDATE. On PostgreSQL the same check can run at SERIALIZABLE, but then 40001 is part of the API: in a Quarkus or Spring service, the transaction boundary needs a retry around it, and the retry must cover the whole @Transactional method, not one repository call. In a Temporal activity, let the activity's database work be one transaction and treat 40001 as a retryable failure, so Temporal's retry reruns all of it. For a lost update, JPA's @Version gives you an OptimisticLockException instead of silent loss; catch it, reload, and redo the change.",
+  "mistake": "Reading a value, deciding in code, and writing the result, all inside a transaction at the default isolation level, and believing the transaction makes it safe. People believe it because the code reads like one atomic step, and in tests with one request at a time it is. A transaction makes the writes all-or-nothing; it does not stop another transaction from reading the same old value in the meantime. The result is lost updates on counters and balances, and write skew on any rule over several rows. The fix depends on the shape: make the update relative (`SET x = x - 1000`), lock the rows the decision reads with `SELECT ... FOR UPDATE`, add a version column, or run at SERIALIZABLE with a retry of the whole transaction.",
+  "compare": {
+    "title": "The two withdrawals at SERIALIZABLE: Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle: SERIALIZABLE is snapshot isolation",
+      "src": "-- in each session; :own is 109 in A, 209 in B\nSET TRANSACTION ISOLATION LEVEL SERIALIZABLE;\n\nSELECT SUM(balance_minor) FROM accounts\nWHERE customer_id = 9;              -- 10000 in both\n\nUPDATE accounts\nSET balance_minor = balance_minor - 8000\nWHERE account_id = :own;            -- different rows\n\nCOMMIT;                             -- both succeed:\n                                    -- the total is -6000\n\n-- ORA-08177 \"can't serialize access for this\n-- transaction\" comes only when both change\n-- the SAME row"
+    },
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL: SERIALIZABLE is SSI",
+      "src": "-- in each session; :own is 109 in A, 209 in B\nBEGIN ISOLATION LEVEL SERIALIZABLE;\n\nSELECT sum(balance_minor) FROM accounts\nWHERE customer_id = 9;              -- 10000 in both\n\nUPDATE accounts\nSET balance_minor = balance_minor - 8000\nWHERE account_id = :own;            -- different rows\n\nCOMMIT;                             -- one fails with\n                                    -- 40001, read/write\n                                    -- dependencies\n\n-- retried from BEGIN, it reads 2000 and refuses;\n-- PostgreSQL's REPEATABLE READ behaves like the\n-- Oracle column"
+    },
+    "note": "The same keyword buys two different guarantees. Hermitage, Martin Kleppmann's test suite that runs the same interleavings against many databases, classifies Oracle's serializable as snapshot isolation: it prevents lost updates (P4) but not write skew (G2-item), which is PostgreSQL's REPEATABLE READ. PostgreSQL's SERIALIZABLE prevents every anomaly in the suite. Both databases default to READ COMMITTED with a snapshot per statement. So on Oracle, a rule across rows needs SELECT ... FOR UPDATE on a row every conflicting transaction must lock; on PostgreSQL you may choose between that lock and SERIALIZABLE with a retry loop."
+  },
+  "worked": {
+    "title": "A refund that can never exceed its payment, under concurrency",
+    "steps": [
+      {
+        "say": "Lesson 2 left one rule without a constraint: the refunds of a payment must not add up to more than the payment. Payment 5 is 48,000 and already has refunds of 12,000 and 6,000, so 30,000 is left. Two support agents refund 25,000 each at the same moment. Each checks first, at Read Committed:",
+        "code": "-- 1. the racy version, run by both agents at once\nBEGIN;\nSELECT p.amount_minor - coalesce(sum(r.amount_minor), 0) AS refundable\nFROM payments p LEFT JOIN refunds r ON r.payment_id = p.payment_id\nWHERE p.payment_id = 5\nGROUP BY p.amount_minor;                  -- 30000 in both sessions: 25000 fits\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (5, 25000, 'customer_request', now());\nCOMMIT;                                   -- both commit: 68000 refunded on 48000",
+        "lang": "sql"
+      },
+      {
+        "say": "Both inserts are new rows, so there is no existing refund row to lock and no row both transactions change: write skew. Make the transactions meet on a row that does exist. Every refund of payment 5 must lock payment 5 first:",
+        "code": "-- 2. one refund of a payment at a time: lock the parent row first\nBEGIN;\nSELECT amount_minor FROM payments WHERE payment_id = 5 FOR UPDATE;   -- the second agent waits here\nSELECT coalesce(sum(amount_minor), 0) FROM refunds WHERE payment_id = 5;\n-- a new statement, so a new snapshot: the second agent sees 43000, refundable 5000\n-- insert only if 48000 - sum >= 25000\nCOMMIT;",
+        "lang": "sql"
+      },
+      {
+        "say": "In Kotlin, the check and the insert sit between the lock and the commit, and every path ends the transaction:",
+        "code": "// 3. the service method\nfun refund(conn: Connection, paymentId: Long, amount: Long): Boolean {\n    conn.autoCommit = false\n    try {\n        val paid = conn.prepareStatement(\"SELECT amount_minor FROM payments WHERE payment_id = ? FOR UPDATE\")\n            .use { it.setLong(1, paymentId); it.executeQuery().use { rs -> rs.next(); rs.getLong(1) } }\n        val refunded = conn.prepareStatement(\"SELECT coalesce(sum(amount_minor), 0) FROM refunds WHERE payment_id = ?\")\n            .use { it.setLong(1, paymentId); it.executeQuery().use { rs -> rs.next(); rs.getLong(1) } }\n        if (refunded + amount > paid) {            // the rule, checked while we hold the lock\n            conn.rollback()\n            return false\n        }\n        conn.prepareStatement(\n            \"INSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (?, ?, 'customer_request', now())\",\n        ).use { it.setLong(1, paymentId); it.setLong(2, amount); it.executeUpdate() }\n        conn.commit()                               // releases the lock: the next refund may check\n        return true\n    } catch (e: SQLException) {\n        conn.rollback()\n        throw e\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "The other way drops the lock and runs the same reads and insert at SERIALIZABLE, inside the retry function you write in the lab. Both are correct. The lock makes refunds of one payment queue up, which suits a hot row and needs no retries. Serializable needs no knowledge of which row to lock, and pays with an occasional retry.",
+        "code": "// 4. the same rule without FOR UPDATE: SERIALIZABLE plus a retry of everything\nval ok = serializable(conn) { _ ->\n    val paid = amountOf(conn, paymentId)               // plain SELECTs, no lock\n    val refunded = refundedSoFar(conn, paymentId)\n    if (refunded + amount > paid) false\n    else { insertRefund(conn, paymentId, amount); true }\n}\n// the second agent's attempt fails with 40001; its retry sees 43000 and returns false",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Stop the double withdrawal, then write the retry loop",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l12/withdraw.sql",
+      "labs/sql/src/main/kotlin/sfz/sql/l12/Retry.kt"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l12.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder. Seven of the ten fail: the two `withdraw` tests where both withdrawals are Ivy's leave her total below zero, and the five `serializable` tests stop at a TODO.",
+      "`withdraw.sql` is one transaction. The tests run it in two sessions at once, one statement at a time, taking turns, and each session has its own one-row `withdrawal` table. Read the failure message: it lists every statement each session ran and what it returned.",
+      "Fix `withdraw.sql`. Either change its isolation level (the tests retry a session that fails with 40001, as your application would) or lock the rows the rule reads before the UPDATE. When it passes, try the other fix too.",
+      "Write `serializable` in `Retry.kt`: autocommit off, isolation SERIALIZABLE, run the work, commit, and on 40001 or 40P01 roll back and run the whole work again, up to `maxAttempts` attempts.",
+      "Run the tests until all ten pass. The last one runs two real withdrawals on two threads through your function, and makes both read Ivy's total before either writes."
+    ],
+    "hints": [
+      "`BEGIN ISOLATION LEVEL SERIALIZABLE;` is the one-line fix. In the log of the passing test, one session's COMMIT fails with 40001, and its retry updates nothing because its new snapshot sees the first withdrawal.",
+      "The lock version starts with `BEGIN;` (Read Committed), then `SELECT 1 FROM accounts WHERE customer_id = (SELECT customer_id FROM accounts JOIN withdrawal USING (account_id)) FOR UPDATE;`, then the same UPDATE. At REPEATABLE READ the same lock still ends in a 40001 for the waiting session: its snapshot is older than the commit it waited for.",
+      "In `serializable`, call `conn.commit()` inside the try, because SSI often reports the conflict at commit. Catch `SQLException`, call `conn.rollback()`, and rethrow unless `e.sqlState` is 40001 or 40P01 and attempts remain. Catch other exceptions separately: roll back and rethrow."
+    ],
+    "done_when": "All ten tests in `IsolationTest` pass."
+  },
+  "drill": {
+    "title": "The anomaly table, from memory",
+    "minutes": 4,
+    "prompt": "Without looking, fill in the table for PostgreSQL: for each of dirty read, non-repeatable read, phantom, lost update and write skew, what happens at Read Committed, Repeatable Read and Serializable? Then write one sentence on what an application must do with SQLSTATE 40001.",
+    "answer": {
+      "lang": "text",
+      "src": "                     Read Committed   Repeatable Read   Serializable\ndirty read           never            never             never\nnon-repeatable read  happens          never             never\nphantom              happens          never (in PG)     never\nlost update          happens          error 40001       error 40001\nwrite skew           happens          happens           error 40001\n\n40001: roll back, then run the WHOLE transaction again from BEGIN,\nreads included, a bounded number of times (40P01, deadlock, the same)."
+    }
+  },
+  "recap": [
+    "A transaction makes its changes permanent all at once, at the moment its COMMIT record reaches the write-ahead log. An error, a ROLLBACK or a crash before that undoes all of them. JDBC starts in autocommit: one transaction per statement.",
+    "Read, compute in code, write: two such transactions on one row lose an update at Read Committed, though the second UPDATE waits for the row lock. Write `SET x = x - n`, lock with FOR UPDATE, or use a version column.",
+    "Read Committed takes a snapshot per statement, so reads in one transaction can disagree. Repeatable Read keeps one snapshot (snapshot isolation) and turns a conflicting update into error 40001.",
+    "Write skew: two transactions read the same rows, write different ones, and break a rule together. Repeatable Read and Oracle's SERIALIZABLE allow it.",
+    "PostgreSQL's SERIALIZABLE (SSI) tracks reads and aborts one transaction of a dangerous pair with 40001. Retry the whole transaction, or lock the rows the rule reads with SELECT ... FOR UPDATE."
+  ],
+  "quiz": [
+    {
+      "q": "At READ COMMITTED, transaction A runs `SELECT count(*) FROM ledger_entries WHERE account_id = 109` twice. Between the two, B inserts a ledger entry for 109 and commits. What does A's second count return?",
+      "options": [
+        "The same as the first: a transaction sees one consistent state",
+        "One more than the first: each statement takes a new snapshot",
+        "An error, because rows changed under the transaction",
+        "The same as the first, unless A locked the rows with FOR UPDATE"
+      ],
+      "answer": 1,
+      "why": "Read Committed takes a snapshot at the start of each statement, so the second count includes B's committed row: a phantom. The first option describes Repeatable Read, where both counts would match. Neither level raises an error for a read."
+    },
+    {
+      "q": "Two Kafka consumers apply a 100 fee to account 109 at the same moment, at READ COMMITTED. Which code keeps both fees?",
+      "options": [
+        "`SELECT balance_minor`, then `UPDATE ... SET balance_minor = :computed`",
+        "The same two statements inside one BEGIN ... COMMIT",
+        "The same two statements, with an index on account_id",
+        "`UPDATE accounts SET balance_minor = balance_minor - 100 WHERE account_id = 109`"
+      ],
+      "answer": 3,
+      "why": "The relative UPDATE computes from the row it holds the lock on: the second one waits, then PostgreSQL rereads the committed row and subtracts from the new value. The read-then-write versions compute from a value read before the lock, so one fee is lost, transaction or not. An index changes speed, not the interleaving."
+    },
+    {
+      "q": "A REPEATABLE READ transaction fails on its third statement with SQLSTATE 40001, `could not serialize access due to concurrent update`. What should the application do?",
+      "options": [
+        "Roll back and run the whole transaction again from BEGIN, reads included",
+        "Run the third statement again in the same transaction",
+        "Switch that one statement to READ COMMITTED and run it again",
+        "Nothing: PostgreSQL has already retried it"
+      ],
+      "answer": 0,
+      "why": "After an error the transaction is aborted and only ROLLBACK works. The retry has to redo the reads, because the error means they are out of date: rerunning the one statement would write a value computed from the old snapshot, which is the lost update the error just prevented."
+    },
+    {
+      "q": "An Oracle service enforces a merchant's daily limit across terminals: SELECT SUM(amount) for today, then INSERT the payment if it fits, at SERIALIZABLE. Two terminals pay at the same moment. What can happen?",
+      "options": [
+        "Nothing bad: SERIALIZABLE prevents every anomaly",
+        "One INSERT always fails with ORA-08177",
+        "Both inserts commit and the limit is exceeded",
+        "The second SELECT waits until the first transaction commits"
+      ],
+      "answer": 2,
+      "why": "Oracle's SERIALIZABLE is snapshot isolation. Both transactions read the same sum from their snapshots and insert different rows, so no row is changed by both and nothing is reported: write skew. ORA-08177 appears only when two serializable transactions change the same row. Lock a row both must touch, such as the merchant row, with SELECT ... FOR UPDATE."
+    },
+    {
+      "q": "Lesson 2 noted that \"the refunds of a payment never exceed its amount\" spans rows, so no CHECK constraint can say it. Two agents refund the same payment at once, each reading the sum of refunds first, at READ COMMITTED. Which change makes the rule hold?",
+      "options": [
+        "Add a UNIQUE index on refunds (payment_id)",
+        "Lock the payment row with SELECT ... FOR UPDATE before reading the sum",
+        "Put each agent's check and insert in one transaction",
+        "Run both at REPEATABLE READ"
+      ],
+      "answer": 1,
+      "why": "The rows that conflict are new refunds that do not exist yet, so the transactions must meet on a row that does: the payment. The second agent waits for the lock, and its next statement sees the first refund. Each agent already has one transaction, which does not stop the race. Repeatable Read lets write skew through. A unique index would allow only one refund per payment.",
+      "from": "sql-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "When do a transaction's changes become permanent and visible to others?",
+      "back": "All at once, when its COMMIT record reaches the write-ahead log on disk. Before that no other session sees them, and a crash undoes them."
+    },
+    {
+      "front": "What does a Read Committed statement read?",
+      "back": "A snapshot taken when that statement starts: everything committed by then. Two SELECTs in one transaction can disagree."
+    },
+    {
+      "front": "What happens at Repeatable Read if you update a row that another transaction changed and committed after your snapshot?",
+      "back": "ERROR: could not serialize access due to concurrent update (40001). Roll back and retry the whole transaction."
+    },
+    {
+      "front": "What is write skew?",
+      "back": "Two transactions read the same rows, each writes a different row, and together they break a rule each one checked. Repeatable Read allows it; Serializable aborts one."
+    },
+    {
+      "front": "What should code do with SQLSTATE 40001?",
+      "back": "Roll back and run the whole transaction again from BEGIN, reads included, a bounded number of times. Treat 40P01 (deadlock) the same way."
+    },
+    {
+      "front": "Is Oracle's SERIALIZABLE the same as PostgreSQL's?",
+      "back": "No. Oracle's is snapshot isolation, like PostgreSQL's REPEATABLE READ: write skew gets through."
+    },
+    {
+      "front": "Why can SERIALIZABLE abort a transaction that did not really conflict?",
+      "back": "A sequential scan records a read of the whole table, so any write to it looks like a dependency. Index scans record less."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Transaction",
+      "plain": "A group of statements whose changes become permanent together at COMMIT, or not at all."
+    },
+    {
+      "term": "Commit point",
+      "plain": "The moment the COMMIT record is on disk in the write-ahead log. Before it the transaction did not happen; after it, all of it did."
+    },
+    {
+      "term": "Snapshot",
+      "plain": "The set of committed transactions a statement can see: everything committed before it was taken, nothing after, nothing uncommitted."
+    },
+    {
+      "term": "Isolation level",
+      "plain": "The setting that decides when a transaction's snapshot is taken and which conflicts PostgreSQL turns into errors."
+    },
+    {
+      "term": "Lost update",
+      "plain": "Two transactions read the same value and both write a result computed from it; the second write erases the first."
+    },
+    {
+      "term": "Write skew",
+      "plain": "Two transactions read the same rows, write different rows, and together break a rule that each checked."
+    },
+    {
+      "term": "Serialization failure (40001)",
+      "plain": "PostgreSQL aborting a transaction because committing it would break its isolation level. The fix is to retry the whole transaction."
+    },
+    {
+      "term": "SSI",
+      "plain": "Serializable Snapshot Isolation: snapshot reads plus tracking of read and write dependencies, aborting one transaction of a dangerous pair. PostgreSQL's SERIALIZABLE."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"The limit check and the insert run in one @Transactional method, so two requests can never both pass the check.\" Explain when that is wrong on PostgreSQL and on Oracle, and what you would change.",
+    "answer": "The transaction makes the method's writes all-or-nothing, but it does not stop a second request from running the same check at the same time. At the default READ COMMITTED, both requests' SELECTs run before either commits, both see the same total, and both insert. Each insert is a new row, so no row lock is shared and nothing waits. That is write skew, and it gets through Repeatable Read on PostgreSQL and SERIALIZABLE on Oracle as well, because both are snapshot isolation: they only detect two transactions changing the same row. There are two fixes. Make the requests meet on one existing row, for example `SELECT ... FROM merchants WHERE merchant_id = ? FOR UPDATE` before the check: the second request waits, and at Read Committed its next statement sees the first insert. That works on both databases. Or, on PostgreSQL, run the method at SERIALIZABLE: SSI notices that each transaction read what the other wrote and aborts one with 40001, so the method needs a retry around the whole transaction, reads included. I'd use the lock when there is an obvious parent row, and SERIALIZABLE with a retry when the rule's rows are hard to name."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Read Committed has a subtle rule for writes. When an `UPDATE` or `DELETE` finds that its target row was changed by a transaction that has just committed, it does not use its snapshot for that row. It rereads the newest version and checks the `WHERE` condition again; if the row still matches, the update applies to the new version. That is why `SET balance_minor = balance_minor - 1000` is safe. It also means a statement can see a mix: the new version of the rows it updates, and its snapshot for everything else. The PostgreSQL docs show a `DELETE` that misses a row because of it. When a statement's correctness depends on several rows staying consistent, move to Repeatable Read or Serializable, or lock first.\n\nA transaction left open costs more than its locks. While it is open, its snapshot keeps every row version that it might still need, so VACUUM cannot remove the dead versions other transactions leave behind, and tables and indexes grow. A service that forgets to commit, or a psql session left at `course=*#`, shows up as `idle in transaction` in `pg_stat_activity`. Set `idle_in_transaction_session_timeout` on the server or the role, so PostgreSQL ends such sessions for you.\n\nLong reports have a better option than plain Repeatable Read. `BEGIN ISOLATION LEVEL SERIALIZABLE, READ ONLY, DEFERRABLE` waits, if it must, until it can take a snapshot that no concurrent writer can invalidate, and then runs without any risk of a serialization failure and without SSI bookkeeping. It suits a month-end statement run against a busy database.\n\nMySQL's InnoDB is the odd one out. Its default, REPEATABLE READ, does not prevent lost updates, according to Hermitage: a read-modify-write on one row loses an update there with no error. If a team you work with uses MySQL, treat every read-then-write as unsafe unless it locks.\n\nThe engine side of this lesson is in the database internals track: \"MVCC: versions, snapshots and VACUUM\" stores the versions and builds the snapshot test, and \"Concurrency control: locks, deadlocks and SSI\" builds row locks, deadlock detection and the dependency tracking behind 40001."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: Transaction isolation",
+      "url": "https://www.postgresql.org/docs/18/transaction-iso.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Serialization failure handling",
+      "url": "https://www.postgresql.org/docs/18/mvcc-serialization-failure-handling.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Explicit locking",
+      "url": "https://www.postgresql.org/docs/18/explicit-locking.html"
+    },
+    {
+      "title": "Hermitage: testing the I in ACID (test suite)",
+      "url": "https://github.com/ept/hermitage"
+    },
+    {
+      "title": "Martin Kleppmann: Hermitage, testing the \"I\" in ACID",
+      "url": "https://martin.kleppmann.com/2014/11/25/hermitage-testing-the-i-in-acid.html"
+    }
+  ]
+}

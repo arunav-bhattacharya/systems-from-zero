@@ -1,0 +1,484 @@
+{
+  "id": "redis-08",
+  "title": "Distributed locks, honestly",
+  "minutes": 40,
+  "goal": "By the end you can take and release a Redis lock that never deletes another client's, explain what a lease can't protect against, and add fencing tokens so a paused holder can't corrupt the data it guards.",
+  "warmup": {
+    "q": "Pod A takes a lock with a 10-second lease, then stops for 15 seconds in a GC pause. Meanwhile pod B takes the lock and writes the payout file. Which change stops A from overwriting B's file when it wakes up?",
+    "options": [
+      "Release the lock with compare-and-delete instead of DEL",
+      "Run the lock on five Redis servers with Redlock",
+      "Raise the lease to 60 seconds",
+      "Make the file store refuse writes that carry an older fencing token"
+    ],
+    "answer": 3,
+    "why": "The pause happens after A got the lock, so nothing on the Redis side can stop A from writing when it wakes: A doesn't know its lease ended. Compare-and-delete only stops A from deleting B's lock. Redlock makes acquiring survive a server failure, not a pause. A longer lease just needs a longer pause. Only the store sees both writes, so only the store can refuse the stale one, if each write carries a number that grows with every lock holder."
+  },
+  "sections": [
+    {
+      "h": "A lock is a key that only one client can create",
+      "body": "The nightly settlement batch builds the payout file that tells the bank how much to pay each merchant. A scheduler in each of 3 pods starts it, because one scheduler would be a single point of failure. It must run once: if two pods build and send the file, merchants are paid twice.\n\nInside one JVM you would reach for `synchronized` or a `ReentrantLock`. Three pods share no memory, so the lock has to live somewhere they can all reach. Lesson 1 gives you the first piece. One thread runs each command, so a command that creates a key only if it doesn't exist is a perfect \"first one wins\". `SET lock:settle pod-a NX` answers `OK` to exactly one pod and nil to the others. Holding the lock means the key exists, and releasing it is `DEL`.\n\nThat breaks the first time the holder dies. Pod A is OOM-killed halfway through the batch, the key stays forever, and no pod ever runs the batch again. So the lock needs a deadline: `SET lock:settle pod-a NX PX 30000`. It has to be one command with the PX inside the SET, for lesson 7's reason: `SETNX` followed by `EXPIRE` can leave a key with no TTL. A lock with a deadline is a **lease**: you hold it until you release it or until the time runs out, whichever comes first.\n\nThe lease is what makes a Redis lock work, and what makes it dangerous. Redis deletes the key after 30 seconds whether or not the holder has finished, and nothing tells the holder. Suppose the batch runs slower than usual, or pod A's JVM stops for a 35-second garbage collection. A stop-the-world pause stops every thread, including whatever might have noticed. The lease runs out. Pod B's `SET NX` succeeds and B starts the batch too. Then A finishes and runs `DEL lock:settle`, which deletes B's lock, not A's. Pod C's `SET NX` succeeds while B is still running. Three pods have run a batch that must run once, and every step looked correct from where it ran.\n\nThat is the model for this lesson. A Redis lock is a lease: a key that says who may act, until a deadline. Redis enforces the deadline. Nothing enforces that the holder stops acting when the deadline passes. Each of the next sections deals with one consequence of that.",
+      "try": {
+        "title": "Let a lease run out, then delete the wrong lock",
+        "minutes": 4,
+        "steps": [
+          "Open two redis-cli prompts from the `labs` folder (`docker compose -f env/redis.yml exec redis redis-cli`), one for pod A and one for pod B. Start the server first if needed.",
+          "Pod A clears any lock left from an earlier run and takes the lock with a 10-second lease; pod B tries at once and checks the TTL. Then wait at least 10 seconds: A is \"paused\".",
+          "Pod B tries again. Then pod A, which knows nothing about the pause, releases with `DEL`. Finally a third pod tries. Predict every reply first."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "two prompts (lines starting with # are notes)",
+          "src": "# pod A\nDEL lock:settle\nSET lock:settle pod-a NX PX 10000\n# pod B\nSET lock:settle pod-b NX PX 10000\nPTTL lock:settle\n# wait 10 seconds: A's lease runs out while A is \"paused\"\nPTTL lock:settle\nSET lock:settle pod-b NX PX 30000\n# pod A wakes up and releases its lock\nDEL lock:settle\n# pod B (playing pod C)\nSET lock:settle pod-c NX PX 30000\nGET lock:settle"
+        },
+        "expect": "The first `DEL` prints `(integer) 0`, or 1 if an earlier run left the key behind. A's SET prints `OK` and B's first SET prints `(nil)`; `PTTL` shows just under 10000. After the wait, `PTTL` prints `(integer) -2`: the key is gone. B's SET prints `OK`, so B now holds the lock. A's `DEL` prints `(integer) 1`: it deleted B's lock, and A can't tell from the reply. Pod C's SET prints `OK` while B is still \"working\", and `GET` shows `\"pod-c\"`."
+      },
+      "refs": [
+        {
+          "title": "Distributed locks with Redis (Redis docs)",
+          "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Release only your own lock, in one command",
+      "body": "To stop A from deleting B's lock, each lock must say whose it is. Each acquire stores a random value that only that holder knows, a **token**: `SET lock:settle 6f1e... NX PX 30000`, with a fresh UUID every time. The Redis docs suggest 20 random bytes; a random UUID has 122 random bits, which is plenty. A pod name won't do, because the same pod can hold the lock twice in a row, and its old attempt and its new one would look identical.\n\nThe obvious release is GET the key, compare it with my token in Java, and DEL if they match. It is lesson 6's check-then-act. There is a gap between A's GET and A's DEL, and a pause can land in it: A reads its own token, a GC stops A, A's lease expires, B acquires, and A's DEL deletes B's lock after all. The simulator below lets you produce exactly that.\n\nThe compare and the delete have to be one command. The classic way is the Lua script from the Redis docs:\n\n```text\nif redis.call('GET', KEYS[1]) == ARGV[1] then\n    return redis.call('DEL', KEYS[1])\nend\nreturn 0\n```\n\nIt returns 1 when it deleted my lock, and 0 when the key holds someone else's token, or doesn't exist. Redis 8.4 made it a single built-in command: `DELEX lock:settle IFEQ <token>`, which is `redis.delex(key, CompareCondition.valueEq(token))` in Jedis. Extending a lease needs the same care, because it must only push out my own deadline: `SET lock:settle <token> IFEQ <token> PX 30000` on Redis 8.4, or a script that compares the token before `PEXPIRE`.\n\nBe clear about what this fixes. A can no longer delete B's lock, so C can't get in while B works. But A and B both still ran the batch: A's lease expired while A was working, and no release script can undo that. The next two sections deal with that.",
+      "sim": {
+        "title": "Pod A releases with GET, compare, then DEL",
+        "intro": "lock = 1 means the key holds A's token, 2 means B's token, 0 means there is no key. A releases the slow way: three steps. Can you make A delete B's lock?",
+        "vars": {
+          "lock": 1
+        },
+        "threads": [
+          {
+            "name": "Pod A",
+            "steps": [
+              {
+                "op": "check",
+                "var": "lock",
+                "eq": 1,
+                "code": "GET lock:settle == tok-A? (if not: stop, it isn't mine)"
+              },
+              {
+                "op": "note",
+                "code": "full GC: the JVM stops for 12 s"
+              },
+              {
+                "op": "set",
+                "var": "lock",
+                "n": 0,
+                "code": "DEL lock:settle"
+              }
+            ]
+          },
+          {
+            "name": "Pod B",
+            "steps": [
+              {
+                "op": "set",
+                "var": "lock",
+                "n": 0,
+                "code": "(10 s later) A's lease ends: Redis deletes the key"
+              },
+              {
+                "op": "check",
+                "var": "lock",
+                "eq": 0,
+                "code": "SET lock:settle tok-B NX PX 10000 (only if no key)"
+              },
+              {
+                "op": "set",
+                "var": "lock",
+                "n": 2,
+                "code": "OK: B holds the lock and starts the batch"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "lock",
+          "eq": 0,
+          "say": "A deleted B's lock. A's GET saw its own token, then A paused; by the time its DEL arrived, the key held B's token. B is still running the batch and the key is gone, so any pod's SET NX succeeds now. Inside one script, nothing can run between the compare and the delete."
+        }
+      },
+      "try": {
+        "title": "Release by token, with a script and with DELEX",
+        "minutes": 3,
+        "steps": [
+          "At a redis-cli prompt (`docker compose -f env/redis.yml exec redis redis-cli`), clear the key, then let pod B take the lock with token `tok-b-6f1e`.",
+          "Play pod A's late release with the script and A's old token, then read the key. Then try `DELEX` (Redis 8.4) with A's token and with B's.",
+          "Take the lock as pod C with a 2-second lease and extend it with `SET ... IFEQ`. Then try to extend it with A's token."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL lock:settle\nSET lock:settle tok-b-6f1e NX PX 30000\nEVAL \"if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0\" 1 lock:settle tok-a-91c2\nGET lock:settle\nDELEX lock:settle IFEQ tok-a-91c2\nDELEX lock:settle IFEQ tok-b-6f1e\nSET lock:settle tok-c-0d77 NX PX 2000\nSET lock:settle tok-c-0d77 IFEQ tok-c-0d77 PX 30000\nPTTL lock:settle\nSET lock:settle tok-a-91c2 IFEQ tok-a-91c2 PX 30000"
+        },
+        "expect": "The first `DEL` prints `(integer) 0`, or 1 if an earlier run left the key behind. The SET prints `OK`. The script prints `(integer) 0` and `GET` still shows `\"tok-b-6f1e\"`: A's late release left B's lock alone. `DELEX ... IFEQ tok-a-91c2` prints `(integer) 0`, and `DELEX ... IFEQ tok-b-6f1e` prints `(integer) 1`. C's SET prints `OK`, the extend prints `OK`, and `PTTL` shows `(integer) 29999` or close: the 2-second lease is now 30 seconds. Extending with A's token prints `(nil)` and changes nothing."
+      },
+      "refs": [
+        {
+          "title": "DELEX (Redis 8.4)",
+          "url": "https://redis.io/docs/latest/commands/delex/",
+          "kind": "docs"
+        },
+        {
+          "title": "SET: NX, PX and IFEQ",
+          "url": "https://redis.io/docs/latest/commands/set/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A lease can run out while its holder is still working",
+      "body": "How long should the lease be? Too short, and a slow batch outlives it. Too long, and a crashed holder blocks everyone until it ends: with a 10-minute lease, a pod that dies one second in stalls the batch for 9 minutes 59 seconds.\n\nThe usual answer is to keep the lease short and renew it while the work runs. A background thread in the holder extends the lease every few seconds, with the compare-and-set from the last section. If the holder dies, the renewals stop and the lease runs out quickly.\n\nRedisson, a Java client that builds locks and other objects on top of Redis, does this for you and calls it the **watchdog**. `RLock.lock()` with no lease time takes a lease of `lockWatchdogTimeout`, 30 seconds by default, and keeps extending it while the Redisson client that took it is running. In the demo, with the timeout set to 3 seconds, the lock's TTL stayed between about 2,000 and 3,000 ms for 4 seconds: the watchdog put it back to 3,000 about once a second, a third of the timeout. With an explicit lease, `lock.lock(2, TimeUnit.SECONDS)`, there is no watchdog, and the key was gone after 2 seconds whether or not the work was done. Redisson's lock is also not a plain string. It is a hash whose field is the client's id plus the thread id and whose value counts how many times that thread took it, so the same thread can take it again (like a `ReentrantLock`), and only that thread may unlock it.\n\nRenewal narrows the gap. It doesn't close it, because the watchdog is a thread in the same JVM, and a stop-the-world GC pause stops it too. So does a VM paused by its hypervisor, or a network partition that cuts the holder off from Redis while it keeps working on the database. In each case the holder goes on believing it holds the lock, because nothing in its own process ran to tell it otherwise. Checking \"do I still hold it?\" right before each write doesn't help either: the pause can come between the check and the write. Martin Kleppmann's analysis of Redis locks walks through these cases one by one.",
+      "try": {
+        "title": "Watch Redisson's watchdog renew a lease",
+        "minutes": 3,
+        "steps": [
+          "Run `WatchdogDemo` or `WatchdogDemoKt` from the `labs` folder. It takes about 8 seconds. The demo sets `lockWatchdogTimeout` to 3 seconds so the renewals are easy to see.",
+          "Read the first PTTL line. What is the lowest value, and how often does it jump back up?",
+          "Read the second line, with a fixed 2-second lease. Then run the demo again and compare the two fencing tokens with the first run."
+        ],
+        "code": {
+          "lang": "java",
+          "title": "WatchdogDemo.java",
+          "src": "package sfz.redis.l08.demo;\n\nimport org.redisson.Redisson;\nimport org.redisson.api.RFencedLock;\nimport org.redisson.api.RLock;\nimport org.redisson.api.RedissonClient;\nimport org.redisson.config.Config;\nimport redis.clients.jedis.RedisClient;\n\nimport java.util.concurrent.TimeUnit;\n\n/** Watch Redisson's lock watchdog renew a lease, then a lock with a fixed lease run out, then fencing tokens. */\npublic class WatchdogDemo {\n    static final String LOCK = \"demo:l08:lock:settle\";\n\n    public static void main(String[] args) throws Exception {\n        Config config = new Config();\n        config.useSingleServer().setAddress(\"redis://localhost:6379\");\n        config.setLockWatchdogTimeout(3_000);                   // the default is 30 s; 3 s keeps the demo short\n        RedissonClient redisson = Redisson.create(config);\n\n        try (RedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()) {\n            redis.del(LOCK);\n            RLock lock = redisson.getLock(LOCK);\n\n            lock.lock();                                         // no lease given: the watchdog keeps it alive\n            System.out.println(\"lock() with the watchdog. Redis holds a \" + redis.type(LOCK) + \": \" + redis.hgetAll(LOCK));\n            StringBuilder ttls = new StringBuilder();\n            for (int i = 0; i < 8; i++) {\n                Thread.sleep(500);\n                ttls.append(redis.pttl(LOCK)).append(' ');\n            }\n            System.out.println(\"  PTTL every 500 ms for 4 s: \" + ttls.toString().trim());\n            lock.unlock();\n\n            lock.lock(2, TimeUnit.SECONDS);                      // a fixed 2 s lease: no watchdog\n            ttls.setLength(0);\n            for (int i = 0; i < 6; i++) {\n                Thread.sleep(500);\n                ttls.append(redis.pttl(LOCK)).append(' ');\n            }\n            System.out.println(\"lock(2, SECONDS), no watchdog.\");\n            System.out.println(\"  PTTL every 500 ms for 3 s: \" + ttls.toString().trim() + \"   (-2: the key is gone)\");\n            System.out.println(\"  isHeldByCurrentThread() = \" + lock.isHeldByCurrentThread());\n\n            RFencedLock fenced = redisson.getFencedLock(\"demo:l08:fenced:settle\");\n            Long first = fenced.lockAndGetToken();\n            fenced.unlock();\n            Long second = fenced.lockAndGetToken();\n            fenced.unlock();\n            System.out.println(\"RFencedLock tokens for two acquisitions: \" + first + \", \" + second);\n        } finally {\n            redisson.shutdown();\n        }\n    }\n}\n",
+          "run": "./gradlew :redis:demo -Pmain=sfz.redis.l08.demo.WatchdogDemo",
+          "file": "labs/redis/src/demo/java/sfz/redis/l08/demo/WatchdogDemo.java",
+          "alt": {
+            "lang": "kotlin",
+            "title": "WatchdogDemo.kt",
+            "src": "package sfz.redis.l08.demo\n\nimport org.redisson.Redisson\nimport org.redisson.config.Config\nimport redis.clients.jedis.RedisClient\nimport java.util.concurrent.TimeUnit\n\n/** Watch Redisson's lock watchdog renew a lease, then a lock with a fixed lease run out, then fencing tokens. */\nprivate const val LOCK = \"demo:l08:lock:settle\"\n\nfun main() {\n    val config = Config().apply {\n        useSingleServer().setAddress(\"redis://localhost:6379\")\n        setLockWatchdogTimeout(3_000)                        // the default is 30 s; 3 s keeps the demo short\n    }\n    val redisson = Redisson.create(config)\n    try {\n        RedisClient.builder().hostAndPort(\"localhost\", 6379).build().use { redis ->\n            redis.del(LOCK)\n            val lock = redisson.getLock(LOCK)\n            fun pttlEvery500ms(times: Int) = (1..times).joinToString(\" \") { Thread.sleep(500); redis.pttl(LOCK).toString() }\n\n            lock.lock()                                      // no lease given: the watchdog keeps it alive\n            println(\"lock() with the watchdog. Redis holds a ${redis.type(LOCK)}: ${redis.hgetAll(LOCK)}\")\n            println(\"  PTTL every 500 ms for 4 s: ${pttlEvery500ms(8)}\")\n            lock.unlock()\n\n            lock.lock(2, TimeUnit.SECONDS)                   // a fixed 2 s lease: no watchdog\n            val ttls = pttlEvery500ms(6)\n            println(\"lock(2, SECONDS), no watchdog.\")\n            println(\"  PTTL every 500 ms for 3 s: $ttls   (-2: the key is gone)\")\n            println(\"  isHeldByCurrentThread() = ${lock.isHeldByCurrentThread}\")\n\n            val fenced = redisson.getFencedLock(\"demo:l08:fenced:settle\")\n            val first = fenced.lockAndGetToken().also { fenced.unlock() }\n            val second = fenced.lockAndGetToken().also { fenced.unlock() }\n            println(\"RFencedLock tokens for two acquisitions: $first, $second\")\n        }\n    } finally {\n        redisson.shutdown()\n    }\n}\n",
+            "run": "./gradlew :redis:demo -Pmain=sfz.redis.l08.demo.WatchdogDemoKt",
+            "file": "labs/redis/src/demo/kotlin/sfz/redis/l08/demo/WatchdogDemo.kt"
+          }
+        },
+        "expect": "The first line shows a hash such as `{7aadc447-...:3=1}`: the field is the Redisson client id and the thread id, the value a hold count of 1. The PTTL readings saw-tooth, for example `2418 2954 2432 2955 2451 2957 2451 2956`: they never fall far below 2,000 ms because the watchdog resets the lease to 3,000 about every second. With `lock(2, SECONDS)` they count down, `1494 987 484 -2 -2 -2`: no renewals, the key is gone after 2 seconds, and `isHeldByCurrentThread()` is `false`. The fencing tokens are `1, 2` on the first run and `3, 4` on the next: the counter lives in Redis and keeps growing."
+      },
+      "refs": [
+        {
+          "title": "Locks and synchronizers (Redisson docs)",
+          "url": "https://redisson.pro/docs/data-and-services/locks-and-synchronizers/",
+          "kind": "docs"
+        },
+        {
+          "title": "How to do distributed locking (Martin Kleppmann)",
+          "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Fencing tokens let the resource refuse a stale holder",
+      "body": "If the holder can't know that its lease ended, someone else has to refuse its late writes. The only party that sees every write is the resource itself: the payout file store, the ledger table, the bank's API.\n\nThat takes one more number. Each time a client acquires the lock, it also gets a **fencing token**, a number that grows with every acquisition: 33 for A, 34 for B. Every write to the resource carries the token. The resource remembers the highest token it has accepted and refuses any write with a lower one. When A wakes from its pause and writes with 33 after B has written with 34, the write is refused. The stepper plays it with the numbers from Kleppmann's post.\n\nIn Redis the counter is `INCR fence:{settle}`, run by the same script that takes the lock, so a token is issued exactly when a lock is: if `SET ... NX PX` succeeds, return `INCR`, otherwise return 0. The lab's `RedisLock` does that. The resource side is the half people miss, because it isn't Redis code. In Oracle it is `UPDATE payout_files SET content = :c, fence = :t WHERE batch = :b AND fence <= :t`, and zero rows updated means \"you are a stale holder\". The lab's `PayoutLedger` models that store.\n\nTwo warnings. The counter must never go backwards, so it gets no TTL, and it must live on a Redis whose eviction policy can't drop it (lesson 4: the `volatile-*` policies only evict keys that have a TTL). And a counter on one Redis server is only as durable as that server. If a failover loses its last increments, because replication is asynchronous (lesson 10), a new holder can get a number that was already handed out. Kleppmann argues that this is why fencing tokens belong to a system built on consensus, such as ZooKeeper or etcd.\n\nHis split is the first question to ask about any lock. Is it for **efficiency**, so that two pods don't do the same work twice, and a rare double run only costs some CPU or a duplicate email? Or is it for **correctness**, where a double run pays merchants twice? An efficiency lock can be a single Redis key with a token, like lesson 5's stampede lock. A correctness lock needs the resource to check something: fencing tokens, or a design where the second run fails anyway, such as a unique constraint on the batch id in the payouts table.",
+      "stepper": {
+        "title": "Fencing tokens: the store refuses the paused holder",
+        "intro": "Tokens 33 and 34, as in Kleppmann's example. The store stands in for your database.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Pod A takes the lock and fencing token 33\"><rect class=\"box-a\" x=\"20\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"34\" text-anchor=\"middle\">Redis (the lock service)</text><text class=\"t-s t-code t-a\" x=\"34\" y=\"58\" text-anchor=\"start\">lock:{settle} = tok-A   PTTL 10000</text><text class=\"t-s t-code t-a\" x=\"34\" y=\"82\" text-anchor=\"start\">fence:{settle} = 33</text><text class=\"t-s\" x=\"34\" y=\"106\" text-anchor=\"start\">one script: SET NX PX, then INCR</text><rect class=\"box\" x=\"330\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"34\" text-anchor=\"middle\">payout store (batch-118)</text><text class=\"t-s t-code\" x=\"344\" y=\"58\" text-anchor=\"start\">highest fence seen: 32</text><text class=\"t-s t-code\" x=\"344\" y=\"82\" text-anchor=\"start\">file: (last night's run)</text><text class=\"t-s\" x=\"344\" y=\"106\" text-anchor=\"start\">checks every write's fence</text><rect class=\"box-a\" x=\"20\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"158\" text-anchor=\"middle\">pod A</text><text class=\"t-s t-code t-ok\" x=\"34\" y=\"180\" text-anchor=\"start\">EVAL acquire &gt; 33</text><text class=\"t-s\" x=\"34\" y=\"202\" text-anchor=\"start\">holds the lock, fence 33</text><text class=\"t-s\" x=\"34\" y=\"224\" text-anchor=\"start\">starts building the file</text><rect class=\"box\" x=\"330\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"158\" text-anchor=\"middle\">pod B</text><text class=\"t-s t-code\" x=\"344\" y=\"180\" text-anchor=\"start\">EVAL acquire &gt; 0</text><text class=\"t-s\" x=\"344\" y=\"202\" text-anchor=\"start\">someone holds it: waits</text><rect class=\"box\" x=\"20\" y=\"254\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"278.0\" text-anchor=\"middle\">Every successful acquire also gets the next number from the counter.</text></svg>",
+            "say": "Pod A runs the acquire script: `SET lock:{settle} tok-A NX PX 10000` succeeds, so the same script runs `INCR fence:{settle}` and returns 33. A holds a 10-second lease and fencing token 33. Pod B's attempt returns 0: the lock is taken, and no number is used up. (The braces keep both keys in one Redis Cluster slot, lesson 11.)"
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"A stops for a GC pause and its lease expires\"><rect class=\"box-dim\" x=\"20\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"34\" text-anchor=\"middle\">Redis (the lock service)</text><text class=\"t-s t-code t-bad\" x=\"34\" y=\"58\" text-anchor=\"start\">lock:{settle} = (expired)</text><text class=\"t-s t-code\" x=\"34\" y=\"82\" text-anchor=\"start\">fence:{settle} = 33</text><text class=\"t-s\" x=\"34\" y=\"106\" text-anchor=\"start\">the deadline passed: key deleted</text><rect class=\"box\" x=\"330\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"34\" text-anchor=\"middle\">payout store (batch-118)</text><text class=\"t-s t-code\" x=\"344\" y=\"58\" text-anchor=\"start\">highest fence seen: 32</text><text class=\"t-s t-code\" x=\"344\" y=\"82\" text-anchor=\"start\">file: (last night's run)</text><rect class=\"box-bad\" x=\"20\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"158\" text-anchor=\"middle\">pod A: stopped</text><text class=\"t-s t-bad\" x=\"34\" y=\"180\" text-anchor=\"start\">full GC, 15 s, every thread</text><text class=\"t-s\" x=\"34\" y=\"202\" text-anchor=\"start\">A has no idea time passed</text><text class=\"t-s t-m\" x=\"34\" y=\"224\" text-anchor=\"start\">(no watchdog runs either)</text><rect class=\"box\" x=\"330\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"158\" text-anchor=\"middle\">pod B</text><text class=\"t-s\" x=\"344\" y=\"180\" text-anchor=\"start\">still waiting</text><rect class=\"box\" x=\"20\" y=\"254\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"278.0\" text-anchor=\"middle\">Redis enforces the deadline. Nothing tells the holder that it passed.</text></svg>",
+            "say": "A's JVM stops for a 15-second full GC. Every thread stops, including any thread that would renew the lease. After 10 seconds Redis deletes `lock:{settle}`, exactly as asked. A can't notice: for A, no time has passed at all."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"B takes the lock with token 34 and writes\"><rect class=\"box-a\" x=\"20\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"34\" text-anchor=\"middle\">Redis (the lock service)</text><text class=\"t-s t-code t-a\" x=\"34\" y=\"58\" text-anchor=\"start\">lock:{settle} = tok-B   PTTL 10000</text><text class=\"t-s t-code t-a\" x=\"34\" y=\"82\" text-anchor=\"start\">fence:{settle} = 34</text><rect class=\"box-ok\" x=\"330\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"34\" text-anchor=\"middle\">payout store (batch-118)</text><text class=\"t-s t-code t-ok\" x=\"344\" y=\"58\" text-anchor=\"start\">write with fence 34: 34 &gt;= 32</text><text class=\"t-s t-code t-ok\" x=\"344\" y=\"82\" text-anchor=\"start\">highest fence seen: 34</text><text class=\"t-s t-code\" x=\"344\" y=\"106\" text-anchor=\"start\">file: B's (4,210 payouts)</text><rect class=\"box-bad\" x=\"20\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"158\" text-anchor=\"middle\">pod A: stopped</text><text class=\"t-s t-bad\" x=\"34\" y=\"180\" text-anchor=\"start\">still in the GC pause</text><rect class=\"box-a\" x=\"330\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"158\" text-anchor=\"middle\">pod B</text><text class=\"t-s t-code t-ok\" x=\"344\" y=\"180\" text-anchor=\"start\">EVAL acquire &gt; 34</text><text class=\"t-s\" x=\"344\" y=\"202\" text-anchor=\"start\">builds and writes the file</text><text class=\"t-s\" x=\"344\" y=\"224\" text-anchor=\"start\">with fence 34</text><rect class=\"box\" x=\"20\" y=\"254\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"278.0\" text-anchor=\"middle\">B is the rightful holder now, and its writes carry the larger number.</text></svg>",
+            "say": "Pod B's next attempt succeeds and gets token 34. B builds the payout file and writes it with fence 34. The store compares: 34 is at least the highest it has seen, 32, so it accepts, and now remembers 34."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"A wakes up and its stale write is refused\"><rect class=\"box\" x=\"20\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"34\" text-anchor=\"middle\">Redis (the lock service)</text><text class=\"t-s t-code\" x=\"34\" y=\"58\" text-anchor=\"start\">lock:{settle} = tok-B</text><text class=\"t-s t-code\" x=\"34\" y=\"82\" text-anchor=\"start\">fence:{settle} = 34</text><rect class=\"box-bad\" x=\"330\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"34\" text-anchor=\"middle\">payout store (batch-118)</text><text class=\"t-s t-code t-bad\" x=\"344\" y=\"58\" text-anchor=\"start\">write with fence 33: 33 &lt; 34</text><text class=\"t-s t-bad\" x=\"344\" y=\"82\" text-anchor=\"start\">refused, nothing changed</text><text class=\"t-s t-code\" x=\"344\" y=\"106\" text-anchor=\"start\">file: B's (4,210 payouts)</text><rect class=\"box-a\" x=\"20\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"158\" text-anchor=\"middle\">pod A: awake</text><text class=\"t-s\" x=\"34\" y=\"180\" text-anchor=\"start\">still believes it holds the lock</text><text class=\"t-s\" x=\"34\" y=\"202\" text-anchor=\"start\">writes its file, fence 33</text><text class=\"t-s t-code t-bad\" x=\"34\" y=\"224\" text-anchor=\"start\">&gt; refused</text><rect class=\"box\" x=\"330\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"158\" text-anchor=\"middle\">pod B</text><text class=\"t-s\" x=\"344\" y=\"180\" text-anchor=\"start\">finishing its run</text><rect class=\"box\" x=\"20\" y=\"254\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"278.0\" text-anchor=\"middle\">Only the resource saw both writes, so only the resource can refuse the stale one.</text></svg>",
+            "say": "The GC ends. A carries on from where it stopped and writes its version of the file with fence 33. No check in A would have caught this: the pause could have come after any check. The store sees 33, below the 34 it already accepted, and refuses. B's file stays."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Without the check, A would have overwritten B's file\"><rect class=\"box\" x=\"20\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"34\" text-anchor=\"middle\">Redis (the lock service)</text><text class=\"t-s\" x=\"34\" y=\"58\" text-anchor=\"start\">hands out the numbers</text><text class=\"t-s\" x=\"34\" y=\"82\" text-anchor=\"start\">can't see the writes</text><rect class=\"box-bad\" x=\"330\" y=\"14\" width=\"290\" height=\"112\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"34\" text-anchor=\"middle\">store without a fence check</text><text class=\"t-s t-bad\" x=\"344\" y=\"58\" text-anchor=\"start\">A's write accepted</text><text class=\"t-s t-code t-bad\" x=\"344\" y=\"82\" text-anchor=\"start\">file: A's (4,198 payouts)</text><text class=\"t-s t-bad\" x=\"344\" y=\"106\" text-anchor=\"start\">12 merchants missing</text><rect class=\"box\" x=\"20\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"165.0\" y=\"158\" text-anchor=\"middle\">the lock alone</text><text class=\"t-s\" x=\"34\" y=\"180\" text-anchor=\"start\">kept A and B apart only while</text><text class=\"t-s\" x=\"34\" y=\"202\" text-anchor=\"start\">A's lease was alive</text><rect class=\"box-ok\" x=\"330\" y=\"138\" width=\"290\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"158\" text-anchor=\"middle\">the fencing token</text><text class=\"t-s t-ok\" x=\"344\" y=\"180\" text-anchor=\"start\">keeps them apart at the</text><text class=\"t-s t-ok\" x=\"344\" y=\"202\" text-anchor=\"start\">resource, whatever the timing</text><rect class=\"box\" x=\"20\" y=\"254\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320.0\" y=\"278.0\" text-anchor=\"middle\">Redis issues the tokens; the store must enforce them, or they protect nothing.</text></svg>",
+            "say": "Take the check away and A's write lands after B's: the file the bank receives is A's stale version, built before B's run, missing 12 merchants. The lock kept A and B apart only while A's lease was alive. The token keeps them apart at the one place that sees every write. That is why fencing needs the resource to cooperate: in Oracle, an `UPDATE ... WHERE fence <= :token`."
+          }
+        ]
+      },
+      "try": {
+        "title": "Fence a write by hand",
+        "minutes": 3,
+        "steps": [
+          "At a redis-cli prompt (`docker compose -f env/redis.yml exec redis redis-cli`), clear the store's hash, set the fence counter to 32 and take two tokens, one for pod A and one for pod B.",
+          "A Redis hash plays the payout store here, and the script plays its rule: refuse a fence lower than the one stored. Let B write with its token first, then A with its older one.",
+          "Read the stored file. Then, before you run it, predict what A's write would return if B had never written."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL payout:batch-118\nSET fence:{settle} 32\nINCR fence:{settle}\nINCR fence:{settle}\nEVAL \"local f = tonumber(redis.call('HGET', KEYS[1], 'fence') or '0') if tonumber(ARGV[1]) < f then return 0 end redis.call('HSET', KEYS[1], 'fence', ARGV[1], 'content', ARGV[2]) return 1\" 1 payout:batch-118 34 \"B: 4210 payouts\"\nEVAL \"local f = tonumber(redis.call('HGET', KEYS[1], 'fence') or '0') if tonumber(ARGV[1]) < f then return 0 end redis.call('HSET', KEYS[1], 'fence', ARGV[1], 'content', ARGV[2]) return 1\" 1 payout:batch-118 33 \"A: 4198 payouts\"\nHGETALL payout:batch-118"
+        },
+        "expect": "The first `DEL` prints `(integer) 0`, or 1 if an earlier run left the key behind. The two `INCR`s print `(integer) 33` (A's token) and `(integer) 34` (B's). B's write returns `(integer) 1`, and A's returns `(integer) 0`: 33 is lower than the stored 34. `HGETALL` shows `fence` `\"34\"` and `content` `\"B: 4210 payouts\"`. Had B never written, A's write would return 1: fencing only refuses a holder once a newer one has written, which is exactly the case that matters."
+      },
+      "refs": [
+        {
+          "title": "Distributed locks: disclaimer about consistency",
+          "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Redlock, and the argument about it",
+      "body": "Everything so far used one Redis server, and one server can fail. Adding a replica doesn't make the lock safe, because replication is asynchronous. Pod A takes the lock on the primary, the primary crashes before the write reaches the replica, the replica is promoted without the key, and pod B takes the same lock. The Redis docs give this exact sequence.\n\nRedlock is Redis's answer. Run N independent Redis masters, usually 5, with no replication between them. To acquire, a client sends `SET key token NX PX ttl` to all 5 in parallel, with a short timeout for each, and holds the lock only if it got a majority (at least 3) and the whole attempt took less than the TTL. What is left of the TTL after the attempt is how long it may hold the lock. If it fails, it releases on all 5.\n\nIn 2016 Martin Kleppmann argued that Redlock is unsafe when correctness depends on it. Its safety depends on timing: bounded network delay, bounded pauses, and clocks that don't jump. If one node's clock jumps forward, its key expires early and two clients can each get a majority. A GC pause while the replies are on their way leaves a client believing it holds a lock that has already expired. And Redlock has no fencing tokens, because a random value has no order. His advice: for efficiency, a single Redis is enough; for correctness, use a consensus system and fencing.\n\nSalvatore Sanfilippo (antirez), who designed Redlock, replied within days. He argued that Redlock needs clocks that tick at about the same rate, not synchronized ones, and that clock jumps come from administrators and badly configured NTP, which you can avoid. He argued that a pause before the client's final time check is caught by that check, and a pause after it hurts every lease-based lock equally. And he argued that the large random token can be used for check-and-set on the resource instead of a counter. He agreed that Redis should use a monotonic clock for expiry.\n\nBoth have a point, and the practical answer has settled. The Redis docs now ask you to read both posts, recommend fencing tokens when correctness matters, and warn that Redis doesn't use a monotonic clock for TTLs. Redisson deprecated its RedLock object in favor of RLock and RFencedLock, saying the algorithm's safety guarantees are contested. So: use a single Redis lock with a token for efficiency. For correctness, make the resource enforce it with fencing tokens it checks, a unique constraint, or a lock in the database itself, such as Oracle's `SELECT ... FOR UPDATE` on the batch row. Five Redis servers cost more than either option and settle neither argument.",
+      "refs": [
+        {
+          "title": "How to do distributed locking (Martin Kleppmann)",
+          "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+          "kind": "read"
+        },
+        {
+          "title": "Is Redlock safe? (antirez)",
+          "url": "https://antirez.com/news/101",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A Redis lock is a hotel key card with a checkout time. The front desk (Redis) gives one guest a card for room 118 that works until 11:00, and won't issue another while it is valid. At 11:00 it hands a new card to the next guest. The front desk keeps its side of the deal perfectly, but it never walks up to the room: if the first guest is still inside, napping past checkout (a GC pause), both guests now think the room is theirs. A fencing token is a number printed on each card, with a door that remembers the highest number it has seen and refuses lower ones. Card 34 opens the door, so card 33 never will again. The analogy breaks on who checks: a hotel door is consulted every time someone enters, while a Redis lock is consulted once, when you take it, and the resource never asks again unless you make it check the token.",
+  "in_your_world": "Before you take a Redis lock, look for a tool that already makes the work run once. Temporal allows only one running workflow per workflow id, so a settlement workflow with the id `settle-batch-118` can't run twice at once, and that check doesn't depend on anyone's clock. In Oracle, a unique constraint on the batch id in the payouts table makes a second run fail at the insert, and `SELECT ... FOR UPDATE` on the batch row is a lock that lives with the data. A Kafka consumer group already gives each partition to one consumer. Use a Redis lock for efficiency jobs where a rare double run is harmless: refreshing a cache, recomputing a report, lesson 5's stampede protection. When you do use it for something that moves money, pass the fencing token down to the write, as a column the update checks.",
+  "mistake": "The most common mistake is a lock that is only correct while nothing is slow: `SET lock NX PX 30000` to take it, `DEL lock` in a finally block, and a critical section that writes to the database with no other check. It passes every test, because tests don't pause for 35 seconds. In production a long GC, a slow query or a node under memory pressure lets the lease expire mid-work, a second pod starts, and the first pod's DEL then removes the second pod's lock, letting a third in. People write it this way because it reads like a `ReentrantLock`, which can't expire behind your back. The fix has three parts: a random token per acquire, release with compare-and-delete (`DELEX key IFEQ token` on 8.4+, a Lua script before that), and, if a double run costs money, a fencing token or constraint that the resource itself checks.",
+  "compare": {
+    "title": "Take the lock, write with the fence, release: Java and Kotlin",
+    "java": {
+      "title": "SettlementJob.java",
+      "src": "void settle(String batchId) {\n    Optional<RedisLock.Lease> lease = lock.tryAcquire(\"settle\", Duration.ofSeconds(30));\n    if (lease.isEmpty()) return;                                   // another pod is running the batch\n    try {\n        String file = buildPayoutFile(batchId);\n        boolean written = ledger.write(batchId, lease.get().fence(), file);   // the store checks the fence\n        if (!written) log.warn(\"lost the lock to a newer holder; file not written\");\n    } finally {\n        lock.release(lease.get());                                 // compare-and-delete: never another pod's lock\n    }\n}"
+    },
+    "kotlin": {
+      "title": "SettlementJob.kt",
+      "src": "inline fun <T> RedisLock.withLock(resource: String, lease: Duration, block: (RedisLock.Lease) -> T): T? {\n    val held = tryAcquire(resource, lease).orElse(null) ?: return null   // another pod is running it\n    try {\n        return block(held)\n    } finally {\n        release(held)                                              // compare-and-delete: never another pod's lock\n    }\n}\n\nfun settle(batchId: String) {\n    lock.withLock(\"settle\", Duration.ofSeconds(30)) { lease ->\n        val written = ledger.write(batchId, lease.fence(), buildPayoutFile(batchId))   // the store checks the fence\n        if (!written) log.warn(\"lost the lock to a newer holder; file not written\")\n    }\n}"
+    },
+    "note": "Both send the same two scripts to Redis: acquire (SET NX PX, then INCR the fence) and compare-and-delete release. Java repeats the try/finally at every call site. Kotlin writes it once as an inline extension function: the lambda's body is copied into the caller, so a `return` inside it returns from `settle`, and a caller can't forget the release. Neither version relies on the lock alone. The release in `finally` can't undo a write made after the lease ran out, so the write carries the fence and the store decides. When `write` returns false, the pod lost the lock while working and must not report the batch as done."
+  },
+  "worked": {
+    "title": "Build the lock one failure at a time",
+    "steps": [
+      {
+        "say": "First one wins: `NX` creates the key only if it doesn't exist, and one thread runs each command, so exactly one pod gets `OK` and the others get nil. It fails the first time a holder crashes: the key never goes away.",
+        "code": "SET lock:settle pod-a NX",
+        "lang": "text"
+      },
+      {
+        "say": "Add a deadline inside the same command, and a random token so the holder can prove later that the lock is still its own. A UUID per acquire, never the pod name.",
+        "code": "String token = UUID.randomUUID().toString();\nboolean got = redis.set(\"lock:settle\", token, SetParams.setParams().nx().px(30_000)) != null;   // \"OK\" or null",
+        "lang": "java",
+        "alt_code": "val token = UUID.randomUUID().toString()\nval got = redis.set(\"lock:settle\", token, SetParams.setParams().nx().px(30_000)) != null   // \"OK\" or null",
+        "alt_lang": "kotlin"
+      },
+      {
+        "say": "Release only your own lock, compare and delete in one command. On Redis 8.4+ that is `DELEX`; before that, the three-line Lua script with GET, compare and DEL.",
+        "code": "boolean released = redis.delex(\"lock:settle\", CompareCondition.valueEq(token)) == 1;   // DELEX ... IFEQ token",
+        "lang": "java",
+        "alt_code": "val released = redis.delex(\"lock:settle\", CompareCondition.valueEq(token)) == 1L   // DELEX ... IFEQ token",
+        "alt_lang": "kotlin"
+      },
+      {
+        "say": "Number the holders. The acquire becomes a script that increments a counter only when the SET succeeded, so every holder gets a larger fence than the one before, and a failed attempt uses up nothing.",
+        "code": "if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then\n    return redis.call('INCR', KEYS[2])     -- KEYS[2] = fence:{settle}, no TTL, ever\nend\nreturn 0",
+        "lang": "text"
+      },
+      {
+        "say": "Make the resource check the number. This is the step that protects the data, and it lives in your database, not in Redis: the update succeeds only for a fence at least as large as the last one written.",
+        "code": "UPDATE payout_files\n   SET content = :content, fence = :fence\n WHERE batch = :batch\n   AND fence <= :fence;     -- 0 rows: a newer holder already wrote; stop",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A Redis lock with tokens and fencing, and the store that enforces it",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/redis/src/main/java/sfz/redis/l08/RedisLock.java",
+      "labs/redis/src/main/kotlin/sfz/redis/l08/PayoutLedger.kt"
+    ],
+    "run": "./gradlew :redis:test --tests 'sfz.redis.l08.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. All 13 fail: nine in `RedisLockTest` use the shared Redis container, and four in `PayoutLedgerTest` need no Docker. Lease expiry in the tests is real but short (200 ms leases), so a few of them take a fraction of a second.",
+      "In `RedisLock.java`, write the `ACQUIRE` script and `tryAcquire`. Run `./gradlew :redis:test --tests 'sfz.redis.l08.RedisLockTest'`. Most tests pass now. `a late release does not delete the next holder's lock` still fails: that is the bug in the stub's `release`.",
+      "Fix `release` with the `RELEASE` script, and write `extend` with one `SET ... IFEQ`.",
+      "In `PayoutLedger.kt`, write `write` with one `compute`. Run all 13. The last test in `RedisLockTest` is the stepper end to end: A's lease expires during a pause, B writes with a larger fence, and A's late write is refused."
+    ],
+    "hints": [
+      "`if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return redis.call('INCR', KEYS[2]) end return 0`. The Lua number reaches Java as a `Long`.",
+      "`redis.eval(ACQUIRE, List.of(lockKey(resource), fenceKey(resource)), List.of(token, String.valueOf(lease.toMillis())))`.",
+      "`redis.set(key, token, SetParams.setParams().condition(CompareCondition.valueEq(token)).px(ms))` returns null when the condition was false, so `return reply != null;`.",
+      "Inside `compute`, return `old` to keep the stored file, or `PayoutFile(fence, content)` to replace it. A `var written = false` outside the lambda records which branch ran."
+    ],
+    "done_when": "All 13 tests in `sfz.redis.l08` pass."
+  },
+  "drill": {
+    "title": "Safe release from memory",
+    "minutes": 4,
+    "prompt": "Close the lab. Write `release(key, token)` with Jedis twice: with the compare-and-delete Lua script, and with the Redis 8.4 command. Then write one sentence on why it can't be a GET in Java followed by a DEL.",
+    "answer": {
+      "lang": "java",
+      "src": "static final String RELEASE = \"\"\"\n        if redis.call('GET', KEYS[1]) == ARGV[1] then\n            return redis.call('DEL', KEYS[1])\n        end\n        return 0\n        \"\"\";\n\nboolean release(String key, String token) {\n    return Long.valueOf(1).equals(redis.eval(RELEASE, List.of(key), List.of(token)));   // compare and delete, one command\n}\n\nboolean releaseOnRedis84(String key, String token) {\n    return redis.delex(key, CompareCondition.valueEq(token)) == 1;                      // DELEX key IFEQ token\n}\n// GET then DEL is two commands: a pause between them lets the lease expire, and the DEL removes the next holder's lock",
+      "alt": {
+        "lang": "kotlin",
+        "src": "val RELEASE = \"\"\"\n    if redis.call('GET', KEYS[1]) == ARGV[1] then\n        return redis.call('DEL', KEYS[1])\n    end\n    return 0\n\"\"\".trimIndent()\n\nfun release(key: String, token: String): Boolean =\n    redis.eval(RELEASE, listOf(key), listOf(token)) == 1L                                 // compare and delete, one command\n\nfun releaseOnRedis84(key: String, token: String): Boolean =\n    redis.delex(key, CompareCondition.valueEq(token)) == 1L                              // DELEX key IFEQ token\n// GET then DEL is two commands: a pause between them lets the lease expire, and the DEL removes the next holder's lock"
+      }
+    }
+  },
+  "recap": [
+    "A Redis lock is a lease: `SET key token NX PX ttl` in one command. Redis enforces the deadline; nothing makes the holder stop when it passes.",
+    "Release with compare-and-delete, a Lua script or `DELEX key IFEQ token` on Redis 8.4+. Plain DEL, or GET then DEL, can delete the next holder's lock.",
+    "Renewing the lease (Redisson's watchdog, 30-second default) covers slow work, but not a paused or partitioned holder: the renewing thread stops too.",
+    "A fencing token grows with every acquisition and travels with every write; the resource refuses tokens lower than the highest it has seen. Only the resource can stop a stale holder.",
+    "Redlock takes a majority of 5 independent masters, and its safety for correctness is disputed. Use one Redis lock for efficiency, and fencing or the database for correctness."
+  ],
+  "quiz": [
+    {
+      "q": "Pod A releases its lock with `if (token.equals(redis.get(key))) redis.del(key);`. Why is that still unsafe?",
+      "options": [
+        "GET returns a cached copy, not the live value",
+        "DEL fails on a key that has a TTL",
+        "A pause between the GET and the DEL lets the lease expire and another pod take the lock, and the DEL then deletes that pod's lock",
+        "It is safe: the token check proves the lock is A's"
+      ],
+      "answer": 2,
+      "why": "The check and the delete are two commands, and anything can happen between them: a GC pause, a slow network. The token check was true when it ran and false by the time DEL arrived. A Lua script or `DELEX key IFEQ token` does the compare and the delete inside one command, where nothing can run in between."
+    },
+    {
+      "q": "From lesson 4: the lock's Redis runs `maxmemory-policy allkeys-lru` and fills up. The fence counter `fence:{settle}` hasn't been touched for a day and is evicted. What happens at the next acquire?",
+      "options": [
+        "INCR starts again from 0 and returns 1, so the store, which has seen 34, refuses every write from now on",
+        "INCR fails with an error because the key is gone",
+        "Nothing: Redis never evicts keys that have no TTL",
+        "The lock can't be acquired until someone restores the key"
+      ],
+      "answer": 0,
+      "why": "INCR on a missing key starts from 0 (lesson 1), so the next holder gets 1. The store refuses any fence below 34, so every future batch fails: safe, but stuck until someone fixes the counter. The allkeys policies can evict any key; only the volatile policies limit themselves to keys with a TTL. A fence counter needs a Redis that never evicts it.",
+      "from": "redis-04"
+    },
+    {
+      "q": "You take a Redisson lock with `lock.lock()` (watchdog, 30-second timeout). The holder's JVM then stops for 45 seconds in a full GC. What happens?",
+      "options": [
+        "The watchdog keeps renewing during the pause, so the lock stays safe",
+        "The watchdog's thread stops too, the lease ends after about 30 seconds, and another pod can take the lock while the holder still believes it has it",
+        "Redisson notices the pause and rolls back the holder's writes",
+        "The lock is held until the JVM exits"
+      ],
+      "answer": 1,
+      "why": "A stop-the-world pause stops every thread in the JVM, the watchdog included. Redis expires the lease on schedule, another pod acquires, and when the pause ends the first holder carries on. The watchdog protects against slow work, not against a stopped process. That case needs a fencing check at the resource."
+    },
+    {
+      "q": "Which of these needs fencing tokens or another check at the resource, not just a Redis lock?",
+      "options": [
+        "Only one pod refreshes a cached exchange-rate table each minute",
+        "Two pods shouldn't recompute the same merchant report at the same time",
+        "Only one request should load a hot merchant into the cache (stampede protection)",
+        "The payout file for a batch must be sent to the bank exactly once"
+      ],
+      "answer": 3,
+      "why": "In the first three a rare double run wastes some work and nothing else: those locks are for efficiency, and a single Redis key with a token is enough. Sending a payout file twice pays merchants twice. That is a correctness lock, so the resource must refuse the second run: a fencing token it checks, or a unique constraint on the batch id."
+    },
+    {
+      "q": "A team runs Redlock on five Redis masters to protect a ledger update and skips fencing, because \"a majority makes it safe\". What is the strongest objection?",
+      "options": [
+        "Five masters are too slow for payment traffic",
+        "A holder can still pause after acquiring and write after its lease ended, and Redlock's random value has no order, so the ledger can't tell the stale write from the current one",
+        "Redlock needs replication between the five masters, and replication is asynchronous",
+        "Redlock only works with Redis Cluster"
+      ],
+      "answer": 1,
+      "why": "A majority protects the acquire against one server failing. It can't stop a holder that paused after it got the lock, which is the same failure a single server has. Without an ordered token the ledger has nothing to compare. Redlock deliberately uses independent masters with no replication, and works without Cluster."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Why must the PX be inside the SET that takes a lock?",
+      "back": "So that a crashed holder's lock expires. SETNX followed by EXPIRE can leave a lock with no TTL, held forever."
+    },
+    {
+      "front": "Why does every acquire store a fresh random token?",
+      "back": "So release and extend can check that the lock is still theirs. A pod name repeats; a UUID per acquire doesn't."
+    },
+    {
+      "front": "What is compare-and-delete on Redis 8.4+, and before?",
+      "back": "`DELEX key IFEQ token`. Before 8.4, a Lua script: if GET equals the token then DEL, else return 0."
+    },
+    {
+      "front": "What does Redisson's lock watchdog do, and what can't it handle?",
+      "back": "It keeps extending a lock taken without a lease time (`lockWatchdogTimeout`, 30 s default) while the client runs. It can't help when the whole JVM pauses: it stops too."
+    },
+    {
+      "front": "What is a fencing token?",
+      "back": "A number that grows with every lock acquisition and travels with every write. The resource refuses a write whose number is lower than the highest it has accepted."
+    },
+    {
+      "front": "Efficiency lock or correctness lock?",
+      "back": "Efficiency: a double run only wastes work, so one Redis key is fine. Correctness: a double run corrupts data or moves money twice, so the resource must enforce it."
+    },
+    {
+      "front": "Redlock in one sentence?",
+      "back": "SET NX PX on 5 independent masters; the lock is held if at least 3 succeed within the TTL. Whether it is safe for correctness is disputed."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Lease",
+      "plain": "A lock with a deadline: held until released or until the time runs out, whichever comes first."
+    },
+    {
+      "term": "Lock token",
+      "plain": "A random value stored in the lock key by the holder, so only the holder can release or extend it."
+    },
+    {
+      "term": "Compare-and-delete",
+      "plain": "Delete a key only if it still holds an expected value, in one command (`DELEX ... IFEQ` or a Lua script)."
+    },
+    {
+      "term": "Lock watchdog",
+      "plain": "A background task that keeps extending a lock's lease while its holder is alive (Redisson's name for it)."
+    },
+    {
+      "term": "Stop-the-world pause",
+      "plain": "A pause in which every thread of a JVM stops, for example during a full garbage collection."
+    },
+    {
+      "term": "Fencing token",
+      "plain": "A number that grows with each lock holder; the protected resource refuses writes carrying a lower number."
+    },
+    {
+      "term": "Redlock",
+      "plain": "A lock algorithm that takes the same lock on a majority of N independent Redis masters."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your settlement job takes a Redis lock with a 30-second lease and releases it with compare-and-delete. A reviewer asks: \"What if the job pauses for 40 seconds?\" Explain what happens and what you would change.",
+    "answer": "Redis deletes the lock after 30 seconds, as it should, and nothing tells our job. A second pod's SET NX succeeds and it starts the same batch, while ours is frozen in a GC pause or cut off by the network. When ours wakes up it carries on and writes its payout file, so two pods have written. The compare-and-delete stops us from deleting the second pod's lock, but it can't stop our write, and checking the lock before writing doesn't help, because the pause can fall between the check and the write. A watchdog that renews the lease covers slow work but stops during a pause like everything else. So the protection has to sit at the resource. I'd have the acquire script also INCR a fence counter and pass that number to the write, and make the payouts table accept a write only when the fence is at least the last one stored: `UPDATE ... WHERE fence <= :fence`. Zero rows updated tells the job it lost the lock. Since this lock is about not paying merchants twice, I'd also add a unique constraint on the batch id, so a second payout file can't be inserted at all."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Locks that don't depend on time.** A Redis lock is a lease because Redis can't know whether a client is alive. Systems built on consensus can tie a lock to a session. In ZooKeeper, a lock is an ephemeral node that disappears when the client's session ends, and the node's version or the transaction id (zxid) can serve as a fencing token, as Kleppmann suggests. etcd has leases and a global revision number that grows with every write, which a resource can use the same way. These still expire a session after a timeout, so a paused client still needs fencing; the difference is that the token is ordered and durable.\n\n**Locks inside the database.** If the resource is a database, its own locks avoid the two-system problem entirely. Oracle's `SELECT ... FOR UPDATE` holds a row lock until the transaction ends, and a session that dies releases it with its transaction. Oracle's `DBMS_LOCK` and PostgreSQL's advisory locks (`pg_advisory_lock`) give named locks that also end with the session. The lock belongs to the same session as the data changes. If the client pauses, the row stays locked and every other session waits; if its connection dies, the database rolls its transaction back and frees the lock. At no moment do two clients both hold it, and no clock decides when it ends.\n\n**Redisson's fenced lock.** `RFencedLock` (`redisson.getFencedLock(name)`, then `lockAndGetToken()` or `tryLockAndGetToken(...)`) returns a token that grows with every acquisition, like the lab's `RedisLock`. Redisson's docs say the guarded service should accept a token only if it is at least as large as the previous one, the same rule as the lab's `PayoutLedger`.\n\n**Waiting for a lock.** The lab's `tryAcquire` tries once. A loop that retries at a fixed interval makes every waiting pod hit Redis at the same moment; retry after a random delay instead, as the Redis docs recommend for Redlock. Redisson's `tryLock(wait, lease, unit)` subscribes to an unlock notification over pub/sub (lesson 9) instead of polling.\n\n**Clocks.** Redis computes TTLs from the wall clock, not a monotonic one, so a server whose clock jumps forward expires leases early. The Redis docs mention this in their consistency disclaimer, and it is one more reason to run NTP in slewing mode on lock servers rather than letting it step the clock."
+  },
+  "sources": [
+    {
+      "title": "Distributed locks with Redis (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/clients/patterns/distributed-locks/"
+    },
+    {
+      "title": "How to do distributed locking (Martin Kleppmann, 2016)",
+      "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html"
+    },
+    {
+      "title": "Is Redlock safe? (antirez, 2016)",
+      "url": "https://antirez.com/news/101"
+    },
+    {
+      "title": "Locks and synchronizers (Redisson docs)",
+      "url": "https://redisson.pro/docs/data-and-services/locks-and-synchronizers/"
+    },
+    {
+      "title": "DELEX (Redis docs)",
+      "url": "https://redis.io/docs/latest/commands/delex/"
+    }
+  ]
+}

@@ -1,0 +1,406 @@
+{
+  "id": "sql-02",
+  "title": "Designing a schema: normalization and constraints",
+  "minutes": 40,
+  "goal": "By the end you can find the functional dependencies hiding in a flat table, split it so each fact is stored once, decide when a copy is worth keeping, and write a CREATE TABLE whose constraints reject bad rows, including overlapping time ranges.",
+  "warmup": {
+    "q": "A table has `CHECK (fee_bps BETWEEN 0 AND 1000)` on a column that allows NULL. What happens to `INSERT ... VALUES (NULL)` for that column?",
+    "options": [
+      "It is rejected: NULL is not between 0 and 1000",
+      "It is accepted: the check is unknown, and a CHECK fails only on false",
+      "It is accepted and stored as 0",
+      "It is rejected with a NOT NULL error"
+    ],
+    "answer": 1,
+    "why": "`NULL BETWEEN 0 AND 1000` is unknown, the three-valued logic from lesson 1. A CHECK constraint rejects a row only when its condition is false, so unknown passes. WHERE is the mirror image: it keeps a row only when the condition is true. If NULL must be refused, the column also needs `NOT NULL`."
+  },
+  "sections": [
+    {
+      "h": "Repeated facts drift apart",
+      "body": "A partner bank sends a file of payments every night. The fastest way to load it is to keep it exactly as it arrives, one row per payment, every detail on every row. That is `payments_export`. Here are 5 of its 10 columns:\n\n```postgresql\ncourse=# SELECT payment_id, customer_name, merchant_name, mcc, mcc_description\ncourse-# FROM payments_export\ncourse-# ORDER BY payment_id;\n payment_id | customer_name |   merchant_name   | mcc  |       mcc_description\n------------+---------------+-------------------+------+------------------------------\n         13 | Ben Carter    | Harbor Hotel      | 7011 | Hotels, motels, resorts\n         14 | Asha Rao      | Northwind Grocers | 5411 | Grocery stores, supermarkets\n         15 | Elena Petrova | Volt Electronics  | 5732 | Electronics stores\n         16 | Jonas Weber   | Harbor Hotel      | 7011 | Hotels, motels, resorts\n         17 | Farid Hadad   | Volt Electronics  | 5732 | Electronics stores\n         18 | Farid Haddad  | Volt Electronics  | 5732 | Electronic stores\n         19 | Chloe Martin  | Volt Electronics  | 5732 | Electronics stores\n         20 | Ben Carter    | Northwind Grocers | 5411 | Grocery stores, supermarkets\n         21 | Mateo Ruiz    | Quick Bite        | 5812 | Eating places, restaurants\n         22 | Jonas Weber   | Harbor Hotel      | 7011 | Hotels, motels, resorts\n(10 rows)\n```\n\nThe `mcc` is the merchant category code, a four-digit number the card networks use to say what kind of business a merchant is. Volt Electronics is in category 5732, and the file says so four times in ten rows. A year of files would say it once for every Volt payment, perhaps 50,000 times. Each copy is a chance to disagree, and this file already disagrees twice. Payment 17 spells Farid's surname with one d. Payment 18 calls category 5732 \"Electronic stores\". Which spelling is right? The table cannot tell you, because it stores the same fact in several places and has no rule that keeps them equal.\n\nStoring a fact many times causes three kinds of damage, and each has a name. A fact stored on n rows must be changed on n rows, and missing one leaves the table contradicting itself, as it does here. That is an **update anomaly**. You also cannot record a fact on its own: category 5814 means \"Fast food restaurants\", but there is nowhere to write that down until a payment at a fast-food merchant arrives. That is an insert anomaly. And deleting one fact can delete another: payment 21 is the only Quick Bite row in the file, so removing it as a fraud reversal also loses the fact that Quick Bite is a restaurant. That is a delete anomaly.\n\nThe fix is to store each fact once and point at it from everywhere else, which is what keys from lesson 1 are for. A key is a column, or a set of columns, whose value names exactly one row, so another table can refer to the row by that value. **Normalization** is the method that decides which facts get their own table.",
+      "try": {
+        "title": "Find the disagreements",
+        "minutes": 3,
+        "steps": [
+          "Start the database if it is not running (`docker compose -f env/postgres.yml up -d` from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the first query. It groups the rows by email and counts how many different names each email has. Predict how many emails come back.",
+          "Run the second. Does every merchant name come with exactly one category code?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT customer_email, count(DISTINCT customer_name) AS names, min(customer_name), max(customer_name)\nFROM payments_export\nGROUP BY customer_email\nHAVING count(DISTINCT customer_name) > 1;\n\nSELECT merchant_name, count(DISTINCT mcc) AS codes\nFROM payments_export\nGROUP BY merchant_name\nHAVING count(DISTINCT mcc) > 1;"
+        },
+        "expect": "The first query finds one email with two names:\n\n```postgresql\n      customer_email      | names |     min     |     max\n--------------------------+-------+-------------+--------------\n farid.haddad@example.com |     2 | Farid Hadad | Farid Haddad\n(1 row)\n```\n\nThe second returns `(0 rows)`: in this file, every merchant name maps to one code. `GROUP BY` puts rows with the same email in one group and `HAVING` filters the groups. Lesson 4 covers both in depth."
+      }
+    },
+    {
+      "h": "Functional dependencies show where to cut",
+      "body": "How do you decide which facts get their own table? Start with a concrete promise about the data: every row with the email `farid.haddad@example.com` should have the same customer name. That promise is a **functional dependency**, written `customer_email → customer_name`. In general, `X → Y` means \"any two rows that agree on X also agree on Y\": X determines Y. You find dependencies by asking what the columns mean, and you test them against the data with the query from the Try it: group by X and look for a group with more than one Y.\n\nA key is the strongest dependency there is. `payment_id` determines every other column of the export, because it names one payment. The trouble starts with dependencies whose left side is not a key. The export has three:\n\n- `customer_email → customer_name`\n- `merchant_name → mcc`\n- `mcc → mcc_description`\n\nEach one is a fact about something other than the payment, stored on every payment row. The figure shows the pattern: `payment_id → merchant_name → mcc → mcc_description` is a chain, and the far end of the chain repeats for every payment of every merchant in that category. The cure is mechanical. Take each dependency whose left side is not a key, move its columns into a new table, and make the left side that table's primary key. The fact table keeps only the column that points at the new table. Do that three times and you get `customers` (email → name), `merchants` (name → category) and `mcc_codes` (category → description), plus `payments`, which keeps the payment's own facts and a reference to each of the others. That is the course schema. It uses surrogate ids such as `merchant_id` as the keys, but the split is the same.\n\nThe **normal forms** are names for how far along this road a table is. Each one adds a rule to the previous one:\n\n1. First normal form (1NF): every column holds one value. No `\"visa,amex\"` in a column, no `card1`, `card2`, `card3` columns.\n2. Second normal form (2NF): no column depends on only part of a composite key (a key made of several columns). In `settlement_lines(batch_id, merchant_id, merchant_name, amount)` with key `(batch_id, merchant_id)`, `merchant_name` depends on `merchant_id` alone, so it breaks 2NF. A table whose key is one column, like the export with `payment_id`, is in 2NF automatically.\n3. Third normal form (3NF): no column depends on another non-key column. The export fails here, through the chain in the figure.\n4. Boyce-Codd normal form (BCNF): the left side of every dependency is a candidate key. It differs from 3NF only in rare tables with overlapping candidate keys.\n\nAim for BCNF by default. It costs joins on read (lesson 3 of this track) and saves you from deciding which of two spellings is true.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 256\" role=\"img\" aria-label=\"Functional dependencies in payments_export: payment_id determines merchant_name, customer_email, amount and time; merchant_name determines mcc; mcc determines mcc_description; customer_email determines customer_name.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"100\" width=\"120\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"80.0\" y=\"123\" text-anchor=\"middle\">payment_id</text><rect class=\"box\" x=\"200\" y=\"30\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"275.0\" y=\"53\" text-anchor=\"middle\">merchant_name</text><rect class=\"box\" x=\"400\" y=\"30\" width=\"90\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"445.0\" y=\"53\" text-anchor=\"middle\">mcc</text><rect class=\"box\" x=\"530\" y=\"30\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"605.0\" y=\"53\" text-anchor=\"middle\">mcc_description</text><rect class=\"box\" x=\"200\" y=\"100\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"275.0\" y=\"123\" text-anchor=\"middle\">customer_email</text><rect class=\"box\" x=\"400\" y=\"100\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475.0\" y=\"123\" text-anchor=\"middle\">customer_name</text><rect class=\"box\" x=\"200\" y=\"170\" width=\"230\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"315.0\" y=\"193\" text-anchor=\"middle\">amount_minor, created_at</text><line class=\"ln\" x1=\"140\" y1=\"112\" x2=\"198\" y2=\"54\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"140\" y1=\"118\" x2=\"198\" y2=\"118\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"140\" y1=\"124\" x2=\"198\" y2=\"182\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"350\" y1=\"48\" x2=\"398\" y2=\"48\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"490\" y1=\"48\" x2=\"528\" y2=\"48\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"350\" y1=\"118\" x2=\"398\" y2=\"118\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"240\" text-anchor=\"start\">white: the key decides it.  blue: a non-key column decides it, so the fact repeats on every row.</text></svg>",
+        "caption": "The dependencies in payments_export. Each blue arrow starts at a column that is not a key, so its fact repeats; each one becomes its own table."
+      },
+      "try": {
+        "title": "Test a dependency, then break the load",
+        "minutes": 4,
+        "steps": [
+          "Run the first query. It lists the distinct pairs of category and description. If `mcc → mcc_description` held, each `mcc` would appear once.",
+          "Now try to build the `mcc_codes` table from the file. Predict which statement fails and why.",
+          "`ROLLBACK` drops the new table again: in PostgreSQL even `CREATE TABLE` is part of the transaction."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT DISTINCT mcc, mcc_description FROM payments_export ORDER BY mcc;\n\nBEGIN;\nCREATE TABLE export_mcc (mcc text PRIMARY KEY, description text NOT NULL);\nINSERT INTO export_mcc SELECT DISTINCT mcc, mcc_description FROM payments_export;\nROLLBACK;"
+        },
+        "expect": "`5732` appears twice, with \"Electronics stores\" and \"Electronic stores\". The `CREATE TABLE` succeeds and the `INSERT` fails on the primary key:\n\n```text\nERROR:  duplicate key value violates unique constraint \"export_mcc_pkey\"\nDETAIL:  Key (mcc)=(5732) already exists.\n```\n\nThe key on `mcc` is the dependency `mcc → description` turned into a rule. Once the table exists, the second spelling has nowhere to go."
+      },
+      "refs": [
+        {
+          "title": "Database normalization (Wikipedia)",
+          "url": "https://en.wikipedia.org/wiki/Database_normalization",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Keep a copy on purpose, and check it",
+      "body": "Normalization says: store a fact once and compute everything else. An account's balance is computed from the ledger, the table of money movements: it is the sum of that account's entries. Every card authorization asks \"does the account have enough money?\", so it would compute that sum every time. How expensive is that?\n\nOn the large data set that the index lesson uses (3.4 million ledger rows), summing account 42's 46 entries without an index takes about 42 ms: PostgreSQL reads every row in the table to find those 46. With an index on `account_id` it drops to about 0.3 ms. That is fine for account 42, but the internal clearing account has 750,000 entries, so even with the index its sum reads 750,000 rows. Reading one stored number takes about 0.015 ms. (Times from an Apple-silicon laptop under Docker Desktop. Yours will differ with CPU and disk, but the ratios hold.)\n\nSo the course schema keeps a copy on purpose: `accounts.balance_minor` holds the sum of the account's ledger entries. Storing a value you could compute is **denormalization**, and it brings back the update anomaly from the first section. Every new ledger entry now needs two writes, the entry and the balance, and they must agree. Three ways to keep them in step, from best to worst:\n\n1. Write both in the same transaction. Either both commit or neither does.\n2. Let a trigger, a function the database runs on every insert, update the balance.\n3. Update the balance from application code after the commit. A crash between the two steps leaves them apart forever.\n\nWhatever you choose, add a **reconciliation query**: a check that recomputes the sum and compares it with the copy. It runs nightly, and it is the lab's third exercise. The Try it shows drift appearing. Look closely at account 112 in its output, because that row is where reconciliation queries go wrong.\n\nTwo details in the output matter later. `sum` of a `bigint` column returns `numeric`, an arbitrary-precision decimal, so the total cannot overflow. And, from lesson 1, `sum` over zero rows returns NULL, not 0.",
+      "try": {
+        "title": "Make the cache drift",
+        "minutes": 4,
+        "steps": [
+          "Type `\\pset null '∅'`. Look at journal 3: a deposit of 300.00 into account 103, written as two entries that sum to zero (money leaves the clearing account 900 and arrives in 103).",
+          "Start a transaction and post a new deposit of 10.00 to account 103, without touching `accounts`.",
+          "Compare each balance with its ledger sum for accounts 103, 112 and 900. Predict: what will a check like `balance_minor <> ledger` say about account 112?",
+          "`ROLLBACK` when you are done."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nSELECT account_id, entry_type, amount_minor, created_at FROM ledger_entries WHERE journal_id = 3;\n\nBEGIN;\nINSERT INTO ledger_entries (journal_id, account_id, entry_type, amount_minor, created_at)\nVALUES (3001, 103, 'deposit', 1000, now()), (3001, 900, 'deposit', -1000, now());\n\nSELECT a.account_id, a.balance_minor,\n       (SELECT sum(e.amount_minor) FROM ledger_entries e WHERE e.account_id = a.account_id) AS ledger\nFROM accounts a\nWHERE a.account_id IN (103, 112, 900)\nORDER BY a.account_id;\nROLLBACK;"
+        },
+        "expect": "```postgresql\n account_id | balance_minor | ledger\n------------+---------------+---------\n        103 |          9086 |   10086\n        112 |             0 |       ∅\n        900 |       -860000 | -861000\n(3 rows)\n```\n\nAccounts 103 and 900 have drifted by 1000 cents in opposite directions. Account 112 has no ledger entries, so its sum is NULL, and `0 <> NULL` is unknown: a reconciliation that compares the two directly will never report account 112, whatever its balance says."
+      }
+    },
+    {
+      "h": "Constraints are rules the server checks on every write",
+      "body": "Your payment service validates its input in Kotlin before it inserts. That is not enough. A second service, a migration script, a teammate in psql or a retried message can all write to the same table, and none of them runs your validation. Two requests can also pass the same check at the same moment and both insert. The only place a rule holds for every writer is the database, at the moment of the write. A **constraint** is such a rule. Build them up from the simplest:\n\n`NOT NULL` refuses a missing value. Use it on every column that must always have a value, which is most of them.\n\n`CHECK (condition)` refuses a row for which the condition is false. Remember lesson 1's three-valued logic: a CHECK fails only on **false**, so a NULL passes `CHECK (fee_bps BETWEEN 0 AND 1000)`, because the condition is unknown. Put `NOT NULL` next to every CHECK whose column must have a value. A CHECK sees one row only. \"A payment's refunds never add up to more than the payment\" depends on other rows, so it cannot be a CHECK. That rule needs a trigger or application code plus locking, the subject of the lesson on row locks.\n\n`UNIQUE` refuses a second row with the same values. By default two NULLs count as different, so a UNIQUE column accepts many NULLs. PostgreSQL 15 added `UNIQUE NULLS NOT DISTINCT` to allow only one.\n\n`PRIMARY KEY` is `UNIQUE` plus `NOT NULL`, once per table.\n\n`REFERENCES` is the foreign key from lesson 1. It also decides what happens when the referenced row is deleted. The default, `NO ACTION`, refuses the delete while anything still points at the row. `CASCADE` deletes the pointing rows too, and `SET NULL` empties their reference. For money, keep the default: deleting a merchant must never delete its payments silently.\n\nTypes are constraints too. Store money as `bigint` cents, never as `float` (0.1 + 0.2 is not 0.3 in binary floating point) and not as PostgreSQL's `money` type, which depends on a locale setting. Store instants as `timestamptz`, and text as `text` with a CHECK when you need a format, such as `CHECK (country_code ~ '^[A-Z]{2}$')`.\n\nOne more behaviour surprises people. Identity columns take their numbers from a sequence, and a sequence never gives a number back: an insert that fails still uses one up. Ids have gaps, so never use them as a count.",
+      "try": {
+        "title": "Watch the server say no",
+        "minutes": 4,
+        "steps": [
+          "Run the block one statement at a time. Before each INSERT, predict: accepted or rejected?",
+          "After `ROLLBACK`, run `\\d fee_overrides`. Is the table still there?",
+          "Run the `DELETE`. Merchant 6 has no payments. Why does it still fail?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nBEGIN;\nCREATE TABLE fee_overrides (\n    merchant_id bigint REFERENCES merchants,\n    fee_bps     int CHECK (fee_bps BETWEEN 0 AND 1000)\n);\nINSERT INTO fee_overrides VALUES (1, NULL), (NULL, 250);\nSELECT * FROM fee_overrides;\nINSERT INTO fee_overrides VALUES (1, 2000);\nROLLBACK;\n\n\\d fee_overrides\nDELETE FROM merchants WHERE merchant_id = 6;"
+        },
+        "expect": "Both NULL rows are accepted: the CHECK is unknown for the first, and a NULL foreign key points at nothing, so there is nothing to check for the second. The fee of 2000 is refused:\n\n```text\nERROR:  new row for relation \"fee_overrides\" violates check constraint \"fee_overrides_fee_bps_check\"\nDETAIL:  Failing row contains (1, 2000).\n```\n\nAfter `ROLLBACK`, `\\d` prints `Did not find any relation named \"fee_overrides\".` The table vanished with the transaction. The `DELETE` fails because merchant 6 has a settlement account (306) that references it:\n\n```text\nERROR:  update or delete on table \"merchants\" violates foreign key constraint \"accounts_merchant_id_fkey\" on table \"accounts\"\nDETAIL:  Key (merchant_id)=(6) is still referenced from table \"accounts\".\n```"
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Constraints",
+          "url": "https://www.postgresql.org/docs/18/ddl-constraints.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL wiki: Don't Do This (money, serial, varchar(n))",
+          "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Time ranges that must not overlap",
+      "body": "A merchant's fee changes over time. Merchant 1 paid 290 basis points (2.90%) until 1 July 2026 and 250 after it. To price a payment you need exactly one fee in force at its timestamp. Store the periods, and then make overlaps impossible.\n\nSimplest version: two columns, `valid_from` and `valid_to`, with `CHECK (valid_from < valid_to)` and `UNIQUE (merchant_id, valid_from)`. It rejects two periods that start on the same day. It accepts January to July plus June to September, which both cover 15 June. A UNIQUE constraint compares a new row with existing rows for equality only, and an overlap is not equality.\n\nNext try: check in the application before inserting. \"Select the periods for this merchant, and insert only if none overlaps.\" Two admins saving at the same moment both see no overlap, and both insert. That is a check-then-act race: the check and the insert are two steps, and another writer can act between them.\n\nThe database has to compare the new range with the stored ranges itself, at insert time. PostgreSQL stores a period as a **range type**: `tstzrange` holds a start and an end instant, written `[2026-01-01,2026-07-01)`. The square bracket includes the start, the round bracket excludes the end, and an empty end means \"no end\". The operator `&&` asks whether two ranges overlap, and `@>` asks whether a range contains an instant. With those, the rule fits in one line. PostgreSQL 18 added **temporal keys**:\n\n```sql\nPRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)\n```\n\nIt means: for each `merchant_id`, no two `valid_during` ranges may overlap. PostgreSQL keeps it in a GiST index, a search tree built for questions like \"which stored ranges overlap this one?\", and checks it on every insert and update. Before version 18 you wrote the same rule as an **exclusion constraint**, `EXCLUDE USING gist (merchant_id WITH =, valid_during WITH &&)`, which reads \"no two rows where merchant_id is equal and the ranges overlap\". Both need the `btree_gist` extension so that a plain `bigint` can sit in a GiST index; the course schema installs it. Both fail with SQLSTATE 23P01. One difference: `WITHOUT OVERLAPS` also refuses an empty range, and EXCLUDE accepts it.\n\nFinding the fee for a payment is then one lookup: `WHERE merchant_id = 4 AND valid_during @> timestamptz '2026-03-12 16:40+00'` returns 280.",
+      "stepper": {
+        "title": "A temporal key checks every insert",
+        "intro": "Merchants 6 and 8 have no fee schedule yet. Click Next to insert rows and watch which ones the key accepts.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 262\" role=\"img\" aria-label=\"Fee schedules of merchants 6 and 8 on a 2026 timeline, as rows are inserted one by one\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)</text><line class=\"ln-d\" x1=\"130\" y1=\"204\" x2=\"590\" y2=\"204\"/><line class=\"ln\" x1=\"130.0\" y1=\"198\" x2=\"130.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"130.0\" y=\"226\" text-anchor=\"middle\">Jan 2026</text><line class=\"ln\" x1=\"245.0\" y1=\"198\" x2=\"245.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"245.0\" y=\"226\" text-anchor=\"middle\">Apr</text><line class=\"ln\" x1=\"360.0\" y1=\"198\" x2=\"360.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"226\" text-anchor=\"middle\">Jul</text><line class=\"ln\" x1=\"475.0\" y1=\"198\" x2=\"475.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"226\" text-anchor=\"middle\">Oct</text><line class=\"ln\" x1=\"590.0\" y1=\"198\" x2=\"590.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"590.0\" y=\"226\" text-anchor=\"middle\">Jan 2027</text><text class=\"t\" x=\"20\" y=\"76\" text-anchor=\"start\">merchant 6</text><text class=\"t\" x=\"20\" y=\"168\" text-anchor=\"start\">merchant 8</text><text class=\"t-s t-code\" x=\"20\" y=\"250\" text-anchor=\"start\">-- no rows yet for merchants 6 and 8</text></svg>",
+            "say": "The key is `(merchant_id, valid_during WITHOUT OVERLAPS)`. PostgreSQL keeps it in a GiST index, a search tree that can answer \"which stored ranges overlap this one?\". Every insert asks that question for the new row's merchant before the row is stored."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 262\" role=\"img\" aria-label=\"Fee schedules of merchants 6 and 8 on a 2026 timeline, as rows are inserted one by one\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)</text><line class=\"ln-d\" x1=\"130\" y1=\"204\" x2=\"590\" y2=\"204\"/><line class=\"ln\" x1=\"130.0\" y1=\"198\" x2=\"130.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"130.0\" y=\"226\" text-anchor=\"middle\">Jan 2026</text><line class=\"ln\" x1=\"245.0\" y1=\"198\" x2=\"245.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"245.0\" y=\"226\" text-anchor=\"middle\">Apr</text><line class=\"ln\" x1=\"360.0\" y1=\"198\" x2=\"360.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"226\" text-anchor=\"middle\">Jul</text><line class=\"ln\" x1=\"475.0\" y1=\"198\" x2=\"475.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"226\" text-anchor=\"middle\">Oct</text><line class=\"ln\" x1=\"590.0\" y1=\"198\" x2=\"590.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"590.0\" y=\"226\" text-anchor=\"middle\">Jan 2027</text><text class=\"t\" x=\"20\" y=\"76\" text-anchor=\"start\">merchant 6</text><text class=\"t\" x=\"20\" y=\"168\" text-anchor=\"start\">merchant 8</text><rect class=\"box-a\" x=\"132.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"245.0\" y=\"75\" text-anchor=\"middle\">300 bps</text><text class=\"t-s t-code\" x=\"20\" y=\"250\" text-anchor=\"start\">INSERT (6, '[2026-01-01,2026-07-01)', 300)   -&gt; INSERT 0 1</text></svg>",
+            "say": "Merchant 6 gets 300 basis points (3.00%) from 1 January. The range is half-open: it includes 1 January and stops just before 1 July. Nothing else exists for merchant 6, so the row goes in."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 262\" role=\"img\" aria-label=\"Fee schedules of merchants 6 and 8 on a 2026 timeline, as rows are inserted one by one\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)</text><line class=\"ln-d\" x1=\"130\" y1=\"204\" x2=\"590\" y2=\"204\"/><line class=\"ln\" x1=\"130.0\" y1=\"198\" x2=\"130.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"130.0\" y=\"226\" text-anchor=\"middle\">Jan 2026</text><line class=\"ln\" x1=\"245.0\" y1=\"198\" x2=\"245.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"245.0\" y=\"226\" text-anchor=\"middle\">Apr</text><line class=\"ln\" x1=\"360.0\" y1=\"198\" x2=\"360.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"226\" text-anchor=\"middle\">Jul</text><line class=\"ln\" x1=\"475.0\" y1=\"198\" x2=\"475.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"226\" text-anchor=\"middle\">Oct</text><line class=\"ln\" x1=\"590.0\" y1=\"198\" x2=\"590.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"590.0\" y=\"226\" text-anchor=\"middle\">Jan 2027</text><text class=\"t\" x=\"20\" y=\"76\" text-anchor=\"start\">merchant 6</text><text class=\"t\" x=\"20\" y=\"168\" text-anchor=\"start\">merchant 8</text><rect class=\"box-ok\" x=\"132.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"245.0\" y=\"75\" text-anchor=\"middle\">300 bps</text><rect class=\"box-a\" x=\"362.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"475.0\" y=\"75\" text-anchor=\"middle\">280 bps</text><text class=\"t-s t-code\" x=\"20\" y=\"250\" text-anchor=\"start\">INSERT (6, '[2026-07-01,)', 280)              -&gt; INSERT 0 1</text></svg>",
+            "say": "The next period starts on 1 July and has no end (an empty upper bound means \"until further notice\"). The two ranges touch at 1 July but do not overlap, because the first one excludes its end. Accepted."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 262\" role=\"img\" aria-label=\"Fee schedules of merchants 6 and 8 on a 2026 timeline, as rows are inserted one by one\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)</text><line class=\"ln-d\" x1=\"130\" y1=\"204\" x2=\"590\" y2=\"204\"/><line class=\"ln\" x1=\"130.0\" y1=\"198\" x2=\"130.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"130.0\" y=\"226\" text-anchor=\"middle\">Jan 2026</text><line class=\"ln\" x1=\"245.0\" y1=\"198\" x2=\"245.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"245.0\" y=\"226\" text-anchor=\"middle\">Apr</text><line class=\"ln\" x1=\"360.0\" y1=\"198\" x2=\"360.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"226\" text-anchor=\"middle\">Jul</text><line class=\"ln\" x1=\"475.0\" y1=\"198\" x2=\"475.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"226\" text-anchor=\"middle\">Oct</text><line class=\"ln\" x1=\"590.0\" y1=\"198\" x2=\"590.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"590.0\" y=\"226\" text-anchor=\"middle\">Jan 2027</text><text class=\"t\" x=\"20\" y=\"76\" text-anchor=\"start\">merchant 6</text><text class=\"t\" x=\"20\" y=\"168\" text-anchor=\"start\">merchant 8</text><rect class=\"box-ok\" x=\"132.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"245.0\" y=\"75\" text-anchor=\"middle\">300 bps</text><rect class=\"box-ok\" x=\"362.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"475.0\" y=\"75\" text-anchor=\"middle\">280 bps</text><rect class=\"box-bad\" x=\"323.66666666666663\" y=\"90\" width=\"111.00000000000006\" height=\"28\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"379.16666666666663\" y=\"109\" text-anchor=\"middle\">310 bps</text><text class=\"t-s t-code\" x=\"20\" y=\"250\" text-anchor=\"start\">INSERT (6, '[2026-06-01,2026-09-01)', 310)   -&gt; ERROR 23P01</text></svg>",
+            "say": "A third row for June to September overlaps both stored periods. Which fee applies on 15 June: 300 or 310? The key refuses to let the question arise: `conflicting key value violates exclusion constraint`, SQLSTATE 23P01. Nothing is written."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 262\" role=\"img\" aria-label=\"Fee schedules of merchants 6 and 8 on a 2026 timeline, as rows are inserted one by one\"><text class=\"t-s t-code\" x=\"20\" y=\"26\" text-anchor=\"start\">PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)</text><line class=\"ln-d\" x1=\"130\" y1=\"204\" x2=\"590\" y2=\"204\"/><line class=\"ln\" x1=\"130.0\" y1=\"198\" x2=\"130.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"130.0\" y=\"226\" text-anchor=\"middle\">Jan 2026</text><line class=\"ln\" x1=\"245.0\" y1=\"198\" x2=\"245.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"245.0\" y=\"226\" text-anchor=\"middle\">Apr</text><line class=\"ln\" x1=\"360.0\" y1=\"198\" x2=\"360.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"226\" text-anchor=\"middle\">Jul</text><line class=\"ln\" x1=\"475.0\" y1=\"198\" x2=\"475.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"475.0\" y=\"226\" text-anchor=\"middle\">Oct</text><line class=\"ln\" x1=\"590.0\" y1=\"198\" x2=\"590.0\" y2=\"210\"/><text class=\"t-s t-m\" x=\"590.0\" y=\"226\" text-anchor=\"middle\">Jan 2027</text><text class=\"t\" x=\"20\" y=\"76\" text-anchor=\"start\">merchant 6</text><text class=\"t\" x=\"20\" y=\"168\" text-anchor=\"start\">merchant 8</text><rect class=\"box-ok\" x=\"132.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"245.0\" y=\"75\" text-anchor=\"middle\">300 bps</text><rect class=\"box-ok\" x=\"362.0\" y=\"56\" width=\"226.0\" height=\"28\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"475.0\" y=\"75\" text-anchor=\"middle\">280 bps</text><rect class=\"box-a\" x=\"323.66666666666663\" y=\"148\" width=\"111.00000000000006\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"379.16666666666663\" y=\"167\" text-anchor=\"middle\">310 bps</text><text class=\"t-s t-code\" x=\"20\" y=\"250\" text-anchor=\"start\">INSERT (8, '[2026-06-01,2026-09-01)', 310)   -&gt; INSERT 0 1</text></svg>",
+            "say": "The same range for merchant 8 is fine. The key compares ranges only between rows with the same `merchant_id`, just as a two-column UNIQUE key compares the second column only within equal first columns."
+          }
+        ]
+      },
+      "try": {
+        "title": "Insert three fee periods",
+        "minutes": 4,
+        "steps": [
+          "Look at merchant 1's two periods. They touch at 1 July 2026. Predict which of the three inserts for merchant 6 fails.",
+          "Run the block. After the error, the transaction is aborted, so `ROLLBACK` it.",
+          "Run `\\d merchant_fee_schedules` and find the key."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT * FROM merchant_fee_schedules WHERE merchant_id = 1 ORDER BY valid_during;\n\nBEGIN;\nINSERT INTO merchant_fee_schedules VALUES (6, '[2026-01-01,2026-07-01)', 300);\nINSERT INTO merchant_fee_schedules VALUES (6, '[2026-07-01,)', 280);\nINSERT INTO merchant_fee_schedules VALUES (6, '[2026-06-01,2026-09-01)', 310);\nROLLBACK;"
+        },
+        "expect": "The first two inserts print `INSERT 0 1`. The third fails:\n\n```text\nERROR:  conflicting key value violates exclusion constraint \"merchant_fee_schedules_pkey\"\nDETAIL:  Key (merchant_id, valid_during)=(6, [\"2026-06-01 00:00:00+00\",\"2026-09-01 00:00:00+00\")) conflicts with existing key (merchant_id, valid_during)=(6, [\"2026-01-01 00:00:00+00\",\"2026-07-01 00:00:00+00\")).\n```\n\nThe message calls the primary key an exclusion constraint, because that is how PostgreSQL implements it. `\\d` lists it as `\"merchant_fee_schedules_pkey\" PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)`."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: CREATE TABLE (WITHOUT OVERLAPS, EXCLUDE)",
+          "url": "https://www.postgresql.org/docs/18/sql-createtable.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "The partner's export is an email thread where everyone pastes the customer's details into every reply. After twenty replies there are two spellings of the name, and nobody knows which one is right. A normalized schema keeps the details in one contact card, and every message links to the card. Constraints are the rules on the card form itself: the email field must be filled in, the country must be two capital letters. The analogy breaks in two places. A link costs something every time you read it, which in SQL is a join. And sometimes a pasted copy is worth keeping, like a cached balance, as long as something compares it with the card every night.",
+  "in_your_world": "Oracle reporting schemas are full of copied columns: the merchant name on the payment row, the customer segment on the transaction. Each one is a bet that every writer keeps it updated. When you design the PostgreSQL side of a payments service, keep `accounts.balance`-style copies only where a hot read path needs them, update them in the same transaction as the ledger insert, and ship the reconciliation query with the feature. Kafka events are a different case: a `PaymentAuthorized` event that carries the merchant name is a snapshot of a moment, and copying there is correct. And put the rules in the schema, not only in Quarkus validators: a Temporal activity retried after a timeout, or a Flyway backfill, writes past your Kotlin code but never past a constraint.",
+  "mistake": "The common mistake is trusting the application to keep a rule that only the database can keep. Teams validate \"no overlapping fee periods\" or \"one primary card per account\" in a service method, then a second writer, a backfill or two concurrent requests break it, and the bad rows are found months later in a settlement report. It happens because the check works in every test, where requests never collide. The fix is to state the rule as a constraint: `NOT NULL` next to every CHECK, `UNIQUE` on every candidate key, a partial unique index (an index over only the rows that match its WHERE: `CREATE UNIQUE INDEX ... ON cards (account_id) WHERE is_primary`) for \"at most one\", and `WITHOUT OVERLAPS` or `EXCLUDE` for ranges.",
+  "compare": {
+    "title": "The same table, and a failed migration, in Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle",
+      "src": "CREATE TABLE refunds (\n    refund_id     NUMBER(19) GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,\n    payment_id    NUMBER(19) NOT NULL REFERENCES payments,\n    amount_minor  NUMBER(19) NOT NULL CHECK (amount_minor > 0),\n    reason        VARCHAR2(20 CHAR) NOT NULL,\n    created_at    TIMESTAMP WITH TIME ZONE NOT NULL\n);\n\n-- DDL commits implicitly, before and after each statement.\n-- A migration that fails on its third statement\n-- leaves the first two applied."
+    },
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL 18",
+      "src": "CREATE TABLE refunds (\n    refund_id     bigint GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,\n    payment_id    bigint NOT NULL REFERENCES payments,\n    amount_minor  bigint NOT NULL CHECK (amount_minor > 0),\n    reason        text NOT NULL,\n    created_at    timestamptz NOT NULL\n);\n\n-- DDL is transactional: inside BEGIN ... COMMIT,\n-- an error on the third statement rolls back\n-- all three."
+    },
+    "note": "The column definitions map one to one: `NUMBER(19)` becomes `bigint`, `VARCHAR2(n CHAR)` becomes `text` (add a CHECK on `length()` if the limit is a real rule), and both databases accept the standard `GENERATED BY DEFAULT AS IDENTITY` (Oracle since 12c). The behaviour that differs is DDL inside transactions. Oracle commits before and after every DDL statement, so a half-applied migration stays half-applied and you repair it by hand. PostgreSQL runs `CREATE`, `ALTER` and `DROP` inside the transaction like any `INSERT`, and Flyway wraps each PostgreSQL migration in a transaction, so a failed migration leaves no trace. A few statements, such as `CREATE INDEX CONCURRENTLY`, cannot run inside a transaction block."
+  },
+  "worked": {
+    "title": "From the partner's flat file to a table that guards one fact",
+    "steps": [
+      {
+        "say": "Write down the dependencies you expect from what the columns mean, then test each one. A dependency `X → Y` fails when some X has more than one Y. The email test finds Farid's two spellings.",
+        "code": "-- 1. test customer_email -> customer_name\nSELECT customer_email, count(DISTINCT customer_name) AS names\nFROM payments_export\nGROUP BY customer_email\nHAVING count(DISTINCT customer_name) > 1;      -- farid.haddad@example.com | 2",
+        "lang": "sql"
+      },
+      {
+        "say": "Name the key and follow the chain. `payment_id` determines everything, and `merchant_name → mcc → mcc_description` hangs off it. The far end of the chain becomes the first new table, with the left side of the dependency as its primary key.",
+        "code": "-- 2. one fact, one table: the left side is the key\nCREATE TABLE export_mcc (\n    mcc          text PRIMARY KEY CHECK (mcc ~ '^[0-9]{4}$'),\n    description  text NOT NULL\n);",
+        "lang": "sql"
+      },
+      {
+        "say": "Load it. The primary key refuses the second spelling of 5732, so the load fails instead of picking one at random:\n\n```text\nERROR:  duplicate key value violates unique constraint \"export_mcc_pkey\"\nDETAIL:  Key (mcc)=(5732) already exists.\n```\n\nThis is the key doing its job. `SELECT DISTINCT ON` or `min(mcc_description)` would make the error go away and keep whichever spelling sorts first.",
+        "code": "-- 3. load: fails on 5732\nINSERT INTO export_mcc SELECT DISTINCT mcc, mcc_description FROM payments_export;",
+        "lang": "sql"
+      },
+      {
+        "say": "Decide which spelling is true (the networks' list says \"Electronics stores\"), fix the source rows, and load again. Four codes go in: `INSERT 0 4`. From now on a fifth spelling has nowhere to live.",
+        "code": "-- 4. fix the data, then load\nUPDATE payments_export\nSET mcc_description = 'Electronics stores'\nWHERE mcc = '5732' AND mcc_description <> 'Electronics stores';   -- UPDATE 1\nINSERT INTO export_mcc SELECT DISTINCT mcc, mcc_description FROM payments_export;",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Test a dependency, build a table that refuses bad rows, catch a drifting cache",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l02/mcc_description_conflicts.sql",
+      "labs/sql/src/main/resources/sfz/sql/l02/card_limits.sql",
+      "labs/sql/src/main/resources/sfz/sql/l02/balance_drift.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l02.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder. Most of the eleven fail. Each test runs in a transaction that is rolled back, so the tables you create vanish after every test.",
+      "In `mcc_description_conflicts.sql`, list each `mcc` of `payments_export` that has more than one description, with the count.",
+      "In `card_limits.sql`, replace the CREATE TABLE so the database refuses every bad row the comment lists: unknown cards, NULLs, limits outside 1 to 10,000,000 cents, and overlapping periods for one card.",
+      "In `balance_drift.sql`, fix the reconciliation query so it also reports an account that has a balance but no ledger entries.",
+      "Run the tests until all eleven pass. Try your DDL in psql first, inside `BEGIN` and `ROLLBACK`."
+    ],
+    "hints": [
+      "The card limit tests accept SQLSTATE 23P01 (exclusion) or 23505 (unique) for an overlap, so either `WITHOUT OVERLAPS` or `EXCLUDE USING gist` passes.",
+      "A CHECK passes on NULL. The NULL tests need `NOT NULL` on all three columns.",
+      "`coalesce(x, 0)` returns x, or 0 when x is NULL. Compute the ledger sum in a subquery, then compare."
+    ],
+    "done_when": "All eleven tests in `SchemaDesignTest` pass."
+  },
+  "drill": {
+    "title": "Write the fee schedule table from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write the CREATE TABLE for `merchant_fee_schedules`: a merchant, a period and a fee in basis points from 0 to 1000. No merchant may have two periods in force at once. Write the PostgreSQL 18 key, then the exclusion constraint you would use on PostgreSQL 17.",
+    "answer": {
+      "lang": "sql",
+      "src": "CREATE TABLE merchant_fee_schedules (\n    merchant_id   bigint NOT NULL REFERENCES merchants,\n    valid_during  tstzrange NOT NULL,                  -- [from, to), open end allowed\n    fee_bps       int NOT NULL CHECK (fee_bps BETWEEN 0 AND 1000),\n    PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)   -- PostgreSQL 18\n);\n\n-- PostgreSQL 17 and older (CREATE EXTENSION btree_gist first):\n--     EXCLUDE USING gist (merchant_id WITH =, valid_during WITH &&)"
+    }
+  },
+  "recap": [
+    "A fact stored on many rows drifts: update, insert and delete anomalies all come from repetition.",
+    "A functional dependency `X → Y` says rows that agree on X agree on Y. Test it with `GROUP BY X HAVING count(DISTINCT Y) > 1`.",
+    "Normalize by moving every dependency whose left side is not a key into its own table, keyed by that left side. BCNF is the target.",
+    "Denormalize only for a measured read path, write the copy in the same transaction, and ship a reconciliation query that handles NULL sums.",
+    "Constraints are the only rules every writer obeys. A CHECK passes on NULL, so pair it with `NOT NULL`; a foreign key does not create an index.",
+    "`PRIMARY KEY (id, period WITHOUT OVERLAPS)` (PostgreSQL 18) or `EXCLUDE USING gist` stops overlapping ranges, which UNIQUE cannot."
+  ],
+  "quiz": [
+    {
+      "q": "`settlement_lines(batch_id, merchant_id, merchant_name, amount_minor)` has the key `(batch_id, merchant_id)`. `merchant_name` depends on `merchant_id` alone. Which normal form does the table break first?",
+      "options": [
+        "1NF",
+        "2NF",
+        "3NF, but not 2NF",
+        "None: every column depends on the key"
+      ],
+      "answer": 1,
+      "why": "2NF forbids a column that depends on only part of a composite key. `merchant_name` depends on `merchant_id`, which is half the key, so every batch repeats the name. \"Every column depends on the key\" is tempting because `(batch_id, merchant_id)` does determine the name, but it determines it through only one of its columns."
+    },
+    {
+      "q": "Which constraint stops two fee periods for the same merchant from overlapping?",
+      "options": [
+        "UNIQUE (merchant_id, valid_during)",
+        "CHECK (lower(valid_during) < upper(valid_during))",
+        "PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)",
+        "REFERENCES merchants"
+      ],
+      "answer": 2,
+      "why": "UNIQUE compares ranges for equality, so `[Jan, Jul)` and `[Jun, Sep)` are different and both get in. A CHECK sees one row at a time. Only an overlap test against the stored rows, done by a temporal key or `EXCLUDE ... WITH &&`, can refuse it."
+    },
+    {
+      "q": "A team adds `CHECK (refunded_minor <= amount_minor)` to `payments`, where `refunded_minor` is a nullable column. A bug writes NULL into `refunded_minor`. What happens?",
+      "options": [
+        "The insert fails, because NULL is not less than or equal to the amount",
+        "The insert succeeds: the check is unknown, and only false fails a CHECK",
+        "PostgreSQL stores 0 instead",
+        "The insert fails with a NOT NULL error"
+      ],
+      "answer": 1,
+      "why": "`NULL <= amount_minor` is unknown, and a CHECK rejects only false. If NULL is not allowed, the column needs `NOT NULL` as well."
+    },
+    {
+      "q": "A reconciliation query uses `WHERE a.balance_minor <> (SELECT sum(e.amount_minor) FROM ledger_entries e WHERE e.account_id = a.account_id)`. Account 112 shows a balance of 700 and has no ledger rows. Does the query report it?",
+      "options": [
+        "No: the sum of zero rows is NULL, `700 <> NULL` is unknown, and WHERE drops the row",
+        "Yes: an account with no rows sums to 0, and 700 is not 0",
+        "No: a scalar subquery that finds no rows raises an error",
+        "Yes, but only after VACUUM updates the statistics"
+      ],
+      "answer": 0,
+      "why": "Two rules from lesson 1 combine. `sum` over no rows is NULL, and WHERE keeps only true rows. Wrap the sum in `coalesce(..., 0)` so empty accounts compare as zero.",
+      "from": "sql-01"
+    },
+    {
+      "q": "`accounts.balance_minor` caches the sum of ledger entries. Which write path keeps it correct when the service crashes at a random moment?",
+      "options": [
+        "Insert the ledger entries and update the balance in the same transaction",
+        "Insert the ledger entries, commit, then update the balance",
+        "Update the balance first, commit, then insert the ledger entries",
+        "Add `CHECK (balance_minor = sum(amount_minor))` to accounts"
+      ],
+      "answer": 0,
+      "why": "A transaction makes both writes visible together or not at all, so a crash cannot leave one without the other. Either two-commit order leaves a window where a crash splits them. A CHECK cannot read other rows or other tables, so the last option is not even valid SQL."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does the functional dependency `X → Y` mean?",
+      "back": "Any two rows that agree on X also agree on Y. X determines Y."
+    },
+    {
+      "front": "How do you test `X → Y` against data?",
+      "back": "`SELECT X FROM t GROUP BY X HAVING count(DISTINCT Y) > 1`. Any row returned breaks the dependency."
+    },
+    {
+      "front": "3NF in one sentence?",
+      "back": "No non-key column depends on another non-key column (on top of 1NF and 2NF)."
+    },
+    {
+      "front": "What happens when a CHECK condition is NULL?",
+      "back": "The row is accepted. A CHECK fails only on false, so pair it with NOT NULL."
+    },
+    {
+      "front": "Does a foreign key create an index on the referencing column?",
+      "back": "No, in PostgreSQL and in Oracle. Create it yourself if you delete or update referenced rows, or join on it."
+    },
+    {
+      "front": "What does `PRIMARY KEY (merchant_id, valid_during WITHOUT OVERLAPS)` enforce?",
+      "back": "No two rows for the same merchant_id have overlapping ranges (PostgreSQL 18). It uses a GiST index and fails with 23P01."
+    },
+    {
+      "front": "Why do identity ids have gaps?",
+      "back": "A sequence never gives a number back. A failed or rolled-back insert still uses one up."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Functional dependency",
+      "plain": "X → Y: rows that agree on X always agree on Y. A key determines every column."
+    },
+    {
+      "term": "Normalization",
+      "plain": "Splitting tables so each fact is stored once, in a table keyed by what determines it."
+    },
+    {
+      "term": "Update anomaly",
+      "plain": "A fact stored on many rows, so one change must touch all of them, and a missed row makes the table contradict itself."
+    },
+    {
+      "term": "Denormalization",
+      "plain": "Storing a value you could compute, such as a cached balance, to make a read fast. It needs a check."
+    },
+    {
+      "term": "Constraint",
+      "plain": "A rule the database checks on every write: NOT NULL, CHECK, UNIQUE, PRIMARY KEY, FOREIGN KEY, EXCLUDE."
+    },
+    {
+      "term": "Range type",
+      "plain": "A value holding a start and an end, such as tstzrange '[2026-01-01,2026-07-01)'."
+    },
+    {
+      "term": "Exclusion constraint",
+      "plain": "A rule that no two rows match under given operators, such as equal merchant and overlapping ranges."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague asks why the course schema has a separate `mcc_codes` table when the partner file already carries the description on every row. Explain it with the file's own data, and say what the primary key on `mcc_codes` adds.",
+    "answer": "In the file, the description depends on the category code, not on the payment, so it is repeated on every payment of every merchant in that category. Repeated facts drift: the file already calls 5732 both \"Electronics stores\" and \"Electronic stores\", and nothing tells you which is right. You also cannot record a category before a payment uses it, and deleting the last payment of a category loses the description. Moving `mcc → description` into its own table stores the fact once. The primary key on `mcc` turns the dependency into a rule: a second description for 5732 is rejected at insert time instead of being stored."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Three PostgreSQL 18 features in the course schema are worth a closer look.\n\n**Virtual generated columns.** `payments.amount_major` is declared `numeric(21, 2) GENERATED ALWAYS AS (amount_minor / 100.0)`. In PostgreSQL 18 a generated column is `VIRTUAL` by default: it takes no space on disk and is computed when you read it. Add `STORED` to compute it on write and keep it on disk, which was the only kind before 18. A generated column is denormalization the database keeps in step for you, because nobody can write to it.\n\n**UUIDv7 keys.** `payment_uid` defaults to `uuidv7()`, new in PostgreSQL 18. A version 7 UUID starts with the creation time in milliseconds, so new ids sort after old ones and land at the right-hand end of the B-tree index. Random version 4 UUIDs land anywhere in the index, so every insert can touch a different page. The seed builds its uids from `created_at`, so you can read the time back:\n\n```postgresql\ncourse=# SELECT payment_id, amount_minor, amount_major, uuid_extract_timestamp(payment_uid) AS uid_time, created_at\ncourse-# FROM payments WHERE payment_id IN (1, 22);\n payment_id | amount_minor | amount_major |         uid_time         |        created_at\n------------+--------------+--------------+--------------------------+--------------------------\n          1 |         4250 |        42.50 | 2026-01-03 10:12:00+00   | 2026-01-03 10:12:00+00\n         22 |        52000 |       520.00 | 2026-03-31 23:59:59.5+00 | 2026-03-31 23:59:59.5+00\n(2 rows)\n```\n\nThe time inside a UUIDv7 is visible to anyone who sees the id. If creation times are sensitive, don't expose v7 ids outside your system.\n\n**Temporal foreign keys.** A table can now reference a temporal key with `PERIOD`: `FOREIGN KEY (merchant_id, PERIOD valid_during) REFERENCES merchant_fee_schedules (merchant_id, PERIOD valid_during)` requires the referenced periods to cover the referencing row's whole period. It does not support `ON DELETE CASCADE` or `SET NULL`. The CREATE TABLE page in the PostgreSQL 18 docs has the details.\n\nNormal forms go further than BCNF. 4NF and 5NF deal with independent multi-valued facts in one table, such as a merchant's card brands and its currencies stored as all combinations. You will rarely need them if every table stores facts about one thing."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: Constraints",
+      "url": "https://www.postgresql.org/docs/18/ddl-constraints.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: CREATE TABLE",
+      "url": "https://www.postgresql.org/docs/18/sql-createtable.html"
+    },
+    {
+      "title": "PostgreSQL 18 release notes",
+      "url": "https://www.postgresql.org/docs/18/release-18.html"
+    },
+    {
+      "title": "Database normalization (Wikipedia)",
+      "url": "https://en.wikipedia.org/wiki/Database_normalization"
+    },
+    {
+      "title": "PostgreSQL wiki: Don't Do This",
+      "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This"
+    }
+  ]
+}

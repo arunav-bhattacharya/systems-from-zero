@@ -1,0 +1,128 @@
+{
+  "id": "net",
+  "intro": "By the end of this track you can follow one HTTPS call from your Kotlin service to a card issuer through every layer it crosses: the DNS lookup and its caches, the ARP request on your own link, the routers and NATs on the way, the TCP handshake and its states, the windows that decide how fast bytes move, the TLS handshake and its certificate checks, the HTTP version on top, and the load balancers, pools and timeouts that production adds. When a call fails, you'll know which layer to look at first and which command shows it: refused or timed out, CLOSE-WAIT or TIME-WAIT, a missing intermediate or an idle connection a balancer forgot.\n\nYou need to read Kotlin or Java, and Docker on your laptop. You don't need any networking background: every lesson starts from a concrete problem and builds the mechanism up from there, with real packets captured on the lab network.\n\nEach lesson has Try its that run in the lab box (`docker compose -f env/labbox.yml run --rm box`, a Linux shell with tcpdump, tshark, ss, dig, curl, openssl and JDK 25) or on the small lab network in `env/net.yml` (client, peer, router, server, a second site behind a 1,400-byte tunnel, and a dual-stack IPv6 link). The labs are Kotlin with JUnit, in `labs/net`, one package per lesson (`sfz.net.l01` to `sfz.net.l12`). They need no Docker: they parse frames captured on the lab network and model state machines and caches with a fake clock, so they run in seconds. Run `./gradlew :net:test --tests 'sfz.net.lNN.*'` from `labs/` until it passes; `./gradlew :net:solutionTest` runs the same tests against the reference answers.",
+  "cheatsheet": "## The four layers and their addresses\n\n| Layer | Unit | Address | Header | Lessons |\n|---|---|---|---|---|\n| Link (Ethernet) | frame | MAC, 48 bits, one link only | 14 bytes | 1, 2 |\n| Internet (IP) | packet | IPv4 32 bits, IPv6 128 bits, end to end | 20 bytes (IPv4), 40 (IPv6) | 3, 4, 5 |\n| Transport (UDP, TCP, QUIC) | datagram, segment | port, 16 bits | UDP 8, TCP 20 to 60 | 6, 7, 8, 11 |\n| Application (DNS, TLS, HTTP) | message | a name | varies | 9 to 12 |\n\nMAC addresses are rewritten at every router; IP addresses and ports travel end to end until a NAT rewrites them. EtherType `0x0800` is IPv4 (`0x0806` ARP, `0x86dd` IPv6); IP protocol 6 is TCP, 17 UDP.\n\n## Numbers worth remembering\n\n| What | Value |\n|---|---|\n| Ethernet MTU, TCP MSS | 1,500 bytes; 1,460 bytes of TCP data (1,448 with timestamps) |\n| Biggest unfragmented ping | `ping -M do -s 1472` (1,472 + 28 bytes of headers) |\n| Private IPv4 ranges | 10/8, 172.16/12, 192.168/16; carrier-grade NAT 100.64/10 |\n| Starting TTL on Linux | 64 |\n| Linux ephemeral ports | 32768 to 60999: 28,232 ports |\n| TIME-WAIT | 60 s on Linux, 30 s on macOS: about 470 new connections a second to one address and port |\n| Connect to a silent address | Linux gives up after about 136 s unless you set a connect timeout |\n| Initial congestion window | 10 segments; slow start doubles it per round trip; CUBIC cuts to 70% on loss |\n| Throughput ceiling | window / round trip; to fill a link, bandwidth x round trip in flight |\n| Delayed ACK on Linux | at least 40 ms: the Nagle stall |\n| JVM DNS cache | 30 s for answers, 10 s for failures, whatever the TTL |\n| Negative DNS answer cached | min(SOA TTL, SOA minimum) |\n| New HTTPS connection | 1 round trip TCP + 1 round trip TLS 1.3 before the request leaves |\n| JDK 25 ClientHello | 1,614 bytes with the X25519MLKEM768 key share: two segments |\n| HTTP/2 frame header | 9 bytes; windows start at 65,535 bytes; frames carry at most 16,384 bytes by default |\n| Idle timeouts | JDK HttpClient pool 30 s, JDK HttpServer 30 s, AWS ALB 60 s, AWS NLB and NAT gateway 350 s, TCP keepalive first probe 2 h |\n\n## Symptoms and what they mean\n\n| You see | It means | Lesson |\n|---|---|---|\n| `Destination Host Unreachable` from your own address | ARP (or neighbor discovery) got no answer on your link | 2 |\n| `* * *` in the middle of a traceroute, answers after it | that hop doesn't answer probes; nothing about loss | 4 |\n| small requests work, big transfers hang after the handshake | path MTU black hole: ICMP Fragmentation Needed is blocked | 4 |\n| `Connection refused` within one round trip | RST: the host is up, nothing listens on the port | 7 |\n| `Connect timed out` | the SYN got no answer: firewall, route or host down | 7 |\n| `Cannot assign requested address` | ephemeral ports used up, usually by TIME-WAIT | 7 |\n| CLOSE-WAIT growing on your side | your code never calls `close()` | 7 |\n| about 40 ms per small request | Nagle plus delayed ACK: write once, or `TCP_NODELAY` | 8 |\n| a new name fails for minutes after it was created | the NXDOMAIN was cached | 9 |\n| still calling the old IP after a DNS change | caches (resolver, JVM 30 s) and pooled connections | 9 |\n| `PKIX path building failed` | no chain to a trusted root: missing intermediate or private CA | 10 |\n| `No subject alternative DNS name matching ...` | the certificate doesn't name the host you called | 10 |\n| `header parser received no bytes`, `Connection reset` | a forgotten idle connection, or an mTLS rejection | 10, 12 |\n| every HTTP/2 request slow together under loss | TCP head-of-line blocking | 11 |\n| only the first call after a quiet period fails | pool idle timeout longer than a hop's | 12 |\n\n## Commands\n\n| Question | Command |\n|---|---|\n| Where does a packet to X go? | `ip route get 10.10.2.20` |\n| Who is on my link? | `ip neigh` (IPv4 and IPv6) |\n| Which sockets, in which state? | `ss -tan`, `ss -tin` (cwnd, rtt), `ss -tanp state time-wait` |\n| What is on the wire? | `tcpdump -i eth0 -nn -S 'tcp port 9000'`; `-XX` for the bytes |\n| What does a frame mean? | `tshark -r f.pcap -V`, `-d tcp.port==8080,http2` for cleartext HTTP/2 |\n| Which path? | `traceroute -n host`, `ping -M do -s 1472 host` |\n| Who answers for a name? | `dig +trace name`, `dig +norecurse @server name` |\n| Where does the time go? | `curl -w '%{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}\\n'` |\n| What certificate does a server send? | `openssl s_client -connect host:443 -servername host -showcerts` |\n| What is inside my TLS? | `SSLKEYLOGFILE=keys.log curl ...`, then `tshark -o tls.keylog_file:keys.log` |\n| Simulate a bad network | `tc qdisc add dev eth0 root netem delay 50ms loss 1%` |\n\n## Pairs people mix up\n\n| | | The difference |\n|---|---|---|\n| MAC address | IP address | MAC: the next box on this link, rewritten at each router. IP: the final destination, end to end. |\n| Switch | Router | A switch forwards frames inside one link by MAC and learns ports. A router forwards packets between networks by longest prefix match and lowers the TTL. |\n| UDP | TCP | UDP: one datagram, no handshake, no resend, message boundaries kept. TCP: a byte stream, handshake, ordering, resends, flow and congestion control. |\n| Refused | Timed out | Refused: an RST, the host is there. Timed out: silence, something drops packets. |\n| TIME-WAIT | CLOSE-WAIT | TIME-WAIT: the side that closed first, normal, 60 s. CLOSE-WAIT: the peer closed and your program hasn't: a leak. |\n| Flow control | Congestion control | Flow: the receiver's free buffer (rwnd). Congestion: the sender's guess at what the network takes (cwnd). Send min of both. |\n| HTTP/2 blocking | HTTP/3 blocking | HTTP/2: one lost TCP segment stalls every stream. HTTP/3: QUIC stalls only the streams in the lost packet. |\n| L4 balancer | L7 balancer | L4: per connection, bytes unread. L7: ends TLS, reads and routes each request, adds X-Forwarded-For. |\n| HTTP keep-alive | TCP keepalive | HTTP: reuse a connection for more requests. TCP: empty probes on an idle connection (`SO_KEEPALIVE`). |\n\n## JVM settings that matter\n\n| Setting | What it controls |\n|---|---|\n| `socket.connect(address, ms)`, `HttpClient.Builder.connectTimeout` | how long to wait for the SYN-ACK |\n| `socket.soTimeout` | how long each read may wait |\n| `HttpRequest.Builder.timeout` | until the response headers arrive |\n| `sendAsync(...).orTimeout(...)` | the whole call, body included |\n| `socket.tcpNoDelay = true` | turns off Nagle's algorithm |\n| `networkaddress.cache.ttl` (security property) | the JVM's DNS cache, 30 s by default |\n| `-Djava.net.preferIPv6Addresses=true` | the JVM tries IPv6 first; it never races the two |\n| `-Djdk.httpclient.keepalive.timeout=N` | how long the HttpClient pool keeps idle connections (30 s) |\n| `HttpClient.Version.HTTP_3` | HTTP/3, from JDK 26 only |\n",
+  "recap": [
+    "A request crosses four layers, each with its own address: a name (DNS), a port (TCP or UDP), an IP address (end to end) and a MAC address (the next box only). Each layer wraps the one above in a header, and the receiver unwraps them in reverse.",
+    "On one link, ARP (IPv4) or neighbor discovery (IPv6) turns an IP address into a MAC, and switches learn where each MAC lives. Between links, routers forward each packet alone by longest prefix match, lower the TTL, and report problems with ICMP, which traceroute and path MTU discovery depend on.",
+    "Private IPv4 addresses reach the internet through NAT, which keeps one table entry per connection and forgets idle ones. IPv6 gives every host global addresses of its own and replaces ARP and broadcast with multicast neighbor discovery.",
+    "UDP delivers datagrams or loses them silently. TCP builds a reliable byte stream with a handshake, sequence numbers, ACKs, retransmission and per-direction closing; TIME-WAIT belongs to the side that closed first, CLOSE-WAIT to code that never closed.",
+    "TCP's throughput is at most a window per round trip. The receive window protects the receiver, the congestion window protects the network, and small writes can stall 40 ms between Nagle and delayed ACKs.",
+    "DNS walks root, TLD and authoritative servers, and every answer is a copy with a TTL. Nothing is pushed: resolvers, the JVM (30 s) and connection pools each hold their copies by their own rules.",
+    "TLS 1.3 agrees on keys in one round trip, encrypts everything after the ServerHello, and authenticates the server with a certificate chain the client checks: signatures, CA flags, dates and the name. The SNI stays visible; mTLS makes the client prove itself too.",
+    "HTTP/1.1 carries one exchange per connection at a time; HTTP/2 interleaves streams on one TCP connection but suffers TCP's head-of-line blocking; HTTP/3 puts streams into QUIC over UDP so a loss stalls only its own stream.",
+    "In production, a request crosses proxies that open their own connections and pools that forget idle connections by their own clocks. Give every wait its own timeout, retry only what's safe with backoff and jitter, and keep each client's idle timeout below the next hop's."
+  ],
+  "quiz": [
+    {
+      "q": "A packet goes from your laptop through three routers to a server, with no NAT on the way. Which addresses in the packet are rewritten at every hop?",
+      "options": [
+        "The source and destination MAC addresses; the IP addresses stay the same",
+        "The destination IP address, so the next router can find it",
+        "Nothing: all addresses travel end to end",
+        "The source port, so replies come back through the same router"
+      ],
+      "answer": 0,
+      "why": "A MAC address only means something on one link, so every router writes a new Ethernet header with its own MAC as the source and the next hop's as the destination. The IP addresses name the endpoints and travel unchanged; only a NAT rewrites them (and the ports)."
+    },
+    {
+      "q": "Two hosts are on different subnets, joined through a switch and a router. Which statement is right?",
+      "options": [
+        "The switch reads the destination IP address and picks the router",
+        "The router learns MAC addresses per port and floods unknown ones",
+        "The switch forwards frames by MAC address inside one link; the router forwards packets between subnets by the longest matching route and lowers the TTL",
+        "Both read the IP header; the router is just faster"
+      ],
+      "answer": 2,
+      "why": "A switch never reads IP: it learns which MAC lives on which port and forwards (or floods) frames within one link. Getting to another subnet takes a router, which looks up the destination IP in its routing table, picks the most specific match and decrements the TTL. The second option describes a switch."
+    },
+    {
+      "q": "A service sends a DNS query over UDP, and the datagram is lost. Who notices and sends it again?",
+      "options": [
+        "The kernel's UDP code, after the retransmission timeout",
+        "The router that dropped it, with an ICMP message",
+        "Nobody: the lookup fails at once",
+        "The resolver code in the application, after its own timeout, because UDP never resends"
+      ],
+      "answer": 3,
+      "why": "UDP adds ports and a checksum to IP and nothing else: no ACKs, no timers, no resends. DNS clients build their own reliability, waiting a few seconds and asking again (glibc waits 5 s). TCP would resend from the kernel; a router that drops a packet for congestion sends nothing back."
+    },
+    {
+      "q": "A connect to a partner's API fails after about 136 seconds with a connect timeout, and the application set no connect timeout. What happened?",
+      "options": [
+        "The partner's service is down but its host is up",
+        "The partner refused the connection",
+        "The SYNs got no answer at all: a firewall or a route dropped them, or the host is gone, and Linux gave up after its retries",
+        "The TLS handshake took too long"
+      ],
+      "answer": 2,
+      "why": "With nothing listening, the host would answer the SYN with an RST at once: connection refused, within a round trip. 136 seconds is Linux resending the SYN with growing gaps and finally giving up, which happens only when nothing comes back. TLS starts after the connect, so it can't make the connect time out."
+    },
+    {
+      "q": "`ss -tan` on a payment service shows 3,000 sockets to a fraud API, all in CLOSE-WAIT, and the number grows every hour. What is wrong?",
+      "options": [
+        "The fraud API's connections are in their normal 60-second wait after closing",
+        "The fraud API closed those connections and the service's code never closed its end",
+        "The service is opening too many new connections",
+        "FIN packets are being lost on the network"
+      ],
+      "answer": 1,
+      "why": "CLOSE-WAIT means the peer sent its FIN and the kernel acknowledged it, and now waits for the local program to call `close()`. A growing count is a leak, often a response body nobody read to the end. The first option describes TIME-WAIT, which belongs to the side that closed first and goes away by itself after 60 seconds on Linux."
+    },
+    {
+      "q": "A Kafka consumer pauses for 10 seconds while the broker keeps sending a large fetch response. What stops the broker from sending more than the consumer can hold?",
+      "options": [
+        "The congestion window, which shrinks when the consumer pauses",
+        "The broker notices the pause through TCP keepalive",
+        "Nothing: the extra data is dropped and resent later",
+        "The consumer's receive window, which falls to zero as its socket buffer fills"
+      ],
+      "answer": 3,
+      "why": "Flow control protects the receiver: every ACK carries the free space in its receive buffer, and when the paused consumer stops reading, that window reaches zero and the broker's kernel stops sending. Congestion control protects the network and reacts to loss, not to a slow reader. Keepalive only probes idle connections."
+    },
+    {
+      "q": "A partner moves its API to a new IP address. DNS answers with the new address everywhere, yet your service keeps sending requests to the old one for an hour. What is the most likely reason?",
+      "options": [
+        "DNS changes take 24 to 48 hours to propagate",
+        "The JVM caches DNS answers forever by default",
+        "Pooled connections opened before the change still point at the old address, and DNS is only consulted when a connection opens",
+        "The partner's TLS certificate still names the old address"
+      ],
+      "answer": 2,
+      "why": "Every cache honours some expiry: resolvers the TTL, the JVM 30 seconds by default. A connection pool doesn't look at DNS again until it opens a new connection, so long-lived pooled connections keep going to the old address until the pool replaces them. A maximum connection lifetime bounds that. Certificates name hosts, not addresses."
+    },
+    {
+      "q": "Your service calls `https://api.issuer.example/authorize` over TLS 1.3. What can a router on the path read?",
+      "options": [
+        "The addresses, the name api.issuer.example from the ClientHello's SNI, and the size and timing of each record",
+        "The full URL, because the path travels in the ClientHello",
+        "Nothing at all",
+        "The request headers but not the body"
+      ],
+      "answer": 0,
+      "why": "The ClientHello is sent in the clear and names the server, so that the server can pick a certificate; the IP addresses and record sizes are visible too. Everything after the ServerHello, including the path, headers and body, is encrypted. Encrypted Client Hello can hide the name where both sides support it."
+    },
+    {
+      "q": "A mobile app sends six API requests at once over a lossy cellular link, and one packet is lost. How do HTTP/2 and HTTP/3 differ?",
+      "options": [
+        "No difference: both run over TCP",
+        "HTTP/2 resends only the lost frame; HTTP/3 resends the whole connection's data",
+        "Over HTTP/2 every request whose bytes come after the hole waits for TCP's retransmission; over HTTP/3 only the stream that lost data waits",
+        "HTTP/3 never loses packets, because QUIC uses UDP"
+      ],
+      "answer": 2,
+      "why": "HTTP/2 multiplexes streams over one TCP byte stream, and TCP delivers nothing past a hole, so a single loss stalls the streams behind it. QUIC orders bytes per stream, so the other streams keep flowing. UDP loses packets like anything else; QUIC recovers them itself."
+    },
+    {
+      "q": "Every morning the first authorization after the overnight quiet fails with `Connection reset`, and the issuer's backends never saw it. The client's pool keeps idle connections 10 minutes; the network load balancer in front of the issuer forgets idle ones after 350 seconds. What is the fix?",
+      "options": [
+        "Turn on retries for every request, POST included",
+        "Raise the client's connect timeout",
+        "Set the pool's idle timeout below the balancer's 350 seconds (and retry once on a fresh connection only for idempotent requests)",
+        "Switch the issuer calls to UDP"
+      ],
+      "answer": 2,
+      "why": "The balancer forgot the connection and answered the morning's request with a reset, before any backend saw it. If the pool drops idle connections first, the request simply opens a new connection. Blind retries of POST risk double charges, and the connect timeout isn't involved: the connection was already open."
+    }
+  ]
+}

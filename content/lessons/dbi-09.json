@@ -1,0 +1,407 @@
+{
+  "id": "dbi-09",
+  "title": "Query execution: iterators, joins and vectors",
+  "minutes": 40,
+  "goal": "By the end you can explain how a plan runs as a tree of iterators that pull one row at a time, predict the work a nested loop, hash and merge join do and find it in EXPLAIN ANALYZE, say what vectorized execution saves, and build a small Volcano executor with a vectorized filter.",
+  "warmup": {
+    "q": "`SELECT id FROM payments WHERE amount_cents > 90000 LIMIT 5` runs on a 100,000-row table with no index on `amount_cents`. About 1 row in 10 matches. Roughly how many rows does the sequential scan read?",
+    "options": [
+      "All 100,000: the filter has to see every row before LIMIT can pick 5",
+      "About 50 or 60: the scan stops once LIMIT has its 5 rows",
+      "Exactly 5",
+      "About 10,000: every matching row, of which LIMIT keeps 5"
+    ],
+    "answer": 1,
+    "why": "PostgreSQL's executor pulls rows. LIMIT asks the filter for a row, the filter asks the scan until a row passes, and after the fifth row LIMIT stops asking. With 1 row in 10 matching, the scan reads about 50 rows; the first Try it shows 62. Reading all 100,000 is what happens when every operator builds its whole result before passing it on. Exactly 5 would need an index that finds only matching rows."
+  },
+  "sections": [
+    {
+      "h": "A plan is a tree of operators that pull rows one at a time",
+      "body": "Take `SELECT id, amount_cents FROM payments WHERE amount_cents > 90000 LIMIT 5`. The planner, lesson 10's subject, turns it into a **plan**: a tree of small operators that each do one job. A scan reads the table, a filter applies the WHERE clause, and a limit stops after 5 rows. EXPLAIN prints that tree with the root at the top and the scan at the bottom. This lesson is about how rows move through it.\n\nVersion 1 runs each operator to completion and hands its whole result to the next. The scan reads all 100,000 payments into a list, the filter builds a second list of the 10,000 that pass, and LIMIT keeps 5 and throws the rest away. It works, but it holds whole intermediate results in memory, which a 200-million-row ledger won't fit, and it reads 100,000 rows to answer a question about 5.\n\nVersion 2 turns the flow around. Every operator has the same three methods: `open()` to get ready, `next()` to return one row or null when there are no more, and `close()` to clean up. An operator gets its input by calling `next()` on its child. To produce a row, LIMIT calls the filter's `next()`, the filter calls the scan's `next()` until a row passes, and that row travels back up. After the fifth row, LIMIT returns null without calling its child again, and the scan never reads another row. Nothing is collected in a list: each operator holds one row at a time. This is the **iterator model**, also called the Volcano model after Goetz Graefe's research system from the early 1990s. PostgreSQL's executor works this way; its docs call it \"a demand-pull pipeline\". In Kotlin terms it is a `Sequence` rather than a `List`: `payments.asSequence().filter { it.amount > 90_000 }.take(5)` stops after five matches.\n\nThe stepper shows the calls going down and the rows coming up. In the Try it, the Seq Scan under the Limit returns 5 rows and discards 57, so it read 62 of the 100,000 rows. Without the LIMIT it reads them all and discards 90,001.\n\nSome operators can't stream. A sort can't return its first row before it has seen every input row, because the last row read might sort first. So on its first `next()` it pulls its whole input, sorts it, then hands rows out one per call. Grouping with a hash table works the same way. These are called blocking operators, or pipeline breakers, and they are where memory limits (`work_mem`) and temp files come in.",
+      "stepper": {
+        "title": "Rows flow up as next() calls go down",
+        "intro": "The plan for `SELECT * FROM payments WHERE amount > 9000 LIMIT 2` over six rows. Use Next and Back, or the arrow keys.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"open() travels from Limit down to the scan; no row has been read.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box-a\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"119.0\" text-anchor=\"middle\">Limit 2</text><rect class=\"box-a\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box-a\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"275.0\" text-anchor=\"middle\">Seq Scan on payments</text><line class=\"ln-a\" x1=\"110\" y1=\"58\" x2=\"110\" y2=\"88\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"77.0\" text-anchor=\"end\">open()</text><line class=\"ln-a\" x1=\"110\" y1=\"140\" x2=\"110\" y2=\"166\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"157.0\" text-anchor=\"end\">open()</text><line class=\"ln-a\" x1=\"110\" y1=\"218\" x2=\"110\" y2=\"244\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"235.0\" text-anchor=\"end\">open()</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-m\" x=\"522\" y=\"65\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-m\" x=\"522\" y=\"105\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-m\" x=\"522\" y=\"145\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-m\" x=\"522\" y=\"185\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The plan for `SELECT * FROM payments WHERE amount > 9000 LIMIT 2` is three operators. The client opens the root, and each operator opens its child: `open()` travels down the tree. The scan positions itself at the start of the table. No row has been read yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"next() goes down to the scan, which returns p1; the filter rejects it.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"110\" text-anchor=\"middle\">Limit 2</text><text class=\"t-s t-m\" x=\"145\" y=\"128\" text-anchor=\"middle\">waiting for a row</text><rect class=\"box-a\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box-a\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"275.0\" text-anchor=\"middle\">Seq Scan on payments</text><line class=\"ln-a\" x1=\"110\" y1=\"58\" x2=\"110\" y2=\"88\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"77.0\" text-anchor=\"end\">next()</text><line class=\"ln-a\" x1=\"110\" y1=\"140\" x2=\"110\" y2=\"166\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"157.0\" text-anchor=\"end\">next()</text><line class=\"ln-a\" x1=\"110\" y1=\"218\" x2=\"110\" y2=\"244\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"235.0\" text-anchor=\"end\">next()</text><line class=\"ln\" x1=\"180\" y1=\"244\" x2=\"180\" y2=\"218\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"188\" y=\"235.0\" text-anchor=\"start\">p1 (4,200)</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box-dim\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-bad\" x=\"522\" y=\"65\" text-anchor=\"start\">read, filtered out</text><rect class=\"box\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-m\" x=\"522\" y=\"105\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-m\" x=\"522\" y=\"145\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-m\" x=\"522\" y=\"185\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The client calls `next()` on Limit, Limit calls the filter, the filter calls the scan. The scan reads one row, p1, and returns it. The filter evaluates `4,200 > 9000`: false. It doesn't return to Limit yet; it throws p1 away and asks the scan again."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"The scan returns p2, it passes the filter, and travels up to the client.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"110\" text-anchor=\"middle\">Limit 2</text><text class=\"t-s t-m\" x=\"145\" y=\"128\" text-anchor=\"middle\">returned 1 of 2</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"275.0\" text-anchor=\"middle\">Seq Scan on payments</text><line class=\"ln\" x1=\"180\" y1=\"244\" x2=\"180\" y2=\"218\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"188\" y=\"235.0\" text-anchor=\"start\">p2 (9,700)</text><line class=\"ln\" x1=\"180\" y1=\"166\" x2=\"180\" y2=\"140\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"188\" y=\"157.0\" text-anchor=\"start\">p2</text><line class=\"ln\" x1=\"180\" y1=\"88\" x2=\"180\" y2=\"58\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"188\" y=\"77.0\" text-anchor=\"start\">p2</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box-dim\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-bad\" x=\"522\" y=\"65\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-ok\" x=\"522\" y=\"105\" text-anchor=\"start\">read, passed</text><rect class=\"box\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-m\" x=\"522\" y=\"145\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-m\" x=\"522\" y=\"185\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The second `next()` on the scan returns p2. `9,700 > 9000` is true, so the filter returns p2 to Limit, and Limit returns it to the client. One call from the client cost two calls on the scan. The client now has its first row before the table has been read any further."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"The next call reads p3, which is filtered out, then p4, which goes up to the client.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"110\" text-anchor=\"middle\">Limit 2</text><text class=\"t-s t-m\" x=\"145\" y=\"128\" text-anchor=\"middle\">returned 2 of 2</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"275.0\" text-anchor=\"middle\">Seq Scan on payments</text><line class=\"ln-a\" x1=\"110\" y1=\"58\" x2=\"110\" y2=\"88\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"77.0\" text-anchor=\"end\">next()</text><line class=\"ln-a\" x1=\"110\" y1=\"140\" x2=\"110\" y2=\"166\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"157.0\" text-anchor=\"end\">next()</text><line class=\"ln-a\" x1=\"110\" y1=\"218\" x2=\"110\" y2=\"244\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"235.0\" text-anchor=\"end\">next() x2</text><line class=\"ln\" x1=\"180\" y1=\"166\" x2=\"180\" y2=\"140\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"188\" y=\"157.0\" text-anchor=\"start\">p4</text><line class=\"ln\" x1=\"180\" y1=\"88\" x2=\"180\" y2=\"58\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"188\" y=\"77.0\" text-anchor=\"start\">p4</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box-dim\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-bad\" x=\"522\" y=\"65\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-ok\" x=\"522\" y=\"105\" text-anchor=\"start\">read, passed</text><rect class=\"box-dim\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-bad\" x=\"522\" y=\"145\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-ok\" x=\"522\" y=\"185\" text-anchor=\"start\">read, passed</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The client asks again. The filter pulls p3 (1,100, rejected) and p4 (9,900, passed), and p4 travels up. Limit has now returned 2 rows, its whole quota. Each operator held one row at a time; nothing built a list."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"The client asks a third time; Limit returns null without calling the filter.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box-b\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s t-b\" x=\"145\" y=\"110\" text-anchor=\"middle\">Limit 2</text><text class=\"t-s t-m\" x=\"145\" y=\"128\" text-anchor=\"middle\">quota met: returns null</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"275.0\" text-anchor=\"middle\">Seq Scan on payments</text><line class=\"ln-a\" x1=\"110\" y1=\"58\" x2=\"110\" y2=\"88\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"77.0\" text-anchor=\"end\">next()</text><line class=\"ln\" x1=\"180\" y1=\"88\" x2=\"180\" y2=\"58\" marker-end=\"url(#arr)\"/><text class=\"t-s t-b\" x=\"188\" y=\"77.0\" text-anchor=\"start\">null</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box-dim\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-bad\" x=\"522\" y=\"65\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-ok\" x=\"522\" y=\"105\" text-anchor=\"start\">read, passed</text><rect class=\"box-dim\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-bad\" x=\"522\" y=\"145\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-ok\" x=\"522\" y=\"185\" text-anchor=\"start\">read, passed</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The client calls `next()` once more. Limit has its 2 rows, so it returns null at once, **without calling its child**. The filter and the scan are never asked again: p5 and p6 are never read. On the 100,000-row table in the Try it, this is why the scan reads 62 rows instead of 100,000."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"close() travels down the tree; the scan read 4 of 6 rows.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"40\" y=\"16\" width=\"210\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"41.0\" text-anchor=\"middle\">client (psql)</text><rect class=\"box-dim\" x=\"40\" y=\"90\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"119.0\" text-anchor=\"middle\">Limit 2</text><rect class=\"box-dim\" x=\"40\" y=\"168\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"197.0\" text-anchor=\"middle\">Filter amount &gt; 9000</text><rect class=\"box-dim\" x=\"40\" y=\"246\" width=\"210\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"266\" text-anchor=\"middle\">Seq Scan on payments</text><text class=\"t-s t-m\" x=\"145\" y=\"284\" text-anchor=\"middle\">read 4 of 6 rows</text><line class=\"ln-a\" x1=\"110\" y1=\"58\" x2=\"110\" y2=\"88\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"77.0\" text-anchor=\"end\">close()</text><line class=\"ln-a\" x1=\"110\" y1=\"140\" x2=\"110\" y2=\"166\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"157.0\" text-anchor=\"end\">close()</text><line class=\"ln-a\" x1=\"110\" y1=\"218\" x2=\"110\" y2=\"244\" marker-end=\"url(#arr)\"/><text class=\"t-s t-code t-a\" x=\"102\" y=\"235.0\" text-anchor=\"end\">close()</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"start\">payments, in file order</text><rect class=\"box-dim\" x=\"330\" y=\"44\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"65\" text-anchor=\"middle\">p1   amount 4,200</text><text class=\"t-s t-bad\" x=\"522\" y=\"65\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"84\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"105\" text-anchor=\"middle\">p2   amount 9,700</text><text class=\"t-s t-ok\" x=\"522\" y=\"105\" text-anchor=\"start\">read, passed</text><rect class=\"box-dim\" x=\"330\" y=\"124\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"145\" text-anchor=\"middle\">p3   amount 1,100</text><text class=\"t-s t-bad\" x=\"522\" y=\"145\" text-anchor=\"start\">read, filtered out</text><rect class=\"box-ok\" x=\"330\" y=\"164\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"185\" text-anchor=\"middle\">p4   amount 9,900</text><text class=\"t-s t-ok\" x=\"522\" y=\"185\" text-anchor=\"start\">read, passed</text><rect class=\"box\" x=\"330\" y=\"204\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"225\" text-anchor=\"middle\">p5   amount 9,300</text><text class=\"t-s t-m\" x=\"522\" y=\"225\" text-anchor=\"start\">not read</text><rect class=\"box\" x=\"330\" y=\"244\" width=\"180\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"265\" text-anchor=\"middle\">p6   amount 2,800</text><text class=\"t-s t-m\" x=\"522\" y=\"265\" text-anchor=\"start\">not read</text></svg>",
+            "say": "The client closes the plan and `close()` travels down, so each operator can release what it holds: buffer pins, memory, temp files. Count the work: 4 rows read, 2 returned, 6 `next()` calls on the scan side. A plan that built full lists would have read all 6, or all 100,000."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch LIMIT stop a scan",
+        "minutes": 4,
+        "steps": [
+          "From `labs/`, start PostgreSQL with `docker compose -f env/postgres.yml up -d --wait` and open psql with `docker compose -f env/postgres.yml exec db psql -U sfz`.",
+          "Create `merchants` (1,000 rows) and `payments` (100,000 rows); the next Try its use them too.",
+          "Predict how many rows the scan reads for the LIMIT 5 query, then run both EXPLAINs. `EXPLAIN ANALYZE` runs the query and reports the real row counts; `COSTS OFF, TIMING OFF` hides the noise."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "CREATE TABLE merchants (id int PRIMARY KEY, name text, country text);\nINSERT INTO merchants\n  SELECT g, 'merchant-' || g, (ARRAY['NL','DE','FR','ES','IT'])[1 + g % 5]\n  FROM generate_series(1, 1000) g;\nCREATE TABLE payments (id bigint PRIMARY KEY, merchant_id int, amount_cents bigint);\nINSERT INTO payments\n  SELECT g, 1 + (g * 7919) % 1000, (g * 104729) % 100000\n  FROM generate_series(1, 100000::bigint) g;\nVACUUM ANALYZE merchants, payments;\nSET max_parallel_workers_per_gather = 0;\n\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)\n  SELECT id, amount_cents FROM payments WHERE amount_cents > 90000 LIMIT 5;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)\n  SELECT id, amount_cents FROM payments WHERE amount_cents > 90000;"
+        },
+        "expect": "```text\n                      QUERY PLAN\n-------------------------------------------------------\n Limit (actual rows=5.00 loops=1)\n   ->  Seq Scan on payments (actual rows=5.00 loops=1)\n         Filter: (amount_cents > 90000)\n         Rows Removed by Filter: 57\n\n                     QUERY PLAN\n----------------------------------------------------\n Seq Scan on payments (actual rows=9999.00 loops=1)\n   Filter: (amount_cents > 90000)\n   Rows Removed by Filter: 90001\n```\n\nWith the LIMIT, the scan returned 5 rows and threw away 57: it read 62 rows and stopped, because the Limit stopped asking. Without it, the scan read all 100,000. The filter is printed as a line of the Seq Scan node because PostgreSQL evaluates simple WHERE clauses inside the scan instead of as a separate operator; it is the same pull. `max_parallel_workers_per_gather = 0` turns off parallel query for your session, so each plan runs in one process and the trees stay small."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Executor (a demand-pull pipeline)",
+          "url": "https://www.postgresql.org/docs/18/executor.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/18/using-explain.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A nested loop join compares every pair",
+      "body": "Now a join: each payment with its merchant's name. `payments` has 100,000 rows, `merchants` has 1,000, and the condition is `m.id = p.merchant_id`. A join is an operator with two children, the outer and the inner, and its `next()` must return the next matching pair.\n\nVersion 1 is the **nested loop join**, the two for-loops anyone would write. For each outer row, scan the whole inner input and return every pair whose keys are equal. In iterator terms, the join closes and reopens its inner child for every outer row. The cost is outer rows times inner rows: 1,000 x 100,000 = 100 million comparisons to produce 100,000 pairs. In the Try it, PostgreSQL, forced into this plan, put the merchants outside, scanned all of `payments` once per merchant (`loops=1000`), reported `Rows Removed by Join Filter: 99900000`, and took about 14 seconds.\n\nThe cost multiplies, so the fix is to make the inner side cheap. If the inner table has an index on the join key, the B+tree from lesson 4, then for each outer row the join does one index lookup instead of a full scan: three or four page reads, most of them buffer-pool hits, instead of 100,000 rows. That is the **index nested loop join**, and for a small outer side it is the best plan there is. In the Try it, joining 10 payments to their merchants does 10 index lookups and touches 10 merchant rows. A nested loop is also the only join that works for any condition, such as `p.amount_cents > m.daily_limit_cents`, because it compares every pair.\n\nReading the numbers needs one rule. EXPLAIN reports a node that ran several times per loop: `actual rows=1.00 loops=10` means the inner index scan ran 10 times and returned 1 row on average each time, 10 rows in total. Multiply rows by loops to get the total. PostgreSQL 18 prints rows with two decimals because they are averages.",
+      "try": {
+        "title": "Count the work of two nested loops",
+        "minutes": 4,
+        "steps": [
+          "Turn off hash joins (and memoize, a cache PostgreSQL can put in front of the inner side) and join 10 payments to their merchants. Predict the inner node's `loops`.",
+          "Turn off the other join methods and index scans, and join everything. Predict `Rows Removed by Join Filter` before you run it. It takes several seconds."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "SET max_parallel_workers_per_gather = 0;\nSET enable_hashjoin = off;\nSET enable_memoize = off;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)\n  SELECT p.id, m.name FROM payments p JOIN merchants m ON m.id = p.merchant_id\n  WHERE p.id <= 10;\n\nSET enable_mergejoin = off;\nSET enable_indexscan = off;\nSET enable_bitmapscan = off;\nSET enable_material = off;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF)\n  SELECT m.country, sum(p.amount_cents)\n  FROM payments p JOIN merchants m ON m.id = p.merchant_id GROUP BY m.country;\nRESET ALL;"
+        },
+        "expect": "The index nested loop:\n\n```text\n                                    QUERY PLAN\n----------------------------------------------------------------------------------\n Nested Loop (actual rows=10.00 loops=1)\n   ->  Index Scan using payments_pkey on payments p (actual rows=10.00 loops=1)\n         Index Cond: (id <= 10)\n         Index Searches: 1\n   ->  Index Scan using merchants_pkey on merchants m (actual rows=1.00 loops=10)\n         Index Cond: (id = p.merchant_id)\n         Index Searches: 10\n```\n\nThe plain nested loop over everything:\n\n```text\n         ->  Nested Loop (actual rows=100000.00 loops=1)\n               Join Filter: (m.id = p.merchant_id)\n               Rows Removed by Join Filter: 99900000\n               ->  Seq Scan on merchants m (actual rows=1000.00 loops=1)\n               ->  Seq Scan on payments p (actual rows=100000.00 loops=1000)\n Execution Time: 13751.943 ms\n```\n\n(output trimmed). The inner index scan ran 10 times, one lookup per payment. The plain version scanned `payments` 1,000 times and compared 100 million pairs to keep 100,000: about 14 seconds here, more or less on your machine. The `enable_*` settings only make the planner avoid a plan type, which is how you see a plan it would never pick. Never set them in production; `RESET ALL` puts them back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Planner/optimizer (the three join methods)",
+          "url": "https://www.postgresql.org/docs/18/planner-optimizer.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A hash join reads each side once",
+      "body": "For an equality join on two big inputs there is a better idea: build a lookup table. The **hash join** reads the smaller input completely into a hash table keyed on the join column. That is the build phase, and it happens before the first row comes out. Then it pulls rows from the other input one at a time and looks up each one's key: the probe phase. Each input is read once, so the work grows with outer plus inner rows: 101,000 row reads instead of 100 million comparisons. In the Try it the hash join takes tens of milliseconds where the nested loop took 14 seconds. The build side is a pipeline breaker; the probe side streams.\n\nTwo limits come with it. It only works for equality: a hash table answers \"which rows have key 17\", never \"which rows have a key below 17\". And the table needs memory. PostgreSQL allows a hash table `work_mem` times `hash_mem_multiplier`, 4 MB times 2 by default. If the build side doesn't fit, it splits both inputs into batches by hash value, writes the batches to temp files and joins them one pair at a time. EXPLAIN then shows `Batches: 4` instead of 1, and the join still finishes, with extra disk traffic.\n\nThe third classic join is the **merge join**. If both inputs arrive sorted on the join key, walk them side by side, the way you merge two sorted lists, always advancing the side with the smaller key. Each side is read once and nothing extra is held in memory. It shines when the order is free, for example from a B+tree index scan, or when the result must be sorted anyway. When the order isn't free, it has to sort first: in the Try it the merge join sorts all 100,000 payments, spilling 2.5 MB to a temp file, and it is clearly slower than the hash join.\n\nThe figure puts the three side by side. The planner of lesson 10 chooses among them from its estimates of how many rows each side will have. The rough rule: index nested loop for a small outer side with an index on the inner, hash join for big unsorted equality joins, merge join when both inputs already come sorted.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 310\" role=\"img\" aria-label=\"Three join algorithms for 100,000 payments and 1,000 merchants: nested loop does 100 million comparisons, hash join builds a table of merchants and probes it once per payment, merge join walks two sorted inputs.\"><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">join 100,000 payments with 1,000 merchants on merchant_id</text><rect class=\"box-bad\" x=\"16\" y=\"36\" width=\"204\" height=\"196\" rx=\"8\"/><text class=\"t t-bad\" x=\"118\" y=\"62\" text-anchor=\"middle\">nested loop</text><text class=\"t-s t-code\" x=\"32\" y=\"94\" text-anchor=\"start\">for each payment:</text><text class=\"t-s t-code\" x=\"32\" y=\"118\" text-anchor=\"start\">  scan all merchants</text><text class=\"t-s t-code\" x=\"32\" y=\"166\" text-anchor=\"start\">100,000 x 1,000 =</text><text class=\"t-s\" x=\"32\" y=\"190\" text-anchor=\"start\">100 million comparisons</text><rect class=\"box-a\" x=\"248\" y=\"36\" width=\"204\" height=\"196\" rx=\"8\"/><text class=\"t t-a\" x=\"350\" y=\"62\" text-anchor=\"middle\">hash join</text><text class=\"t-s t-code\" x=\"264\" y=\"94\" text-anchor=\"start\">build: hash table of</text><text class=\"t-s t-code\" x=\"264\" y=\"118\" text-anchor=\"start\">  1,000 merchants</text><text class=\"t-s t-code\" x=\"264\" y=\"142\" text-anchor=\"start\">probe: one lookup</text><text class=\"t-s t-code\" x=\"264\" y=\"166\" text-anchor=\"start\">  per payment</text><text class=\"t-s\" x=\"264\" y=\"190\" text-anchor=\"start\">about 101,000 row reads</text><rect class=\"box\" x=\"480\" y=\"36\" width=\"204\" height=\"196\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"62\" text-anchor=\"middle\">merge join</text><text class=\"t-s t-code\" x=\"496\" y=\"94\" text-anchor=\"start\">both sides sorted</text><text class=\"t-s t-code\" x=\"496\" y=\"118\" text-anchor=\"start\">  on merchant_id</text><text class=\"t-s t-code\" x=\"496\" y=\"142\" text-anchor=\"start\">walk them side by side</text><text class=\"t-s\" x=\"496\" y=\"190\" text-anchor=\"start\">each side read once</text><text class=\"t-s\" x=\"16\" y=\"258\" text-anchor=\"start\">nested loop: any condition; fast only if the inner side is tiny or indexed</text><text class=\"t-s\" x=\"16\" y=\"278\" text-anchor=\"start\">hash join: equality only; needs work_mem for the build side</text><text class=\"t-s\" x=\"16\" y=\"298\" text-anchor=\"start\">merge join: equality; cheap when the inputs already come sorted, e.g. from an index</text></svg>",
+        "caption": "The same join three ways: 100 million comparisons, one hash lookup per payment, or one pass over two sorted inputs."
+      },
+      "try": {
+        "title": "Hash join, merge join and a spill",
+        "minutes": 5,
+        "steps": [
+          "Run the planner's own plan for the per-country sum, then force a merge join. Predict which side the hash join builds on, and what the merge join must do first.",
+          "Create `refunds` (30,000 rows) and join it to payments, first with the default `work_mem`, then with 256 kB. Predict what changes in the Hash node."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "SET max_parallel_workers_per_gather = 0;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF)\n  SELECT m.country, sum(p.amount_cents)\n  FROM payments p JOIN merchants m ON m.id = p.merchant_id GROUP BY m.country;\n\nSET enable_hashjoin = off;\nSET enable_nestloop = off;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF)\n  SELECT m.country, sum(p.amount_cents)\n  FROM payments p JOIN merchants m ON m.id = p.merchant_id GROUP BY m.country;\nRESET enable_hashjoin;\nRESET enable_nestloop;\n\nCREATE TABLE refunds AS\n  SELECT g AS id, g * 3 AS payment_id, 500 AS amount_cents FROM generate_series(1, 30000::bigint) g;\nVACUUM ANALYZE refunds;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF)\n  SELECT sum(p.amount_cents - r.amount_cents) FROM payments p JOIN refunds r ON r.payment_id = p.id;\nSET work_mem = '256kB';\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF)\n  SELECT sum(p.amount_cents - r.amount_cents) FROM payments p JOIN refunds r ON r.payment_id = p.id;\nRESET ALL;"
+        },
+        "expect": "The planner's own choice is a hash join, with the 1,000 merchants as the build side:\n\n```text\n   ->  Hash Join (actual rows=100000.00 loops=1)\n         Hash Cond: (p.merchant_id = m.id)\n         ->  Seq Scan on payments p (actual rows=100000.00 loops=1)\n         ->  Hash (actual rows=1000.00 loops=1)\n               Buckets: 1024  Batches: 1  Memory Usage: 48kB\n               ->  Seq Scan on merchants m (actual rows=1000.00 loops=1)\n Execution Time: 45.003 ms\n```\n\nForced to merge, it reads merchants in key order from the primary-key index and sorts the payments, on disk:\n\n```text\n   ->  Merge Join (actual rows=100000.00 loops=1)\n         Merge Cond: (m.id = p.merchant_id)\n         ->  Index Scan using merchants_pkey on merchants m (actual rows=1000.00 loops=1)\n               Index Searches: 1\n         ->  Sort (actual rows=100000.00 loops=1)\n               Sort Key: p.merchant_id\n               Sort Method: external sort  Disk: 2552kB\n               ->  Seq Scan on payments p (actual rows=100000.00 loops=1)\n Execution Time: 51.954 ms\n```\n\nThe refunds join builds a hash table of 30,000 rows: `Buckets: 32768  Batches: 1  Memory Usage: 1663kB` with the default `work_mem`, and `Buckets: 16384  Batches: 4  Memory Usage: 483kB` with 256 kB, where it splits both sides into 4 batches on disk (output trimmed). Times vary from run to run and machine to machine, so compare them within one run; the row counts, loops and batches don't change."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Resource consumption (work_mem, hash_mem_multiplier)",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Vectorized execution pulls a thousand rows per call",
+      "body": "The iterator model costs something on every row. For each row, each operator makes a call through an interface, which the CPU can't predict well when many operator types share one call site, and the WHERE clause is evaluated by walking an expression tree. For `amount_cents > 9000` the comparison itself takes well under a nanosecond; the machinery around it takes many times that. On a query that touches 10 rows through an index nobody notices. On an analytics query that scans 100 million rows, it is most of the time.\n\nVectorized execution changes the unit of work. `next()` returns a batch of about a thousand rows, stored by column, so a filter runs one tight loop over a plain array of amounts: no calls inside the loop, no expression tree, and code that the CPU can pipeline and the compiler can turn into SIMD instructions that compare several values at once. The cost of a call is paid once per thousand rows instead of once per row. This design came out of the MonetDB/X100 research at CWI, and it is how DuckDB runs every query: its operators pass vectors of 2,048 values (`STANDARD_VECTOR_SIZE`). Lesson 11 covers the column storage it pairs with.\n\nIn the Try it, the lab's demo runs the same filter and sum over 10 million payments three ways. In my run the row-at-a-time pipeline took 13.9 ns per row, batches of 1,024 took 1.9 ns, and a hand-written loop 0.33 ns. That last line is the third design, compiled execution, used by HyPer and its successors: generate code for the whole query so that scan, filter and sum fuse into one loop. PostgreSQL stays row-at-a-time, and since version 11 it can compile the expressions of an expensive query with LLVM (the `jit` setting) to cut some of the interpretation cost.\n\nWhy does PostgreSQL keep the iterator model? Its typical query finds a few rows through an index, where per-row overhead is noise, and the model keeps every operator small and easy to combine. DuckDB is built for the other end: scans over millions of rows. Your lab builds both: the iterator operators, then a vectorized filter that pulls batches of 1,024.",
+      "try": {
+        "title": "Time rows against batches",
+        "minutes": 3,
+        "steps": [
+          "Read `VectorDemo.kt`: the same `sum(amount) WHERE amount > 9000` as a Volcano pipeline, as batches of 1,024, and as one loop.",
+          "From `labs/`, run the demo (no Docker needed). Predict the ratio between the Volcano and the batch times. When you are done with this lesson, stop and delete the database: `docker compose -f env/postgres.yml down -v`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "./gradlew :internals:demo -Pmain=sfz.internals.l09.demo.VectorDemoKt --console=plain -q",
+          "run": "./gradlew :internals:demo -Pmain=sfz.internals.l09.demo.VectorDemoKt --console=plain -q",
+          "file": "labs/internals/src/demo/kotlin/sfz/internals/l09/demo/VectorDemo.kt"
+        },
+        "expect": "```text\nrows: 10,000,000   matching sum: 9,490,500,000\nplan             cpu ms     ns/row\nvolcano           139.3      13.93\nvectorized         18.8       1.88\nplain loop          3.3       0.33\n```\n\nHere the Volcano pipeline needed about 7 times as long per row as the batch pipeline, and the plain loop was about 6 times faster again. Your numbers depend on your CPU, your JDK and what else the machine is doing (the demo prints the best of 5 runs to soften that), but the order stays the same. The batch version spends its time in two loops with no calls inside; the Volcano version makes a `next()` call per row per operator and evaluates the WHERE clause by walking an expression tree. The first run also compiles the demo, which takes longer."
+      },
+      "refs": [
+        {
+          "title": "DuckDB 2.0 docs: Vector (STANDARD_VECTOR_SIZE)",
+          "url": "https://duckdb.org/docs/2.0/internals/vector.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Why DuckDB (columnar-vectorized execution)",
+          "url": "https://duckdb.org/why_duckdb",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "The iterator model is a pull-based assembly line, like a kanban system in a car plant. A station asks the station before it for one part only when it needs one, so nothing piles up between stations, and when the last station stops asking, the whole line stops. Vectorized execution moves parts in crates of a thousand instead of one at a time, so the walking between stations is paid once per crate. The analogy breaks at sorting and hashing: some operators must take in every part before they hand out the first one, which a good assembly line tries never to do and a database does all the time.",
+  "in_your_world": "The N+1 query from an ORM is a nested loop join run by your service: for each of 500 orders, one `SELECT ... FROM merchants WHERE id = ?`, each a 1 ms round trip, so 500 ms, where one JOIN would let PostgreSQL hash-join in a few milliseconds. In Hibernate or Panache, fetch the association with a join (`JOIN FETCH`) or in one batch. Oracle has the same three join methods (nested loops, hash join, sort merge join) and its execution plans name them the same way, so the habit of reading rows and loops carries over. A Kafka Streams stream-table join is a hash join that never ends: the table side is the build side, kept in a local state store, and every stream record is a probe. And when a reporting query on the payments database is slow, `EXPLAIN (ANALYZE)` tells you which node did the work, by its rows and loops, before anyone guesses.",
+  "mistake": "The common mistake is fixing one slow join by turning off a join method for the whole server, such as `enable_nestloop = off` in `postgresql.conf` or a connection pool's init SQL. The one query gets faster, and hundreds of others that relied on index nested loops (fetch a few rows by key and join them) switch to hash joins that scan entire tables. People do it because the slow plan's nested loop looked guilty in EXPLAIN. Usually the real cause is a bad row estimate: the planner expected 10 outer rows and got 100,000, which lesson 10 covers. Fix the estimate (ANALYZE, extended statistics, a better index), or as a last resort set the flag with `SET LOCAL` inside that one transaction.",
+  "compare": {
+    "title": "One filter, two execution models (the lab's code)",
+    "a": {
+      "label": "Volcano",
+      "lang": "kotlin",
+      "title": "one row per call",
+      "src": "class Filter(child: Operator, private val predicate: (Row) -> Boolean) : Unary(child) {\n    override fun next(): Row? {\n        while (true) {\n            val row = child.next() ?: return null   // a call per row\n            if (predicate(row)) return row           // another call per row\n        }\n    }\n}"
+    },
+    "b": {
+      "label": "Vectorized",
+      "lang": "kotlin",
+      "title": "1,024 rows per call",
+      "src": "override fun nextBatch(): Batch? {\n    while (true) {\n        val b = child.nextBatch() ?: return null     // a call per batch\n        val c = b.columns[column]\n        val selected = IntArray(b.size)\n        var n = 0\n        for (i in 0 until b.size) {                    // a tight loop, no calls\n            if (c[i] > greaterThan) selected[n++] = i\n        }\n        if (n == 0) continue\n        return Batch(b.columns.map { col -> LongArray(n) { col[selected[it]] } }, n)\n    }\n}"
+    },
+    "note": "Both compute the same rows and both are pulled from above. The Volcano filter makes two calls per row and works on boxed values in a list; the vectorized one makes one call per 1,024 rows and spends its time in a loop over a `LongArray`, which the JIT compiles to fast machine code. The price is that every operator must work on batches, which makes LIMIT and joins more complicated to write."
+  },
+  "worked": {
+    "title": "Trace a hash join on five rows",
+    "steps": [
+      {
+        "say": "The build side is three merchants, the probe side four payments, one with a null merchant. The join is `HashJoin(build = merchants, probe = payments, buildKey = 0, probeKey = 1)`.",
+        "code": "merchants (id, name):   (1, Acme)  (2, Bolt)  (3, Cord)\npayments (id, merchant): (p1, 2)  (p2, null)  (p3, 1)  (p4, 2)",
+        "lang": "text"
+      },
+      {
+        "say": "`open()` runs the build phase: it drains the build side into a hash table from key to rows, then opens the probe side. Nothing has been read from `payments` yet.",
+        "code": "override fun open() {\n    build.open()\n    while (true) {\n        val row = build.next() ?: break\n        val k = row[buildKey] ?: continue          // a null key never matches\n        table.getOrPut(k) { mutableListOf() } += row\n    }\n    probe.open()\n}\n// table = {1: [(1, Acme)], 2: [(2, Bolt)], 3: [(3, Cord)]}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Each `next()` first hands out pending matches for the current probe row; when there are none, it pulls the next probe row and looks its key up once.",
+        "code": "override fun next(): Row? {\n    while (true) {\n        if (matches.hasNext()) return matches.next() + probeRow!!\n        val p = probe.next() ?: return null\n        probeRow = p\n        matches = p[probeKey]?.let { table[it] }?.iterator() ?: emptyList<Row>().iterator()\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Call `next()` four times. p2's null key skips the lookup. The fourth call pulls nothing new from the build side.",
+        "code": "next() -> pulls p1, key 2 -> (2, Bolt, p1, 2)\nnext() -> pulls p2, key null, no lookup; pulls p3, key 1 -> (1, Acme, p3, 1)\nnext() -> pulls p4, key 2 -> (2, Bolt, p4, 2)\nnext() -> probe returns null -> null",
+        "lang": "text"
+      },
+      {
+        "say": "Count the work. The hash join read 3 build rows and 4 probe rows, and did 3 lookups. A nested loop over the same inputs would have examined 4 x 3 = 12 pairs. With 100,000 payments and 1,000 merchants that is 101,000 reads against 100 million comparisons.",
+        "code": "hash join:    build 3 rows + probe 4 rows, 3 lookups\nnested loop:  4 outer rows x 3 inner rows = 12 comparisons",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a Volcano executor with joins and a vectorized filter",
+    "minutes": 15,
+    "files": [
+      "labs/internals/src/main/kotlin/sfz/internals/l09/Operators.kt",
+      "labs/internals/src/main/kotlin/sfz/internals/l09/Vectors.kt"
+    ],
+    "run": "./gradlew :internals:test --tests 'sfz.internals.l09.*'",
+    "steps": [
+      "Read the top of `Operators.kt`: the `Operator` interface, `Scan`, and `Unary`, which opens and closes its child for you. Then read the `Counting` wrapper at the top of `ExecutorTest.kt`: it is how the tests see what each operator pulled.",
+      "Run the tests once. All 11 fail.",
+      "Write `next()` for `Filter`, `Project` and `Limit`. The pipeline and limit tests pass.",
+      "Write `open()` and `next()` for `NestedLoopJoin`, then for `HashJoin`. The join tests compare your hash join with your nested loop join on random data with duplicate and null keys.",
+      "Write `BatchFilter.nextBatch()` in `Vectors.kt` and run the tests until all 11 pass. Then run the demo from the last Try it again and look at its code next to yours."
+    ],
+    "hints": [
+      "`Limit.next()` must check its count before it calls `child.next()`. If it calls first and checks after, it pulls one row too many, and the limit test counts the scan's rows.",
+      "In `NestedLoopJoin`, keep the current outer row in `outer`. When the inner side returns null, take the next outer row; if there is none, return null; otherwise `right.close()` and `right.open()` to rescan, and loop.",
+      "In `HashJoin`, a pending list of matches for the current probe row (an `Iterator<Row>`) is the whole trick: one probe row can match several build rows, and `next()` returns them one call at a time.",
+      "In `BatchFilter`, collect the passing positions first, then copy those positions of every column. Skip a batch where nothing passed: the tests check that you never return an empty batch."
+    ],
+    "done_when": "All 11 tests in `ExecutorTest` pass."
+  },
+  "drill": {
+    "title": "Write a nested loop join from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write `open()` and `next()` of a `NestedLoopJoin(left, right, leftKey, rightKey)` over the `Operator` interface (`open`, `next(): Row?`, `close`). It returns `leftRow + rightRow` for every pair with equal, non-null keys, and rescans the right side for every left row. Then say how many times the right side is opened for 100 left rows.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "private var outer: Row? = null\n\noverride fun open() {\n    left.open()\n    outer = left.next()\n    if (outer != null) right.open()\n}\n\noverride fun next(): Row? {\n    while (true) {\n        val l = outer ?: return null              // left side used up: done\n        val r = right.next()\n        if (r == null) {                          // right side used up for this left row\n            outer = left.next() ?: return null\n            right.close()                         // rescan it for the next left row\n            right.open()\n            continue\n        }\n        val k = l[leftKey]\n        if (k != null && k == r[rightKey]) return l + r\n    }\n}\n\n// 100 left rows: the right side is opened 100 times (once in open, then 99 rescans),\n// and it produces 100 x |right| rows in total."
+    }
+  },
+  "recap": [
+    "A plan is a tree of operators with `open`, `next` and `close`. Each `next()` pulls one row from below, so LIMIT stops the scan early and nothing is collected in lists.",
+    "Sorts and hash tables are pipeline breakers: they read all their input before returning a row, and they use `work_mem` and temp files.",
+    "A nested loop join costs outer x inner comparisons; with an index on the inner side it becomes one lookup per outer row, the best plan for a small outer side.",
+    "A hash join builds a table from the smaller side and probes it once per row of the other: about outer + inner work, equality only, batches on disk when the table outgrows `work_mem`.",
+    "A merge join walks two inputs sorted on the key; it is cheap when the order comes from an index and costly when it has to sort.",
+    "Vectorized execution passes about a thousand values per call and runs tight loops over arrays; that is why DuckDB is fast on scans, while PostgreSQL stays row-at-a-time."
+  ],
+  "quiz": [
+    {
+      "q": "EXPLAIN ANALYZE shows `Index Scan using merchants_pkey on merchants m (actual rows=1.00 loops=250)` under a Nested Loop. How many merchant rows did this node return in total?",
+      "options": [
+        "1",
+        "250",
+        "1,000",
+        "It can't be known from this line"
+      ],
+      "answer": 1,
+      "why": "For a node that runs several times, EXPLAIN shows rows as an average per loop. The inner index scan ran 250 times, once per outer row, and returned 1 row each time on average: 250 rows in total. Reading `rows=1.00` as the total is the classic misreading, and it hides that the node ran 250 times."
+    },
+    {
+      "q": "Join 2 million authorizations with 50 card networks on `network_id`. Neither table has an index on the join columns, and nothing is sorted. Which join does the least work?",
+      "options": [
+        "Nested loop with the networks outside: 50 scans of 2 million rows",
+        "Nested loop with the authorizations outside: 2 million scans of 50 rows",
+        "Hash join building a table of the 50 networks and probing it once per authorization",
+        "Merge join after sorting both tables"
+      ],
+      "answer": 2,
+      "why": "The hash join reads each table once: 50 rows to build a tiny table, then 2 million probes, about 2 million units of work. Either nested loop examines 100 million pairs. A merge join would first sort 2 million rows, which costs more than hashing them, since nothing arrives sorted."
+    },
+    {
+      "q": "`SELECT * FROM payments ORDER BY created_at LIMIT 10` runs on 10 million rows with no index on `created_at`. How many rows does the plan read before the first row comes out?",
+      "options": [
+        "10, because LIMIT stops the scan",
+        "About 100, because the sort works in chunks",
+        "It depends on how many rows fit in work_mem",
+        "All 10 million, because the last row read might be the first in order"
+      ],
+      "answer": 3,
+      "why": "A sort is a pipeline breaker: it can't return its first row until it has seen every input row. PostgreSQL makes this one cheap in memory, with a top-N heapsort that keeps only the best 10 rows, but it still reads all 10 million. An index on `created_at` would deliver rows already in order, and then LIMIT could stop the scan after 10."
+    },
+    {
+      "q": "From lesson 4: an index nested loop join looks up the merchants of 10,000 payments in a B+tree of height 3 on `merchants.id`. Roughly how many index page accesses does that take, and why is it cheaper than it sounds?",
+      "options": [
+        "About 30,000, three per lookup from root to leaf, but the root and the upper level stay in the buffer pool, so most are memory hits",
+        "10,000, one per lookup",
+        "3, because the tree is read once and reused",
+        "About 10 million, because each lookup scans the leaf level"
+      ],
+      "answer": 0,
+      "why": "Each lookup descends from the root through one inner level to a leaf: three page accesses. The root and the inner pages are touched by every lookup, so they stay hot in the buffer pool from lesson 3, and only leaf pages may need a disk read. Scanning the leaf level is what a B+tree lets you avoid.",
+      "from": "dbi-04"
+    },
+    {
+      "q": "On one CPU core, why does a vectorized filter over 10 million amounts run several times faster than a Volcano filter over the same data?",
+      "options": [
+        "It reads less data from disk",
+        "It pays the call overhead once per batch and spends its time in a tight loop over an array that the CPU can pipeline and the compiler can vectorize",
+        "It uses an index to skip rows",
+        "It runs the batches on several threads"
+      ],
+      "answer": 1,
+      "why": "Both read the same values, on one thread, with no index. The Volcano filter makes calls and walks an expression for every row; the vectorized one makes one call per 1,024 rows and runs a loop with no calls inside, which modern CPUs and JIT compilers execute very efficiently. The demo measured 13.9 ns per row against 1.9."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What are the three methods of an operator in the iterator (Volcano) model?",
+      "back": "`open()` to prepare, `next()` to return one row or null at the end, `close()` to clean up. Parents call `next()` on their children."
+    },
+    {
+      "front": "What is a pipeline breaker?",
+      "back": "An operator that must read all its input before returning its first row, such as a sort or the build side of a hash join."
+    },
+    {
+      "front": "How much work does a nested loop join do?",
+      "back": "Outer rows x inner rows comparisons. With an index on the inner key: one index lookup per outer row instead."
+    },
+    {
+      "front": "What are the two phases of a hash join?",
+      "back": "Build: read the smaller input into a hash table on the join key. Probe: read the other input once and look up each row's key."
+    },
+    {
+      "front": "What does `Batches: 4` on a Hash node mean?",
+      "back": "The build side didn't fit in `work_mem` x `hash_mem_multiplier`, so both inputs were split into 4 batches written to temp files and joined one pair at a time."
+    },
+    {
+      "front": "How do you read `rows=1.00 loops=250` in EXPLAIN ANALYZE?",
+      "back": "The node ran 250 times and returned 1 row per run on average: 250 rows in total. Multiply rows by loops."
+    },
+    {
+      "front": "What is vectorized execution?",
+      "back": "Operators pass batches of values (DuckDB: 2,048) stored by column, and process each batch in a tight loop, paying per-call overhead once per batch."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Plan",
+      "plain": "The tree of operators the planner builds for a query; EXPLAIN prints it, root at the top."
+    },
+    {
+      "term": "Iterator (Volcano) model",
+      "plain": "Every operator has open, next and close, and pulls one row at a time from its children."
+    },
+    {
+      "term": "Pipeline breaker",
+      "plain": "An operator that consumes all its input before producing output, such as a sort or a hash build."
+    },
+    {
+      "term": "Nested loop join",
+      "plain": "For each outer row, scan the inner input and return the matching pairs."
+    },
+    {
+      "term": "Index nested loop join",
+      "plain": "A nested loop whose inner side is an index lookup on the join key, one per outer row."
+    },
+    {
+      "term": "Hash join",
+      "plain": "Build a hash table from one input, then probe it with each row of the other. Equality joins only."
+    },
+    {
+      "term": "Merge join",
+      "plain": "Walk two inputs sorted on the join key side by side, as when merging sorted lists."
+    },
+    {
+      "term": "Vectorized execution",
+      "plain": "Operators pass batches of about a thousand values by column instead of one row per call."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate ran the same join twice, once with `enable_hashjoin = off`, and saw 50 ms against 9 seconds. Explain what the executor did differently in the two runs, using the iterator model and the row counts in the plans.",
+    "answer": "Both plans are trees of operators that pull rows with `next()`. In the fast run the hash join first pulled all 1,000 merchants from its build child into a hash table, then pulled the 100,000 payments one at a time and looked each one's merchant id up in the table: about 101,000 rows read and 100,000 lookups. In the slow run the planner could only use a nested loop. For each of the 1,000 merchants it closed and reopened the payments scan and compared every payment, so the inner scan ran 1,000 times (`loops=1000`) and 100 million pairs were examined, of which 99.9 million were thrown away (`Rows Removed by Join Filter`). The join produced the same 100,000 rows both times; the nested loop just did a thousand times more work to find them. A nested loop is only fast when the outer side is small and the inner side is an index lookup."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Compiled execution.** Thomas Neumann's HyPer work (VLDB 2011) generates machine code for each query: instead of operators calling each other, the scan, filter and aggregate become one loop, with each row kept in CPU registers while it passes through. Vectorized and compiled engines reach similar speed on most analytics queries by different routes. PostgreSQL's JIT is narrower: with `jit = on` (the default in version 18) it compiles expressions and tuple decoding with LLVM once a query's estimated cost passes `jit_above_cost`, and EXPLAIN ANALYZE prints a `JIT:` section when it did.\n\n**Grouping and sorting.** GROUP BY runs either as a hash aggregate (a hash table from group key to running totals, as in the Try its' `HashAggregate`) or as a sort followed by a group aggregate that streams through runs of equal keys. When the input doesn't fit in `work_mem`, a sort writes sorted runs to temp files and merges them, the external merge sort you saw as `Sort Method: external merge`. Hash aggregation spills batches the way the hash join does.\n\n**Parallel query.** With parallel workers enabled, PostgreSQL runs copies of the lower part of a plan in several processes and a `Gather` node pulls their rows together; a hash join can even build one shared hash table. The Try its turned this off to keep the trees small. DuckDB splits work into small morsels of rows that idle threads pick up, which keeps all cores busy without planning the split in advance.\n\n**Memoize.** Since PostgreSQL 14, a nested loop's inner side can sit behind a `Memoize` node, a small cache from join key to result. When many outer rows share a key, as 100,000 payments share 1,000 merchants, the inner lookup runs once per distinct key and every repeat is a cache hit. That is why the second Try it turned it off."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18: Executor",
+      "url": "https://www.postgresql.org/docs/18/executor.html"
+    },
+    {
+      "title": "PostgreSQL 18: Planner/optimizer",
+      "url": "https://www.postgresql.org/docs/18/planner-optimizer.html"
+    },
+    {
+      "title": "PostgreSQL 18: Using EXPLAIN",
+      "url": "https://www.postgresql.org/docs/18/using-explain.html"
+    },
+    {
+      "title": "DuckDB 2.0 docs: Vector",
+      "url": "https://duckdb.org/docs/2.0/internals/vector.html"
+    },
+    {
+      "title": "Why DuckDB",
+      "url": "https://duckdb.org/why_duckdb"
+    }
+  ]
+}

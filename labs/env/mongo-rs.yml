@@ -1,0 +1,60 @@
+# MongoDB 9.0 as a THREE-member replica set (rs0), for the failover Try-it in lesson nosql-08.
+#   docker compose -f env/mongo-rs.yml up -d --wait                  start it (about 30 seconds; mongo1 becomes primary)
+#   docker compose -f env/mongo-rs.yml exec mongo1 mongosh sfz       a mongosh prompt on mongo1 (mongo2, mongo3 work too)
+#   docker network disconnect sfz-mongo-rs_default sfz-mongo-rs-mongo1-1
+#                                                                    cut mongo1 off from the other two (a network partition)
+#   docker network connect --alias mongo1 sfz-mongo-rs_default sfz-mongo-rs-mongo1-1
+#                                                                    heal it (keep the alias: the set knows it as mongo1)
+#   docker compose -f env/mongo-rs.yml down -v                       stop all three and delete the data
+# No host ports: talk to the members through `exec`, so this file never clashes with env/mongo.yml.
+# Scripts in env/mongo/ are mounted read-only at /sfz, as in env/mongo.yml.
+# Memory: three small WiredTiger caches, 512 MB per container, about 1.5 GB in all.
+name: sfz-mongo-rs
+
+x-member: &member
+  image: mongo:9.0
+  command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+  mem_limit: 512m
+  volumes:
+    - ./mongo:/sfz:ro
+
+services:
+  mongo2:
+    <<: *member
+    hostname: mongo2
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+  mongo3:
+    <<: *member
+    hostname: mongo3
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 3s
+      timeout: 10s
+      retries: 30
+  mongo1:
+    <<: *member
+    hostname: mongo1
+    depends_on:
+      mongo2: { condition: service_healthy }
+      mongo3: { condition: service_healthy }
+    healthcheck:
+      # The first check creates the set. mongo1 has priority 2, so it wins the first election and
+      # takes the primary role back whenever it's healthy and caught up. Healthy = mongo1 is PRIMARY.
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          let s; try { s = rs.status() } catch (e) {
+          rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo1:27017', priority: 2},
+          {_id: 1, host: 'mongo2:27017'}, {_id: 2, host: 'mongo3:27017'}]}); throw new Error('initiated') }
+          if (s.myState !== 1) throw new Error('not primary yet')
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s

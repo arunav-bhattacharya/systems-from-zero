@@ -1,0 +1,507 @@
+{
+  "id": "os-05",
+  "title": "Locks at the OS level: futexes and deadlock",
+  "minutes": 40,
+  "goal": "By the end you can explain how a futex keeps uncontended locks out of the kernel, read futex activity and lock waits from strace, ps and jstack, and fix a deadlock by naming the condition your fix breaks.",
+  "warmup": {
+    "q": "One thread locks and unlocks an uncontended pthread mutex one million times. About how many system calls does that make?",
+    "options": [
+      "About 1,000,000: every lock asks the kernel",
+      "About 2,000,000: one to take the lock and one to release it",
+      "Close to zero",
+      "About 1,000: the kernel batches them"
+    ],
+    "answer": 2,
+    "why": "An uncontended lock is one compare-and-swap on a word in user space, and releasing it is one more atomic instruction. The kernel is called only when a thread has to sleep or wake someone. In the lab box, a million pairs made exactly one `futex` call, and that one came from `pthread_join`."
+  },
+  "sections": [
+    {
+      "h": "A lock needs an instruction that reads and writes in one step",
+      "body": "Two payment threads add to the same merchant balance. Each runs `balance = balance + 50`, which the CPU does in three steps: load the value into a register, add, store it back. If both load 100 before either stores, both store 150, and one deposit is gone. Shared data needs a lock: a guarantee that only one thread at a time runs the code between `lock()` and `unlock()`, the **critical section**.\n\nThe simplest lock is a flag: `if (!locked) { locked = true; ... }`. It fails for the same reason the balance did. Checking the flag and setting it are two steps, and the scheduler can switch threads between them:\n\n```text\nT1: reads locked = false\nT2: reads locked = false\nT1: locked = true, enters the critical section\nT2: locked = true, enters the critical section     both inside\n```\n\nThe fix comes from the hardware. CPUs have instructions that read and write a memory word as one step that no other CPU can split. The one locks are built on is **compare-and-swap** (CAS): \"if this word holds 0, put 1 in it, and tell me whether you did\". If two threads race to CAS the same word, exactly one wins. On arm64 it's the `CAS` family of instructions (older cores use an exclusive load and store pair); on x86 it's `LOCK CMPXCHG`. Java exposes it as `AtomicInteger.compareAndSet`.\n\nA lock that loops on CAS until it wins is a **spinlock**. The kernel uses spinlocks inside itself, for critical sections that last nanoseconds. In user space they break when the holder isn't running. Lesson 4 of this track showed that the scheduler can take the CPU away from a thread in the middle of its work. If that thread holds the lock, every waiter spins through its own 3 ms slice on a lock that can't be released until the holder runs again.\n\nSo a waiter should sleep, and only the kernel can put a thread to sleep and wake it later. The naive design asks the kernel every time a thread takes or releases the lock. A system call costs about 150 ns, as lesson 1 measured, and taking and releasing an uncontended lock in user space costs a few nanoseconds: one million pairs on one thread take 8 ms in the Try-it below. Two system calls per pair would make the common case, where nobody else wants the lock, nearly 40 times slower.",
+      "try": {
+        "title": "Time a lock with and without contention",
+        "minutes": 3,
+        "steps": [
+          "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`. `os/c/l05/counter.c` starts N threads that each add 1 to a shared balance a million times, under one pthread mutex.",
+          "Predict how long one million `lock()` and `unlock()` pairs take on one thread. Then predict four threads: four times as long, or worse?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -pthread -o /tmp/counter os/c/l05/counter.c\ntime /tmp/counter 1\ntime /tmp/counter 4"
+        },
+        "expect": "Timings vary a little between runs:\n\n```text\n1 threads: balance = 1000000 (expected 1000000)\n\nreal\t0m0.008s\nuser\t0m0.007s\nsys\t0m0.001s\n4 threads: balance = 4000000 (expected 4000000)\n\nreal\t0m0.174s\nuser\t0m0.257s\nsys\t0m0.292s\n```\n\nOne thread: about 8 ns to take and release the lock, all in user space (`sys` is 1 ms). Four threads did four times the work and took over 20 times as long, and more of their CPU time went to the kernel (`sys`) than to your code (`user`). The balance is right both times: the lock works. Contention is what costs."
+      },
+      "refs": [
+        {
+          "title": "OSTEP chapter 28: Locks",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-locks.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "A futex keeps the kernel out until someone has to wait",
+      "body": "A **futex** (fast user-space mutex) splits a lock in two. The lock itself is a 32-bit integer in your process's memory, the futex word, and taking or releasing it is a CAS on that word. The kernel joins in only when a thread has to wait, through one system call, `futex`, with two operations that matter here:\n\n- `FUTEX_WAIT(addr, expected)`: put me to sleep, but only if the word at `addr` still holds `expected`. The kernel loads the word, compares it and starts the sleep as one atomic step. If the word changed, the call fails at once with `EAGAIN`.\n- `FUTEX_WAKE(addr, n)`: wake up to `n` threads sleeping on `addr`.\n\nThe kernel keeps a wait queue per address, and nothing at all for a futex that nobody is waiting on.\n\nglibc's mutex gives the word three values: 0 is free, 1 is locked, 2 is locked with waiters. Ulrich Drepper's paper \"Futexes Are Tricky\" walks through why it takes three. To lock, CAS 0 to 1; if that works, you're done, with no system call. If not, set the word to 2 and call `FUTEX_WAIT(addr, 2)`. To release it, swap the word to 0, and only if the old value was 2, call `FUTEX_WAKE(addr, 1)`.\n\nThe check inside `FUTEX_WAIT` prevents a lost wake-up. Without it, T2 could decide to sleep, T1 could release the lock and wake nobody (T2 isn't asleep yet), and then T2 would sleep forever on a free lock. With it, the kernel sees that the word is no longer 2 and sends T2 back to try again.\n\nYou can watch both paths. Under `strace -c`, one thread taking a pthread mutex a million times makes 1 `futex` call (and that one is `pthread_join` waiting for the thread to end). Four threads make 2,749, and 1,042 of them fail with `EAGAIN`: the race in the last frame of the stepper, over and over.\n\nThe JVM sits on the same mechanism. `ReentrantLock` takes the lock with a CAS on an `int` inside the lock object. When it has to wait, it parks the thread with `LockSupport.park`, which on Linux ends in a `futex` wait. `synchronized` also starts with a CAS in user space and parks through the kernel only under contention. So \"is this lock slow?\" is really \"how often do threads find it taken?\".",
+      "stepper": {
+        "title": "One contended round of a futex lock",
+        "intro": "Two threads, one lock word in user space and the kernel's wait queue below the line. The counter at the top right counts system calls.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"T1 takes the free lock with one compare-and-swap, no system call\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">CAS 0 to 1: got it</text><rect class=\"box\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">running</text><rect class=\"box-a\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-a\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 1</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">0 free, 1 locked, 2 waiters</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">empty</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 0</text><line class=\"ln-a\" x1=\"230\" y1=\"72\" x2=\"328\" y2=\"100\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The word is 0, free. T1 runs `lock()`: one compare-and-swap from 0 to 1, and it succeeds. T1 owns the lock and the kernel was never asked. This is the path a million uncontended locks take, at a few nanoseconds each."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"T2 tries the same compare-and-swap and fails because the word is 1\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">holds the lock</text><rect class=\"box-b\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">CAS 0 to 1: fails</text><rect class=\"box\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-m\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 1</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">0 free, 1 locked, 2 waiters</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">empty</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 0</text><line class=\"ln-a\" x1=\"230\" y1=\"156\" x2=\"328\" y2=\"126\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "T2 wants the lock while T1 is inside. Its compare-and-swap expects 0, finds 1, and fails. Spinning would burn T2's slice, so it gets ready to sleep."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"T2 sets the word to 2 and asks the kernel to sleep while it is 2\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">holds the lock</text><rect class=\"box-a\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">FUTEX_WAIT(word, 2)</text><rect class=\"box-a\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-a\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 2</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">0 free, 1 locked, 2 waiters</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box-a\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">payment, asleep</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 1</text><line class=\"ln-a\" x1=\"230\" y1=\"156\" x2=\"328\" y2=\"126\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"180\" y1=\"188\" x2=\"328\" y2=\"246\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "T2 swaps the word to 2, which means \"locked, and someone is waiting\", then calls `futex(FUTEX_WAIT, &word, 2)`. In one step, the kernel checks that the word still holds 2 and puts T2 on the wait queue for that address. `ps` would now show T2 in `futex_wait_queue` using no CPU. First system call."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"T1 unlocks: swaps the word to 0, sees 2, and calls FUTEX_WAKE\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">release: old value 2</text><rect class=\"box-dim\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">asleep</text><rect class=\"box-a\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-a\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 0</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">0 free, 1 locked, 2 waiters</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">payment, asleep</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 2</text><line class=\"ln-a\" x1=\"230\" y1=\"72\" x2=\"328\" y2=\"100\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"230\" y1=\"90\" x2=\"328\" y2=\"236\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "T1 leaves its critical section. `unlock()` swaps the word to 0 and looks at the old value. It was 2, so somebody may be asleep, and T1 calls `futex(FUTEX_WAKE, &word, 1)`. Had the old value been 1, releasing the lock would have been one instruction and no system call."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The kernel wakes T2, which swaps in 2 and owns the lock\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">running</text><rect class=\"box-a\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">woken: swap 2, got it</text><rect class=\"box-a\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-a\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 2</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">0 free, 1 locked, 2 waiters</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">empty</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 2</text><line class=\"ln-a\" x1=\"230\" y1=\"156\" x2=\"328\" y2=\"126\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The kernel moves T2 off the wait queue and the scheduler runs it. T2 swaps the word to 2 and sees the old value 0: it owns the lock. It sets 2, not 1, because it can't know whether other threads are still asleep, so when it releases the lock it will make one possibly unneeded wake call. That's the price of keeping the kernel out of the fast path."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"If the word changes before the kernel checks, FUTEX_WAIT fails with EAGAIN and T2 retries\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">user space: your process</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"67.0\" text-anchor=\"middle\">refund (T1)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"87.0\" text-anchor=\"middle\">unlocked a moment ago</text><rect class=\"box-bad\" x=\"20\" y=\"124\" width=\"210\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"125.0\" y=\"151.0\" text-anchor=\"middle\">payment (T2)</text><text class=\"t-s t-m\" x=\"125.0\" y=\"171.0\" text-anchor=\"middle\">FUTEX_WAIT: EAGAIN</text><rect class=\"box-b\" x=\"330\" y=\"70\" width=\"180\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"420.0\" y=\"107.0\" text-anchor=\"middle\">futex word</text><text class=\"t-s t-m\" x=\"420.0\" y=\"127.0\" text-anchor=\"middle\">= 0</text><text class=\"t-s t-m\" x=\"420\" y=\"172\" text-anchor=\"middle\">changed before the kernel checked</text><line class=\"ln-d\" x1=\"20\" y1=\"208\" x2=\"700\" y2=\"208\"/><text class=\"t-s t-m\" x=\"20\" y=\"230\" text-anchor=\"start\">kernel</text><rect class=\"box\" x=\"330\" y=\"222\" width=\"370\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"515.0\" y=\"247.0\" text-anchor=\"middle\">wait queue for the word's address</text><text class=\"t-s t-m\" x=\"515.0\" y=\"267.0\" text-anchor=\"middle\">empty</text><text class=\"t-s t-a\" x=\"700\" y=\"26\" text-anchor=\"end\">system calls so far: 1</text><line class=\"ln-a\" x1=\"180\" y1=\"188\" x2=\"328\" y2=\"246\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Another run, with different timing. T2 set the word to 2, but before its `FUTEX_WAIT` reached the kernel, T1 unlocked and the word went to 0. The kernel compares, finds 0 instead of the expected 2, and returns `EAGAIN` at once instead of sleeping. T2 just tries again. Without that check T2 could sleep forever on a lock nobody holds. These are the errors in the `futex` row of the strace counts."
+          }
+        ]
+      },
+      "try": {
+        "title": "Count the futex calls",
+        "minutes": 4,
+        "steps": [
+          "Run the same counter under `strace -f -c -e trace=futex`, which counts only `futex` system calls across all threads.",
+          "Predict the count for 1 thread, then for 4. Then run the Java version, `LockCounter`, which does the same with a `ReentrantLock`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -pthread -o /tmp/counter os/c/l05/counter.c\nstrace -f -c -e trace=futex /tmp/counter 1 2>&1 | grep -E \"threads|futex\"\nstrace -f -c -e trace=futex /tmp/counter 4 2>&1 | grep -E \"threads|futex\"\njavac -d /tmp/out os/src/demo/java/sfz/os/l05/demo/LockCounter.java\nfor n in 1 4; do strace -f -c -e trace=futex java -cp /tmp/out sfz.os.l05.demo.LockCounter $n 2>&1 | grep -E \"threads|futex\"; done",
+          "file": "labs/os/src/demo/java/sfz/os/l05/demo/LockCounter.java"
+        },
+        "expect": "Columns: % time, seconds, microseconds per call, calls, errors. Counts change between runs:\n\n```text\n1 threads: balance = 1000000 (expected 1000000)\n100.00    0.001263        1263         1           futex\n4 threads: balance = 4000000 (expected 4000000)\n100.00    0.081274          29      2749      1042 futex\n1 threads: balance = 1,000,000 in 25 ms\n100.00    0.234507         227      1031       204 futex\n4 threads: balance = 4,000,000 in 61 ms\n100.00    0.448618         196      2283       259 futex\n```\n\nA million uncontended locks: one `futex` call, from `pthread_join`. With contention: 2,749 calls, and the 1,042 errors are `FUTEX_WAIT` returning `EAGAIN` because the word changed first. The JVM makes about 1,000 `futex` calls even with one thread: its own threads park and wake while it starts up (lesson 3's few dozen tasks). Contention adds about 1,250 more."
+      },
+      "refs": [
+        {
+          "title": "futex(7): fast user-space locking",
+          "url": "https://man7.org/linux/man-pages/man7/futex.7.html",
+          "kind": "docs"
+        },
+        {
+          "title": "FUTEX_WAIT(2const)",
+          "url": "https://man7.org/linux/man-pages/man2/FUTEX_WAIT.2const.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Ulrich Drepper: Futexes Are Tricky",
+          "url": "https://akkadia.org/drepper/futex.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Deadlock: each thread holds the lock the other needs",
+      "body": "Futexes make waiting cheap. They also make a mistake quiet. A refund moves 120 from a merchant's account to a customer's, and at the same moment a payment moves 80 the other way. Each transfer locks its source account, then its target, so both balances change under both locks:\n\n```java\nsynchronized (from) {\n    synchronized (to) {\n        from.balance -= amount;\n        to.balance += amount;\n    }\n}\n```\n\nRun them together and the refund can lock the merchant while the payment locks the customer. Now the refund waits for the customer, which the payment holds, and the payment waits for the merchant, which the refund holds. Neither can go on, and neither will give up what it has. That's a **deadlock**. Try to cause one in the simulator.\n\nFour conditions must all hold for a deadlock. OSTEP lists them after Coffman and colleagues (1971):\n\n1. Mutual exclusion: a lock has one owner at a time.\n2. Hold and wait: a thread keeps the locks it has while it waits for another.\n3. No preemption: nothing can take a lock away from the thread that holds it.\n4. Circular wait: there is a cycle of threads, each waiting for a lock the next one holds.\n\nThe last condition is the one you can draw. Put an arrow from each waiting thread to the thread that holds the lock it wants: that's a **wait-for graph**, and a deadlock is a cycle in it. Here the graph is refund to payment, and payment back to refund. `jstack` builds the same graph from the JVM's lock records and prints the cycle as \"Found one Java-level deadlock\".\n\nThe kernel sees none of it. To the kernel, both threads are asleep in `futex_wait_queue`, using no CPU, exactly like idle workers waiting for a job. Nothing times out, and the JVM doesn't break the cycle either. The two threads, and every later request that needs either account, stay stuck until the process restarts. The symptom in production is a service with idle CPUs whose requests never come back.",
+      "sim": {
+        "title": "A refund and a payment lock the same two accounts",
+        "intro": "You are the scheduler: pick which transfer runs its next line. First make them deadlock. Then reset and get both to finish, with the merchant at 9960.",
+        "vars": {
+          "merchant": 10000
+        },
+        "locks": [
+          "ACC-1001",
+          "ACC-2002"
+        ],
+        "threads": [
+          {
+            "name": "refund",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "ACC-1001",
+                "code": "synchronized (merchant) {      // from"
+              },
+              {
+                "op": "lock",
+                "lock": "ACC-2002",
+                "code": "  synchronized (customer) {    // to"
+              },
+              {
+                "op": "read",
+                "var": "merchant",
+                "reg": "m",
+                "code": "    m = merchant.balance"
+              },
+              {
+                "op": "add",
+                "reg": "m",
+                "n": -120,
+                "code": "    m = m - 120               // customer gets +120"
+              },
+              {
+                "op": "write",
+                "var": "merchant",
+                "reg": "m",
+                "code": "    merchant.balance = m"
+              },
+              {
+                "op": "unlock",
+                "lock": "ACC-2002",
+                "code": "  }                             // releases customer"
+              },
+              {
+                "op": "unlock",
+                "lock": "ACC-1001",
+                "code": "}                               // releases merchant"
+              }
+            ]
+          },
+          {
+            "name": "payment",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "ACC-2002",
+                "code": "synchronized (customer) {      // from"
+              },
+              {
+                "op": "lock",
+                "lock": "ACC-1001",
+                "code": "  synchronized (merchant) {    // to"
+              },
+              {
+                "op": "read",
+                "var": "merchant",
+                "reg": "m",
+                "code": "    m = merchant.balance"
+              },
+              {
+                "op": "add",
+                "reg": "m",
+                "n": 80,
+                "code": "    m = m + 80                // customer pays 80"
+              },
+              {
+                "op": "write",
+                "var": "merchant",
+                "reg": "m",
+                "code": "    merchant.balance = m"
+              },
+              {
+                "op": "unlock",
+                "lock": "ACC-1001",
+                "code": "  }                             // releases merchant"
+              },
+              {
+                "op": "unlock",
+                "lock": "ACC-2002",
+                "code": "}                               // releases customer"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "merchant",
+          "eq": 9960,
+          "say": "Both transfers finished: 10,000 - 120 + 80 = 9,960. Every order that works lets one transfer take both locks before the other takes its first. Run refund line 1 and payment line 1 back to back and nothing can finish."
+        }
+      },
+      "try": {
+        "title": "Deadlock two transfers and look from both sides",
+        "minutes": 4,
+        "steps": [
+          "`Transfers naive` runs the refund and the payment from this section at the same time. A 50 ms pause between the two locks makes the deadlock happen on every run.",
+          "Look from the kernel's side with `ps` (the `WCHAN` column names the kernel function a thread sleeps in), then from the JVM's side with `jstack`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l05/demo/Transfers.java\njava -cp /tmp/out sfz.os.l05.demo.Transfers naive 30 & pid=$!\nsleep 4\nps -L -p $pid -o tid,pcpu,stat,wchan:20,comm | grep -E \"TID|refund|payment\"\njstack $pid | sed -n '/Found one Java-level deadlock/,/^Java stack/p'\nkill $pid",
+          "file": "labs/os/src/demo/java/sfz/os/l05/demo/Transfers.java"
+        },
+        "expect": "TIDs and addresses differ between runs:\n\n```text\npid 40: naive locks\nstill waiting after 3 s: deadlock\n  TID %CPU STAT WCHAN                COMMAND\n   62  0.0 Sl   futex_wait_queue     refund\n   63  0.0 Sl   futex_wait_queue     payment\nFound one Java-level deadlock:\n=============================\n\"refund\":\n  waiting to lock monitor 0x0000ffff280021a0 (object 0x000000008bb19370, a sfz.os.l05.demo.Transfers$Account),\n  which is held by \"payment\"\n\n\"payment\":\n  waiting to lock monitor 0x0000ffff20000ed0 (object 0x000000008bb191f8, a sfz.os.l05.demo.Transfers$Account),\n  which is held by \"refund\"\n\nJava stack information for the threads listed above:\n```\n\nThe kernel's view: two sleeping threads (`S`) at 0.0% CPU, parked in `futex_wait_queue`, the kernel side of `FUTEX_WAIT`. Nothing about them looks wrong. The JVM's view: a cycle of two, refund waiting for payment and payment waiting for refund."
+      },
+      "refs": [
+        {
+          "title": "OSTEP chapter 32: Common Concurrency Problems",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "jstack command (JDK 25)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstack.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Break one of the four conditions and the deadlock can't happen",
+      "body": "All four conditions are needed, so a fix only has to remove one. Each fix below removes a different one, and each has a price.\n\nBreak circular wait with a lock order. Pick one global order for the locks, say by account id, and always lock the smaller id first, whichever way the money goes. Both transfers now start with `ACC-1001`. Whoever gets it also gets the second lock; the other waits on its first lock while holding nothing, so no cycle can form. The lab's explorer counts it: the two naive transfers can interleave in 6 ways and 2 of them deadlock; ordered, there are 2 ways and neither does. Reach for this fix first. Its price is discipline: every code path that takes two of these locks has to follow the order.\n\nBreak no preemption with a timeout. Lock the first account, then `tryLock(10, MILLISECONDS)` the second. If that fails, release the first, wait a random moment and start again. The thread takes the lock away from itself. The random wait matters. Without it, both threads can retry in step forever, each getting its first lock and failing on its second. That's a **livelock**: as busy as a deadlock is idle, and just as stuck.\n\nBreak hold and wait by taking every lock at once, inside one global lock that guards the acquiring. It's simple and correct, and it lets only one transfer acquire locks at a time across the whole service.\n\nBreak mutual exclusion by not locking at all. A single counter can be an `AtomicLong` updated with CAS. A transfer can't, because two balances must change together and CAS works on one word.\n\nDatabases have the same problem with row locks, and they detect deadlocks instead of preventing them. PostgreSQL waits on a lock for `deadlock_timeout`, 1 s by default, then builds a wait-for graph; if it finds a cycle, it aborts one transaction with a deadlock error. The JVM only reports. In the lab you build that report yourself: the wait-for graph from a real `jstack` dump, the cycle in it, and the proof that ordering removes it.",
+      "try": {
+        "title": "Run the two fixes",
+        "minutes": 3,
+        "steps": [
+          "`ordered` locks the smaller account id first in both transfers. `trylock` uses a `ReentrantLock` per account and `tryLock(10 ms)` on the second, backing off for a random 1 to 99 ms when it fails.",
+          "Predict which one prints a retry."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l05/demo/Transfers.java\njava -cp /tmp/out sfz.os.l05.demo.Transfers ordered\njava -cp /tmp/out sfz.os.l05.demo.Transfers trylock",
+          "file": "labs/os/src/demo/java/sfz/os/l05/demo/Transfers.java"
+        },
+        "expect": "```text\npid 40: ordered locks\nmerchant 9960, customer 540\npid 63: trylock locks\nrefund done after 1 attempt(s)\npayment done after 2 attempt(s)\nmerchant 9960, customer 540\n```\n\nBoth finish with the right balances. The ordered version never retries: the second transfer simply waits on `ACC-1001` while holding nothing. In the `trylock` version both transfers grab their first lock, one times out on its second, lets go and retries after its random pause. Which one retries changes from run to run."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: deadlock_timeout",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-locks.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A futex is a meeting room with a sign on the door and a receptionist downstairs. You flip the sign from Free to Busy yourself; nobody else is involved, and that's most visits. Only when the sign already says Busy do you go down and ask to be called when the room frees up, and the receptionist checks the sign once more before writing your name down, in case it changed while you walked. Whoever leaves flips the sign back, and only if the sign said someone was waiting do they phone reception. A deadlock is two people each holding the key to one room and waiting outside the other. The analogy breaks at fairness. A receptionist calls people in order, but a woken thread has to race any newcomer for the compare-and-swap, and the newcomer, already running, often wins.",
+  "in_your_world": "The ledger service's transfer code is where this bites: two accounts, two locks, and traffic in both directions. The JVM version is the `synchronized` pair from this lesson. The database version is two transactions running `SELECT ... FOR UPDATE` on the same two ledger rows in opposite orders. Oracle detects that cycle and raises `ORA-00060` in one session; the JVM never does anything about it, so a deadlocked Kafka consumer simply stops making progress, its partitions lag, and the CPU graph looks calm. Sort the account ids before you lock, in Kotlin and in SQL. The futex half matters too. A `synchronized` cache in front of the card-issuer client is free while traffic is light and turns into `futex` calls and `sys` time when every request thread hits it. And never hold a lock across the issuer's 120 ms call: every other thread that needs that lock waits the full 120 ms.",
+  "mistake": "Locking in argument order: `transfer(from, to)` locks `from`, then `to`. It reads naturally, it passes every unit test because tests run one transfer at a time, and it deadlocks in production the first time two opposite transfers overlap. The fix is to order the locks by something that belongs to the account, its id, never by the role it plays in the call. The second half of the mistake is reaching for `System.identityHashCode` as the order key. Two objects can have the same identity hash, and then the order is undefined for that pair. Use a real, unique key, and if you truly have none, add one more lock that only the tie case takes.",
+  "compare": {
+    "title": "The transfer before and after lock ordering",
+    "a": {
+      "label": "naive: source, then target",
+      "lang": "java",
+      "title": "deadlocks when two transfers cross",
+      "src": "void transfer(Account from, Account to, long amount) {\n    synchronized (from) {\n        synchronized (to) {\n            from.balance -= amount;\n            to.balance += amount;\n        }\n    }\n}"
+    },
+    "b": {
+      "label": "ordered: smaller id first",
+      "lang": "java",
+      "title": "cannot deadlock",
+      "src": "void transfer(Account from, Account to, long amount) {\n    Account first = from.id.compareTo(to.id) < 0 ? from : to;\n    Account second = first == from ? to : from;\n    synchronized (first) {\n        synchronized (second) {\n            from.balance -= amount;\n            to.balance += amount;\n        }\n    }\n}"
+    },
+    "note": "The body is the same, and so are the locks. Only the order changes, from the role an account plays in this call (source or target) to a property of the account itself (its id). Two transfers between the same accounts now ask for the locks in the same order, so one of them always waits before it holds anything. The order has to come from a key that never ties: account ids work, `System.identityHashCode` doesn't, because two objects can share a hash code."
+  },
+  "worked": {
+    "title": "Find and fix a deadlock in a running JVM",
+    "steps": [
+      {
+        "say": "The symptom: requests to the transfer endpoint hang, and the service uses almost no CPU. Start from the kernel's side. Threads at 0% CPU sleeping in `futex_wait_queue` are waiting for a lock (or a condition); that alone doesn't prove a deadlock, since idle pool threads look the same.",
+        "code": "ps -L -p $pid -o tid,pcpu,stat,wchan:20,comm | grep -E \"TID|refund|payment\"\n#   TID %CPU STAT WCHAN                COMMAND\n#    62  0.0 Sl   futex_wait_queue     refund\n#    63  0.0 Sl   futex_wait_queue     payment",
+        "lang": "bash"
+      },
+      {
+        "say": "Ask the JVM for the cycle. `jstack` runs the same wait-for-graph search the lab builds. Add `-l` so it also lists `ReentrantLock` owners (\"Locked ownable synchronizers\").",
+        "code": "jstack -l $pid | sed -n '/Found one Java-level deadlock/,/^Java stack/p'\n# \"refund\":\n#   waiting to lock monitor ... (object 0x000000008bb18d78, a sfz.os.l05.demo.Transfers$Account),\n#   which is held by \"payment\"\n# \"payment\":\n#   waiting to lock monitor ... (object 0x000000008bb18d30, a sfz.os.l05.demo.Transfers$Account),\n#   which is held by \"refund\"",
+        "lang": "bash"
+      },
+      {
+        "say": "Read the two stacks below the summary. Both threads sit on the same line of the same method, each holding one `Account` and waiting for the other. Same code, arguments in opposite order: the lock order comes from the call, not from the data.",
+        "code": "\"refund\":\n\tat sfz.os.l05.demo.Transfers.transfer(Transfers.java:21)\n\t- waiting to lock <0x000000008bb18d78> (a sfz.os.l05.demo.Transfers$Account)\n\t- locked <0x000000008bb18d30> (a sfz.os.l05.demo.Transfers$Account)",
+        "lang": "text"
+      },
+      {
+        "say": "Fix it by ordering on the account id, which breaks circular wait, and restart the process: nothing frees the stuck threads. Then prove the fix under the same timing.",
+        "code": "Account first = from.id.compareTo(to.id) < 0 ? from : to;    // ACC-1001 before ACC-2002, always\nAccount second = first == from ? to : from;\n\n// java -cp /tmp/out sfz.os.l05.demo.Transfers ordered\n// merchant 9960, customer 540",
+        "lang": "java"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Find the cycle in a real deadlock dump",
+    "minutes": 15,
+    "files": [
+      "labs/os/src/main/kotlin/sfz/os/l05/Deadlock.kt",
+      "labs/os/src/test/resources/sfz/os/l05/transfers-deadlock.jstack.txt",
+      "labs/os/src/test/resources/sfz/os/l05/lock-transfers-deadlock.jstack.txt"
+    ],
+    "run": "./gradlew :os:test --tests 'sfz.os.l05.*'",
+    "steps": [
+      "Open the two dumps. Both are `jstack -l` output from the lab box: this lesson's `Transfers naive` (with `synchronized`) and the same deadlock built with two `ReentrantLock`s. Find each thread's `- locked`, `- waiting to lock`, `- parking to wait for` and \"Locked ownable synchronizers\" lines.",
+      "Run the tests from the `labs` folder. All nine fail.",
+      "Write `LockDump.parse`. For each line that matches `HEADER`, take the lines after it while they are blank or start with whitespace. Holds come from `LOCKED` and `OWNABLE` matches, the wait from the first `WAITING` match.",
+      "Write `WaitForGraph.edges`: map every held lock address to its holder, then each waiting thread to the holder of the lock it wants.",
+      "Write `findCycle`. Each thread waits for at most one other, so following the edges from a thread either ends or comes back to a thread already on your path.",
+      "Write `Fix.breaks` and `Schedules.orderedTransfer`. The last two tests use the explorer that is written for you: 2 deadlocks in 6 schedules for the naive transfers, none once they're ordered."
+    ],
+    "hints": [
+      "`main` shows `- waiting on <0x...>` and `- locked <0x...>` for the same object. That's `Object.wait()`, which has given the monitor back, so `WAITING` deliberately doesn't match it.",
+      "The deadlock summary at the end of a dump repeats `\"refund\":` without `nid=`, so `HEADER` skips it. Stop a thread's section at the first line that starts with a non-space character, or the summary's lock lines end up in the last thread's section.",
+      "In `findCycle`, once you meet a thread already on the path, the cycle is the path from that thread's first position to the end. Rotate it so the smallest name comes first: `cycle.drop(i) + cycle.take(i)`."
+    ],
+    "done_when": "All nine tests in `DeadlockTest` pass."
+  },
+  "drill": {
+    "title": "Order the locks, name the conditions",
+    "minutes": 4,
+    "prompt": "From memory, write a Kotlin `transfer(from, to, amount)` that can't deadlock with `synchronized`. Then list the four deadlock conditions and, for each, one fix that removes it.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun transfer(from: Account, to: Account, amount: Long) {\n    val (first, second) = if (from.id < to.id) from to to else to to from   // one global order: by id\n    synchronized(first) {\n        synchronized(second) {\n            from.balance -= amount\n            to.balance += amount\n        }\n    }\n}\n\n// mutual exclusion -> no lock at all: CAS on one word (AtomicLong), only for single-word updates\n// hold and wait    -> take every lock at once, under one global lock\n// no preemption    -> tryLock(timeout) the second, release the first, random back-off, retry\n// circular wait    -> lock in a global order (above)"
+    }
+  },
+  "recap": [
+    "A lock is built on compare-and-swap: one instruction that reads, compares and writes a word with no other CPU in between. A check-then-set flag is not a lock.",
+    "A futex is a 32-bit word in user space plus a kernel wait queue. Taking and releasing the lock are atomic instructions; `futex()` is called only to sleep (`FUTEX_WAIT`) or wake (`FUTEX_WAKE`).",
+    "`FUTEX_WAIT` sleeps only if the word still holds the expected value, or fails with `EAGAIN`. That check prevents lost wake-ups, and it's the errors column in `strace -c`.",
+    "Deadlock needs mutual exclusion, hold and wait, no preemption and circular wait. A cycle in the wait-for graph is the deadlock; `jstack` finds it, the kernel only sees threads asleep in `futex_wait_queue`.",
+    "Remove any one condition: lock ordering (circular wait), tryLock with random back-off (no preemption), all locks at once (hold and wait), CAS instead of a lock (mutual exclusion)."
+  ],
+  "quiz": [
+    {
+      "q": "Which of these makes a `futex` system call with a glibc mutex?",
+      "options": [
+        "Locking a mutex nobody holds",
+        "Unlocking a mutex nobody is waiting for",
+        "A thread finding the mutex held and going to sleep",
+        "Every thousandth lock, to keep the kernel's records in sync"
+      ],
+      "answer": 2,
+      "why": "Taking a free mutex is a compare-and-swap, and unlocking one with the word at 1 is an atomic swap: no kernel. Only a thread that must wait calls `FUTEX_WAIT`, and the unlocker then calls `FUTEX_WAKE` because the word says 2. The kernel keeps no records for a futex nobody waits on."
+    },
+    {
+      "q": "A C program whose eight threads do nothing but take and release one shared pthread mutex shows 9,000 `futex` calls with 3,500 errors under `strace -f -c -e trace=futex`. What are the errors?",
+      "options": [
+        "`FUTEX_WAIT` calls that found the word already changed and returned `EAGAIN` instead of sleeping",
+        "The kernel running out of memory for wait queues",
+        "Deadlocks the kernel detected and broke",
+        "Threads interrupted by `SIGKILL`"
+      ],
+      "answer": 0,
+      "why": "`FUTEX_WAIT` sleeps only if the word still holds the value the caller expected; if the lock was released in between, it fails at once with `EAGAIN` and the thread retries. Those are harmless races under contention. The kernel never detects user-space deadlocks: it doesn't know what a futex word means."
+    },
+    {
+      "q": "A service hangs at 0% CPU, two worker threads sleep in `futex_wait_queue`, and `jstack` prints \"Found one Java-level deadlock\" between `transfer` calls. Which change makes this deadlock impossible for any pair of accounts?",
+      "options": [
+        "Use `new ReentrantLock(true)` so the lock is fair",
+        "Add `Thread.sleep(10)` between taking the two locks",
+        "Give the worker pool more threads",
+        "Always lock the account with the smaller id first"
+      ],
+      "answer": 3,
+      "why": "A global order removes circular wait: two transfers between the same accounts ask for the locks in the same order, so one waits before it holds anything. Fairness only changes who gets a free lock next; it does nothing for a lock that's never released. A sleep makes the deadlock more likely, as the demo's 50 ms pause shows."
+    },
+    {
+      "q": "You change the second `lock()` to `tryLock(10, MILLISECONDS)`; on failure the thread releases the first lock and immediately tries again. Which condition did you break, and what can still go wrong?",
+      "options": [
+        "Circular wait; nothing else can go wrong",
+        "No preemption; both threads can retry in lockstep forever, a livelock, so add a random back-off",
+        "Mutual exclusion; the balances can now be corrupted",
+        "Hold and wait; the transfers now run one at a time"
+      ],
+      "answer": 1,
+      "why": "Releasing what you hold when you can't get the next lock is self-preemption, which removes the no-preemption condition. With identical timing both threads keep grabbing their first lock and failing on the second. OSTEP's cure for that livelock is a random delay before retrying, as the demo's `trylock` mode does."
+    },
+    {
+      "q": "From the last lesson: two threads use a spinlock (a loop on compare-and-swap), pinned to the same CPU on the lab box. The holder is switched out inside its critical section. About how long does the waiter burn CPU before the holder can run again?",
+      "options": [
+        "No time: a spinning thread gives up the CPU at once",
+        "About 100 ms: one cgroup period",
+        "About one time slice, around 3 ms on a machine with 8 or more CPUs",
+        "About 1 ms: one timer tick"
+      ],
+      "answer": 2,
+      "from": "os-04",
+      "why": "A spinner never blocks, so the scheduler lets it use its whole slice, and EEVDF's default slice is 3 ms with 8 or more CPUs. Only then can the holder run and release the lock. That wasted slice is why user-space locks sleep through the kernel instead of spinning for long."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does compare-and-swap do?",
+      "back": "In one indivisible step: if the word holds the expected value, write the new value and report success; otherwise change nothing and report failure."
+    },
+    {
+      "front": "What is a futex?",
+      "back": "A 32-bit word in user memory used as a lock, plus a kernel wait queue per address. The kernel is called only to sleep or wake threads."
+    },
+    {
+      "front": "What does `FUTEX_WAIT(addr, val)` do if `*addr != val`?",
+      "back": "Fails at once with `EAGAIN` instead of sleeping. The check and the sleep are atomic, which prevents lost wake-ups."
+    },
+    {
+      "front": "What do 0, 1 and 2 mean in glibc's mutex word?",
+      "back": "0 free, 1 locked, 2 locked with (possibly) waiting threads. Releasing the lock calls `FUTEX_WAKE` only when it swaps out a 2."
+    },
+    {
+      "front": "The four conditions for deadlock?",
+      "back": "Mutual exclusion, hold and wait, no preemption, circular wait. All four must hold."
+    },
+    {
+      "front": "Which condition does lock ordering break?",
+      "back": "Circular wait. With one global order, no cycle of waiting threads can form."
+    },
+    {
+      "front": "How does a Java deadlock look from the kernel's side?",
+      "back": "Threads asleep (`S`) at 0% CPU with `WCHAN` `futex_wait_queue`. Only `jstack` shows the cycle."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Critical section",
+      "plain": "The code between taking a lock and releasing it, which only one thread may run at a time."
+    },
+    {
+      "term": "Compare-and-swap (CAS)",
+      "plain": "An atomic instruction that writes a new value only if the word still holds the expected one, and reports whether it did."
+    },
+    {
+      "term": "Spinlock",
+      "plain": "A lock whose waiters loop on CAS instead of sleeping. Good for nanosecond critical sections, wasteful when the holder isn't running."
+    },
+    {
+      "term": "Futex",
+      "plain": "Fast user-space mutex: a lock word in your memory, with the `futex()` system call used only to sleep and wake."
+    },
+    {
+      "term": "Contention",
+      "plain": "Threads trying to take a lock that another thread holds. It is what sends a futex lock into the kernel."
+    },
+    {
+      "term": "Deadlock",
+      "plain": "A set of threads each waiting for a lock another one in the set holds, so none can ever continue."
+    },
+    {
+      "term": "Wait-for graph",
+      "plain": "Arrows from each waiting thread to the thread holding what it waits for. A cycle in it is a deadlock."
+    },
+    {
+      "term": "Livelock",
+      "plain": "Threads that keep retrying and failing in step: busy, but making no progress."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks why the settlement service's `synchronized` blocks are \"free\" in the load test with one client and eat 30% CPU in `sys` time with 50. Explain what happens inside the lock in both cases.",
+    "answer": "The lock is a word in memory. When nobody else holds it, taking it is one compare-and-swap and releasing it is one atomic swap, a few nanoseconds, and the kernel never hears about it. That's the one-client case. With 50 clients, threads often find the word already taken. Spinning would waste their time slices, so the JVM parks them, and on Linux parking is a `futex(FUTEX_WAIT)` system call: the kernel puts the thread on a wait queue for that address. Every release that finds waiters makes a `FUTEX_WAKE` call, and each woken thread has to be scheduled again, often only to find the lock taken by someone else. All those system calls, sleeps, wake-ups and context switches are the `sys` time. The fix isn't a faster lock but less contention: hold the lock for less time, keep slow calls like the card issuer outside it, or split the shared state so threads don't all need the same lock."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "A `ReentrantLock` deadlock looks different in a dump, which is why the lab parses two files. The waiting thread is `WAITING (parking)`, the lock is an AQS object, and the owner shows only under `jstack -l`:\n\n```text\n\"refund\" #25 [58] prio=5 os_prio=0 cpu=0.53ms elapsed=3.15s tid=0x0000ffff7c1498d0 nid=58 waiting on condition  [...]\n   java.lang.Thread.State: WAITING (parking)\n\tat jdk.internal.misc.Unsafe.park(java.base@25.0.5/Native Method)\n\t- parking to wait for  <0x000000008bb17020> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)\n\t...\n   Locked ownable synchronizers:\n\t- <0x000000008bb16ff0> (a java.util.concurrent.locks.ReentrantLock$NonfairSync)\n```\n\nThe summary at the end says \"waiting for ownable synchronizer\" instead of \"waiting to lock monitor\". Without `-l` you see what each thread waits for, but not who owns it.\n\n`NonfairSync` is the default. A non-fair lock lets a running thread take a just-released lock ahead of threads that are parked, because waking a parked thread takes a system call and a trip through the scheduler, while the running thread is already on a CPU. `new ReentrantLock(true)` hands the lock to the longest waiter instead, and pays for it in throughput.\n\nNot every wait that shows `futex_wait_queue` is a lock. `Object.wait()`, `Condition.await()`, `CountDownLatch.await()` and an idle thread pool's `take()` all park through the same `futex` call. In the dump, `- waiting on <0x...>` (a monitor's wait set) and `parking to wait for` a `ConditionObject` or `CountDownLatch$Sync` are waits for a signal, not for a lock, and no thread \"holds\" them. That's why the lab's graph only draws an edge when some thread really holds the address.\n\nDatabases detect where the JVM only reports. PostgreSQL's docs explain the 1 s default of `deadlock_timeout` plainly: the check is \"relatively expensive\", so the server assumes deadlocks are rare and only looks for a cycle once a lock wait has lasted that long. Oracle reports `ORA-00060` in one of the sessions in the cycle. Either way your code must catch the error and retry the transaction, which is one more reason to lock rows in a fixed order in the first place."
+  },
+  "sources": [
+    {
+      "title": "futex(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/futex.2.html"
+    },
+    {
+      "title": "FUTEX_WAIT(2const), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/FUTEX_WAIT.2const.html"
+    },
+    {
+      "title": "Ulrich Drepper: Futexes Are Tricky",
+      "url": "https://akkadia.org/drepper/futex.pdf"
+    },
+    {
+      "title": "OSTEP chapter 32: Common Concurrency Problems",
+      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-bugs.pdf"
+    },
+    {
+      "title": "OSTEP chapter 28: Locks",
+      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-locks.pdf"
+    }
+  ]
+}
