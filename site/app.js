@@ -546,13 +546,15 @@
     const src = q.from && L[q.from] ? `<span class="tag from">From: ${esc(L[q.from].title)}</span>` : "";
     // every question's options are a calm radio group: one ring per answer, no boxes
     const warm = !!opt.warm;
+    // the number shares the question's first line; tags (an earlier lesson, the source lesson) sit under the answers
+    const tags = `${src}${opt.lessonTag || ""}`;
     return `<div class="qcard${warm ? " warm" : ""}" id="q-${esc(key)}-${qi}">
-      <div class="qn">${opt.num ? `<span class="label">Q${qi + 1}</span>` : ""}${src}${opt.lessonTag || ""}</div>
-      <div class="q prose" style="max-width:none">${q.q}</div>
+      <div class="qhead${opt.num ? " num" : ""}">${opt.num ? `<span class="qnum">Q${qi + 1}</span>` : ""}<div class="q prose" style="max-width:none">${q.q}</div></div>
       <div class="opts radio${answered ? " done" : ""}" role="radiogroup" aria-label="${warm ? "Your guess" : "Your answer"}">${q.options.map((o, k) => {
         const cls = answered ? (k === q.answer ? "right" : k === pick ? "wrong" : "") : "";
         return `<button class="opt ${cls}" data-act="answer" data-key="${esc(key)}" data-qi="${qi}" data-k="${k}" role="radio" aria-checked="${pick === k}" ${answered ? "disabled" : ""}><span class="ring" aria-hidden="true"></span><span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`;
       }).join("")}</div>
+      ${tags ? `<div class="qn">${tags}</div>` : ""}
       ${answered ? `<div class="why"><b>${pick === q.answer ? (opt.warm ? "Good guess." : "Right.") : opt.warm ? `Not quite. The answer is ${"ABCD"[q.answer]}.` : `Not this one. The answer is ${"ABCD"[q.answer]}.`}</b> ${q.why}${opt.warm ? " Keep it in mind as you read." : ""}</div>` : ""}
     </div>`;
   }
