@@ -5,7 +5,7 @@ import org.testcontainers.utility.DockerImageName
 import redis.clients.jedis.RedisClient
 
 /**
- * A second, deliberately tiny Redis server for the eviction tests (lesson 4), started the first
+ * A second, deliberately tiny Redis server for the eviction tests (lesson 5 of the cache track), started the first
  * time a test touches it and shared by every test in the JVM.
  *
  * It runs with `maxmemory 4mb`. An empty Redis 8.10 already uses about 1.4 MB, so about 2,000

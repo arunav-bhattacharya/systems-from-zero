@@ -1,0 +1,448 @@
+{
+  "id": "cons-05",
+  "title": "Coordination services: ZooKeeper, etcd and KRaft",
+  "minutes": 40,
+  "goal": "By the end you can explain why systems hand their agreement to a small coordination service, use its four primitives (compare-and-set, a revision counter, sessions with ephemeral keys, watches) for leader election, service discovery and locks, fence a paused leader with the revision as its token, and say how ZooKeeper, etcd and Kafka's KRaft controllers each provide them.",
+  "warmup": {
+    "q": "Three settlement pods elect a leader through etcd, with a 10 s lease. The leader, pod A, freezes in a 15 s GC pause. etcd expires its lease and pod B takes over. When pod A wakes, it writes tonight's payout file. What can stop that write?",
+    "options": [
+      "etcd: it revoked A's lease, so A's write fails",
+      "A's etcd client: it knows the lease expired and blocks the write",
+      "Only the payout store, if it checks a token from the election (such as the leader key's revision) and refuses one lower than it has already seen",
+      "Raft: A's term is lower than B's"
+    ],
+    "answer": 2,
+    "why": "The write goes from pod A to the payout store; etcd isn't on that path and never sees it. A's client can't help either: A checked that it was leader before the pause, and a paused process gets no signal that time passed. Only the receiver of the write can refuse it, and it needs a number that grows with every new leader to do so. Raft terms belong to etcd's own servers, not to its clients."
+  },
+  "sections": [
+    {
+      "h": "Agreement is hard to build, so systems borrow it",
+      "body": "Lesson 4 built Raft, and the 2015 membership bug showed how long a careful implementation can hide a mistake. Yet most systems need agreement on only a few facts. Which of three settlement pods runs tonight's batch. Which instances of the fraud service are alive. Which node owns shard 7. What the current fee table is. Embedding a consensus protocol in every service to agree on a few kilobytes is the wrong trade.\n\nGoogle drew that conclusion in its Chubby paper (2006). The team built a lock service instead of a Paxos library, because application developers found a lock and a small file far easier to use correctly than a consensus protocol. A Chubby cell is five replicas running Paxos, and its clients hold coarse-grained locks for hours or days, not milliseconds. Open-source copies followed: ZooKeeper from Yahoo!, etcd from CoreOS, Consul from HashiCorp. They are called **coordination services**, and they share a shape. They are small: three or five nodes, the data in memory, kilobytes to megabytes. Their data changes slowly: \"pod A leads settlement\" changes every few minutes or hours, not thousands of times a second. And every write goes through consensus, so every change has one place in one order.\n\nWhat makes them useful is four primitives on top of the key-value store, which this lesson calls the coordination instruction set:\n\n- compare-and-set: \"create this key only if it doesn't exist\", lesson 3's single decision;\n- a counter that grows with every change (the zxid in ZooKeeper, the revision in etcd), which orders all writes and makes fencing tokens;\n- sessions: a client keeps a lease alive with heartbeats, and keys tied to the session (ephemeral keys) vanish when it stops, which is failure detection;\n- watches: the service tells you when a key changes, so you don't poll.\n\nLeader election, service discovery, group membership, partition assignment and locks are each a short recipe over these four. The figure is the picture to keep: a small consensus group in the middle, clients around it holding sessions, and the resource they protect off to one side, which is where the last check has to happen.\n\nAgreement costs what lesson 3 said it costs. Every write is a consensus write, so adding servers makes writes slower: ZooKeeper's saturated write throughput fell from 21,000 a second on 3 servers to 8,000 on 13, while reads, served by each server from its own copy, rose. etcd's published benchmark (three members on cloud VMs) puts one client's write at 1.6 ms and its linearizable read at 0.7 ms.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 330\" role=\"img\" aria-label=\"A coordination service of three nodes running Raft or Zab sits on the left and holds a few kilobytes of facts at revision 41. Three settlement pods hold sessions with it; pod A leads and writes to a payout ledger with token 41, and the ledger refuses lower tokens. Along the bottom are the four primitives: compare-and-set, a revision counter, sessions with ephemeral keys, and watches.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"24\" text-anchor=\"start\">a few facts, agreed by consensus; clients hold sessions; the resource checks the token</text><rect class=\"box-a\" x=\"16\" y=\"44\" width=\"214\" height=\"196\" rx=\"8\"/><text class=\"t-s t-a\" x=\"123\" y=\"68\" text-anchor=\"middle\">coordination service</text><rect class=\"box\" x=\"34\" y=\"82\" width=\"52\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"60.0\" y=\"102.0\" text-anchor=\"middle\">n1</text><rect class=\"box\" x=\"98\" y=\"82\" width=\"52\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"124.0\" y=\"102.0\" text-anchor=\"middle\">n2</text><rect class=\"box\" x=\"162\" y=\"82\" width=\"52\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"188.0\" y=\"102.0\" text-anchor=\"middle\">n3</text><text class=\"t-s\" x=\"123\" y=\"142\" text-anchor=\"middle\">Raft or Zab</text><text class=\"t-s t-m\" x=\"123\" y=\"166\" text-anchor=\"middle\">3 or 5 nodes</text><text class=\"t-s t-m\" x=\"123\" y=\"190\" text-anchor=\"middle\">kilobytes, in memory</text><text class=\"t-s t-code\" x=\"123\" y=\"216\" text-anchor=\"middle\">revision 41</text><line class=\"ln-d\" x1=\"230\" y1=\"70\" x2=\"290\" y2=\"70\"/><line class=\"ln-d\" x1=\"230\" y1=\"140\" x2=\"290\" y2=\"140\"/><line class=\"ln-d\" x1=\"230\" y1=\"210\" x2=\"290\" y2=\"210\"/><text class=\"t-s t-m\" x=\"260\" y=\"62\" text-anchor=\"middle\">lease</text><rect class=\"box-ok\" x=\"290\" y=\"50\" width=\"170\" height=\"40\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"375.0\" y=\"74.0\" text-anchor=\"middle\">pod A  leader</text><rect class=\"box\" x=\"290\" y=\"120\" width=\"170\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"375.0\" y=\"144.0\" text-anchor=\"middle\">pod B  follower</text><rect class=\"box\" x=\"290\" y=\"190\" width=\"170\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"375.0\" y=\"214.0\" text-anchor=\"middle\">pod C  follower</text><line class=\"ln-a\" x1=\"460\" y1=\"70\" x2=\"510\" y2=\"124\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"590\" y=\"96\" text-anchor=\"middle\">write, token 41</text><rect class=\"box-b\" x=\"510\" y=\"110\" width=\"174\" height=\"60\" rx=\"8\"/><text class=\"t-s t-b\" x=\"597.0\" y=\"136.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"597.0\" y=\"153.0\" text-anchor=\"middle\">refuses token &lt; 41</text><text class=\"t-s t-m\" x=\"16\" y=\"268\" text-anchor=\"start\">the coordination instruction set</text><rect class=\"box\" x=\"16\" y=\"278\" width=\"160\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"96.0\" y=\"300.0\" text-anchor=\"middle\">compare-and-set</text><rect class=\"box\" x=\"186\" y=\"278\" width=\"160\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"266.0\" y=\"300.0\" text-anchor=\"middle\">revision counter</text><rect class=\"box\" x=\"356\" y=\"278\" width=\"160\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"436.0\" y=\"300.0\" text-anchor=\"middle\">session, ephemeral</text><rect class=\"box\" x=\"526\" y=\"278\" width=\"158\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"605.0\" y=\"300.0\" text-anchor=\"middle\">watch</text></svg>",
+        "caption": "The coordination instruction set: a small consensus group, clients holding sessions, and a resource that checks the token on every write."
+      },
+      "refs": [
+        {
+          "title": "Burrows: The Chubby lock service for loosely-coupled distributed systems (OSDI 2006)",
+          "url": "https://static.googleusercontent.com/media/research.google.com/en//archive/chubby-osdi06.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Hunt et al.: ZooKeeper, wait-free coordination for Internet-scale systems (USENIX ATC 2010)",
+          "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "ZooKeeper: znodes, sessions and one-shot watches",
+      "body": "ZooKeeper stores a tree of small nodes called **znodes**, named like file paths: `/election`, `/election/n-0000000003`, `/config/fees`. Each holds a few bytes or kilobytes. An ensemble of three or five servers replicates every write with Zab, the leader-based atomic broadcast that lesson 3 put in the same family as Raft. Every change gets a **zxid**, a 64-bit number that grows with each write (the leader's epoch in the high half, a counter in the low half), and every znode records the zxid that created it (`cZxid`), a version for its data and a version for its list of children (`cversion`).\n\nTwo flags on `create` turn the tree into coordination. An **ephemeral** znode belongs to the session that created it and is deleted when that session ends. A **sequential** znode gets a counter from its parent appended to its name, ten digits: create `/election/n-` three times and you get `n-0000000000`, `n-0000000001`, `n-0000000002`. The counter only goes up, even after the nodes are gone.\n\nA **session** is ZooKeeper's failure detector. The client connects to any server and sends heartbeats. The session timeout is negotiated between 2 and 20 times the server's `tickTime`, which is 2 s by default, so between 4 and 40 s. The ensemble, not the client, decides when a session has expired, and deletes its ephemeral znodes then. A client that crashes without closing its session leaves its znodes in place until the timeout runs out, which the Try it shows.\n\nA **watch** is a one-shot notification. Read a znode or list its children with the watch flag, and the server sends one event the next time that data or child list changes. Then the watch is gone. Between the event and your next read more can change, and a client that is disconnected misses events, so every recipe reads the state again instead of trusting the event. ZooKeeper 3.6 added persistent, recursive watches that stay registered.\n\nReads come from whichever server the client is connected to, out of its local copy. They scale with servers but can be stale, while writes are linearizable. A client that must see the latest write calls `sync` before reading.\n\nThe lock recipe from the ZooKeeper paper puts the pieces together. Create `/lock/n-` as ephemeral and sequential, then list the children. If yours is the lowest, you hold the lock. If not, watch only the node just before yours, and check again when it goes. When the holder dies, one client wakes up. In the naive version every waiter watches the holder, and 100 waiters wake up to find that 99 of them lost: the herd effect. In Java nobody writes this by hand: Apache Curator ships it as `InterProcessMutex`, and leader election as `LeaderLatch` and `LeaderSelector`. HBase and Flink's high-availability mode run on ZooKeeper, and so did Kafka until version 3.9.",
+      "try": {
+        "title": "Watch ephemeral nodes outlive a crashed client",
+        "minutes": 5,
+        "steps": [
+          "Start ZooKeeper (the official image is at 3.9.6) and define a helper that runs one `zkCli.sh` command and keeps only the interesting lines: `docker run -d --name sfz-zk -m 512m zookeeper:3.9.6`, wait five seconds, then `zk() { docker exec sfz-zk zkCli.sh -server localhost:2181 \"$@\" 2>&1 | grep -E '^(Created|\\[|cZxid|ephemeralOwner|cversion)'; }`.",
+          "Create the parent and two ephemeral sequential znodes, list them and look at one. Each `zk` call is a client that exits without closing its session, like a crashed pod.",
+          "Predict what `ls /election` shows 40 seconds later, and what name the next sequential znode gets. Then run the last three commands.",
+          "Watches: open a second terminal with `docker exec -it sfz-zk zkCli.sh -server localhost:2181` and type `ls -w /election`. In the first terminal run `zk create -e -s /election/n- pod-d` twice. Count the events the second terminal prints. Stop with `docker rm -f sfz-zk`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in any terminal",
+          "src": "zk create /election \"\"\nzk create -e -s /election/n- pod-a\nzk create -e -s /election/n- pod-b\nzk ls /election\nzk stat /election/n-0000000000\nsleep 40\nzk ls /election\nzk stat /election\nzk create -e -s /election/n- pod-c"
+        },
+        "expect": "```text\n$ zk create /election \"\"\nCreated /election\n$ zk create -e -s /election/n- pod-a\nCreated /election/n-0000000000\n$ zk create -e -s /election/n- pod-b\nCreated /election/n-0000000001\n$ zk ls /election\n[n-0000000000, n-0000000001]\n$ zk stat /election/n-0000000000\ncZxid = 0x4\ncversion = 0\nephemeralOwner = 0x1000038624e0001\n(40 s later)\n$ zk ls /election\n[]\n$ zk stat /election\ncZxid = 0x2\ncversion = 4\nephemeralOwner = 0x0\n$ zk create -e -s /election/n- pod-c\nCreated /election/n-0000000002\n```\n\nThe two znodes outlived the clients that made them: `ephemeralOwner` names a session, and the ensemble keeps a session until its timeout runs out without a heartbeat. `zkCli.sh` asks for 30 s, so after 40 s both are gone. The parent's `cversion` of 4 counts two creates and two deletes, and the next sequential name is `n-0000000002`: the counter never reuses a number. The owner id and zxids differ on your machine. In the watching terminal you see one event, `WatchedEvent state:SyncConnected type:NodeChildrenChanged path:/election`, for the first create and nothing for the second: the watch fired once and was gone."
+      },
+      "refs": [
+        {
+          "title": "ZooKeeper Programmer's Guide: znodes, sessions, watches and guarantees",
+          "url": "https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Apache Curator: recipes",
+          "url": "https://curator.apache.org/docs/recipes",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "etcd: revisions, leases and watches you can resume",
+      "body": "etcd spells the same four primitives differently. It is the store under every Kubernetes cluster, and its current release is 3.7.3; 3.7 removed the old v2 API for good. Keys are flat strings, and a prefix such as `/svc/payments/` plays the role of a directory. Three or five members replicate every write with Raft, through the same etcd-io/raft library lesson 4 mentioned.\n\nThe counter is the **revision**: one number for the whole cluster, raised by one for every change, or for every transaction however many keys it touches. Each key remembers its `create_revision`, its `mod_revision` (last change) and its `version` (changes since it was created). etcd is multi-version: it keeps old revisions until they are compacted, so you can read a key as it was at revision 2, and you can start a watch from a past revision. That makes watches resumable. A client that was disconnected asks for every change after revision 1,042 and misses nothing, unless compaction already threw those revisions away. ZooKeeper's one-shot watches can't do that.\n\nCompare-and-set is a transaction: a list of comparisons, the operations to run if they all hold, and the operations to run if not. \"If the `create_revision` of `/leader` is 0, which means the key doesn't exist, put `/leader pod-a`\" is lesson 3's single decision in one line. Two pods that send it at the same moment get one SUCCESS and one FAILURE.\n\nSessions are **leases**. A client grants a lease with a time to live (TTL), attaches keys to it, and keeps it alive with heartbeats. When the TTL passes without one, etcd revokes the lease and deletes every key attached to it, and each deletion is a change with its own revision. Watches report PUT and DELETE events for a key or a prefix, in revision order and never twice. They are not linearizable, and the docs say delivery takes about 10 ms in a healthy cluster with no upper bound in an unhealthy one.\n\nReads are linearizable by default, served through lesson 4's ReadIndex. A serializable read is answered by any member from its own copy: faster (0.3 ms against 0.7 ms for one client in etcd's benchmark) and possibly stale. The Go client's concurrency package wraps all of this in a `Session` (a lease kept alive, 60 s by default), a `Mutex` and an `Election`, and `etcdctl lock` and `etcdctl elect` are built on them. jetcd, the official Java client, offers lock and election clients over the same server APIs.",
+      "try": {
+        "title": "Revisions, compare-and-set and a lease running out",
+        "minutes": 5,
+        "steps": [
+          "Start a one-member etcd 3.7.3 and an alias for its CLI: `docker run -d --name sfz-etcd -m 512m gcr.io/etcd-development/etcd:v3.7.3 etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://localhost:2379`, then `alias ectl='docker exec -i sfz-etcd etcdctl'`.",
+          "Write a key twice, read it with all its fields, then read it as of revision 2.",
+          "Run the same compare-and-set for pod-a and then for pod-b. Predict which one wins.",
+          "In a second terminal start `docker exec sfz-etcd etcdctl watch --prefix /svc/payments`. Grant a 10 s lease, register pod-a's address under it, and wait 10 seconds without keeping it alive. Keep `sfz-etcd` running for the next Try it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in any terminal",
+          "src": "ectl put /config/fx-rate 1.09\nectl put /config/fx-rate 1.10\nectl get /config/fx-rate -w fields\nectl get /config/fx-rate --rev=2\nprintf 'create(\"/leader\") = \"0\"\\n\\nput /leader pod-a\\n\\n\\n' | ectl txn\nprintf 'create(\"/leader\") = \"0\"\\n\\nput /leader pod-b\\n\\nget /leader\\n\\n' | ectl txn\nectl lease grant 10\nectl put --lease=<lease id from the line above> /svc/payments/pod-a 10.0.0.5:8080"
+        },
+        "expect": "```text\n$ ectl get /config/fx-rate -w fields\n\"ClusterID\" : 14841639068965178418\n\"MemberID\" : 10276657743932975437\n\"Revision\" : 3\n\"RaftTerm\" : 2\n\"Key\" : \"/config/fx-rate\"\n\"CreateRevision\" : 2\n\"ModRevision\" : 3\n\"Version\" : 2\n\"Value\" : \"1.10\"\n\"Lease\" : 0\n\"More\" : false\n\"Count\" : 1\n$ ectl get /config/fx-rate --rev=2\n/config/fx-rate\n1.09\n$ ... | ectl txn        (pod-a)\nSUCCESS\n\nOK\n$ ... | ectl txn        (pod-b)\nFAILURE\n\n/leader\npod-a\n$ ectl lease grant 10\nlease 694da1b9e3d39309 granted with TTL(10s)\n$ ectl put --lease=694da1b9e3d39309 /svc/payments/pod-a 10.0.0.5:8080\nOK\n```\n\nand in the watching terminal, the second event about 10 s after the first:\n\n```text\nPUT\n/svc/payments/pod-a\n10.0.0.5:8080\nDELETE\n/svc/payments/pod-a\n```\n\nThe cluster started at revision 1, and each put raised it by one: the key was created at 2 and last changed at 3, its second version. Revision 2 is still stored, so the old value comes back. pod-a's transaction found no `/leader` and wrote it; pod-b's comparison failed, so its else branch read who had won. Nobody renewed the lease, so etcd deleted the key when the 10 s ran out and the watch reported it. That is service discovery's failure detection. The cluster and member ids and the lease id differ on your machine; the revisions don't."
+      },
+      "refs": [
+        {
+          "title": "etcd: API guarantees (revisions, watches, linearizable and serializable reads)",
+          "url": "https://etcd.io/docs/v3.6/learning/api_guarantees/",
+          "kind": "docs"
+        },
+        {
+          "title": "etcd client v3 concurrency package: Session, Mutex, Election",
+          "url": "https://pkg.go.dev/go.etcd.io/etcd/client/v3/concurrency",
+          "kind": "docs"
+        },
+        {
+          "title": "Announcing etcd v3.7.0",
+          "url": "https://etcd.io/blog/2026/announcing-etcd-3.7/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Leader election, discovery and locks, fenced by the revision",
+      "body": "With the four primitives, the everyday jobs become short recipes.\n\nLeader election: every candidate creates a key under one prefix, attached to its own lease. The key with the lowest `create_revision` (or, in ZooKeeper, the lowest sequence number) is the leader, and every other candidate watches the key just before its own. That is what etcd's `Election` and Curator's `LeaderLatch` do. Kubernetes controllers elect their leader through Lease objects stored in etcd, and every kubelet heartbeats through one.\n\nService discovery: each instance registers `/svc/payments/<pod>` with its address, under a lease. Clients list the prefix and watch it. This doesn't need linearizability. A list one second old is fine, because clients must cope with an endpoint that died a moment ago anyway, so serializable reads and a client-side cache are the right choice.\n\nMembership and partition assignment: members register the same way, and the leader writes one key that maps partitions to members, with a compare-and-set on that key's `mod_revision` so that two leaders can't overwrite each other's plan.\n\nLocks are leader election for a resource, and here the danger of the Faults, time and truth track's fencing lesson comes back. A lease only says who should hold the lock; it can't stop a holder that paused past its lease from acting when it wakes. Jepsen tested etcd 3.4.3 in 2020 and found its key-value operations strict serializable, and its locks unsafe: with 1 to 3 s TTLs, mutual exclusion failed within minutes even in a healthy cluster, and with 2 s TTLs about 18% of acknowledged updates to a lock-protected set were lost. Jepsen's answer, like DDIA's, is **fencing**.\n\nHere the token comes free. The leader key's `create_revision` was assigned by consensus, so no two leaders share one, and every new leader's is higher. The resource stores the highest token it has accepted and refuses any lower one. Chubby called this a sequencer; in ZooKeeper the znode's `cZxid` does the job. The stepper plays it out with a 15 s GC pause, and the lab builds it.\n\nOne rule keeps it honest: the check must happen at the resource, in the same atomic step as the write. A payout service that checks the token and then writes in two steps has reopened the gap. In a SQL store that means one conditional statement, which the worked example shows.",
+      "stepper": {
+        "title": "A leader frozen past its lease, and the ledger that refuses it",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"etcd at revision 11 holds three election keys: A at revision 7, B at 9, C at 11. Pod A leads with token 7; B watches A's key and C watches B's. The ledger's highest token is 7.\"><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 11</text><rect class=\"box\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">settlement/A  rev 7</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-ok\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: leader, token 7</text><rect class=\"box\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: watches A's key</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-b\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-b\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 7</text><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 0 s</text></svg>",
+            "say": "Three settlement pods campaign under the prefix `settlement/`. Each created a key tied to its own lease with a 10 s TTL: A's key got revision 7, B's 9, C's 11 (other writes took the numbers between). **The lowest revision leads**, so pod A leads, and 7 is its fencing token. B watches A's key and C watches B's: one watcher per key, so no herd."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Pod A writes the payout for batch 17 with token 7. The ledger accepts it; its highest token is 7.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 11</text><rect class=\"box\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">settlement/A  rev 7</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-ok\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: leader, token 7</text><rect class=\"box\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: watches A's key</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-a\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-a\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 7</text><text class=\"t-s t-ok\" x=\"598\" y=\"160\" text-anchor=\"middle\">accepted: batch 17, token 7</text><line class=\"ln-a\" x1=\"482\" y1=\"46\" x2=\"512\" y2=\"102\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 0.5 s</text></svg>",
+            "say": "Pod A writes the payout file for batch 17 and sends its token with the write. The ledger compares 7 with the highest token it has accepted, 7, and **accepts**. The ledger is the only party that sees every write, which is why the check lives there."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Pod A is frozen in a GC pause and sends no keep-alives; its key is still in etcd.\"><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 11</text><rect class=\"box-b\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-b\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">A  rev 7  no keep-alives</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-bad\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: frozen (GC pause)</text><rect class=\"box\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: watches A's key</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-b\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-b\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 7</text><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 1 s</text></svg>",
+            "say": "Pod A's JVM stops for 15 seconds: a long collection, a stalled disk under the GC log, a VM migration. Its keep-alives stop with it. **To etcd, a paused pod and a dead one look exactly the same**: the lease just counts down."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"The lease ran out: etcd deleted A's key at revision 12. Pod B's watch fired and B now leads with token 9. Pod A is still frozen.\"><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 12</text><rect class=\"box-dim\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-m\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">A  deleted at rev 12</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-bad\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: frozen (GC pause)</text><rect class=\"box-a\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: leader, token 9</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-b\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-b\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 7</text><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 11 s</text></svg>",
+            "say": "The TTL passes without a keep-alive. etcd revokes the lease and **deletes A's key: one change, revision 12**. B's watch fires, B lists the keys, finds its own lowest, and leads with token 9. A is still frozen and has no idea."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Pod B writes batch 18 with token 9. The ledger accepts it and its highest token becomes 9.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 12</text><rect class=\"box-dim\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-m\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">A  deleted at rev 12</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-bad\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: frozen (GC pause)</text><rect class=\"box-ok\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: leader, token 9</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-a\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-a\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 9</text><text class=\"t-s t-ok\" x=\"598\" y=\"160\" text-anchor=\"middle\">accepted: batch 18, token 9</text><line class=\"ln-a\" x1=\"482\" y1=\"114\" x2=\"512\" y2=\"102\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 11.5 s</text></svg>",
+            "say": "B runs batch 18 and writes with token 9. 9 is higher than 7, so the ledger **accepts it and remembers 9**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Pod A wakes, still believing it leads, and writes with token 7. The ledger refuses it because 7 is lower than 9.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 12</text><rect class=\"box-dim\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-m\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">A  deleted at rev 12</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-b\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-b\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: thinks it leads</text><rect class=\"box-ok\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: leader, token 9</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-bad\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 9</text><text class=\"t-s t-bad\" x=\"598\" y=\"160\" text-anchor=\"middle\">refused: token 7 &lt; 9</text><line class=\"ln-bad\" x1=\"482\" y1=\"46\" x2=\"512\" y2=\"102\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 16 s</text></svg>",
+            "say": "A wakes up and finishes what it was doing when it froze: it writes a payout with token 7. It checked that it was leader before the pause, and nothing has told it otherwise. **The ledger refuses: 7 is lower than 9.** Without that check, two pods would have written payouts and the merchants of batch 17 could be paid twice."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Pod A's keep-alive fails, so it rejoins with a new key at revision 13 and watches C's key. B still leads.\"><rect class=\"box\" x=\"16\" y=\"16\" width=\"236\" height=\"230\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134\" y=\"40\" text-anchor=\"middle\">etcd   revision 13</text><rect class=\"box-dim\" x=\"30\" y=\"56\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-m\" x=\"134.0\" y=\"77.0\" text-anchor=\"middle\">A  deleted at rev 12</text><rect class=\"box\" x=\"30\" y=\"100\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"121.0\" text-anchor=\"middle\">settlement/B  rev 9</text><rect class=\"box\" x=\"30\" y=\"144\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"134.0\" y=\"165.0\" text-anchor=\"middle\">settlement/C  rev 11</text><rect class=\"box-a\" x=\"30\" y=\"188\" width=\"208\" height=\"34\" rx=\"8\"/><text class=\"t-s t-a\" x=\"134.0\" y=\"209.0\" text-anchor=\"middle\">settlement/A  rev 13</text><rect class=\"box-a\" x=\"282\" y=\"24\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"382.0\" y=\"50.0\" text-anchor=\"middle\">pod A: watches C's key</text><rect class=\"box-ok\" x=\"282\" y=\"92\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"382.0\" y=\"118.0\" text-anchor=\"middle\">pod B: leader, token 9</text><rect class=\"box\" x=\"282\" y=\"160\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"382.0\" y=\"186.0\" text-anchor=\"middle\">pod C: watches B's key</text><rect class=\"box-b\" x=\"512\" y=\"70\" width=\"172\" height=\"64\" rx=\"8\"/><text class=\"t-s t-b\" x=\"598.0\" y=\"98.0\" text-anchor=\"middle\">payout ledger</text><text class=\"t-s t-m\" x=\"598.0\" y=\"115.0\" text-anchor=\"middle\">highest token 9</text><text class=\"t-s t-m\" x=\"16\" y=\"280\" text-anchor=\"start\">t = 16 s</text></svg>",
+            "say": "A's next keep-alive fails: the lease is gone. Now it knows it lost, so it **rejoins at the back** with a new lease and a new key, revision 13, and watches C's key. A token never comes back down: if C leads next, its token is 11, and A's would be 13."
+          }
+        ]
+      },
+      "try": {
+        "title": "Elect a leader with etcdctl, then crash it",
+        "minutes": 5,
+        "steps": [
+          "Keep `sfz-etcd` from the last Try it running. Each candidate runs as its own container that shares etcd's network, so `docker stop` is a clean shutdown and `docker kill` is a crash: `cand() { docker run -d --name sfz-$1 --network container:sfz-etcd --entrypoint etcdctl gcr.io/etcd-development/etcd:v3.7.3 elect settlement $1; }`.",
+          "Start pod-a, then pod-b. Read each one's log (`elect` prints the leader key once it leads) and list the keys with their create revisions.",
+          "Stop pod-a cleanly and read pod-b's log again. Then start pod-c, crash pod-b with `docker kill`, and time how long pod-c waits. Predict the wait first: `etcdctl elect` uses the concurrency package's default lease.",
+          "Clean up: `docker rm -f sfz-pod-a sfz-pod-b sfz-pod-c sfz-etcd`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in any terminal",
+          "src": "cand pod-a; sleep 1; cand pod-b; sleep 2\ndocker logs sfz-pod-a; docker logs sfz-pod-b\nectl get --prefix settlement -w fields | grep -E '\"Key\"|\"CreateRevision\"|\"Value\"'\ndocker stop sfz-pod-a; sleep 1; docker logs sfz-pod-b\ncand pod-c; sleep 2\ndate +%T; docker kill sfz-pod-b\nuntil docker logs sfz-pod-c | grep -q pod-c; do sleep 1; done; date +%T"
+        },
+        "expect": "```text\n$ docker logs sfz-pod-a\nsettlement/694da1b9e3d3930e\npod-a\n$ docker logs sfz-pod-b\n$ ectl get --prefix settlement -w fields | grep ...\n\"Key\" : \"settlement/694da1b9e3d3930e\"\n\"CreateRevision\" : 7\n\"Value\" : \"pod-a\"\n\"Key\" : \"settlement/694da1b9e3d39313\"\n\"CreateRevision\" : 8\n\"Value\" : \"pod-b\"\n$ docker stop sfz-pod-a; sleep 1; docker logs sfz-pod-b\nsettlement/694da1b9e3d39313\npod-b\n$ cand pod-c; sleep 2\n$ date +%T; docker kill sfz-pod-b\n23:41:50\n$ until ...; date +%T\n23:42:46\n```\n\npod-a's key was created at revision 7 and pod-b's at 8, so pod-a led and pod-b printed nothing: it was waiting on pod-a's key. Each key is named after its lease. A clean stop revokes the lease, so pod-b took over within a second, with 8 as its fencing token. A crash revokes nothing: pod-c waited 56 s, the rest of pod-b's 60 s lease, before it led with revision 10. That wait is the price of failure detection by lease, and a shorter TTL buys a faster takeover with more false alarms. Revisions follow from the last Try it's six changes; the lease names and times differ on your machine."
+      },
+      "refs": [
+        {
+          "title": "Jepsen: etcd 3.4.3 (locks, leases and fencing)",
+          "url": "https://jepsen.io/analyses/etcd-3.4.3",
+          "kind": "read"
+        },
+        {
+          "title": "Kleppmann: How to do distributed locking",
+          "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Kafka moved its coordinator inside, and coordinators fail in partial ways",
+      "body": "Until version 3.9, Kafka used ZooKeeper for all of this. Each broker registered an ephemeral znode, the controller was whichever broker created the ephemeral `/controller` znode first, and topic configuration lived in znodes. That meant two distributed systems to run, secure and upgrade, and a new controller had to read the whole cluster's metadata back out of ZooKeeper before it could act. Kafka 4.0 (March 2025) removed ZooKeeper; the current release is 4.4.0. The controllers now run their own Raft quorum, the pull-based KRaft dialect from lesson 4, over the `__cluster_metadata` log.\n\nIt is the same instruction set, built in. Brokers register with the active controller and send it heartbeats, and the controller fences a broker that goes quiet: a session. Every metadata change is a record at the next offset of the log: a revision. Brokers fetch the log as observers and apply each change: a watch you can resume from any offset. Epochs fence old leaders: a lower controller epoch or partition leader epoch is refused, as the payout ledger refused token 7. Partition data still replicates through Kafka's cheaper in-sync replica protocol, which the Messaging and logs track covers.\n\nCoordination services fail too, and their failures spread because everything leans on them. On 2 November 2020 a switch at Cloudflare went into a partial failure for six minutes: it kept its links up but dropped some traffic. In a three-node etcd cluster, node 1 could no longer reach node 3, the leader, though node 2 reached both. Node 1 kept starting elections, node 2 kept voting for node 3, the votes tied, and no leader that node 1 could reach was elected. While elections block, Raft accepts no writes, so etcd was effectively read-only. A database cluster manager that checked the primary's health through etcd couldn't confirm it and promoted a synchronous replica, without losing data. But a defect made every replica rebuild after a promotion, and the primary of the authentication database, now without its read replicas, was overloaded. API success fell as low as 75% and the dashboard ran up to 80 times slower, for 6 hours and 33 minutes in total. Cloudflare first called it a Byzantine failure; a postscript corrects that to an omission fault. Raft's PreVote and CheckQuorum (lesson 4's Go deeper) target this kind of partial partition.\n\nThe client is part of the system as well. In 2024 Jepsen found that jetcd 0.6.0 to 0.8.2, the official Java client, retried transactions it had already sent when an answer was lost. A transaction that had committed ran a second time: updates were lost, and a conditional transaction failed its own comparison on the rerun and was reported as failed although it had committed. jetcd 0.8.5 retries only idempotent operations by default; on older versions set `retryMaxAttempts(0)` and handle retries yourself, with the idempotency keys you already use for payments.",
+      "try": {
+        "title": "Read Raft's vocabulary off a KRaft quorum",
+        "minutes": 5,
+        "steps": [
+          "From the `labs` folder, start the three-node Kafka 4.4.0 cluster of the Messaging and logs track (about 2.3 GB; each node is a broker and a controller voter): `docker compose -f env/kafka-cluster.yml up -d --wait`.",
+          "Describe the metadata quorum's status and replication. Map each field to lesson 4's words: term, commit index, leader, followers.",
+          "Stop the node that leads (yours may not be kafka-3; change the service name, and run the next commands on a node that is still up). Predict LeaderEpoch first, then describe the quorum again.",
+          "Optional: stop a second node and try `kafka-topics.sh --create`. Then `docker compose -f env/kafka-cluster.yml down -v`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "docker compose -f env/kafka-cluster.yml exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server kafka-1:19092 describe --status\ndocker compose -f env/kafka-cluster.yml exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server kafka-1:19092 describe --replication\ndocker compose -f env/kafka-cluster.yml stop kafka-3\ndocker compose -f env/kafka-cluster.yml exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server kafka-1:19092 describe --status\ndocker compose -f env/kafka-cluster.yml exec kafka-1 /opt/kafka/bin/kafka-metadata-quorum.sh --bootstrap-server kafka-1:19092 describe --replication"
+        },
+        "expect": "```text\nClusterId:              rCAfKEuEQVibTDqU5ooeSA\nLeaderId:               3\nLeaderEpoch:            1\nHighWatermark:          67\nMaxFollowerLag:         0\nMaxFollowerLagTimeMs:   45\nCurrentVoters:          [{\"id\": 1, ...}, {\"id\": 2, ...}, {\"id\": 3, ...}]   (trimmed)\nCurrentObservers:       []\n\nNodeId  ...  LogEndOffset  Lag  ...  Status\n3       ...  69            0    ...  Leader\n1       ...  69            0    ...  Follower\n2       ...  69            0    ...  Follower\n```\n\nafter stopping kafka-3:\n\n```text\nNodeId  ...  LogEndOffset  Lag  ...  Status\n1       ...  97            0    ...  Leader\n2       ...  97            0    ...  Follower\n3       ...  -1            98   ...  Follower\n```\n\nLeaderEpoch is the term and HighWatermark the commit index: offset 67 of `__cluster_metadata` is on a majority. The three voters are the Raft group, and CurrentObservers is empty because every node here is also a voter; brokers on their own would show up there. A clean stop hands leadership over at once, so `describe --status` now shows LeaderId 1 and LeaderEpoch 2, and the stopped node's offset reads -1. With a second node stopped, one voter is left, which is no majority, and a topic create waits about a minute and fails with a disconnect error. Offsets and the first leader differ from run to run. Output trimmed: directory ids and timestamps cut."
+      },
+      "refs": [
+        {
+          "title": "Cloudflare: A Byzantine failure in the real world (2020)",
+          "url": "https://blog.cloudflare.com/a-byzantine-failure-in-the-real-world/",
+          "kind": "read"
+        },
+        {
+          "title": "Jepsen: jetcd 0.8.2 (unsafe client retries)",
+          "url": "https://jepsen.io/analyses/jetcd-0.8.2",
+          "kind": "read"
+        },
+        {
+          "title": "Apache Kafka 4.4: KRaft operations",
+          "url": "https://kafka.apache.org/44/operations/kraft/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A coordination service is a small notary's office for a big company. Departments don't each keep their own official register of who holds the vault key; they ask the office, which stamps every entry with the next number in its book. Anyone holding a stamped entry can prove it is newer than another. Staff who want to stay registered must call in regularly, and the office strikes off anyone who stops calling. The analogy breaks at the vault door. A real guard could phone the notary before letting someone in, but the resource a lock protects usually can't, and the notary can't stop a former key holder who doesn't know he was struck off. So the vault itself has to check the stamp number, which no office procedure can do for it.",
+  "in_your_world": "Your Kafka 4 brokers already depend on a coordination layer, the KRaft controllers, and your Kubernetes clusters on etcd; both are why you run three or five of something. The pattern also shows up in your own services. A settlement or reconciliation job that must run on exactly one of three Quarkus pods needs leader election, and the payout table it writes needs a fence: store the leader key's revision in a `fence` row, and make every payout write a conditional update on it in the same Oracle or PostgreSQL transaction. Temporal makes a similar promise inside its own cluster, one running execution per workflow id, and its activities still need idempotency keys, the same ones you pass to the card issuer, because a timed-out activity is retried just as jetcd retried its lost answers.",
+  "mistake": "The common mistake is treating a lock from etcd, ZooKeeper or a Kubernetes Lease as mutual exclusion. Teams take the lock, check that they still hold it, and then write, often with a renewal thread keeping the lease alive. It looks airtight because nothing goes wrong until a GC pause, a VM stall or a lost network packet lands between the check and the write, and then two pods both run the payout. Jepsen measured about 18% lost updates with etcd locks and 2 s TTLs. The fix is to keep the lock for efficiency and add fencing for correctness: pass the leader key's revision with every write, and have the resource refuse a lower one in the same atomic operation as the write.",
+  "compare": {
+    "title": "The same four primitives in ZooKeeper 3.9 and etcd 3.7",
+    "a": {
+      "label": "ZooKeeper",
+      "lang": "text",
+      "title": "a tree of znodes, replicated with Zab",
+      "src": "compare-and-set  create(path) fails if it exists;\n                 setData(path, data, version)\ncounter          zxid on every change; cZxid, version,\n                 cversion per znode\nsession          client session, timeout 2 to 20 x tickTime;\n                 EPHEMERAL znodes die with it\nordering         SEQUENTIAL znodes: n-0000000007\nwatch            one-shot per read; persistent and\n                 recursive since 3.6\nreads            local to the server (may be stale);\n                 sync() first for the latest"
+    },
+    "b": {
+      "label": "etcd",
+      "lang": "text",
+      "title": "flat keys with history, replicated with Raft",
+      "src": "compare-and-set  Txn: if create_revision(k) == 0 then put\n                 else get\ncounter          one cluster revision per change;\n                 create_revision, mod_revision, version\nsession          lease with a TTL, kept alive by the client;\n                 attached keys die with it\nordering         create_revision of each key\nwatch            per key or prefix, from any revision\n                 still kept (resumable)\nreads            linearizable by default (ReadIndex);\n                 serializable on request"
+    },
+    "note": "Both give you the same four tools, so the recipes look the same. The differences are in the details that bite: ZooKeeper's watches fire once and miss changes while you are disconnected, while etcd's resume from a revision until compaction removes it; ZooKeeper's reads are local unless you call sync, while etcd's are linearizable unless you ask otherwise. In both, the number that orders changes (zxid or revision) is what makes a fencing token."
+  },
+  "worked": {
+    "title": "Fence the payout table with the election revision",
+    "steps": [
+      {
+        "say": "The settlement leader learns its token when it wins: the `create_revision` of its election key. With the Go client that is `Election.Rev()`; with etcdctl, read the key's fields.",
+        "code": "$ ectl get --prefix settlement -w fields | grep -E '\"Key\"|\"CreateRevision\"'\n\"Key\" : \"settlement/694da1b9e3d39313\"\n\"CreateRevision\" : 8",
+        "lang": "bash"
+      },
+      {
+        "say": "Give the payout database one row that remembers the highest token it has accepted, so the check lives at the resource.",
+        "code": "CREATE TABLE payout_fence (id int PRIMARY KEY, token bigint NOT NULL);\nINSERT INTO payout_fence VALUES (1, 0);",
+        "lang": "sql"
+      },
+      {
+        "say": "Every payout transaction starts by moving the fence forward, in one conditional statement. A lower token updates no row.",
+        "code": "BEGIN;\n-- 1 row: this leader is at least as new as any before it\nUPDATE payout_fence SET token = :token WHERE id = 1 AND token <= :token;",
+        "lang": "sql"
+      },
+      {
+        "say": "The leader checks the row count before writing. Zero rows means a newer leader has written: roll back and stop acting as leader.",
+        "code": "val fenced = conn.prepareStatement(\"UPDATE payout_fence SET token = ? WHERE id = 1 AND token <= ?\").use {\n    it.setLong(1, token); it.setLong(2, token)\n    it.executeUpdate() == 1\n}\nif (!fenced) { conn.rollback(); stepDown(); return }\ninsertPayouts(conn, batch)   // same transaction as the fence update\nconn.commit()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Replay the stepper with these numbers. Pod B (token 8) has written, so the fence holds 8. Pod A wakes with token 7: its UPDATE matches no row, it rolls back, and its payouts never reach the table. The row lock on the fence row also orders two leaders that write at the same moment.",
+        "code": "fence = 8\npod A:  UPDATE ... WHERE token <= 7   -> 0 rows -> rollback\npod B:  UPDATE ... WHERE token <= 8   -> 1 row  -> payouts written",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a coordination service and a fenced leader election",
+    "minutes": 20,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/cons/l05/Coordinator.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l05/Election.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l05/Sim.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.cons.l05.*'",
+    "steps": [
+      "Read `Coordinator.kt`: sessions, keep-alives, watches and `delete` are provided. Everything runs on `Sim`'s virtual clock, so a minute of leases and pauses takes a few milliseconds and every run is the same. Run the tests once: all 12 fail.",
+      "Write `Coordinator.create`: sequential names with `nextSequence`, the owning session (refuse an expired one), one new revision per create, and a CREATED event through `fire`. Then write `expire`. The five `CoordinatorTest` tests pass.",
+      "Write `Ledger.append` in `Election.kt`: refuse a token lower than the highest accepted, accept an equal or higher one. The first `ElectionTest` passes.",
+      "Write `Candidate.campaign` and `Candidate.check`, the ZooKeeper recipe: an ephemeral sequential node, lead if it is first, otherwise watch the node just before yours. The election tests pass, including the paused leader whose late write the ledger refuses.",
+      "Run everything. `FencingPropertyTest` runs a few hundred random minutes of pauses (up to 8 s, against a 3 s lease) and crashes: the fenced ledger's tokens never go down, while most of the same runs without the fence let an old leader write after a newer one."
+    ],
+    "hints": [
+      "The parent of `/election/n-` is `/election`: use `parentOf(path)` and call `nextSequence` only for sequential creates, so `/locks/n-` keeps its own counter.",
+      "In `expire`, collect the paths first and delete afterwards: `delete` changes the map you would be iterating over.",
+      "In `check`, look your own node up again with `coord.get`: after a long pause it may be gone, and then you are not the leader, whatever `isLeader` said before.",
+      "Watch with `coord.watch(path) { onWatch() }`, not with `check()` directly: `onWatch` holds the check back while the process is paused, as a frozen JVM would."
+    ],
+    "done_when": "All 12 tests in `sfz.cons.l05` pass."
+  },
+  "drill": {
+    "title": "Write the election check from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write `check()` for a candidate that holds `node`, an ephemeral sequential node under `electionPath`: step out if the node is gone, lead with the node's `createRevision` as the token if it is first, and otherwise watch only its predecessor.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun check() {\n    val me = node?.let { coord.get(it) }\n    if (me == null) { isLeader = false; return }          // the session expired and took the node\n    val queue = coord.children(electionPath)               // sorted by sequence number\n    val i = queue.indexOfFirst { it.path == me.path }\n    if (i == 0) {\n        isLeader = true\n        token = me.createRevision                           // the fencing token\n        return\n    }\n    isLeader = false\n    watchesSet++\n    coord.watch(queue[i - 1].path) { onWatch() }           // only the one just before us: no herd\n}"
+    }
+  },
+  "recap": [
+    "A coordination service is a small consensus group (3 or 5 nodes, kilobytes in memory, slow-changing facts) that systems use instead of embedding consensus themselves; Chubby (2006) set the pattern.",
+    "Four primitives do the work: compare-and-set, a counter on every change (zxid, revision), sessions whose ephemeral keys vanish when the client stops, and watches.",
+    "ZooKeeper: znodes, ephemeral and sequential flags, sessions timed out by the ensemble, one-shot watches, local reads unless you `sync`. etcd: flat keys with history, one cluster revision, leases, resumable watches, linearizable reads by default.",
+    "Leader election and locks are the lowest-key-wins recipe with one watcher per key. Service discovery is keys under a lease plus a watch, and tolerates stale reads.",
+    "No lock gives mutual exclusion on its own: a paused holder acts after its lease ends. Fence with the leader key's revision, checked by the resource in the same atomic step as the write.",
+    "Kafka 4 runs the same instruction set inside its KRaft controllers. Partial partitions (Cloudflare 2020) and client retries (jetcd before 0.8.5) are how coordination fails in practice."
+  ],
+  "quiz": [
+    {
+      "q": "A ZooKeeper lock has 200 waiting clients, and each one watches the lock holder's znode. The holder crashes. What happens, and what is the fix?",
+      "options": [
+        "One waiter is woken at random, which is fair enough",
+        "All 200 are woken, all list the children, and 199 find they lost: watch only the znode just before your own",
+        "None are woken, because watches don't fire for ephemeral znodes",
+        "ZooKeeper queues the waiters itself and hands the lock to the next one"
+      ],
+      "answer": 1,
+      "why": "A watch fires for every client that set it, so 200 events go out and 200 clients hit the ensemble at once to find out that one of them won: the herd effect. With sequential znodes, each waiter only needs to know when the one just before it goes, so a crash wakes exactly one client. ZooKeeper itself hands out no locks; the recipe lives in the client, which is why Curator exists."
+    },
+    {
+      "q": "A pod registers itself under `/svc/fraud/` with an etcd lease of 10 s and keeps it alive every 3 s. The pod's host loses power. When do other services stop seeing it?",
+      "options": [
+        "At once: etcd notices the TCP connection drop and deletes the key",
+        "When the pod's process sends its shutdown hook",
+        "About 10 s after its last keep-alive, when the lease expires and etcd deletes the key, plus the watch delivery delay",
+        "Never: someone must delete the key by hand"
+      ],
+      "answer": 2,
+      "why": "A lease is a timer the client must keep resetting; a dead host can't reset it, and can't run shutdown hooks either. etcd deletes attached keys when the TTL passes, as one change with its own revision, and watchers hear about it a little later (about 10 ms when healthy, unbounded otherwise). The TTL is a trade: shorter means faster detection and more false alarms during a GC pause."
+    },
+    {
+      "q": "A settlement job's two pods both believe they lead. Pod A's election key has create_revision 120, pod B's 133. Both write to the payout table, which keeps a fence row. In which order must the table accept them to stay correct?",
+      "options": [
+        "Any order: the table should accept both, since both pods hold a valid lease",
+        "It must always refuse 133, because 120 was elected first",
+        "It must refuse both until etcd confirms which one leads",
+        "Once it has accepted 133, it must refuse 120; before that, 120 may be accepted"
+      ],
+      "answer": 3,
+      "why": "The fence row remembers the highest token accepted and refuses lower ones. Pod A's writes are fine until the newer leader has written; after that, pod A is a zombie, and its token proves it. Asking etcd before every write doesn't close the gap, because a pause can still fall between the answer and the write."
+    },
+    {
+      "q": "From lesson 4: etcd answers a default (linearizable) read only after the leader confirms it still leads. A service-discovery client lists 300 endpoints every second. What should it use, and why?",
+      "options": [
+        "Serializable reads, or a watch plus a local cache: a list a moment old is fine, because clients must handle a dead endpoint anyway, and it spares the leader a ReadIndex round per read",
+        "Linearizable reads: discovery must never be stale",
+        "Writes, because only writes go through Raft",
+        "A lock around every read"
+      ],
+      "answer": 0,
+      "why": "ReadIndex costs a heartbeat round with a majority before every linearizable read. Discovery doesn't need it: an endpoint that died a second ago will fail its health check or the client's connection attempt regardless. A watch from a known revision keeps the cache current without polling. Keep linearizable reads for decisions where stale data breaks a rule, such as who leads.",
+      "from": "cons-04"
+    },
+    {
+      "q": "Your service uses jetcd 0.8.2 and runs a transaction: if the key `/batch/17/state` has mod_revision 50, set it to `paid`. The network drops the response, jetcd retries, and the call reports failure. What may actually have happened?",
+      "options": [
+        "Nothing was written: a failure means the transaction didn't commit",
+        "The first attempt committed; the retry found mod_revision no longer 50 and failed, so a committed transaction was reported as failed",
+        "etcd ran the transaction twice and stored `paid` twice",
+        "The lease expired"
+      ],
+      "answer": 1,
+      "why": "This is the anomaly Jepsen found in jetcd 0.6.0 to 0.8.2: a retry of a transaction that had already been applied. The first attempt raised the key's mod_revision, so the rerun's comparison failed and the client saw failure. A failure after a lost answer is indefinite, not definite. Newer jetcd retries only idempotent operations; otherwise re-read the state, or use an idempotency key, before deciding."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What are the four primitives of a coordination service?",
+      "back": "Compare-and-set, a counter on every change (zxid or revision), sessions with ephemeral keys, and watches."
+    },
+    {
+      "front": "What is an ephemeral znode?",
+      "back": "A znode owned by a session. The ensemble deletes it when the session expires (no heartbeat within the timeout) or closes."
+    },
+    {
+      "front": "What does an etcd revision count?",
+      "back": "Changes to the whole cluster: every put, delete or transaction adds one. Keys keep create_revision, mod_revision and version."
+    },
+    {
+      "front": "Why can an etcd watch resume and a ZooKeeper watch can't?",
+      "back": "etcd keeps old revisions until compaction, so a client asks for every change after revision N. A ZooKeeper watch is one-shot, and events during a disconnect are lost."
+    },
+    {
+      "front": "What makes a good fencing token from etcd or ZooKeeper?",
+      "back": "The leader key's create_revision (etcd) or the znode's cZxid (ZooKeeper): unique and higher for every new leader, because consensus assigned it."
+    },
+    {
+      "front": "What happened to Cloudflare's etcd in November 2020?",
+      "back": "A partial switch failure cut node 1 from the leader, node 3, but not from node 2. Elections tied, etcd took no writes, and automation built on it turned six minutes into a six-hour outage."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Coordination service",
+      "plain": "A small consensus-replicated store (ZooKeeper, etcd, Consul) for a few slow-changing facts that many systems must agree on."
+    },
+    {
+      "term": "Znode",
+      "plain": "A node in ZooKeeper's tree: a path with a little data, a version and the zxid that created it."
+    },
+    {
+      "term": "Ephemeral node",
+      "plain": "A znode or key tied to a client's session or lease; it disappears when the client stops renewing."
+    },
+    {
+      "term": "Sequential node",
+      "plain": "A znode whose name gets the parent's next counter value appended, such as n-0000000007."
+    },
+    {
+      "term": "Revision",
+      "plain": "etcd's cluster-wide change counter; every change gets the next one, and keys remember theirs."
+    },
+    {
+      "term": "Lease",
+      "plain": "A time-limited grant the client keeps alive with heartbeats; etcd deletes the keys attached to it when it runs out."
+    },
+    {
+      "term": "Watch",
+      "plain": "A request to be notified when a key or a set of keys changes."
+    },
+    {
+      "term": "Herd effect",
+      "plain": "Many clients woken by one change, of which all but one find they lost."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Explain to a teammate why a leader elected through etcd can still corrupt the payout table, and what exactly prevents it.",
+    "answer": "etcd elects a leader by giving each candidate a key under a lease; the lowest create revision leads, and if the leader stops renewing its lease, etcd deletes its key and the next candidate takes over. But the leader can pause, for a long GC, a stalled VM or a slow disk, between checking that it leads and writing. During the pause its lease runs out and another pod becomes leader and writes. When the first one wakes, nothing has told it, so it writes too, and two leaders have written the same batch. etcd can't stop this because the write doesn't go through etcd. The fix is a fencing token: the leader key's create revision, which consensus assigned and which is higher for every new leader. Each write carries it, and the payout table keeps the highest token it has accepted and refuses lower ones in the same atomic statement as the write. The old leader's token is lower, so its write is refused."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Consul and Kubernetes leases.** Consul (Raft too) offers three read modes: `default`, which an old leader can still answer during an election; `consistent`, which checks leadership with a quorum first; and `stale`, which any server answers and which works without a quorum, the default for its DNS interface. Kubernetes builds leader election on `Lease` objects in the API server, which stores them in etcd. Neither changes the fencing rule.\n\n**Watches are not a log.** A ZooKeeper watch fires once and says only that something changed; etcd's watch is ordered and resumable but not linearizable, and compaction limits how far back you can resume. For a reliable stream of changes, use a log (Kafka, or a database's change data capture, which the Stream processing track covers) and keep the coordination service for coordination.\n\n**How much to trust the lease.** Chubby added a lock-delay for clients that can't check sequencers: after a holder dies, the lock stays unavailable for up to a minute so that its in-flight requests drain. etcd's 3.7 release prioritizes lease revocation under overload so that leases end on time. Both reduce the window; only a fencing check at the resource closes it. DDIA's chapter 10 describes these services as a way to hand consensus to a few nodes, and lists their uses and limits."
+  },
+  "sources": [
+    {
+      "title": "Burrows: The Chubby lock service for loosely-coupled distributed systems (OSDI 2006)",
+      "url": "https://static.googleusercontent.com/media/research.google.com/en//archive/chubby-osdi06.pdf"
+    },
+    {
+      "title": "Hunt et al.: ZooKeeper, wait-free coordination for Internet-scale systems (USENIX ATC 2010)",
+      "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf"
+    },
+    {
+      "title": "etcd: API guarantees",
+      "url": "https://etcd.io/docs/v3.6/learning/api_guarantees/"
+    },
+    {
+      "title": "Jepsen: etcd 3.4.3",
+      "url": "https://jepsen.io/analyses/etcd-3.4.3"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 10",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

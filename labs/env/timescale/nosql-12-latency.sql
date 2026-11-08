@@ -1,4 +1,4 @@
--- Lesson nosql-12: one day of card-authorization latencies as a TimescaleDB hypertable.
+-- Lesson store-08: one day of card-authorization latencies as a TimescaleDB hypertable.
 -- Load: docker compose -f env/timescale.yml exec tsdb psql -U sfz -f /sfz/nosql-12-latency.sql (safe to run again)
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 DROP MATERIALIZED VIEW IF EXISTS latency_hourly;

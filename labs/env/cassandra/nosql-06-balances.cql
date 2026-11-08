@@ -1,4 +1,4 @@
--- Lessons nosql-05 and nosql-06: one small table, three copies of every row.
+-- Lessons shard-02 and repl-07: one small table, three copies of every row.
 -- Load it on the three-node cluster with: cqlsh -f /sfz/nosql-06-balances.cql   (safe to run again)
 
 -- NetworkTopologyStrategy: 3 copies in datacenter dc1. With three nodes, every node holds every row.

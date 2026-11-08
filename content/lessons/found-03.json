@@ -1,0 +1,447 @@
+{
+  "id": "found-03",
+  "title": "Faults, failures and the people who run systems",
+  "minutes": 40,
+  "goal": "By the end you can tell a fault from a failure, estimate how often disks, memory and CPUs break in a fleet and what extra copies buy, explain how retries can keep a service down after its trigger is gone, and describe how safe changes, chaos experiments and blameless post-mortems keep faults from becoming failures.",
+  "warmup": {
+    "q": "A service runs at 80% of its capacity. A dependency slows down for five seconds, the queue builds up, and clients start timing out and retrying (up to 4 attempts). Then the dependency recovers fully. What happens next?",
+    "options": [
+      "It recovers within a second or two, as soon as the queue drains",
+      "It recovers after about as long as the slowdown lasted",
+      "It stays overloaded: the retries keep the load above capacity until someone cuts the load or the retries",
+      "It crashes at once and restarts cleanly"
+    ],
+    "answer": 2,
+    "why": "Once every attempt times out, each request turns into four attempts, so the service is offered several times its capacity even after the dependency is fine, and it spends its time answering clients that already gave up. In this lesson's simulation it never recovers. The first two answers assume the queue drains once capacity is back, which only happens if the offered load falls below capacity, and the retries prevent exactly that."
+  },
+  "sections": [
+    {
+      "h": "A fault is a part breaking; a failure is the service breaking",
+      "body": "At 03:12 one disk under the ledger database dies. What happened to the payments business?\n\nIt depends on what else was there. If the database kept a copy of its data on a second machine and switched to it within seconds, checkout never noticed. If that disk held the only copy, checkout has been down since 03:12 and the last payments may be gone. The disk broke either way. What differs is whether the service did.\n\nTwo words keep this straight. A **fault** is one part not working as it should: a disk, a machine, a network link, a bug in one function, a slow dependency. A **failure** is the whole system no longer giving its users the service it promised, which lesson 2 made precise: it is missing its SLO. In any system of real size, faults happen all the time. Reliability means continuing to work correctly while some parts are faulty, and a system that does that is **fault-tolerant**.\n\nFault tolerance always has a scope. A design tolerates particular faults, up to some number: any one disk, one machine, one availability zone (one of the separate datacenters inside a cloud region). Nothing tolerates everything; a bug in every copy of the code defeats any amount of spare hardware. So the useful question about a design is which faults, and how many. A part whose fault alone becomes a failure of the whole system is a **single point of failure**: the one database without a replica, the one load balancer, the one person who knows how to rerun the settlement job.\n\nTwo kinds of failure aren't equal. An hour of checkout outage is expensive and embarrassing, and then it's over. A payment that was accepted and then lost, or a ledger that is silently wrong, doesn't get better with time. The UK Post Office's Horizon accounting system is the grim example: its software, in use from 1999, reported shortfalls in branch accounts that didn't exist, and hundreds of sub-postmasters were convicted of theft or false accounting on its evidence, partly because the courts presumed the computer was right. So most data systems trade some availability for safety. They would rather refuse a write than accept it and lose it.\n\nThe rest of this lesson takes the kinds of fault in order: hardware, software, and people changing things.",
+      "try": {
+        "title": "Find the single points of failure",
+        "minutes": 4,
+        "steps": [
+          "Here is a payments setup: two app servers behind one load balancer; one PostgreSQL primary with a streaming replica in the same rack; a Redis cache of merchant balances; a nightly settlement job that runs from a crontab on one VM, which one engineer knows how to fix; and both app servers read the card issuer's credentials from one config file on a shared NFS mount.",
+          "For each part ask: if this alone breaks, does checkout stop? Does settlement?",
+          "Sort the parts into single points of failure and faults the design tolerates. For each tolerated fault, write down what has to be true for it really to be tolerated."
+        ],
+        "expect": "The single points of failure, the parts whose fault alone stops checkout:\n\n- The one load balancer in front of the two app servers.\n- The shared NFS mount: if it is unavailable, neither app server can read its issuer credentials, so two app servers fail together. One shared dependency undoes the redundancy.\n- The rack: the database primary and its replica sit in one rack, so one rack power fault takes out both copies.\n- For settlement, the one VM and the one engineer who knows the crontab. Checkout keeps working, but merchants don't get paid.\n\nFaults the design tolerates: either app server; the primary's disk or machine, if failover to the replica works and has been tested; and Redis, as long as the code treats a cache miss or a dead cache as \"read from the database\". Redis holds derived data (lesson 1), so losing it costs speed, not facts. If you marked Redis as a single point of failure, check how the code behaves when it's down: that's what decides."
+      }
+    },
+    {
+      "h": "Hardware faults: rare for one part, routine for a fleet",
+      "body": "Hardware faults are the easiest to reason about, because big fleets count them.\n\nStart with disks. Backblaze, a cloud storage company, publishes the failure rates of its hard drives every quarter. The measure is the **annualized failure rate** (AFR): the fraction of drives that fail in a year. Across 344,196 drives in 2025 the AFR was 1.36%. It moves around: in the second quarter of 2026 it was 1.73%, and the worst models that quarter were drives seven to eight and a half years old, failing at 7% to 9% a year. Old hardware fails more.\n\n1.36% sounds small until you multiply it by a fleet. A server with 12 disks has a 15% chance of losing at least one this year. A cluster of 10,000 disks loses about 136 a year, one every two or three days. In that 2026 quarter about 16 drives failed every day in Backblaze's own fleet. At this scale a dead disk is a routine ticket, not an incident, and the software has to treat it that way.\n\nMemory next. A study of Google's servers (2009) found that about a third of machines saw at least one correctable memory error a year. ECC memory (error-correcting code: extra bits stored with each word, so the hardware can repair a single flipped bit) handles those. But 1.3% of machines a year hit an uncorrectable error, which ECC detects but can't repair, and the machine crashes or halts. Then CPUs: Meta, Google and Alibaba have each reported that about 1 in 1,000 of their CPUs can compute wrong results without raising any error. That is **silent data corruption**: no crash and no log line, just a wrong number in a ledger.\n\nThe defence against hardware faults is redundancy: more than one copy, on more than one machine. The lab works out what it buys. Data on one disk is lost with the disk, 1.37% a year. With a second copy on another disk, it is lost only if the second disk dies before the first one's copy has been re-created, and with a 24-hour repair that is about 1 in a million a year. A third copy makes it about 6 in 100 billion. Each extra copy multiplies safety by roughly the chance of a failure inside one repair window, so fast repair matters as much as the number of copies: a week-long repair makes a mirrored pair seven times riskier than a one-day repair.\n\nAll of this assumes disks fail independently. They don't, quite: drives from one batch share defects, and one rack's power supply takes down every disk in it. That's why real systems put copies in different racks and zones, to make the faults they must survive as independent as they can. Software faults are the opposite: correlated by nature.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 640 230\" role=\"img\" aria-label=\"Two disks hold copies of the same data. Disk A fails and its copy takes 24 hours to re-create. The data is lost only if disk B fails inside that window.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"77\" text-anchor=\"start\">disk A</text><text class=\"t\" x=\"20\" y=\"147\" text-anchor=\"start\">disk B</text><rect class=\"box\" x=\"100\" y=\"60\" width=\"200\" height=\"24\" rx=\"4\"/><text class=\"t-s\" x=\"200\" y=\"77\" text-anchor=\"middle\">copy 1</text><rect class=\"box-bad\" x=\"300\" y=\"60\" width=\"40\" height=\"24\" rx=\"4\"/><rect class=\"box\" x=\"340\" y=\"60\" width=\"280\" height=\"24\" rx=\"4\"/><text class=\"t-s\" x=\"480\" y=\"77\" text-anchor=\"middle\">re-created copy</text><text class=\"t-s t-bad\" x=\"320\" y=\"48\" text-anchor=\"middle\">A fails: 24 h to re-create its copy</text><line class=\"ln-d\" x1=\"300\" y1=\"88\" x2=\"300\" y2=\"122\"/><line class=\"ln-d\" x1=\"340\" y1=\"88\" x2=\"340\" y2=\"122\"/><rect class=\"box\" x=\"100\" y=\"130\" width=\"520\" height=\"24\" rx=\"4\"/><text class=\"t-s\" x=\"200\" y=\"147\" text-anchor=\"middle\">copy 2</text><rect class=\"box-b\" x=\"296\" y=\"124\" width=\"48\" height=\"36\" rx=\"4\"/><text class=\"t-s t-b\" x=\"320\" y=\"180\" text-anchor=\"middle\">data is lost only if B also fails inside this window</text><line class=\"ln\" x1=\"100\" y1=\"200\" x2=\"620\" y2=\"200\"/><text class=\"t-s t-m\" x=\"100\" y=\"218\" text-anchor=\"start\">1 January</text><text class=\"t-s t-m\" x=\"620\" y=\"218\" text-anchor=\"end\">31 December</text></svg>",
+        "caption": "With two copies, a disk failure starts a race: the lost copy must be re-created before the other copy fails too. A shorter repair window makes losing the race rarer."
+      },
+      "try": {
+        "title": "Count disk failures and lost data",
+        "minutes": 4,
+        "steps": [
+          "Run the demo below from the `labs` folder. It prints expected disk failures for three fleet sizes, the yearly chance of losing data kept on 1, 2 or 3 disks, and a simulation that checks the formula.",
+          "Predict before it prints: for 5,000 mirrored pairs with a one-day repair, is the yearly chance that some pair loses its data closer to 1 in a million, 1 in 200, or 1 in 2?",
+          "Change `AFR` to `0.08` (drives in their eighth year) in `DiskOddsDemo.kt` and run it again. Which line changes most?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "DiskOddsDemo.kt (excerpt)",
+          "src": "private fun lossPerYear(copies: Int, afr: Double, repair: Double) =\n    copies * ratePerHour(afr).pow(copies) * repair.pow(copies - 1) * HOURS_PER_YEAR\n\n// and a Monte Carlo check: disks fail at random, come back `repair` hours later;\n// count the moments when every copy is down at once\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.found.l03.demo.DiskOddsDemoKt --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/found/l03/demo/DiskOddsDemo.kt"
+        },
+        "expect": "```text\nAFR 1.36%, repair 24 h\n     12 disks:    0.2 failures a year expected, chance of at least one: 15.2%\n  1,000 disks:   13.6 failures a year expected, chance of at least one: 100.0%\n 10,000 disks:  136.0 failures a year expected, chance of at least one: 100.0%\n\none piece of data on N disks, chance per year of losing every copy:\n  1 copy : 1.37e-02\n  2 copies: 1.03e-06\n  3 copies: 5.78e-11\n10,000 disks as 5,000 mirrored pairs: chance some pair loses its data this year: 0.51%\nsame pairs, repair takes a week instead of a day: 3.53%\n\ncheck: 2 copies, 1 failure per 1,000 h, 10 h repair, 2e+07 hours: formula 400 losses, simulation 385\n```\n\nWith 1,000 disks a failure this year is certain (the chance prints as 100.0%, rounded). Copies change the picture: at this failure rate and repair time, each extra copy makes losing one piece of data more than 10,000 times rarer. A fleet of 5,000 mirrored pairs still has about one chance in 200 a year that some pair loses its data, and a slow repair makes it seven times worse. The last line checks the formula against a simulation at deliberately high failure rates; they agree within the simulation's noise.\n\nWith `AFR = 0.08` the per-pair risk becomes 3.81e-05 and the fleet line jumps from 0.51% to 17.34% a year (73.65% with a week-long repair). A mirrored pair squares the failure rate, so drives that fail 6 times as often make pair loss about 37 times as likely. That is why old drives get replaced before they die."
+      },
+      "refs": [
+        {
+          "title": "Backblaze Drive Stats for Q2 2026",
+          "url": "https://www.backblaze.com/blog/backblaze-drive-stats-for-q2-2026/",
+          "kind": "read"
+        },
+        {
+          "title": "Schroeder, Pinheiro and Weber, DRAM Errors in the Wild (SIGMETRICS 2009)",
+          "url": "https://research.google/pubs/dram-errors-in-the-wild-a-large-scale-field-study/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Software faults hit every machine at once",
+      "body": "A disk fails on one machine. A bug fails on every machine that runs the code, often at the same moment, because they all run the same code on the same inputs. Redundancy, which saved you from the disk, now multiplies the damage.\n\nExamples are easy to find. When a leap second (a one-second adjustment to the world's clocks) was added at the end of 30 June 2012, a Linux kernel bug made many Java applications hang, all over the world at once. Some HPE SSD models had a firmware bug that made them fail after exactly 32,768 hours of running, so drives installed together died together. Three recent ones:\n\n- Google Cloud, 12 June 2025: a policy change with blank fields was written to a globally replicated database and reached every region within seconds. A code path added two weeks earlier, with no error handling and no feature flag (a switch that turns new code off without a deploy), hit a null pointer on it and crashed the binary everywhere.\n- AWS, 19 and 20 October 2025: a race condition in the automation that manages DynamoDB's DNS records in us-east-1 (DNS turns a name into server addresses; the Computer networking track covers it) left the service's regional name with no addresses at all. DynamoDB errors lasted about three hours, and some services built on it took until the following afternoon to recover.\n- Cloudflare, 18 November 2025: a database permissions change made the query that builds a configuration file for bot detection return duplicate rows. The file grew past a limit built into the proxy software, and proxies across the network failed as the file spread.\n\nOne pattern runs through them: data or configuration that was accepted as valid reached every machine at once and hit code that had never seen that case. The defences follow. Roll changes out in stages, so a bad one hits a few machines first. Have every consumer check what it receives, such as sizes and missing fields, and keep the last good version when the new one is bad. Put new code paths behind flags.\n\nError handling is where much of this hides. Ding Yuan and colleagues studied 198 user-reported failures in widely used distributed data systems (OSDI 2014). In 92% of the catastrophic ones, the cause was wrong handling of an error the software had already detected. Many were trivial: an empty `catch` block, a handler that only logged, a `TODO` left in place. In 58% of them, a simple test that made the error handler run would have found the bug. The Try it shows how this looks in a settlement job.\n\nThe hardest software faults don't crash anything. A **gray failure** is one where a component looks healthy to whatever checks it while its users see it broken. Microsoft's Azure team reported in 2017 that gray failures, not clean crashes, were behind most of the incidents in their cloud. In one, a driver bug broke a VM's network, but its heartbeats (periodic \"I'm alive\" messages) travelled to the host over a separate local channel, so the health checks stayed green until a customer complained. If a health check doesn't follow the path real requests take, it measures the wrong thing.",
+      "try": {
+        "title": "Run three error handlers against one fault",
+        "minutes": 3,
+        "steps": [
+          "Run the demo below from the `labs` folder. A nightly job sends five payout instructions to a simulated bank; the upload for `m-bikes` fails, once in the first three runs and every time in the last.",
+          "Before it prints, predict what each version reports, and how many payouts the bank actually received.",
+          "Look at the excerpt. If you had to write one test that would have caught the first version, what would it do?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ErrorHandlerDemo.kt (excerpt)",
+          "src": "try {\n    bank.upload(m, c)\n} catch (e: IOException) {\n    // TODO: retry\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.found.l03.demo.ErrorHandlerDemoKt --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/found/l03/demo/ErrorHandlerDemo.kt"
+        },
+        "expect": "```text\n-- swallow the exception, one dropped connection\n    reports: job finished: OK\n    the bank received 4 of 5 payouts\n-- log and continue, one dropped connection\n    warn: upload for m-bikes failed: connection reset by peer\n    reports: job finished: OK (1 warnings)\n    the bank received 4 of 5 payouts\n-- retry, then fail the job, one dropped connection\n    reports: job finished: OK\n    the bank received 5 of 5 payouts\n-- retry, then fail the job, bank keeps failing\n    reports: job FAILED: no payout for [m-bikes], settlement blocked\n    the bank received 4 of 5 payouts\n```\n\nThe first two versions turn a dropped connection into a merchant who doesn't get paid, and report success. The second at least logs a warning, which nobody is paged for. The third retries, which fixes the transient fault, and when the fault doesn't go away it fails the job loudly, so a person finds out tonight rather than when m-bikes calls. One condition hides in the retry: it is only safe because sending the same payout instruction twice must not pay twice. Real payout files carry an instruction id that the bank uses to drop duplicates, the idempotency idea from lesson 2."
+      },
+      "refs": [
+        {
+          "title": "Yuan et al., Simple Testing Can Prevent Most Critical Failures (OSDI 2014)",
+          "url": "https://www.eecg.utoronto.ca/~stumm/Papers/Yuan-OSDI-14.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Google Cloud incident report, 12 June 2025",
+          "url": "https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW",
+          "kind": "read"
+        },
+        {
+          "title": "Huang et al., Gray Failure: The Achilles' Heel of Cloud-Scale Systems (HotOS 2017)",
+          "url": "https://www.microsoft.com/en-us/research/wp-content/uploads/2017/06/paper-1.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Retry storms: when the fix keeps the outage going",
+      "body": "Retrying a failed request is the obvious response to a fault, and usually the right one: the dropped connection in the last Try it needed exactly one retry. Under overload the same retries can keep a service down after the cause has gone.\n\nTake a service that can finish 1,000 requests a second and gets 800, so it is 80% busy and answers in about a millisecond. Its clients give up on an attempt after 200 ms and try again at once, up to 4 attempts in all, a typical client setting. At t = 10 s a dependency slows down, and for five seconds the service can finish only 400 a second. The stepper follows the lab's simulation.\n\nNothing about the trigger lasts. By t = 15 s the dependency is fine and capacity is back to 1,000. But the service is now offered 3,200 attempts a second, because every request times out and is sent four times, and it spends all its capacity on attempts whose clients gave up long ago. **Goodput**, the rate of useful answers, is zero, and it stays zero for the rest of the run.\n\nThis is a **metastable failure**, the name Nathan Bronson and colleagues gave it in 2021: a trigger pushes the system into a bad state, and its own behaviour (the sustaining effect) keeps it there after the trigger is removed. Getting out needs a strong push, such as cutting the load or a restart. Lexiang Huang and colleagues studied 22 such failures at 11 organizations (OSDI 2022). They found that at least 4 of 15 major AWS outages in the previous decade were metastable, and that retry policy was the most common sustaining effect. Note when it happens: the service ran happily at 80% busy, and that efficient state is exactly the vulnerable one. It took a five-second trigger.\n\nThe lab compares fixes on the same trigger:\n\n| Clients and server | Back to normal at |\n|---|---|\n| retry up to 4 attempts at once | never |\n| exponential backoff with jitter, 4 attempts | never |\n| no retries at all | t = 24 s |\n| retries limited by a 10% budget | t = 34 s |\n| retry up to 4, and the server drops expired attempts | t = 15 s |\n\nBackoff waits longer before each retry, with a random part (jitter) so clients don't retry in step. It spreads retries out in time, but here every attempt still times out, so there are just as many. A **retry budget** caps their number: retries may add at most 10% to the load, so the service is never offered more than 880 a second and drains its backlog, slowly, because the server still works through attempts nobody is waiting for. Dropping those fixes the other half. If each request carries its deadline and the server drops expired attempts without working on them, every unit of capacity goes to a request that can still succeed. gRPC builds a retry budget into its clients (`retryThrottling`), and a circuit breaker in the client stops calling a dependency that keeps failing for a while, instead of piling on.",
+      "stepper": {
+        "title": "A five-second slowdown that never ends",
+        "intro": "The lab's simulation, one moment at a time. Goodput is answers that reach a client still waiting for them.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 5 s. 800 requests a second, capacity 1,000, empty queue, goodput 800.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 5 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">800/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 0</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">1,000/s</text><text class=\"t-s t-ok\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 800/s</text><text class=\"t-s t-m\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 0/s</text><text class=\"t-s t-m\" x=\"200\" y=\"204\" text-anchor=\"start\">80% busy: healthy, and vulnerable</text></svg>",
+            "say": "800 new requests a second against a capacity of 1,000: 80% busy. The queue is empty and every answer arrives in about a millisecond. This state is healthy and efficient. It is also vulnerable, because nothing limits what happens if capacity drops."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 10.2 s. Capacity has dropped to 400 a second and the queue holds 80 requests.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 10.2 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">800/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 80</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">400/s</text><rect class=\"box-bad\" x=\"202\" y=\"100\" width=\"88.7\" height=\"44\" rx=\"4\"/><text class=\"t-s t-ok\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 400/s</text><text class=\"t-s t-m\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 0/s</text><text class=\"t-s t-bad\" x=\"200\" y=\"204\" text-anchor=\"start\">a slow dependency: capacity 400/s</text></svg>",
+            "say": "At t = 10 s a dependency slows down and the server can finish only 400 requests a second. 400 more arrive each second than leave. After 0.2 s the queue holds 80 requests, 200 ms of work at this speed, so anything joining it now waits longer than the clients' 200 ms timeout."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 11 s. Clients time out and retry; 3,200 attempts a second; queue 4,157; goodput 0.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 11 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">3,200/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 4,157</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">400/s</text><rect class=\"box-bad\" x=\"202\" y=\"100\" width=\"168.1\" height=\"44\" rx=\"4\"/><path class=\"ln-bad\" d=\"M320 96 V66 H80 V92\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"200\" y=\"58\" text-anchor=\"middle\">timed out after 200 ms: send again</text><text class=\"t-s t-bad\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 0/s</text><text class=\"t-s t-bad\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 400/s</text><text class=\"t-s t-m\" x=\"200\" y=\"204\" text-anchor=\"start\">every request is now sent 4 times</text></svg>",
+            "say": "Clients give up on each attempt after 200 ms and send it again, up to 4 attempts in all. Every attempt now times out, so each new request turns into four, and the server is offered 3,200 attempts a second. 4,157 are queued at t = 11 s."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 12 s. The server works on attempts whose clients gave up: 400 wasted answers a second, goodput 0.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 12 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">3,200/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 6,957</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">400/s</text><rect class=\"box-bad\" x=\"202\" y=\"100\" width=\"178.5\" height=\"44\" rx=\"4\"/><path class=\"ln-bad\" d=\"M320 96 V66 H80 V92\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"200\" y=\"58\" text-anchor=\"middle\">timed out after 200 ms: send again</text><text class=\"t-s t-bad\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 0/s</text><text class=\"t-s t-bad\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 400/s</text><text class=\"t-s t-bad\" x=\"200\" y=\"204\" text-anchor=\"start\">the server answers clients that left</text></svg>",
+            "say": "The server can't see which attempts still have a client waiting. It works through the queue in order, and every answer it produces goes to a client that gave up long ago: 400 wasted answers a second, and goodput zero."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 16 s. Capacity is back to 1,000, but 3,200 attempts arrive each second; queue 16,957; goodput 0.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 16 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">3,200/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 16,957</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">1,000/s</text><rect class=\"box-bad\" x=\"202\" y=\"100\" width=\"196.5\" height=\"44\" rx=\"4\"/><path class=\"ln-bad\" d=\"M320 96 V66 H80 V92\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"200\" y=\"58\" text-anchor=\"middle\">timed out after 200 ms: send again</text><text class=\"t-s t-bad\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 0/s</text><text class=\"t-s t-bad\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 1,000/s</text><text class=\"t-s t-m\" x=\"200\" y=\"204\" text-anchor=\"start\">the trigger is gone; the storm isn't</text></svg>",
+            "say": "At t = 15 s the dependency recovers and capacity is back to 1,000. It makes no difference. 3,200 attempts arrive every second, more than three times capacity, the queue keeps growing, and all 1,000 answers a second go to clients that left."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"t = 59 s. 111,557 attempts queued, goodput still 0.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 59 s</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">3,200/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 111,557</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">1,000/s</text><rect class=\"box-bad\" x=\"202\" y=\"100\" width=\"234.5\" height=\"44\" rx=\"4\"/><path class=\"ln-bad\" d=\"M320 96 V66 H80 V92\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"200\" y=\"58\" text-anchor=\"middle\">timed out after 200 ms: send again</text><text class=\"t-s t-bad\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 0/s</text><text class=\"t-s t-bad\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 1,000/s</text><text class=\"t-s t-bad\" x=\"200\" y=\"204\" text-anchor=\"start\">44 s after the trigger ended: still down</text></svg>",
+            "say": "44 seconds after the trigger ended the service is still down, with 111,557 attempts queued. Nothing outside the system holds it here: its own retries do. Only a strong push gets it out, such as cutting the load or restarting with an empty queue."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"Same trigger, but the server drops attempts whose deadline has passed: at t = 16 s goodput is 880 and the queue is empty.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"30\" text-anchor=\"start\">t = 16 s, shedding</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80\" y=\"118\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"80\" y=\"136\" text-anchor=\"middle\">800 new/s</text><line class=\"ln\" x1=\"140\" y1=\"122\" x2=\"196\" y2=\"122\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"168\" y=\"112\" text-anchor=\"middle\">800/s</text><rect class=\"box\" x=\"200\" y=\"98\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"166\" text-anchor=\"middle\">queue: 0</text><line class=\"ln\" x1=\"440\" y1=\"122\" x2=\"496\" y2=\"122\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"500\" y=\"96\" width=\"160\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"580\" y=\"118\" text-anchor=\"middle\">server</text><text class=\"t-s t-m\" x=\"580\" y=\"136\" text-anchor=\"middle\">1,000/s</text><text class=\"t-s t-ok\" x=\"20\" y=\"204\" text-anchor=\"start\">goodput: 880/s</text><text class=\"t-s t-m\" x=\"20\" y=\"226\" text-anchor=\"start\">wasted: 0/s</text><text class=\"t-s t-ok\" x=\"200\" y=\"204\" text-anchor=\"start\">expired attempts are dropped unread</text></svg>",
+            "say": "Rerun with one change on the server: before working on an attempt, check whether its 200 ms deadline has passed, and if so drop it. During the trigger all 400 answers a second are useful, and the moment capacity returns the service is back, catching up on the backlog with 880 good answers in the next second."
+          }
+        ]
+      },
+      "try": {
+        "title": "Tip a service into a retry storm",
+        "minutes": 4,
+        "steps": [
+          "Run the demo below from the `labs` folder. It runs the same five-second trigger five times with different retry policies and prints a few seconds of each run.",
+          "Predict before you look: which runs are back to normal by t = 40 s?",
+          "Add `-Pargs=backoff` to run only the backoff policy. Compare its attempts per second with plain retries. What did backoff change, and what didn't it?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "RetryStormDemo.kt (excerpt)",
+          "src": "// a timed-out attempt is sent again (if the policy allows)\nif (policy.allowRetry(a.number)) send(a.request, a.number + 1, now)\n\n// the server works on the oldest attempt, whether or not anyone still waits for it\nval a = queue.pollFirst()\nif (config.shedExpired && now > a.deadline) continue        // the fix: drop it unread\ncapAcc -= 1.0\nif (now <= a.deadline && a.request !in done) { done += a.request; goodput++ } else wasted++\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.found.l03.demo.RetryStormDemoKt --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/found/l03/demo/RetryStormDemo.kt"
+        },
+        "expect": "```text\n-- retry up to 4 attempts: recovered at never\n   t   new  attempts  goodput  wasted  queued\n   5   800       800      800       0       0\n  10   800      1757      161     239    1357\n  11   800      3200        0     400    4157\n  15   800      3200        0    1000   14757\n  20   800      3200        0    1000   25757\n  59   800      3200        0    1000  111557\n-- retry budget, 10%: recovered at t=34s\n   t   new  attempts  goodput  wasted  queued\n  11   800       880        0     400     937\n  15   800       880        0    1000    2257\n  30   800       880        0    1000     457\n  40   800       800      800       0       0\n-- retry up to 4, server sheds expired work: recovered at t=15s\n   t   new  attempts  goodput  wasted  queued\n  11   800      2000      400       0     404\n  15   800       978     1000       0      80\n  16   800       800      880       0       0\n```\n\n(output trimmed to a few rows per run). With plain retries, goodput drops to zero within a second of the trigger and never comes back. The budget holds attempts at 880 a second, below capacity, but the server still wastes its time on a backlog of expired attempts until about t = 34 s. Shedding keeps every answer useful: 400 good answers a second during the trigger (all the capacity there is) and full service from t = 15 s, even though the clients still retry four times. The simulation is deterministic, so you get these numbers exactly.\n\nWith `-Pargs=backoff` the attempts per second wobble around 3,200 (1,438, then 3,063, then 3,228 in seconds 10 to 12) instead of jumping straight to it. The jitter spread the retries out; it didn't remove any, and the run never recovers."
+      },
+      "refs": [
+        {
+          "title": "Bronson et al., Metastable Failures in Distributed Systems (HotOS 2021)",
+          "url": "https://sigops.org/s/conferences/hotos/2021/papers/hotos21-s11-bronson.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Huang et al., Metastable Failures in the Wild (OSDI 2022)",
+          "url": "https://www.usenix.org/conference/osdi22/presentation/huang-lexiang",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "People and changes cause most outages",
+      "body": "Hardware and software faults have something in common: something changed. A disk aged, a deploy went out, a config file was pushed. Most of the big incidents in this lesson were changes, and the largest single cause of outages is people changing a running system.\n\nThe best-known example is Amazon S3 on 28 February 2017. An engineer following an established playbook ran a command to take a small number of servers out of a subsystem used for billing, and mistyped one input. The command removed far more servers than intended, including servers of two subsystems that every S3 request in the region depended on. Both had to restart completely, and neither had been fully restarted in that region for many years, so the restarts were slow. S3 in us-east-1 was down for about four hours, and so were the services built on it.\n\nStudies agree. David Oppenheimer and colleagues (2003) found configuration changes by operators to be the leading cause of outages in the internet services they studied, with hardware a cause in only 10% to 25%. Google's SRE book says roughly 70% of its outages come from changes to a live system, and answers with progressive rollouts, fast detection and safe rollback.\n\nIt's tempting to write \"human error\" in the incident report and stop there. Don't. The engineer at AWS did what the tool allowed, following the documented procedure. Human error is where an investigation starts. The useful questions are about the system: why could one typo remove that much capacity? AWS's fixes were system fixes. The tool now removes capacity slowly and refuses to go below a safe minimum, other tools were checked for the same risk, and the index subsystem is being split into smaller cells so a restart is quicker.\n\nTwo practices make teams better at this over time. A **blameless post-mortem** is a written record of an incident (what happened and when, the impact, the causes, and the actions that will stop it happening again), written on the assumption that everyone acted reasonably with what they knew at the time. People who expect blame hide what they did, and then nobody learns why the system let it happen. **Chaos engineering** tests fault tolerance on purpose: define what normal looks like (say, the checkout success rate), predict that it will hold, inject a real fault (stop an instance, drop packets to a dependency, fill a disk) and look for a difference. Netflix's Chaos Monkey, which randomly terminates instances in production, is the best-known tool. Both rest on Yuan's finding: recovery code that never runs probably doesn't work, so make it run, on your schedule and not at 03:12.",
+      "try": {
+        "title": "Make three post-mortem lines blameless",
+        "minutes": 4,
+        "steps": [
+          "Rewrite each line so it says what the system allowed, not who slipped. Invent the details you need.",
+          "1. \"A developer ran the migration against production by mistake.\" 2. \"The on-call engineer was slow to respond.\" 3. \"QA didn't test the error handler.\"",
+          "For each, write one action item that changes a tool, an alert or a test."
+        ],
+        "expect": "Model rewrites (yours will differ in the details you invent; the shape is what matters):\n\n1. \"The migration script reads its target database from an environment variable, which was set to production in the shell it ran from. Nothing asked for confirmation before running against production.\" Action: the script refuses to run against production without an explicit flag, and prints the target before it starts.\n2. \"The first alert went to a chat channel at 02:10. The page went out at 02:31, when the error rate crossed the second threshold.\" Action: page on the burn rate of the checkout SLO (lesson 2) instead of on a fixed error-rate threshold.\n3. \"No test made the `IOException` branch of the settlement upload run, so the empty handler had never executed.\" Action: a test that injects an upload failure and expects the job to fail.\n\nEach rewrite says what the system allowed, not who slipped, and each action changes a tool, an alert or a test, never \"be more careful\"."
+      },
+      "refs": [
+        {
+          "title": "AWS: Summary of the Amazon S3 service disruption, 28 February 2017",
+          "url": "https://aws.amazon.com/message/41926/",
+          "kind": "read"
+        },
+        {
+          "title": "Google SRE book: Postmortem culture",
+          "url": "https://sre.google/sre-book/postmortem-culture/",
+          "kind": "read"
+        },
+        {
+          "title": "Principles of Chaos Engineering",
+          "url": "https://principlesofchaos.org/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A fault is a flat tyre; a failure is missing your flight. A spare in the boot turns most flat tyres into a 20-minute delay, which is redundancy. But if every car from one factory has the same faulty valve, they all get flats on the same hot afternoon and the spares run out with the tow trucks: that's a correlated software fault. The analogy breaks with retries. A driver with a flat doesn't make other drivers' tyres burst, but a client that retries adds load that makes every other client's request slower, which can keep the whole road jammed after the heat has passed.",
+  "in_your_world": "In a payments stack the dangerous faults are rarely the disk. They are the deploy that ships a bad config to every Quarkus pod at once, the Kafka consumer whose error handler logs a poison message and moves on, and the HTTP client whose default retries turn a slow card issuer into four times the traffic. Check your clients: how many attempts, what backoff, and is there a budget or a circuit breaker? A Temporal activity's default retry policy has no maximum number of attempts. That suits a durable workflow, but the activity must be idempotent (an idempotency key on the authorization) and its timeouts shorter than the caller's. Make your readiness probe go through the real request path (a cheap query through the same connection pool) rather than just returning 200, so a gray failure takes the pod out of rotation. And when the next incident review starts, ask what the system allowed before anyone asks who did it.",
+  "mistake": "The most common mistake is adding retries to every call with no limit on how much extra load they may add, because retries fix the transient faults everyone sees every day. Under overload the same retries multiply the traffic by the number of attempts, and they can hold a service in a metastable state long after the trigger is gone. Worse, retries stack across layers: the SDK, your code and the service mesh each retrying 3 times is 27 attempts for one request. Retry only idempotent operations, at one layer, with backoff and jitter, and with a budget that caps retries at a small fraction of requests. On the server, drop work whose deadline has passed.",
+  "compare": {
+    "title": "Plain retries and budgeted retries",
+    "a": {
+      "label": "Plain retries",
+      "lang": "kotlin",
+      "title": "the common default",
+      "src": "// up to 4 attempts, straight away\nfun <T> withRetries(call: () -> T): T {\n    var last: Exception? = null\n    repeat(4) {\n        try { return call() } catch (e: TimeoutException) { last = e }\n    }\n    throw last!!\n}\n"
+    },
+    "b": {
+      "label": "A retry budget",
+      "lang": "kotlin",
+      "title": "at most 10% extra load",
+      "src": "// retries may add at most 10% load, spaced out with backoff and jitter\nclass RetryBudget(private val ratio: Double = 0.1, private val max: Double = 10.0) {\n    private var tokens = 0.0\n    @Synchronized fun onRequest() { tokens = minOf(max, tokens + ratio) }\n    @Synchronized fun tryRetry(): Boolean = (tokens >= 1.0).also { if (it) tokens -= 1.0 }\n}\n\nfun <T> withBudget(budget: RetryBudget, call: () -> T): T {\n    budget.onRequest()\n    var attempt = 0\n    while (true) {\n        try {\n            return call()\n        } catch (e: TimeoutException) {\n            if (++attempt == 4 || !budget.tryRetry()) throw e\n            Thread.sleep(Random.nextLong(0, minOf(2_000L, 50L shl attempt)))   // full jitter\n        }\n    }\n}\n"
+    },
+    "note": "On a normal day the two behave the same: a rare timeout is retried and succeeds. On a bad day the first sends four times the traffic to a dependency that is already struggling. The second lets each request earn a tenth of a retry, so however bad things get, retries add at most about 10% load, and it spaces the ones it allows with a random delay so clients don't retry in lockstep. The lab builds the same budget for the simulation."
+  },
+  "worked": {
+    "title": "How likely is data loss with mirrored disks?",
+    "steps": [
+      {
+        "say": "Turn the yearly failure rate into a rate per hour. For small AFRs this is almost exactly AFR / 8,760.",
+        "code": "λ = -ln(1 - 0.0136) / 8,760 hours = 1.563e-6 failures per disk per hour",
+        "lang": "text"
+      },
+      {
+        "say": "A mirrored pair loses data when one disk fails (2 × λ per hour, because either can go first) and the other fails before the 24-hour repair is done (about λ × 24).",
+        "code": "loss rate = 2 × λ × (λ × R)\n          = 2 × 1.563e-6 × (1.563e-6 × 24)\n          = 1.17e-10 per hour\n          × 8,760 hours = 1.03e-6 per year   (about 1 in a million)",
+        "lang": "text"
+      },
+      {
+        "say": "Scale to the fleet. 10,000 disks as 5,000 independent pairs: the chance that at least one pair loses its data this year.",
+        "code": "1 - (1 - 1.03e-6)^5,000 = 0.0051   (about 1 year in 200)",
+        "lang": "text"
+      },
+      {
+        "say": "Change one input at a time to see what matters. The repair time enters once, so a week instead of a day multiplies the risk by 7. A third copy multiplies it by about 1.5 × λ × R, roughly 1 in 18,000.",
+        "code": "repair 168 h:  7.19e-6 per pair, 3.5% for the fleet\nthree copies:  3 × λ³ × R² × 8,760 = 5.78e-11 per year",
+        "lang": "text"
+      },
+      {
+        "say": "Remember what the formula assumes: independent failures. Two disks from one batch, or in one rack on one power supply, fail together far more often than this, which is why copies go to different racks and zones.",
+        "code": "assumption: disk failures are independent\nreality:    same batch, same rack, same firmware bug -> correlated",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Tip a service into a retry storm, then pull it out",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/found/l03/RetryStorm.kt",
+      "labs/sim/src/main/kotlin/sfz/found/l03/DiskOdds.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.found.l03.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. 14 tests run and 10 fail with `NotImplementedError`. Four pass already: they run the finished simulator with policies that are already written, and show the storm itself.",
+      "Read `simulateStorm` in `RetryStorm.kt`. Find the two lines that make the storm: where a timed-out attempt is sent again, and where the server works on an attempt whose deadline has passed.",
+      "Write `RetryBudget.onRequest` and `allowRetry`. Run `RetryStormTest`: with your budget the service should be back by t = 40 s, and no second should see more attempts than 110% of new requests plus the 10 tokens the bucket can hold.",
+      "In `DiskOdds.kt`, write the four functions. Each one's KDoc gives the formula; `ratePerHour` is done.",
+      "Run all the tests until they pass. The last test in `DiskOddsTest` checks your formula against a simulation of disks failing and being re-created."
+    ],
+    "hints": [
+      "`onRequest`: `tokens = minOf(maxTokens, tokens + ratio)`.",
+      "`allowRetry`: return false when `attempt >= maxAttempts` or `tokens < 1.0`; otherwise subtract 1.0 and return true. Check before you spend.",
+      "`chanceOfAnyFailure` is `1 - (1 - afr).pow(disks)`; `pow` is already imported.",
+      "`lossChancePerYear`: with `val lambda = ratePerHour(afr)`, return `copies * lambda.pow(copies) * repairHours.pow(copies - 1) * HOURS_PER_YEAR`."
+    ],
+    "done_when": "All 14 tests in `RetryStormTest` and `DiskOddsTest` pass."
+  },
+  "drill": {
+    "title": "The storm and the odds, from memory",
+    "minutes": 4,
+    "prompt": "Without notes: (1) define a metastable failure in one sentence; (2) say why backoff alone didn't save the service in the lab; (3) name the two fixes that did; (4) give the expected yearly disk failures for 10,000 disks at 1.36% AFR, and the formula for the yearly chance of losing data on a mirrored pair.",
+    "answer": {
+      "lang": "text",
+      "src": "(1) A trigger pushes the system into a bad state, and its own behaviour\n    (here, retries) keeps it there after the trigger is gone.\n(2) Backoff spreads the retries out in time, but every attempt still times out,\n    so each request still becomes 4 attempts: 3,200 a second against 1,000.\n(3) A retry budget (retries add at most ~10% load), and the server dropping\n    attempts whose deadline has passed, so capacity only goes to live requests.\n(4) 10,000 x 0.0136 = 136 a year, one every 2 to 3 days.\n    Pair: 2 x λ x (λ x R) per hour x 8,760, with λ = AFR / 8,760 (about)\n    and R the repair time in hours: about 1 in a million for a 24 h repair.\n"
+    }
+  },
+  "recap": [
+    "A fault is one part going wrong; a failure is the service missing its SLO. Fault tolerance always names the faults it survives and how many.",
+    "Hardware faults are routine at scale (10,000 disks at 1.36% AFR lose one every two or three days) and mostly independent, so copies in different places plus fast repair make data loss very rare.",
+    "Software and configuration faults are correlated: one bug or bad file hits every machine at once. Staged rollouts, checks at the consumer and tested error handlers are the defence.",
+    "Retries can turn a short overload into a metastable failure that outlives its trigger. Cap retries with a budget and drop work nobody waits for; backoff alone only spreads them out.",
+    "Changes made by people cause most outages. Fix the system that let the mistake through, run recovery on purpose with chaos experiments, and write blameless post-mortems."
+  ],
+  "quiz": [
+    {
+      "q": "A cluster keeps every piece of data on 3 disks in 3 different racks. Which of these is most likely to lose data?",
+      "options": [
+        "Three disks failing independently within one repair window",
+        "A bug in a new release that writes corrupt data on every node",
+        "One disk failing while another is being re-created",
+        "One uncorrectable memory error on one machine"
+      ],
+      "answer": 1,
+      "why": "Three independent disk failures inside one repair window happen about 6 times in 100 billion years per piece of data. A bug in the release runs on every node and writes the same bad data to all three copies at once, so the copies don't help. The third option is the tempting one, but losing one copy while another is being repaired still leaves the third."
+    },
+    {
+      "q": "Your pod's health endpoint answers 200 from its own thread while the pool that handles real requests is deadlocked. Lesson 2 defined an SLI measured at the load balancer. What kind of failure is this, and what would catch it?",
+      "options": [
+        "A gray failure; judge health by real requests' error rate and latency at the load balancer",
+        "A crash failure; a faster heartbeat would catch it",
+        "A metastable failure; add a retry budget",
+        "A hardware fault; replace the machine"
+      ],
+      "answer": 0,
+      "from": "found-02",
+      "why": "The pod looks healthy to its checker while users see it broken: a gray failure. A faster heartbeat checks the same healthy thread more often. An SLI measured at the load balancer sees what users see, failed or slow requests, so health derived from it, or a probe that goes through the request path, takes the pod out."
+    },
+    {
+      "q": "A service runs at 85% of capacity. During a 3-second slowdown its clients time out and retry up to 3 times. Afterwards goodput stays near zero. Which change helps most?",
+      "options": [
+        "Raise the client timeout from 200 ms to 2 s",
+        "Add exponential backoff with jitter, keeping 3 retries",
+        "Cap retries with a budget, and have the server drop requests past their deadline",
+        "Allow more retries so requests eventually get through"
+      ],
+      "answer": 2,
+      "why": "The sustaining effect is the retries plus wasted work on requests nobody waits for. A budget caps the extra load and shedding makes every unit of capacity useful. A longer timeout is tempting and delays the point where clients give up, but once the queue holds more than 2 s of work the same loop starts. Backoff spreads retries out without reducing them."
+    },
+    {
+      "q": "Your fleet has 500 disks with an AFR of 2%. How many disk failures should you plan for this year?",
+      "options": [
+        "About 1",
+        "Probably none, at 2%",
+        "About 50",
+        "About 10"
+      ],
+      "answer": 3,
+      "why": "Expected failures are disks × AFR: 500 × 0.02 = 10. The 2% is per disk; across the fleet a failure every month or so is normal, and the chance that none fails at all is 0.98^500, about 0.004%."
+    },
+    {
+      "q": "An engineer's mistyped command removed too many servers and caused a four-hour outage. Which post-mortem action item helps most?",
+      "options": [
+        "Remind everyone to double-check commands before running them",
+        "Make the tool remove capacity slowly and refuse to go below a safe minimum",
+        "Retrain the engineer",
+        "Require two engineers to approve every command"
+      ],
+      "answer": 1,
+      "why": "This is what AWS did after the 2017 S3 outage: the tool itself now limits the damage any one input can do. Reminders and retraining rely on people never slipping, which they will. A second approver helps for rare, dangerous operations, but reviewers miss typos too, and it doesn't limit the damage when one gets through."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Fault vs failure?",
+      "back": "A fault is one component not working right (a disk, a machine, a bug). A failure is the whole system no longer giving the service it promised, missing its SLO."
+    },
+    {
+      "front": "10,000 disks at 1.36% AFR: failures per year?",
+      "back": "About 136, one every two or three days."
+    },
+    {
+      "front": "Chance per year of losing data kept on 2 disks (AFR 1.36%, 24 h repair)?",
+      "back": "About 1 in a million: 2 × λ × (λ × R) per hour, times 8,760, with λ about AFR / 8,760."
+    },
+    {
+      "front": "What is a metastable failure?",
+      "back": "A bad state started by a trigger and held by the system's own behaviour (often retries) after the trigger is gone. Escaping needs a strong push: cut the load or restart."
+    },
+    {
+      "front": "Why doesn't backoff with jitter end a retry storm?",
+      "back": "It spreads retries out in time but doesn't reduce how many there are. If every attempt still times out, the offered load stays at several times capacity. A retry budget caps the count."
+    },
+    {
+      "front": "What is a gray failure?",
+      "back": "A component that looks healthy to its own checks while users see it failing, such as a heartbeat that answers while request handling is stuck."
+    },
+    {
+      "front": "Yuan et al. (OSDI 2014): the main cause of catastrophic failures?",
+      "back": "Wrong handling of errors the software had already detected (92%). In 58%, a simple test of the error handler would have caught it."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Fault",
+      "plain": "One component not working as it should: a disk, a machine, a bug, a slow dependency."
+    },
+    {
+      "term": "Failure",
+      "plain": "The whole system no longer giving its users the promised service (missing its SLO)."
+    },
+    {
+      "term": "Single point of failure",
+      "plain": "A part whose fault alone becomes a failure of the whole system."
+    },
+    {
+      "term": "Annualized failure rate (AFR)",
+      "plain": "The fraction of a type of component, such as drives, that fails in a year."
+    },
+    {
+      "term": "Gray failure",
+      "plain": "A component that looks healthy to its checks while its users see it broken."
+    },
+    {
+      "term": "Metastable failure",
+      "plain": "A bad state started by a trigger and kept going by the system's own behaviour after the trigger is gone."
+    },
+    {
+      "term": "Retry budget",
+      "plain": "A cap on retries as a fraction of requests, so retries can add only a little extra load."
+    },
+    {
+      "term": "Blameless post-mortem",
+      "plain": "A written review of an incident that looks for what the system allowed, not whom to blame."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your team lead says: \"We run three replicas of everything, so we're safe.\" Explain what three replicas protect against and what they don't.",
+    "answer": "Three replicas protect against independent faults: a disk, a machine, or (if they are in different zones) a datacenter. Losing all three copies to independent hardware failures within one repair window is vanishingly rare, as long as repairs are quick. They don't protect against faults that hit all three at once, and those cause the big outages. A bug or a bad config pushed to every replica breaks every replica; corrupt data written through the leader is faithfully copied to the others; and a retry storm overloads all three replicas together. They also don't help if the health checks can't see a gray failure, or if failover has never been tested. So alongside the replicas we need staged rollouts, input checks, tested error handlers, limits on retries, backups that a bad write can't overwrite, and practice runs of failover."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Shrinking the repair window.** Amazon Aurora's storage keeps 6 copies of the data across 3 availability zones, 2 in each, and needs 4 of them for a write and 3 for a read. That survives losing a whole zone plus one more node. To make a second fault during repair unlikely, it cuts the data into 10 GB segments, so one segment can be re-copied in about 10 seconds over a 10 Gbps link. That is the lab's formula at work: shrink R and the chance of overlapping failures shrinks with it (Verbitski et al., SIGMOD 2017).\n\n**More redundancy can hurt.** The gray-failure paper has a counterintuitive case. In a datacenter network with many core switches, a request that crosses the network passes through more of them as fan-out grows, so adding switches raises the chance that some request hits the one switch that is silently dropping packets. Redundancy helps against clean failures and can spread gray ones.\n\n**The ironies of automation.** Lisanne Bainbridge pointed out in 1983 that automation takes over the easy cases and leaves people the hardest ones, with less practice at them. The S3 outage fits: the restart that took hours was one nobody had needed to do in years. Chaos engineering and game days, rehearsals of failure on purpose, are partly an answer to that.\n\nThe split into hardware faults, software faults and human operations follows Designing Data-Intensive Applications, 2nd edition, chapter 2; the numbers here are newer than the book's."
+  },
+  "sources": [
+    {
+      "title": "Backblaze Drive Stats for 2025",
+      "url": "https://www.backblaze.com/blog/backblaze-drive-stats-for-2025/"
+    },
+    {
+      "title": "Yuan et al., Simple Testing Can Prevent Most Critical Failures (OSDI 2014)",
+      "url": "https://www.eecg.utoronto.ca/~stumm/Papers/Yuan-OSDI-14.pdf"
+    },
+    {
+      "title": "Huang et al., Metastable Failures in the Wild (OSDI 2022)",
+      "url": "https://www.usenix.org/conference/osdi22/presentation/huang-lexiang"
+    },
+    {
+      "title": "AWS: Summary of the Amazon S3 service disruption in the Northern Virginia (US-EAST-1) Region",
+      "url": "https://aws.amazon.com/message/41926/"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 2",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

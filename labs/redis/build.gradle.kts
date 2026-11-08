@@ -7,7 +7,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${versions["coroutines"]}")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-reactive:${versions["coroutines"]}")
     runtimeOnly("org.slf4j:slf4j-simple:${versions["slf4j"]}")
-    // lesson 8's watchdog demo only: what a production lock library does. Pinned here because the
+    // dist-05's watchdog demo only: what a production lock library does. Pinned here because the
     // root versions map has no Redisson entry; the exercises and tests never use it.
     "demoImplementation"("org.redisson:redisson:4.8.0")
     testImplementation("org.testcontainers:testcontainers:${versions["testcontainers"]}")

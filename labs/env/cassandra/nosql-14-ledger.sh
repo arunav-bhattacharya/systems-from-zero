@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lesson nosql-14: give the three-node cluster enough data that streaming, cleanup, repair and
+# Lesson shard-06: give the three-node cluster enough data that streaming, cleanup, repair and
 # snapshots have something to move. Run it inside a node, from the labs folder:
 #   docker compose -f env/cassandra-cluster.yml exec cass1 bash /sfz/nosql-14-ledger.sh
 # It creates payments.ledger (three copies in dc1) and writes 50,000 ledger entries for 5,000

@@ -1,0 +1,471 @@
+{
+ "id": "repl-04",
+ "title": "PostgreSQL replication, backups and failover",
+ "minutes": 40,
+ "goal": "By the end you can apply this track's first three lessons to PostgreSQL 18: build a streaming standby from a base backup and a replication slot, read its lag, choose a synchronous_commit level knowing what each one can lose, explain why a standby cancels queries, promote a standby without ending up with two primaries, bring a database back to the second before an accidental DELETE, and say what PostgreSQL 18 changed in all of this.",
+ "warmup": {
+  "q": "A primary streams to one asynchronous standby that runs about 50 ms behind. The primary's disk dies at 10:42:07, and ops promotes the standby a minute later. What happened to the payments whose clients saw them commit at 10:42:06.98?",
+  "options": [
+   "They are on the new primary: PostgreSQL acknowledges a commit only once a standby has it",
+   "They are probably lost: an asynchronous primary acknowledges a commit once its own WAL is on disk, and the last 50 ms of WAL never reached the standby",
+   "They are lost only if the standby was running read-only queries at the time",
+   "The promotion fetches them from the dead primary's WAL automatically"
+  ],
+  "answer": 1,
+  "why": "This is lesson 1's asynchronous failover on a real system. PostgreSQL replicates asynchronously by default: COMMIT returns when the primary's WAL is flushed, and the walsender ships it a moment later. Commits inside that moment exist only on the dead disk, so the promoted standby never sees them, although their clients were told they committed. Only a synchronous standby (synchronous_commit on or remote_apply with synchronous_standby_names set) closes the gap. Promotion only replays WAL the standby already received; it cannot reach a dead server."
+ },
+ "sections": [
+  {
+   "h": "A standby is a second server that replays the primary's WAL",
+   "body": "This lesson runs the track's first three lessons on one real system. Lesson 1 built single-leader replication: one ordered log, followers at a position in it, a choice of when the leader says OK, a new follower from a snapshot plus a position, and a failover that can lose writes. Lesson 2 showed that PostgreSQL's log is its physical WAL. Lesson 3 showed what lag does to reads. Here is how PostgreSQL 18 does each of them, plus the one thing replication can't give you: a backup.\n\nPostgreSQL builds its followers, which it calls standbys, from machinery it already has. Every change is appended to the write-ahead log first, and after a crash the server replays that log from the last checkpoint onto its data files (the Storage track's lesson on write-ahead logging and crash recovery). Now take a copy of the data directory and never let its recovery end: feed it the primary's WAL as the primary writes it, and it replays each record onto the same 8 KB pages. That copy is a **standby**. It is physical, byte for byte: the same pages, the same row positions, the same major version.\n\nThree pieces build one, and this lesson's Compose file, `env/postgres-ha.yml`, uses all three:\n\n- `pg_basebackup -h primary -U replicator -D $PGDATA -X stream -S standby1 -R` copies the running primary's data directory over a replication connection, plus the WAL written while it copies (`-X stream`). The role needs the REPLICATION attribute and a pg_hba.conf line with the keyword `replication`.\n- `-R` writes an empty `standby.signal`, which makes the server start in standby mode and stay in recovery, and adds `primary_conninfo` (host, port, user, password) to `postgresql.auto.conf`.\n- `-S standby1` streams through a **replication slot**, a record on the primary of the oldest WAL position that standby still needs (`restart_lsn`).\n\nStarted, the standby runs a walreceiver that connects to the primary, and the primary forks a walsender for it. The walsender sends WAL as soon as it is written; the walreceiver writes it to the standby's own `pg_wal` and flushes it; the startup process replays it. Lesson 1's positions are **LSNs** (log sequence numbers) here: byte offsets into the WAL, printed like `0/508F830`, and `pg_wal_lsn_diff` subtracts two of them.\n\nThe slot matters when a standby stops. Without one, each checkpoint lets the primary remove old WAL whether a standby has it or not, and a standby that was down too long gets `requested WAL segment ... has already been removed`: it must be rebuilt from a new base backup. With a slot, the primary keeps all WAL from `restart_lsn` on. That is also the danger: a slot whose standby is gone for good holds WAL forever, until `pg_wal` fills the disk and the primary stops. Drop slots you no longer use, and set `max_slot_wal_keep_size` (default -1, no limit) or PostgreSQL 18's `idle_replication_slot_timeout` (default 0, off), so the primary gives up on a slot before the disk gives up on the primary. This is lesson 1's choice between keeping the log for a follower and rebuilding the follower. With the standby stopped and the timeout at 10 seconds, the next checkpoint chose the rebuild:\n\n```text\n slot_name | active | wal_status | invalidation_reason\n-----------+--------+------------+---------------------\n standby1  | f      | lost       | idle_timeout\n\n-- the standby's log when it came back\nFATAL:  could not start WAL streaming: ERROR:  can no longer access replication slot \"standby1\"\nDETAIL:  This replication slot has been invalidated due to \"idle_timeout\".\n```\n\nOn the primary, `pg_stat_replication` has a row per standby with three positions, and the figure shows where each is measured: `write_lsn`, WAL the standby has handed to its operating system; `flush_lsn`, WAL on its disk; `replay_lsn`, what queries on it can see. `write_lag`, `flush_lag` and `replay_lag` give the same distances in time.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 700 360\" role=\"img\" aria-label=\"The streaming pipeline from the primary's WAL to the standby's replay, with three LSNs\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"30\" text-anchor=\"start\">pg_stat_replication on the primary, with replay paused on the standby</text><rect class=\"box\" x=\"20\" y=\"50\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"81.0\" text-anchor=\"middle\">primary</text><text class=\"t-s\" x=\"120.0\" y=\"99.0\" text-anchor=\"middle\">WAL written to 0/5111380</text><rect class=\"box\" x=\"246\" y=\"50\" width=\"134\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"313.0\" y=\"81.0\" text-anchor=\"middle\">walsender</text><text class=\"t-s\" x=\"313.0\" y=\"99.0\" text-anchor=\"middle\">sent 0/5111380</text><rect class=\"box\" x=\"430\" y=\"50\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"81.0\" text-anchor=\"middle\">standby: walreceiver</text><text class=\"t-s t-code\" x=\"555.0\" y=\"99.0\" text-anchor=\"middle\">write_lsn 0/5111380</text><rect class=\"box\" x=\"430\" y=\"170\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"201.0\" text-anchor=\"middle\">its pg_wal, fsynced</text><text class=\"t-s t-code\" x=\"555.0\" y=\"219.0\" text-anchor=\"middle\">flush_lsn 0/5111380</text><rect class=\"box-b\" x=\"150\" y=\"170\" width=\"250\" height=\"86\" rx=\"8\"/><text class=\"t\" x=\"275.0\" y=\"200.0\" text-anchor=\"middle\">startup process replays</text><text class=\"t-s t-code\" x=\"275.0\" y=\"218.0\" text-anchor=\"middle\">replay_lsn 0/50E13E0</text><text class=\"t-s t-b\" x=\"275.0\" y=\"236.0\" text-anchor=\"middle\">196,512 bytes behind</text><line class=\"ln\" x1=\"220\" y1=\"85\" x2=\"243\" y2=\"85\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"380\" y1=\"85\" x2=\"427\" y2=\"85\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"404\" y=\"76\" text-anchor=\"middle\">WAL</text><line class=\"ln\" x1=\"555\" y1=\"120\" x2=\"555\" y2=\"167\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"205\" x2=\"403\" y2=\"205\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"278\" width=\"380\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"210.0\" y=\"303.0\" text-anchor=\"middle\">slot standby1: keeps WAL from restart_lsn on</text><path class=\"ln-d\" d=\"M555 240L555 298L403 298\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"414\" y=\"318\" text-anchor=\"start\">flush_lsn reported back</text><text class=\"t-s t-a\" x=\"20\" y=\"344\" text-anchor=\"start\">Queries on the standby see 0/50E13E0; the WAL after it is safe on disk, waiting.</text></svg>",
+    "caption": "Where pg_stat_replication measures each position: written to the standby's OS, flushed to its disk, replayed into its tables. The numbers are the Try it's, with replay paused."
+   },
+   "try": {
+    "title": "Watch a standby follow, then stop it replaying",
+    "minutes": 6,
+    "steps": [
+     "Start the two servers from the `labs` folder: `docker compose -f env/postgres-ha.yml up -d --wait`. The first start takes about 20 seconds: initdb on the primary, then `pg_basebackup` for the standby. Then ask the primary about its standby and its slot, and look at the processes on both: `docker compose -f env/postgres-ha.yml exec primary ps -u postgres -o pid,cmd` and the same with `standby`. `docker compose -f env/postgres-ha.yml exec standby bash -c 'cat $PGDATA/postgresql.auto.conf'` shows what `-R` wrote.",
+     "Open psql on each in its own terminal: `docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course` and `docker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course`. Run the session below, switching terminals at each comment.",
+     "Before the count on the standby, predict it: replay is paused, but is the WAL there?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql on the primary and on the standby",
+     "src": "-- primary\n\\x on\nSELECT application_name, client_addr, state, sent_lsn, write_lsn, flush_lsn, replay_lsn,\n       write_lag, flush_lag, replay_lag, sync_state FROM pg_stat_replication;\nSELECT slot_name, slot_type, active, restart_lsn, wal_status FROM pg_replication_slots;\n\\x off\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (1, 500, 'customer_request', now()) RETURNING refund_id;\n-- standby\nSELECT refund_id, amount_minor FROM refunds ORDER BY refund_id DESC LIMIT 1;\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (1, 1, 'duplicate', now());\nSELECT pg_wal_replay_pause();\nSELECT pg_get_wal_replay_pause_state();\n-- primary\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nSELECT 2, 100, 'customer_request', now() FROM generate_series(1, 1000);\nSELECT application_name, sent_lsn, write_lsn, flush_lsn, replay_lsn,\n       pg_wal_lsn_diff(sent_lsn, replay_lsn) AS replay_behind_bytes, write_lag, flush_lag, replay_lag\nFROM pg_stat_replication;\n-- standby\nSELECT count(*) FROM refunds;\nSELECT pg_wal_replay_resume();\nSELECT count(*) FROM refunds;\n"
+    },
+    "expect": "The primary has one standby, streaming and caught up, and an active slot (your LSNs differ):\n\n```text\napplication_name | standby1\nclient_addr      | 172.21.0.3\nstate            | streaming\nsent_lsn         | 0/508DB48\nwrite_lsn        | 0/508DB48\nflush_lsn        | 0/508DB48\nreplay_lsn       | 0/508DB48\nwrite_lag        |\nflush_lag        |\nreplay_lag       |\nsync_state       | async\n\nslot_name   | standby1\nslot_type   | physical\nactive      | t\nrestart_lsn | 0/508DB48\nwal_status  | reserved\n```\n\nThe lag columns show the last lag measured, a fraction of a millisecond, or nothing once the standby has caught up and nothing new arrives. In ps, the primary has `postgres: walsender replicator 172.21.0.3(60024) streaming 0/508F830` and an `archiver`; the standby has `postgres: standby1: startup recovering 000000010000000000000005` and `postgres: standby1: walreceiver streaming 0/508F830`. The new refund (id 7) is on the standby at once, and the standby refuses to write: `ERROR:  cannot execute INSERT in a read-only transaction`. With replay paused (`paused`) and 1,000 rows inserted:\n\n```text\napplication_name    | standby1\nsent_lsn            | 0/5111380\nwrite_lsn           | 0/5111380\nflush_lsn           | 0/5111380\nreplay_lsn          | 0/50E13E0\nreplay_behind_bytes | 196512\nwrite_lag           | 00:00:00.002436\nflush_lag           | 00:00:00.007326\nreplay_lag          | 00:00:02.702068\n```\n\nThe standby received and flushed every byte (write and flush lag of 2 and 7 ms) and replayed none of the 192 KB: its count is still `7`. replay_lag only changes when the standby reports a new replay position, so while replay is paused, trust `replay_behind_bytes`. After `pg_wal_replay_resume()` it is `1007`, at once, because the WAL was already on its disk."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Log-shipping standby servers (streaming replication, slots)",
+     "url": "https://www.postgresql.org/docs/18/warm-standby.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: pg_basebackup",
+     "url": "https://www.postgresql.org/docs/18/app-pgbasebackup.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: Replication settings",
+     "url": "https://www.postgresql.org/docs/18/runtime-config-replication.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Synchronous commit: what a COMMIT waits for, and what each choice loses",
+   "body": "Lesson 1's dial between asynchronous and synchronous is two settings in PostgreSQL. By default replication is **asynchronous**: the primary answers COMMIT as soon as the commit's WAL is on its own disk, and the walsender ships it a moment later; write_lag was 2 ms in the first Try it. If the primary dies inside that moment, the standby never gets those commits. After a failover they are gone, and their clients were told they had committed. For a payment the card network already approved, that is money the ledger no longer knows about.\n\nSynchronous replication closes the gap. Name the standby in `synchronous_standby_names` on the primary, and every COMMIT waits until that standby confirms. `synchronous_commit` (default `on`) chooses what it must confirm:\n\n| synchronous_commit | COMMIT returns once | lost if the primary dies and you fail over |\n|---|---|---|\n| `off` | the WAL is in the primary's memory; the WAL writer flushes it within 3 × wal_writer_delay, 600 ms | up to 600 ms of commits, even with no failover |\n| `local` | the WAL is on the primary's disk | whatever the standby had not received |\n| `remote_write` | the standby has handed it to its operating system | nothing, unless the standby's OS crashes too |\n| `on` | the standby has flushed it to its disk | nothing |\n| `remote_apply` | the standby has replayed it | nothing, and a read on the standby sees it at once |\n\nWith `synchronous_standby_names` empty, every level from `remote_write` up behaves like `local`. The list takes one name, `FIRST 1 (s1, s2)` for the first connected standby in the list, or `ANY 1 (s1, s2)` for whichever confirms first.\n\nThe price is a round trip to the standby, and its fsync, on every commit. In this lesson's containers a commit took about 1.6 ms with `local` and 6 to 7 ms waiting for the standby. Between two zones of a cloud region, add about a millisecond; between regions, about 70.\n\nThe trap is a synchronous standby that is down. Unlike MySQL's semi-sync in lesson 1, PostgreSQL never falls back to asynchronous on its own; the primary holds every COMMIT for as long as that lasts: in this section's Try it, an INSERT hung for 28 seconds until it was cancelled. `statement_timeout` does not end the wait, because its clock stops before the commit. A cancel does, with a warning that says exactly what happened: `The transaction has already committed locally, but might not have been replicated to the standby.` The row is on the primary, visible to everyone. Synchronous replication delays the answer; it never undoes a commit.\n\nSo run it with two standbys and `ANY 1 (s1, s2)`, so that one can be down, or let the HA tool fall back to asynchronous when the last standby fails, which reopens the gap. And choose per transaction: `SET LOCAL synchronous_commit = local` for a page-view log, `on` for the payment.\n\nWhile the standby is down, its slot holds WAL on the primary: in the Try it, one million new rows left 92 MB in `pg_wal` that no checkpoint could remove.",
+   "try": {
+    "title": "Stop the standby: async fills the disk, sync stops the commits",
+    "minutes": 6,
+    "steps": [
+     "Start the servers if they are not running (`docker compose -f env/postgres-ha.yml up -d --wait`, from the `labs` folder) and open psql on the primary (`docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course`). In another terminal, stop the standby: `docker compose -f env/postgres-ha.yml stop standby`.",
+     "Run the first block: the slot query, a million rows, a checkpoint, the slot query again. Then make standby1 synchronous and insert a refund. When it hangs, wait about 20 seconds and press Ctrl+C. Did the refund commit?",
+     "Start the standby again (`docker compose -f env/postgres-ha.yml start standby`) and run the last block. The last three statements put the primary back as it was."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql on the primary",
+     "src": "SELECT slot_name, active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots;\nSELECT count(*) AS files, pg_size_pretty(sum(size)) AS pg_wal FROM pg_ls_waldir();\nCREATE TABLE wal_filler AS SELECT g AS id, md5(g::text) AS pad FROM generate_series(1, 1000000) AS g;\nCHECKPOINT;\nSELECT slot_name, active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained FROM pg_replication_slots;\nSELECT count(*) AS files, pg_size_pretty(sum(size)) AS pg_wal FROM pg_ls_waldir();\n\nALTER SYSTEM SET synchronous_standby_names = 'standby1';\nSELECT pg_reload_conf();\n\\timing on\nSET statement_timeout = '5s';\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (3, 250, 'duplicate', now());\n-- hangs: Ctrl+C after about 20 seconds\nSELECT count(*) FROM refunds WHERE payment_id = 3 AND amount_minor = 250;\nBEGIN;\nSET LOCAL synchronous_commit = local;\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (3, 260, 'duplicate', now());\nCOMMIT;\n\n-- after: docker compose -f env/postgres-ha.yml start standby\nSELECT application_name, state, sync_state FROM pg_stat_replication;\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (3, 280, 'duplicate', now());\nALTER SYSTEM RESET synchronous_standby_names;\nSELECT pg_reload_conf();\nDROP TABLE wal_filler;\n"
+    },
+    "expect": "With the standby stopped, the slot is inactive and holds nothing yet; after a million rows and a checkpoint it holds 92 MB, and pg_wal has grown from 80 MB to 160 MB:\n\n```text\n slot_name | active | wal_status | retained\n-----------+--------+------------+----------\n standby1  | f      | reserved   | 0 bytes\n files | pg_wal\n-------+--------\n     6 | 80 MB\nSELECT 1000000\nCHECKPOINT\n standby1  | f      | reserved   | 92 MB\n    11 | 160 MB\n```\n\nThe synchronous INSERT waits, past the 5-second statement_timeout, until you cancel it; psql prints `Cancel request sent`, then:\n\n```text\nWARNING:  canceling wait for synchronous replication due to user request\nDETAIL:  The transaction has already committed locally, but might not have been replicated to the standby.\nINSERT 0 1\nTime: 28645.510 ms (00:28.646)\n count\n-------\n     1\n```\n\nThe refund committed: the count finds it. The `SET LOCAL synchronous_commit = local` transaction commits in 7.8 ms with the standby still down. Right after the standby starts it shows `catchup | potential` and the next commit waits for it to catch up (1.1 s in one run); a few seconds later it shows `streaming | sync`, and a commit takes about 6.8 ms. Your times differ; the waiting does not."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Write-ahead log settings (synchronous_commit)",
+     "url": "https://www.postgresql.org/docs/18/runtime-config-wal.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: Asynchronous commit",
+     "url": "https://www.postgresql.org/docs/18/wal-async-commit.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Reads on a standby, and the queries replay has to cancel",
+   "body": "A standby is not idle. With `hot_standby = on`, the default, it accepts read-only queries while it replays, so reports, exports and dashboard reads can run there and leave the primary to the writes. Anything that writes fails with `ERROR: cannot execute INSERT in a read-only transaction`. Every read sees the data as of the last replayed record, so lesson 3's anomalies all apply: a read just after a write on the primary can miss it. Lesson 3's fixes are PostgreSQL functions here: compare `pg_last_wal_replay_lsn()` with the LSN of the session's last commit, or commit with `remote_apply` so the standby has replayed it before COMMIT returns.\n\nReplay and reads collide. PostgreSQL keeps the old versions of updated and deleted rows while some transaction might still read them, and VACUUM on the primary removes them once no transaction on the primary needs them (the Transactions track's lesson on MVCC explains why the old versions exist). The primary knows nothing of the standby's queries, and a report on the standby that started at 10:00 may still need a version the primary removed at 10:05. When the standby reaches that cleanup record in the WAL, it has two choices: stop replaying until the report ends, or cancel the report. It waits up to `max_standby_streaming_delay`, 30 s by default and 5 s in this lesson's Compose file, then cancels:\n\n```text\nERROR:  canceling statement due to conflict with recovery\nDETAIL:  User query might have needed to see row versions that must be removed.\n```\n\nDDL conflicts the same way: `ALTER TABLE` or `DROP TABLE` on the primary takes an ACCESS EXCLUSIVE lock, and replaying it cancels standby queries on that table. `pg_stat_database_conflicts` on the standby counts each kind.\n\nEach fix moves the cost somewhere else. `hot_standby_feedback = on` makes the standby report its oldest snapshot to the primary, and VACUUM keeps those versions: no more cancels, but a 3-hour report now keeps 3 hours of dead rows in the primary's tables. A large `max_standby_streaming_delay` lets reports finish while the standby falls behind, so a failover first has to replay the backlog, and every `remote_apply` commit waits for it. For long analytics, use a standby of its own with a long delay, where lag hurts nobody, and keep the failover standby close to the primary.",
+   "try": {
+    "title": "A report on the standby loses to VACUUM on the primary",
+    "minutes": 4,
+    "steps": [
+     "Start the servers if they are not running (`docker compose -f env/postgres-ha.yml up -d --wait`, from the `labs` folder). Open psql on each in its own terminal: `docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course` and `docker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course`.",
+     "On the primary, give the report something to read: `INSERT INTO refunds (payment_id, amount_minor, reason, created_at) SELECT 2, 100, 'customer_request', now() FROM generate_series(1, 1000);`.",
+     "On the standby, start the report: a REPEATABLE READ transaction keeps one snapshot. While it sleeps, delete and vacuum on the primary. Predict when the standby's sleep ends."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql on the standby and on the primary",
+     "src": "-- standby\n\\timing on\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT count(*) FROM refunds;\nSELECT pg_sleep(15);\n-- primary, while the standby sleeps\nDELETE FROM refunds WHERE payment_id = 2;\nVACUUM refunds;\n-- standby, after the error\nSELECT count(*) FROM refunds;\nROLLBACK;\nSELECT datname, confl_snapshot, confl_lock FROM pg_stat_database_conflicts WHERE datname = 'course';\n"
+    },
+    "expect": "The count depends on what earlier Try-its inserted (1,013 rows here). The 15-second sleep ends early, about 5 seconds after the VACUUM:\n\n```text\nSELECT pg_sleep(15);\nERROR:  canceling statement due to conflict with recovery\nDETAIL:  User query might have needed to see row versions that must be removed.\nTime: 7045.483 ms (00:07.045)\nSELECT count(*) FROM refunds;\nERROR:  current transaction is aborted, commands ignored until end of transaction block\nROLLBACK\n datname | confl_snapshot | confl_lock\n---------+----------------+------------\n course  |              1 |          0\n```\n\nThe primary's VACUUM removed the deleted versions, the standby's snapshot still needed them, and after `max_standby_streaming_delay` (5 s here) replay won. The whole transaction is aborted, not only the statement, and the conflict is counted as a snapshot conflict."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Hot standby (query conflicts)",
+     "url": "https://www.postgresql.org/docs/18/hot-standby.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Failover: promote the standby, and keep the old primary out",
+   "body": "Lesson 1's failover has three steps: notice, choose, redirect. PostgreSQL does none of them. It replicates, and it does not decide when to fail over: nothing in it notices that the primary is gone. A person or a tool notices and runs `SELECT pg_promote()` on the standby (or `pg_ctl promote`). The standby replays the WAL it already has, ends recovery, starts a new **timeline** and accepts writes; in one run of the Try it, that took 214 ms. The timeline number is part of every WAL file name (`00000002...` after the first promotion), so WAL written after the split never mixes with the old primary's.\n\nWhat a promotion loses follows from the last section. With asynchronous replication it loses every commit the primary acknowledged and never sent. The Try it widens that gap on purpose by stopping the standby first, and refund 3333 is lost: its client saw `INSERT 0 1`, and the new primary has never heard of it.\n\nThen the old primary comes back: a host that rebooted, a network partition that healed. It still believes it is the primary, on timeline 1, and accepts writes. Two primaries are **split brain**, and the Try it shows how fast that corrupts meaning: both servers hand out refund id 40, one for 4444 and one for 5555. Nothing merges them later. So a failover needs fencing: before the standby takes over, make sure the old primary cannot accept writes, by stopping it, cutting it off the network or pulling it out of the load balancer. The PostgreSQL documentation calls it STONITH, shoot the other node in the head. To bring the old primary back as a standby, `pg_rewind` rewinds its data directory to the point where the timelines split, throwing away its unsent commits (it needs page checksums or `wal_log_hints`, and checksums are on by default since PostgreSQL 18); otherwise, rebuild it with `pg_basebackup`.\n\nClients have to find the new primary. pgJDBC takes several hosts and connects to whichever one accepts writes:\n\n```kotlin\nHikariConfig().apply {\n    jdbcUrl = \"jdbc:postgresql://db-a:5432,db-b:5432/payments?targetServerType=primary\"\n    connectionTimeout = 2_000      // during a failover, borrows fail fast and the caller retries\n}\n```\n\nDoing this by hand at 3 a.m. is slow and easy to get wrong, so most teams automate it with **Patroni**. A Patroni agent runs next to each PostgreSQL and keeps a leader key in a consensus store: etcd, Consul, ZooKeeper or Kubernetes. The key has a time to live, 30 seconds by default, and the primary's agent renews it every `loop_wait`, 10 seconds. If the primary dies, or loses touch with the store, the key expires and the standbys' agents race for it. The store agrees by majority (Raft, in etcd's case, which the Consistency and consensus track builds), so exactly one agent wins, and it promotes its PostgreSQL. A primary whose agent cannot renew the key is demoted to read-only: that is the fence. `maximum_lag_on_failover` keeps standbys that are too far behind out of the race (lesson 1's \"choose the most up-to-date follower\"), and `synchronous_mode` makes Patroni promote only a synchronous standby.\n\nManaged services, such as Amazon RDS and Aurora, Google Cloud SQL and Azure Database for PostgreSQL, run the standby, the failover, the fencing and the backups for you; you pick the options and pay for them. The client side stays yours: short connection timeouts, retries for the transactions a failover cuts off, and knowing whether your option is synchronous.",
+   "stepper": {
+    "title": "Streaming, a crash, a promotion, and what asynchronous replication lost",
+    "intro": "Click Next. The refunds and ids are the ones the Try it below produced.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"A primary streams WAL to a standby\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">timeline 1</text><text class=\"t-s t-a\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"170\" y=\"262\" text-anchor=\"middle\">commits, streams WAL</text><rect class=\"box\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">standby</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">replaying</text><text class=\"t-s t-a\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">read-only</text><path class=\"ln\" d=\"M300 64L170 98\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"320\" y1=\"160\" x2=\"377\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"349\" y=\"150\" text-anchor=\"middle\">WAL</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Refund 7 commits on the primary and reaches the standby in milliseconds.</text></svg>",
+      "say": "Both servers are up. The service writes to the primary; refund 7 (1111) commits there, and the walsender streams the WAL to the standby, which replays it a few milliseconds later. Replication is asynchronous, the default."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The standby is behind and the primary acknowledges a commit it alone has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">timeline 1</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-a\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 8: 3333</text><text class=\"t-s t-m\" x=\"170\" y=\"262\" text-anchor=\"middle\">told the client: INSERT 0 1</text><rect class=\"box-dim\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">standby</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">stopped (lag, cut off)</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">has WAL up to 0/5003FB0</text><path class=\"ln-a\" d=\"M300 64L170 98\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"320\" y1=\"160\" x2=\"377\" y2=\"160\"/><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Asynchronous: refund 8 is acknowledged though no standby has it.</text></svg>",
+      "say": "The standby falls behind: here it is stopped, in real life it is lagging or cut off for a moment. Refund 8 (3333) commits on the primary, and because nothing waits for a standby, the client hears `INSERT 0 1`."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The primary dies with a commit only on its own disk\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box-bad\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">killed</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-bad\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 8: 3333</text><text class=\"t-s t-bad\" x=\"170\" y=\"262\" text-anchor=\"middle\">refund 8 is only on this disk</text><rect class=\"box-dim\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">standby</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">stopped</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">has WAL up to 0/5003FB0</text><path class=\"ln-bad\" d=\"M300 64L170 98\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">The primary dies. Nothing in PostgreSQL notices or decides what to do.</text></svg>",
+      "say": "The primary dies (`docker compose kill`, like a power cut). Refund 8 exists only on its disk. PostgreSQL has no component that notices this or picks a successor: a person or a tool must."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The standby is promoted and the commit is lost\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box-dim\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">old primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">down</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 8: 3333</text><text class=\"t-s t-m\" x=\"170\" y=\"262\" text-anchor=\"middle\">not reachable</text><rect class=\"box-a\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">new primary</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">pg_promote(): timeline 2</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-bad\" x=\"404\" y=\"196\" text-anchor=\"start\">refund 8: lost</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">redo done at 0/5003FB0</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Promoted in 214 ms. Refund 8 never left the old disk: it is lost.</text></svg>",
+      "say": "Someone runs `SELECT pg_promote()` on the standby. It replays the WAL it has (`redo done at 0/5003FB0`), picks a new timeline (`selected new timeline ID: 2`) and accepts writes, 214 ms later. Refund 8 was acknowledged and is not here: that is what asynchronous replication can lose."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The service writes to the new primary\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box-dim\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">old primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">down</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-m\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 8: 3333</text><text class=\"t-s t-m\" x=\"170\" y=\"262\" text-anchor=\"middle\">not reachable</text><rect class=\"box-a\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">new primary</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">timeline 2</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-a\" x=\"404\" y=\"196\" text-anchor=\"start\">refund 40: 4444</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">accepts writes</text><path class=\"ln-a\" d=\"M400 64L530 98\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">The service moves to the new primary. The next refund gets id 40.</text></svg>",
+      "say": "The service reconnects to the new primary and keeps working. The next refund gets id 40: a sequence logs values ahead in the WAL, and the standby continued from the last value it had seen logged."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The old primary returns and two primaries accept writes\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box-bad\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">old primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">back, still timeline 1</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 8: 3333</text><text class=\"t-s t-bad\" x=\"44\" y=\"218\" text-anchor=\"start\">refund 40: 5555</text><text class=\"t-s t-bad\" x=\"170\" y=\"262\" text-anchor=\"middle\">accepts writes too</text><rect class=\"box\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">new primary</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">timeline 2</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-bad\" x=\"404\" y=\"196\" text-anchor=\"start\">refund 40: 4444</text><text class=\"t-s\" x=\"530\" y=\"262\" text-anchor=\"middle\">accepts writes</text><path class=\"ln-bad\" d=\"M300 64L170 98\" marker-end=\"url(#arr)\"/><path class=\"ln\" d=\"M400 64L530 98\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Split brain: two primaries, and refund 40 means two different refunds.</text></svg>",
+      "say": "The old primary's host comes back, and PostgreSQL starts as what it was: a primary on timeline 1, with refund 8. A pod that still has its address writes refund 5555, and it gets id 40 too. Two servers accept writes and disagree about what refund 40 is. That is **split brain**, and nothing merges it later."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"The old primary is fenced, rewound and made a standby\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"260\" y=\"16\" width=\"180\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"45.0\" text-anchor=\"middle\">payments service</text><rect class=\"box\" x=\"20\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"124\" text-anchor=\"middle\">old primary</text><text class=\"t-s t-m\" x=\"170\" y=\"144\" text-anchor=\"middle\">fenced, pg_rewind, standby</text><text class=\"t-s\" x=\"44\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s t-a\" x=\"44\" y=\"196\" text-anchor=\"start\">refund 40: 4444</text><text class=\"t-s t-m\" x=\"170\" y=\"262\" text-anchor=\"middle\">follows timeline 2</text><rect class=\"box-a\" x=\"380\" y=\"100\" width=\"300\" height=\"176\" rx=\"8\"/><text class=\"t\" x=\"530\" y=\"124\" text-anchor=\"middle\">new primary</text><text class=\"t-s t-m\" x=\"530\" y=\"144\" text-anchor=\"middle\">timeline 2</text><text class=\"t-s\" x=\"404\" y=\"174\" text-anchor=\"start\">refund 7: 1111</text><text class=\"t-s\" x=\"404\" y=\"196\" text-anchor=\"start\">refund 40: 4444</text><text class=\"t-s t-m\" x=\"530\" y=\"262\" text-anchor=\"middle\">the only one that writes</text><path class=\"ln-a\" d=\"M400 64L530 98\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"380\" y1=\"160\" x2=\"323\" y2=\"160\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"351\" y=\"150\" text-anchor=\"middle\">WAL</text><text class=\"t-s t-a\" x=\"20\" y=\"322\" text-anchor=\"start\">Fence first. Rewound, the old primary follows the new one; its refund 8 is gone.</text></svg>",
+      "say": "The fix is to fence before you promote: stop the old primary or cut it off, so it cannot take writes. To bring it back, `pg_rewind` rewinds its data directory to where the timelines split, which throws away refund 8, and it restarts as a standby of the new primary. Patroni does the fencing by demoting any primary that cannot renew its leader key."
+     }
+    ]
+   },
+   "try": {
+    "title": "Promote the standby, lose a refund, then meet two primaries",
+    "minutes": 6,
+    "steps": [
+     "Start from fresh servers: `docker compose -f env/postgres-ha.yml down -v`, then `docker compose -f env/postgres-ha.yml up -d --wait`, from the `labs` folder.",
+     "Run the commands below in order. Before the promotion, predict which refunds the new primary will have.",
+     "When you are done, `docker compose -f env/postgres-ha.yml down -v` deletes both servers."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the labs folder",
+     "src": "# 1. a refund that reaches the standby\ndocker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c \"INSERT INTO refunds\n  (payment_id, amount_minor, reason, created_at) VALUES (4, 1111, 'customer_request', now()) RETURNING refund_id\"\ndocker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course -c \"SELECT refund_id, amount_minor FROM refunds WHERE refund_id > 6\"\n\n# 2. the standby falls behind (stopped), a refund commits, the primary dies\ndocker compose -f env/postgres-ha.yml stop standby\ndocker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c \"INSERT INTO refunds\n  (payment_id, amount_minor, reason, created_at) VALUES (4, 3333, 'customer_request', now()) RETURNING refund_id\"\ndocker compose -f env/postgres-ha.yml kill primary\n\n# 3. start the standby alone and promote it\ndocker compose -f env/postgres-ha.yml up -d --wait --no-deps standby\ndocker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course -c \"SELECT pg_promote()\" \\\n  -c \"SELECT refund_id, amount_minor FROM refunds WHERE refund_id > 6\" -c \"INSERT INTO refunds\n  (payment_id, amount_minor, reason, created_at) VALUES (4, 4444, 'customer_request', now()) RETURNING refund_id\"\ndocker compose -f env/postgres-ha.yml logs standby | grep -E \"promote|redo done|timeline ID: 2\"\n\n# 4. the old primary comes back\ndocker compose -f env/postgres-ha.yml start primary\ndocker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c \"SELECT pg_is_in_recovery()\" -c \"INSERT INTO refunds\n  (payment_id, amount_minor, reason, created_at) VALUES (4, 5555, 'customer_request', now()) RETURNING refund_id\"\ndocker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c \"SELECT refund_id, amount_minor FROM refunds WHERE refund_id > 6\"\ndocker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course -c \"SELECT refund_id, amount_minor FROM refunds WHERE refund_id > 6\"\n"
+    },
+    "expect": "Refund 7 (1111) reaches the standby. Refund 8 (3333) is acknowledged by the primary with the standby stopped. After the kill and the promotion, the new primary has refund 7 only, and gives the next refund id 40:\n\n```text\n pg_promote\n------------\n t\n refund_id | amount_minor\n-----------+--------------\n         7 |         1111\n refund_id\n-----------\n        40\n-- the log, prefixes trimmed\nLOG:  received promote request\nLOG:  redo done at 0/5003FB0 system usage: CPU: user: 0.00 s, system: 0.00 s, elapsed: 3.03 s\nLOG:  selected new timeline ID: 2\n```\n\nThe old primary starts as a primary (`pg_is_in_recovery` is `f`) and also gives id 40 to the next refund. The two servers now disagree:\n\n```text\n-- old primary\n refund_id | amount_minor\n-----------+--------------\n         7 |         1111\n         8 |         3333\n        40 |         5555\n-- new primary\n refund_id | amount_minor\n-----------+--------------\n         7 |         1111\n        40 |         4444\n```\n\nRefund 8 is the commit asynchronous replication lost. Refund 40 is split brain: two primaries, one id, two different refunds. Ids jump from 8 to 40 because a sequence logs 32 values ahead in the WAL, and both servers continued from the same logged value."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Failover",
+     "url": "https://www.postgresql.org/docs/18/warm-standby-failover.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: pg_rewind",
+     "url": "https://www.postgresql.org/docs/18/app-pgrewind.html",
+     "kind": "docs"
+    },
+    {
+     "title": "Patroni: replication modes and failover",
+     "url": "https://patroni.readthedocs.io/en/latest/replication_modes.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Backups: a dump, or a base backup plus the WAL archive",
+   "body": "A standby is not a backup. Run `DELETE FROM merchant_fee_schedules` without its WHERE clause, and the standby deletes the same rows a few milliseconds later. A backup is a copy from the past, and there are two kinds.\n\nA **logical** backup is SQL. `pg_dump -Fc -d course -f course.dump` reads one database through one consistent snapshot, without blocking writers, and writes the definitions and rows of its tables: 33 KB in 0.2 s for the course database. `pg_restore` loads it into the same or a later major version, the whole database or one table, in parallel with `-j`. Roles belong to the cluster, so they need `pg_dumpall --globals-only` as well. A dump is only as fresh as its last run, and restoring it means inserting every row and rebuilding every index: fine for gigabytes, hours for terabytes.\n\nA **physical** backup is the data directory plus the WAL. `pg_basebackup` takes the base backup, exactly as it built the standby. **Continuous archiving** keeps the WAL: with `archive_mode = on`, the archiver process runs `archive_command` for each finished 16 MB segment, here `test ! -f /archive/%f && cp %p /archive/%f`, and the primary keeps a segment until the command returns 0. On a quiet server a segment can take hours to fill, so set `archive_timeout` to bound how old the archive gets.\n\nTo restore, copy the base backup into an empty data directory, set `restore_command` to fetch segments back from the archive, create `recovery.signal`, and start. The server replays the archived WAL like a standby that knows when to stop: with `recovery_target_time`, it stops before the first commit after that time, promotes itself onto a new timeline, and opens. That is **point-in-time recovery** (PITR): last night's base backup, plus the WAL up to the second before the bad DELETE. In the Try it the restored server logged `recovery stopping before commit of transaction 865` and had all 8 fee schedules back.\n\nTools do the bookkeeping `cp` does not. pgBackRest, Barman and WAL-G compress, encrypt and verify, keep a retention schedule, and restore in parallel, and PostgreSQL 17 added incremental base backups (`pg_basebackup --incremental`, then `pg_combinebackup`). A backup you have never restored is a hope: restore one on a schedule into a scratch server, run row counts and a few known queries, and time it. That time is how long you would be down; the age of the newest archived segment is how much you would lose.\n\n**Logical replication** is lesson 2's row log: `CREATE PUBLICATION pay FOR TABLE payments, refunds` on the source, `CREATE SUBSCRIPTION ... PUBLICATION pay` on the target. The target can run another major version, hold only some tables and take writes of its own. It needs `wal_level = logical` and a replica identity on every table, and it copies no schema changes and no sequence values (as of PostgreSQL 18). Use it to upgrade with minutes of downtime or to feed a reporting database, not as the copy you fail over to.\n\nWhat PostgreSQL 18 (September 2025) changed for replication and recovery:\n\n| Area | PostgreSQL 18 |\n|---|---|\n| Slots | `idle_replication_slot_timeout` invalidates slots idle for too long (the first section) |\n| pg_rewind | data checksums are on by default in `initdb`, which `pg_rewind` needs |\n| Monitoring | `pg_stat_io` counts WAL I/O, including the walreceiver's writes on a standby |\n| Logical replication | generated columns can be published (`publish_generated_columns`); `CREATE SUBSCRIPTION` streams large transactions in parallel by default; apply conflicts are logged and counted in `pg_stat_subscription_stats` |\n| Tools | `pg_createsubscriber --all` turns a physical standby into logical replicas of every database; `pg_upgrade --swap` and kept planner statistics shorten upgrades |\n\nPostgreSQL 19, at release candidate as this is written, adds logical replication of sequences and a `WAIT FOR LSN` command for lesson 3's read-your-writes wait.\n\nA checklist for the payments cluster:\n\n- at least one standby, with a slot, `max_slot_wal_keep_size` or `idle_replication_slot_timeout` set, and alerts on replay lag and on inactive slots;\n- `synchronous_standby_names = 'ANY 1 (s1, s2)'` over two standbys, or a written decision to accept what asynchronous replication can lose;\n- automatic failover with fencing (Patroni or a managed service), and a planned switchover rehearsed regularly;\n- clients with a multi-host URL or one stable endpoint, short timeouts, and retries made safe by idempotency keys;\n- base backups plus continuous WAL archiving to another site, `archive_timeout` set, failed archiving alerted;\n- a scheduled restore test, with its duration written down.",
+   "try": {
+    "title": "Undo an accidental DELETE with point-in-time recovery",
+    "minutes": 6,
+    "steps": [
+     "Start from fresh servers: `docker compose -f env/postgres-ha.yml down -v`, then `docker compose -f env/postgres-ha.yml up -d --wait`, from the `labs` folder. Take a base backup into the archive volume, next to the archived WAL: `docker compose -f env/postgres-ha.yml exec -u postgres primary pg_basebackup -U sfz -D /archive/base -c fast -P`.",
+     "Open psql on the primary (`docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course`) and run the session below. Copy the time `before_the_mistake` prints.",
+     "Recover to that time in a third server, `restore`: `TARGET_TIME='2026-11-08 02:30:12.69231+00' docker compose -f env/postgres-ha.yml --profile pitr up -d --wait restore`, with your time. Read its log: `docker compose -f env/postgres-ha.yml --profile pitr logs restore`.",
+     "Check the restored server, then copy the rows back to the primary: `docker compose -f env/postgres-ha.yml --profile pitr exec -T restore pg_dump -U sfz -d course --data-only -t merchant_fee_schedules | docker compose -f env/postgres-ha.yml exec -T primary psql -U sfz -d course`. Finish with `docker compose -f env/postgres-ha.yml --profile pitr down -v`."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql on the primary, then on the restored server",
+     "src": "-- primary: a refund after the base backup, then the mistake\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (7, 900, 'customer_request', now()) RETURNING refund_id;\nSELECT count(*) FROM merchant_fee_schedules;\nSELECT now() AS before_the_mistake;\nSELECT pg_sleep(1);\nDELETE FROM merchant_fee_schedules;          -- the cleanup script forgot its WHERE\nSELECT pg_switch_wal();                      -- close the segment so the archiver copies it now\n\n-- restore: docker compose -f env/postgres-ha.yml --profile pitr exec restore psql -U sfz -d course\nSELECT count(*) FROM merchant_fee_schedules;\nSELECT refund_id, amount_minor FROM refunds ORDER BY refund_id DESC LIMIT 2;\nSELECT pg_is_in_recovery();\n"
+    },
+    "expect": "On the primary: refund 7, 8 fee schedules, the time, `DELETE 8`, and the LSN where the segment closed (yours differ):\n\n```text\n refund_id\n-----------\n         7\n count\n-------\n     8\n      before_the_mistake\n------------------------------\n 2026-11-08 02:30:12.69231+00\nDELETE 8\n pg_switch_wal\n---------------\n 0/804E350\n```\n\nThe restore server's log, trimmed and without prefixes (the `cp: cannot stat` lines are restore_command being asked for files that do not exist, which is normal):\n\n```text\nrestore: copying the base backup, recovering to 2026-11-08 02:30:12.69231+00\nLOG:  restored log file \"000000010000000000000006\" from archive\nLOG:  starting point-in-time recovery to 2026-11-08 02:30:12.69231+00\nLOG:  restored log file \"000000010000000000000007\" from archive\nLOG:  restored log file \"000000010000000000000008\" from archive\nLOG:  consistent recovery state reached at 0/6000120\nLOG:  recovery stopping before commit of transaction 865, time 2026-11-08 02:30:13.697982+00\nLOG:  selected new timeline ID: 2\nLOG:  archive recovery complete\nLOG:  database system is ready to accept connections\n```\n\nTransaction 865 is the DELETE, committed one second after the target. On the restored server the count is `8`, refund 7 is there (it came from the WAL, not the backup, which is older), and `pg_is_in_recovery` is `f`: it promoted itself. The copy back prints `COPY 8`, and the primary has its fee schedules again. The base backup took a few seconds; a `pg_dump -Fc` of the same database is 33 KB and takes 0.2 s, but could only have brought back last night."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Continuous archiving and point-in-time recovery",
+     "url": "https://www.postgresql.org/docs/18/continuous-archiving.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: SQL dump",
+     "url": "https://www.postgresql.org/docs/18/backup-dump.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: Logical replication restrictions",
+     "url": "https://www.postgresql.org/docs/18/logical-replication-restrictions.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: Release notes",
+     "url": "https://www.postgresql.org/docs/18/release-18.html",
+     "kind": "docs"
+    }
+   ]
+  }
+ ],
+ "analogy": "Think of the primary as the head clerk who writes every payment into the ledger, and the standby as a second clerk in another building who copies each line as the head clerk reads it to him over the phone. Asynchronous: the head clerk tells the customer \"done\" as soon as the line is in his own book. Synchronous: he waits until the second clerk says \"written\". If the head office burns, the second clerk's book becomes the ledger, minus whatever was said into the phone after the line went dead. If the head clerk turns up next day and keeps writing in his old book, there are two ledgers. And a backup is last night's photocopy of the book plus a recording of every phone call, which you can play back up to the minute before someone crossed out a page. The analogy breaks at what is copied: the clerk copies meaning, while a standby copies bytes of pages, so it can never skip one bad entry, and two books that drifted apart can never be merged.",
+ "in_your_world": "At work, Oracle Data Guard plays the standby's part, and the compare below maps its protection modes to synchronous_commit. For a payments service on PostgreSQL, decide per kind of write: an authorization the card network approved should not live on one disk, so give the cluster two standbys and `ANY 1 (s1, s2)`, while a page-view log can use `SET LOCAL synchronous_commit = local`. Point Quarkus or Hikari at a multi-host URL with `targetServerType=primary`, keep `connectionTimeout` short, and make every write retryable: after a failover a client may not know whether its COMMIT landed, which is what the idempotency key and `ON CONFLICT (payment_uid) DO NOTHING` from the SQL track's lesson on upserts are for. Temporal retries activities on its own, so the activity that writes the payment must be idempotent for the same reason. A Kafka consumer that commits offsets after the database write may see the same message again after a failover and must not apply it twice. Reports and exports belong on a standby of their own, not on the one you fail over to, and any read that follows a write needs lesson 3's LSN check.",
+ "mistake": "Forgetting a replication slot. A team retires a reporting standby by shutting its VM down and nothing else. Its slot stays on the primary, inactive, with a restart_lsn that never moves again, so no checkpoint may remove WAL after it. pg_wal grows by the day's WAL every day, 50 GB in a busy week, and one night the disk is full, the primary cannot write WAL, and it stops. It happens because the slot lives on the primary and the standby's owners never look there. Drop the slot when you retire the standby (`SELECT pg_drop_replication_slot('reports1')`), alert when `pg_replication_slots.active` is false for more than a few minutes, and set `max_slot_wal_keep_size`, or on PostgreSQL 18 `idle_replication_slot_timeout`, so that a forgotten slot is invalidated (wal_status `lost`) before the disk fills.",
+ "compare": {
+  "title": "Shipping the log to a standby: Oracle Data Guard and PostgreSQL",
+  "a": {
+   "label": "Oracle Data Guard",
+   "lang": "text",
+   "title": "Oracle AI Database 26ai",
+   "src": "transport: redo shipped to the standby\n  LOG_ARCHIVE_DEST_2='SERVICE=stby SYNC AFFIRM'\nstandby: managed recovery applies the redo\n  open read-only while applying: Active Data\n  Guard, a separately licensed option\n\nprotection modes\n  MAXIMUM PERFORMANCE   async (the default)\n  MAXIMUM AVAILABILITY  sync, but carries on as\n                        async if no standby answers\n  MAXIMUM PROTECTION    sync; the primary shuts down\n                        rather than commit unprotected\n\nfailover: the Data Guard broker; Fast-Start\n  Failover, where an observer process decides\nbackups: RMAN, with block-level incrementals"
+  },
+  "b": {
+   "label": "PostgreSQL 18",
+   "lang": "text",
+   "title": "PostgreSQL 18",
+   "src": "transport: WAL streamed by a walsender to the\n  standby's walreceiver (primary_conninfo, a slot)\nstandby: the startup process replays the WAL\n  open read-only while replaying: hot_standby,\n  on by default\n\nsynchronous_standby_names and synchronous_commit\n  empty                 async (the default)\n  'ANY 1 (s1, s2)', on  sync; commits wait while no\n                        listed standby answers, with\n                        no automatic fallback\n  (Patroni can fall back to async; with\n   synchronous_mode_strict it never does)\n\nfailover: none built in; pg_promote(), or Patroni\n  with etcd, Consul or ZooKeeper as the referee\nbackups: pg_basebackup and archive_command,\n  pgBackRest or Barman; incrementals since 17"
+  },
+  "note": "The mechanism is the same: ship the redo log and replay it on a copy. Three things differ in practice. Oracle's maximum availability mode drops to asynchronous by itself when no standby answers; PostgreSQL's synchronous replication keeps every commit waiting until someone changes synchronous_standby_names, which is safer for data and worse for uptime unless you run two standbys or let Patroni decide. Reading from the standby is built into PostgreSQL; Oracle sells it as Active Data Guard. And Oracle ships its own failover referee (the Fast-Start Failover observer), while PostgreSQL leaves that to an outside tool and a consensus store."
+ },
+ "worked": {
+  "title": "A manual failover runbook for the payments cluster",
+  "steps": [
+   {
+    "say": "Before anything else, make sure the old primary cannot take writes, even if it is only unreachable from where you stand. Check from two places, then fence it: stop it if you can reach the host, or take it out of the load balancer and block its port.",
+    "lang": "bash",
+    "code": "# 1. is it really gone? ask from two networks\npg_isready -h db-a -p 5432        # from the app subnet\npg_isready -h db-a -p 5432        # from the admin host\n# fence: stop it, or cut it off\nssh db-a 'sudo systemctl stop postgresql' || ssh lb 'disable-backend db-a'"
+   },
+   {
+    "say": "Pick the standby with the most WAL on its disk. Compare the receive positions, not the replay positions: promotion replays everything received first.",
+    "lang": "sql",
+    "code": "-- 2. on each standby\nSELECT pg_last_wal_receive_lsn() AS received,\n       pg_last_wal_replay_lsn()  AS replayed,\n       pg_last_xact_replay_timestamp() AS last_commit_replayed;\n-- db-b: 2/1A0031C8   db-c: 2/19FF2000   -> promote db-b"
+   },
+   {
+    "say": "Promote it and check that it now writes. `pg_promote` waits up to 60 seconds by default and returns false if promotion did not finish.",
+    "lang": "sql",
+    "code": "-- 3. on db-b\nSELECT pg_promote(wait => true, wait_seconds => 60);   -- t\nSELECT pg_is_in_recovery();                              -- f: it is a primary\nSELECT pg_create_physical_replication_slot('db_c', true);\nSELECT pg_create_physical_replication_slot('db_a', true);"
+   },
+   {
+    "say": "Point the other standby at the new primary. `primary_conninfo` takes effect on reload (context sighup), and with `recovery_target_timeline = 'latest'`, the default, the standby follows timeline 2.",
+    "lang": "sql",
+    "code": "-- 4. on db-c\nALTER SYSTEM SET primary_conninfo = 'host=db-b port=5432 user=replicator application_name=db_c';\nALTER SYSTEM SET primary_slot_name = 'db_c';\nSELECT pg_reload_conf();"
+   },
+   {
+    "say": "Bring the old primary back as a standby, never as a primary. pg_rewind rewinds it to where the timelines split; whatever it committed after that is discarded, so look at it first if you need to know what was lost (the deeper section shows how).",
+    "lang": "bash",
+    "code": "# 5. on db-a, PostgreSQL stopped\npg_rewind --target-pgdata=/var/lib/postgresql/18/main \\\n  --source-server='host=db-b port=5432 user=postgres dbname=postgres' --progress\ntouch /var/lib/postgresql/18/main/standby.signal\n# primary_conninfo = 'host=db-b ...' and primary_slot_name = 'db_a' in postgresql.auto.conf, then start it"
+   }
+  ]
+ },
+ "lab": {
+  "title": "A model of streaming replication: replay, commit waits, slots, failover and PITR",
+  "minutes": 15,
+  "needs": [],
+  "files": [
+   "labs/sql/src/main/kotlin/sfz/repl/l04/Streaming.kt",
+   "labs/sql/src/main/kotlin/sfz/repl/l04/Failover.kt"
+  ],
+  "run": "./gradlew :sql:test --tests 'sfz.repl.l04.*'",
+  "steps": [
+   "Run the tests from the `labs` folder; they need no Docker. All 27 fail. `Streaming.kt` gives you a `Primary` that commits WAL records with LSNs, `Standby`s cloned from a base backup, and a `Cluster` whose `stream` ships records the way a walsender does. Read it first.",
+   "Exercise 1, `Standby.replay`: apply each whole record after `replayLsn`, up to `upTo` and never past `flushLsn`. `stream` calls it, so most other tests need it.",
+   "Exercise 2, `Cluster.isAcknowledged`: when has the primary answered a COMMIT? Off, local or no synchronous standby: at once. Otherwise compare the named standbys' write, flush or replay position with the record's end.",
+   "Exercise 3, `Primary.checkpoint`: mark slots that fell more than `maxSlotWalKeepSize` behind as lost, then remove the WAL every remaining slot already has. The tests stop a standby, write 500 commits, and check what the checkpoint keeps.",
+   "In `Failover.kt`, exercise 4 promotes the right standby and lists the acknowledged commits it never had, and exercise 5 replays a base backup and an archive up to a target time. Run the tests until all 27 pass."
+  ],
+  "hints": [
+   "`replay`: `val limit = minOf(upTo, flushLsn)`, then loop over `wal`: `continue` while `record.end <= replayLsn`, `break` at the first `record.end > limit`, otherwise `applyRecord(record, data)` and `replayLsn = record.end`.",
+   "`checkpoint`: the oldest restartLsn among slots that are not lost (or `currentLsn` if there are none) is where the WAL must start; every record with `end <=` that position can go. Mark lost slots first, so they don't hold anything.",
+   "`failover`: filter to running standbys within the lag limit, take `maxByOrNull { it.flushLsn }` (it keeps the first of equals), call its `replay()`, and the lost commits are `acknowledged.filter { it.end > chosen.flushLsn }`.",
+   "`recover`: track `position`, starting at the backup's LSN. Skip records that end at or before it; a record whose `start != position` is a hole. Stop at the first record past the target (with inclusive, `committedAt > targetTime`) and return; running out of records is an error too."
+  ],
+  "done_when": "All 27 tests in `StreamingTest` and `FailoverTest` pass."
+ },
+ "drill": {
+  "title": "A standby from nothing, from memory",
+  "minutes": 5,
+  "prompt": "Without looking, write what the primary needs for a new standby `standby2` on 10.20.1.7 (the role, the slot, the pg_hba.conf line), the one command on the standby's host that clones the primary and makes it a standby, and the query on the primary that shows how many bytes the standby's replay is behind.",
+  "answer": {
+   "lang": "sql",
+   "src": "-- on the primary\nCREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'long-random-secret';\nSELECT pg_create_physical_replication_slot('standby2', true);   -- keeps WAL from now on\n-- pg_hba.conf, then SELECT pg_reload_conf();\n--   hostssl  replication  replicator  10.20.1.7/32  scram-sha-256\n\n-- on the standby's host, with an empty data directory:\n--   pg_basebackup -h primary -U replicator -D \"$PGDATA\" -X stream -S standby2 -R -c fast\n--   (-R writes standby.signal and primary_conninfo), then start PostgreSQL\n\n-- lag, on the primary\nSELECT application_name, state, sync_state,\n       pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn) AS replay_behind_bytes,\n       replay_lag\nFROM pg_stat_replication;"
+  }
+ },
+ "recap": [
+  "A standby is a copy of the data directory that never finishes crash recovery: it streams the primary's WAL and replays it onto the same pages. pg_basebackup -R -S builds one: the copy, standby.signal, primary_conninfo, and a slot.",
+  "A replication slot makes the primary keep WAL until its standby has it. A slot whose standby is gone keeps WAL until the disk fills; drop it, alert on inactive slots, and set max_slot_wal_keep_size or PostgreSQL 18's idle_replication_slot_timeout.",
+  "pg_stat_replication shows each standby's write, flush and replay positions and lags. Asynchronous replication, the default, acknowledges a commit before any standby has it, so a failover can lose it.",
+  "With synchronous_standby_names set, synchronous_commit chooses what COMMIT waits for: remote_write, on (flushed) or remote_apply (visible on the standby). A synchronous standby that is down makes commits wait; use two standbys with ANY 1.",
+  "Standby queries conflict with replay; after max_standby_streaming_delay they are cancelled. hot_standby_feedback trades the cancels for bloat on the primary.",
+  "Failover is pg_promote() plus fencing the old primary, or Patroni with a leader key in etcd. Backups are pg_dump, or a base backup plus archived WAL, which allows point-in-time recovery to just before a mistake. Test the restore."
+ ],
+ "quiz": [
+  {
+   "q": "With `synchronous_standby_names = 'standby1'` and `synchronous_commit = on`, standby1's host loses power. What happens to the payments service's writes, compared with lesson 1's MySQL semi-sync?",
+   "options": [
+    "The primary notices and switches to asynchronous replication by itself",
+    "Every COMMIT waits until standby1 is back or synchronous_standby_names changes; a cancelled wait leaves the transaction committed on the primary",
+    "Every COMMIT fails with an error, so the service can retry elsewhere",
+    "Writes continue, and the primary resends them to standby1 when it returns, so nothing changes"
+   ],
+   "answer": 1,
+   "why": "PostgreSQL has no automatic fallback: with no listed standby connected, commits wait. statement_timeout doesn't end the wait, and a cancel prints that the transaction has already committed locally. That is why you run two standbys with ANY 1 (s1, s2), or let an HA tool such as Patroni drop to asynchronous on purpose. MySQL's semi-sync (lesson 1) and Oracle's maximum availability mode fall back by themselves; PostgreSQL does not.",
+   "from": "repl-01"
+  },
+  {
+   "q": "pg_wal on the primary has grown by 50 GB in a week, and checkpoints remove nothing. pg_replication_slots shows `reports1` with `active = f`, from a reporting standby that was shut down last month. What is going on?",
+   "options": [
+    "max_wal_size is too small, so checkpoints cannot keep up",
+    "The archive_command is failing, so the WAL cannot be recycled",
+    "The slot still says its standby needs WAL from its restart_lsn, so the primary keeps everything since; drop the slot and set max_slot_wal_keep_size",
+    "Hot standby feedback from the old standby blocks VACUUM"
+   ],
+   "answer": 2,
+   "why": "A physical slot pins WAL from its restart_lsn whether its standby is connected or not, and an inactive slot's restart_lsn never moves, so pg_wal grows until the disk fills and the primary stops. A failing archive_command also keeps WAL, and is worth checking, but the inactive slot is the cause shown here. max_wal_size only spaces checkpoints, and feedback affects dead rows, not WAL files."
+  },
+  {
+   "q": "After an automatic failover, the old primary's VM reboots, PostgreSQL starts, and some pods still have its address in their configuration. What is the danger, and what prevents it?",
+   "options": [
+    "None: the old primary sees the new timeline and turns itself into a standby",
+    "The pods get read-only errors until someone reconfigures them",
+    "Its WAL conflicts with the new primary's, so it refuses to start",
+    "Two primaries accept writes and diverge (split brain); fence the old one so it cannot accept writes, and point clients at whichever server is primary"
+   ],
+   "answer": 3,
+   "why": "A PostgreSQL that was a primary starts as a primary: it does not know about timeline 2 unless someone tells it, so pods writing to it create a second history, and the Try it showed one refund id meaning two refunds. Fencing (Patroni demotes a primary that cannot renew its leader key; STONITH in general) stops it, and multi-host URLs with targetServerType=primary or one managed endpoint keep clients on the right server. Afterwards pg_rewind turns it into a standby."
+  },
+  {
+   "q": "At 14:32 someone ran `DELETE FROM merchant_fee_schedules` with no WHERE on a 1 TB payments database. You have a pg_dump from 02:00, a weekly base backup, and continuous WAL archiving. What is the best way back?",
+   "options": [
+    "Restore the 02:00 dump into the production database",
+    "Promote the standby, which still has the rows",
+    "Restore the base backup into a scratch server with recovery_target_time just before 14:32, replay the archived WAL to there, and copy the table's rows back to production",
+    "Run VACUUM FULL to recover the deleted row versions"
+   ],
+   "answer": 2,
+   "why": "Point-in-time recovery replays the archived WAL from the base backup to just before the DELETE, on a separate server, so production keeps running and every other change since 02:00 survives; then only the one table's rows are copied back, as the Try it did with pg_dump. Restoring the dump would lose twelve hours of payments and take hours for 1 TB, the standby replayed the DELETE within milliseconds, and VACUUM removes dead versions rather than bringing them back."
+  },
+  {
+   "q": "During a failover, the payments service's INSERT fails with a connection error right after it sent the COMMIT. It has no answer. The SQL track's lesson on upserts stored each payment with a `payment_uid`. What should the service do?",
+   "options": [
+    "Assume it did not commit and retry the same INSERT as it is",
+    "Retry with `INSERT ... ON CONFLICT (payment_uid) DO NOTHING`, so a payment that did commit is not stored twice",
+    "Wrap the retry in SERIALIZABLE, which detects the duplicate",
+    "Query pg_stat_replication on the new primary to see whether the commit replicated"
+   ],
+   "answer": 1,
+   "why": "The outcome is unknown: the commit may have landed on the old primary and been replicated, landed and been lost, or never happened. A retry that is safe either way needs a unique key the client chose, which the payment_uid is, and ON CONFLICT DO NOTHING turns the second copy into a no-op (the SQL track's lesson on JSONB, upserts and MERGE). A blind retry can double-charge, SERIALIZABLE does not stop two separate transactions from inserting the same payment, and pg_stat_replication describes standbys, not individual transactions.",
+   "from": "sql-09"
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "What does PostgreSQL 18's idle_replication_slot_timeout do?",
+   "back": "At a checkpoint, it invalidates replication slots that have been inactive longer than the timeout (invalidation_reason idle_timeout), so a dead standby can't keep WAL forever. That standby must then be rebuilt. Default 0: off."
+  },
+  {
+   "front": "What is a replication slot, and what is its danger?",
+   "back": "A record on the primary of the oldest WAL its standby still needs; the primary keeps WAL from there. If the standby is gone for good, the WAL piles up until the disk fills."
+  },
+  {
+   "front": "write_lsn, flush_lsn, replay_lsn in pg_stat_replication?",
+   "back": "WAL the standby has handed to its OS, WAL on its disk, and WAL replayed so that queries on it can see it."
+  },
+  {
+   "front": "synchronous_commit = on versus remote_apply?",
+   "back": "on waits until a synchronous standby has flushed the commit's WAL to disk; remote_apply also waits until it has replayed it, so a read there sees the row."
+  },
+  {
+   "front": "What happens to commits when the only synchronous standby is down?",
+   "back": "They wait, with no automatic fallback. Cancelling the wait leaves the transaction committed on the primary."
+  },
+  {
+   "front": "What does `pg_promote()` do?",
+   "back": "Ends recovery on a standby: it replays the WAL it has, picks a new timeline and starts accepting writes."
+  },
+  {
+   "front": "What does point-in-time recovery need?",
+   "back": "A base backup taken before the target time and every archived WAL segment from that backup to the target, plus restore_command, recovery_target_time and recovery.signal."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Standby",
+   "plain": "A copy of the primary's data directory that keeps replaying the primary's WAL; with hot standby it answers read-only queries."
+  },
+  {
+   "term": "Streaming replication",
+   "plain": "The primary's walsender sending WAL to a standby's walreceiver over a connection, as it is written."
+  },
+  {
+   "term": "LSN",
+   "plain": "Log sequence number: a byte position in the WAL, printed like 0/508F830."
+  },
+  {
+   "term": "Replication slot",
+   "plain": "A primary-side record of the oldest WAL a standby still needs, so the primary keeps it."
+  },
+  {
+   "term": "Synchronous replication",
+   "plain": "COMMIT waits until a named standby confirms the commit's WAL, so a failover cannot lose it."
+  },
+  {
+   "term": "Promotion",
+   "plain": "Turning a standby into a primary (pg_promote): recovery ends and a new timeline starts."
+  },
+  {
+   "term": "Split brain",
+   "plain": "Two servers that both accept writes as primary, so their data diverges."
+  },
+  {
+   "term": "Point-in-time recovery",
+   "plain": "Restoring a base backup and replaying archived WAL up to a chosen moment."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A product manager hears \"we have a replica\" and concludes the payments database can't lose a payment or go down for long. Explain what the replica does and doesn't protect against, and what it would take to get closer to that promise.",
+  "answer": "The replica is a second server that copies every change the primary makes, by streaming its write-ahead log and replaying it. If the primary's machine dies, we can promote the replica and be writing again in seconds to a minute, which protects against downtime. It doesn't promise no loss: by default the primary tells a client its payment committed before the replica has it, so the last fraction of a second of payments can be lost in a failover. Making the replica synchronous closes that gap, at a few milliseconds per commit, and then a dead replica would stop all writes, so we'd need two replicas and commit when either confirms. Someone or something also has to decide to fail over and make sure the old primary never comes back as a second primary; that's what Patroni or a managed service does. And the replica copies mistakes instantly: a bad DELETE is gone on both in milliseconds. For that we need backups, a base backup plus the archived WAL, so we can rebuild the database as it was a second before the mistake, and we need to test that restore regularly and know how long it takes."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "A delayed standby guards against mistakes. With `recovery_min_apply_delay = '1h'`, a standby receives WAL at once but replays each commit only an hour after it happened. When someone runs a bad DELETE, you have an hour to pause its replay (`pg_wal_replay_pause()`) and copy the rows out, which is much faster than a point-in-time restore of a large database. It is never the standby you fail over to.\n\nWhat did an asynchronous failover lose? The old primary's WAL after the point where the timelines split is still on its disk until you rewind it. Find the split point in the new primary's timeline history file (`00000002.history` in pg_wal), then run `pg_waldump` over the old primary's WAL from there: it prints each record, with the transaction ids and the relations they touched, so you can see which commits never reached the standby and replay them by hand if they matter.\n\nCascading replication lets a standby feed other standbys, so a remote data center can have three standbys and one cross-region stream. Cascaded standbys are always asynchronous.\n\nQuorum commit generalizes `ANY 1`: `synchronous_standby_names = 'ANY 2 (s1, s2, s3)'` waits for any two of three standbys, and survives losing one without stopping commits. It looks like Raft's majority rule (the Consistency and consensus track), with one difference: PostgreSQL itself does not elect a new primary from that majority, so the guarantee holds only if the failover tool promotes one of the standbys that confirmed.\n\nLogical replication slots used to stay behind on the old primary at a failover, so subscribers broke. PostgreSQL 17 can synchronize them to a physical standby (`sync_replication_slots = on` on the standby, `synchronized_standby_slots` on the primary), so a subscription carries on from the new primary.\n\n`archive_command` runs a shell command per segment. Since PostgreSQL 15, `archive_library` loads a module instead, which tools such as pgBackRest use for speed. Whichever you use, a failing archive keeps WAL on the primary just as a forgotten slot does: alert on `pg_stat_archiver.failed_count`."
+ },
+ "sources": [
+  {
+   "title": "PostgreSQL 18 documentation: High availability, load balancing and replication",
+   "url": "https://www.postgresql.org/docs/18/high-availability.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: Continuous archiving and point-in-time recovery",
+   "url": "https://www.postgresql.org/docs/18/continuous-archiving.html"
+  },
+  {
+   "title": "PostgreSQL 18 release notes",
+   "url": "https://www.postgresql.org/docs/18/release-18.html"
+  },
+  {
+   "title": "Patroni documentation: Replication modes",
+   "url": "https://patroni.readthedocs.io/en/latest/replication_modes.html"
+  },
+  {
+   "title": "Oracle Data Guard: Protection modes (26ai)",
+   "url": "https://docs.oracle.com/en/database/oracle/oracle-database/26/sbydb/oracle-data-guard-protection-modes.html"
+  }
+ ]
+}

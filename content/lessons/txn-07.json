@@ -1,0 +1,429 @@
+{
+  "id": "txn-07",
+  "title": "Atomic commit across machines: two-phase commit and XA",
+  "minutes": 40,
+  "goal": "By the end you can explain why one machine's commit doesn't extend to two, run two-phase commit by hand with PREPARE TRANSACTION, say what an in-doubt participant must do when its coordinator dies and what that costs, judge when XA, a Percolator-style commit or a saga fits, and build a coordinator that recovers from its own log.",
+  "warmup": {
+    "q": "A coordinator has prepared a transfer on two PostgreSQL servers, and both voted yes. It wrote COMMIT to its log, sent COMMIT PREPARED to the first server, and crashed before reaching the second. What does the second server do with the transfer and its row lock?",
+    "options": [
+      "Rolls it back after a timeout, so its row lock is released",
+      "Commits it on its own after a timeout, since it voted yes",
+      "Keeps it prepared and keeps the row lock until someone tells it the outcome, even across a restart",
+      "Asks the first server for the outcome and commits, because PostgreSQL servers coordinate this themselves"
+    ],
+    "answer": 2,
+    "why": "A participant that voted yes has promised to commit if told to, so it can't roll back on its own, and it can't commit on its own because it doesn't know the decision: maybe the coordinator decided abort. It waits, holding its locks, and a prepared transaction survives a restart. Rolling back after a timeout is the tempting answer, and here it would leave the first server's debit committed with no credit. PostgreSQL servers don't talk to each other about prepared transactions; only the coordinator, or a person, finishes them."
+  },
+  "sections": [
+    {
+      "h": "One machine commits with one write; two machines have no such write",
+      "body": "Lesson 1 put the commit at one moment: the commit record reaching the write-ahead log on disk. A crash before that moment undoes everything; a crash after it undoes nothing. One disk, one record, one moment. Every lesson since has been about what concurrent transactions see around that moment. This lesson asks a different question: what if the transaction's rows live on two machines?\n\nHere is the case. A wallet service keeps customer wallets in its own PostgreSQL server, `wallets`. A settlement service keeps what the platform owes each merchant in another server, `payouts`. A coffee purchase moves 30.00 from wallet w-17 to the merchant m-cafe: a debit on `wallets`, a credit on `payouts`. Both must happen, or neither. No single disk holds both rows, so no single commit record can cover both.\n\nVersion 1 commits one, then the other: debit w-17 and COMMIT, then credit m-cafe and COMMIT. Now list what can happen between the two commits. The credit can break a constraint on `payouts`. The network to `payouts` can drop. `payouts` can crash before its commit record reaches disk. The service running the transfer can be killed during a deploy. Each time, the customer has paid 30.00 and the merchant got nothing. The Try it does exactly this.\n\nCan you undo the debit? Not safely. Once `wallets` has committed, other transactions have seen the new balance and acted on it: a fraud check approved the next purchase against 70.00. A credit that puts the money back is a new transaction, not an undo, and it can fail too.\n\nVersion 2 sends both commits at the same moment. That shrinks the window but doesn't close it: one server can still say no, or die, while the other says yes.\n\nThe fix needs two ideas. First, nobody commits until everybody has promised that they can: each server does all its work, checks every constraint, makes its changes durable, and only then gives up its right to say no. Second, one place records the decision durably before anyone is told. **Every participant promises, one durable record decides, then everyone commits.** That is the picture for this lesson, and it has a name: two-phase commit.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A coordinator at the top with its decision log below it. Two participant servers, wallets and payouts, at the bottom left and right. Step 1: the coordinator asks each to prepare and each votes yes, keeping its row lock. Step 2: the coordinator writes txf-1 COMMIT to its log. Step 3: it tells each participant to commit.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"250\" y=\"16\" width=\"180\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"42\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s t-m\" x=\"340\" y=\"62\" text-anchor=\"middle\">the service, or a TM</text><rect class=\"box-b\" x=\"250\" y=\"120\" width=\"180\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"146\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-code t-b\" x=\"340\" y=\"166\" text-anchor=\"middle\">txf-1 COMMIT</text><line class=\"ln-a\" x1=\"340\" y1=\"76\" x2=\"340\" y2=\"116\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"350\" y=\"102\" text-anchor=\"start\">2. decide</text><rect class=\"box\" x=\"16\" y=\"200\" width=\"220\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"126\" y=\"226\" text-anchor=\"middle\">wallets server</text><text class=\"t-s\" x=\"126\" y=\"248\" text-anchor=\"middle\">debit w-17 by 30.00</text><text class=\"t-s t-m\" x=\"126\" y=\"268\" text-anchor=\"middle\">prepared: keeps its lock</text><rect class=\"box\" x=\"444\" y=\"200\" width=\"220\" height=\"84\" rx=\"8\"/><text class=\"t\" x=\"554\" y=\"226\" text-anchor=\"middle\">payouts server</text><text class=\"t-s\" x=\"554\" y=\"248\" text-anchor=\"middle\">credit m-cafe by 30.00</text><text class=\"t-s t-m\" x=\"554\" y=\"268\" text-anchor=\"middle\">prepared: keeps its lock</text><path class=\"ln\" d=\"M250 46 H126 V196\" marker-end=\"url(#arr)\"/><path class=\"ln\" d=\"M430 46 H554 V196\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"136\" y=\"124\" text-anchor=\"start\">1. prepare: yes</text><text class=\"t-s\" x=\"136\" y=\"144\" text-anchor=\"start\">3. commit</text><text class=\"t-s\" x=\"544\" y=\"124\" text-anchor=\"end\">1. prepare: yes</text><text class=\"t-s\" x=\"544\" y=\"144\" text-anchor=\"end\">3. commit</text></svg>",
+        "caption": "The picture for this lesson: every participant first promises it can commit and keeps its locks, one line in the coordinator's log is the decision, and only then does anyone commit."
+      },
+      "try": {
+        "title": "Lose 30.00 between two commits",
+        "minutes": 3,
+        "steps": [
+          "From the `labs` folder, start PostgreSQL with `docker compose -f env/postgres.yml up -d --wait` and open a prompt: `docker compose -f env/postgres.yml exec db psql -U sfz`. One server stands in for two machines: PostgreSQL can't run one transaction across two databases, so `wallets` and `payouts` are as separate as two servers.",
+          "Run the setup, then the transfer. `\\c` closes the current connection and opens a new one. When it closes `payouts` before the COMMIT, that is the settlement service dying mid-transfer.",
+          "Predict both balances before you read them."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "one psql session",
+          "src": "-- setup: two databases standing in for two servers\nCREATE DATABASE wallets;\nCREATE DATABASE payouts;\n\\c wallets\nCREATE TABLE wallets (id text PRIMARY KEY, balance_minor bigint NOT NULL CHECK (balance_minor >= 0));\nINSERT INTO wallets VALUES ('w-17', 10000), ('w-18', 5000);\n\\c payouts\nCREATE TABLE merchant_balances (id text PRIMARY KEY, balance_minor bigint NOT NULL);\nCREATE TABLE payout_entries (transfer_id text PRIMARY KEY, merchant_id text NOT NULL, amount_minor bigint NOT NULL);\nINSERT INTO merchant_balances VALUES ('m-cafe', 0);\n\n-- the transfer, version 1: commit one side, then the other\n\\c wallets\nBEGIN;\nUPDATE wallets SET balance_minor = balance_minor - 3000 WHERE id = 'w-17';\nCOMMIT;\n\\c payouts\nBEGIN;\nUPDATE merchant_balances SET balance_minor = balance_minor + 3000 WHERE id = 'm-cafe';\n\\c wallets\nSELECT balance_minor FROM wallets WHERE id = 'w-17';\n\\c payouts\nSELECT balance_minor FROM merchant_balances WHERE id = 'm-cafe';\n\n-- put the money back for the next Try it\n\\c wallets\nUPDATE wallets SET balance_minor = 10000 WHERE id = 'w-17';"
+        },
+        "expect": "```text\n balance_minor\n---------------\n          7000\n(1 row)\n\nYou are now connected to database \"payouts\" as user \"sfz\".\n balance_minor\n---------------\n             0\n(1 row)\n```\n\n(Setup output trimmed.) The debit committed on `wallets`. The credit was still in an open transaction when its connection closed, so PostgreSQL rolled it back, exactly as it would after a crash. The customer paid 30.00 and the merchant got nothing, and neither server did anything wrong: each kept its own promise about its own data."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Reliability and the write-ahead log",
+          "url": "https://www.postgresql.org/docs/18/wal-intro.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Two-phase commit: every participant promises, then one log line decides",
+      "body": "Two-phase commit (2PC) has two roles. The **coordinator** runs the transaction and decides its outcome. It is often a library inside your own service, called a transaction manager. The **participants** are the servers that hold the data. The transaction gets one global id, here `txf-1`.\n\nPhase one is prepare. The coordinator sends each participant its statements, then asks it to prepare. A participant that can commit writes all its changes, plus a record saying \"prepared\", to its write-ahead log, flushes it to disk, and answers yes. That yes is a promise: whatever happens next, even a crash and a restart, it will commit if told to. So it may no longer abort on its own, and it keeps every lock the transaction took. A participant that can't commit (a constraint failed, it ran out of disk) rolls back and answers no.\n\nThen the coordinator decides. If every answer is yes, it appends `txf-1 COMMIT` to its own log and flushes that to disk. **That one log line is the commit point** of the whole distributed transaction. If any answer is no, or an answer doesn't arrive in time, it decides abort.\n\nPhase two is commit. The coordinator tells every participant the outcome. After a commit decision it keeps retrying each participant until each one confirms, for minutes or days if it must, because it can't take the decision back. The stepper walks through both outcomes.\n\nNotice the two points of no return. A participant's yes takes away its right to abort. The coordinator's log line takes away everyone's right to abort. An abort needs no log line at all: a transaction the log doesn't mention is treated as aborted (presumed abort), which is safe because nobody can have committed without that line.\n\nPostgreSQL implements the participant side. `PREPARE TRANSACTION 'txf-1@wallets'` ends your session's transaction without finishing it: the transaction lives on as a prepared transaction, listed in `pg_prepared_xacts`, holding its locks. Later, any session connected to the same database finishes it with `COMMIT PREPARED` or `ROLLBACK PREPARED`. The feature is off by default (`max_prepared_transactions = 0`), changing that setting needs a restart, and the docs say it isn't meant for application code: it is for transaction managers. In the Try its each participant gets its own gid, because both databases sit on one server and a gid must be unique on the whole server; XA does the same with a branch qualifier.\n\nCount the cost. A local commit is one round trip and one flush. Two-phase commit needs two round trips to every participant and three flushes in a row on the commit path: the participants' prepare records (in parallel), the coordinator's decision, then the participants' commit records. Across two regions, at about 70 ms a round trip, that is about 140 ms of network time on every commit instead of 70.",
+      "stepper": {
+        "title": "One transfer through two-phase commit",
+        "intro": "The coordinator moves 30.00 from w-17 on `wallets` to m-cafe on `payouts`. The bottom line shows what a reader querying both servers would see. Use Next and Back, or the arrow keys.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"Both servers run their part of the transfer in an open transaction and take row locks. Nothing is durable yet.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">BEGIN</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">debit w-17: -30.00</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">row lock on w-17</text><rect class=\"box-a\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">sends the work</text><rect class=\"box-dim\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-m\" x=\"340\" y=\"156\" text-anchor=\"middle\">(empty)</text><rect class=\"box-a\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">BEGIN</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">credit m-cafe: +30.00</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">row lock on m-cafe</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 100.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">either server can still fail and roll back</text><line class=\"ln-a\" x1=\"258\" y1=\"64\" x2=\"220\" y2=\"64\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"422\" y1=\"64\" x2=\"460\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The coordinator opens a transaction on each server and sends its statements under one transfer id, `txf-1`: the debit to `wallets`, the credit and the payout entry to `payouts`. Each server takes row locks as usual. Nothing is durable yet, and either server can still fail and roll back on its own."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"wallets prepares: its changes are on disk, it votes yes, and it keeps its lock.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">PREPARE TRANSACTION</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">on disk: voted yes</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">keeps lock on w-17</text><rect class=\"box\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">asks: prepare?</text><rect class=\"box-dim\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-m\" x=\"340\" y=\"156\" text-anchor=\"middle\">(empty)</text><rect class=\"box\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">BEGIN</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">credit m-cafe: +30.00</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">row lock on m-cafe</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 100.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">wallets can no longer abort on its own</text><line class=\"ln-a\" x1=\"258\" y1=\"64\" x2=\"220\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Phase one. The coordinator asks `wallets` to prepare. `wallets` checks its constraints, writes the changes and a prepare record to its write-ahead log and flushes it, then answers yes. From this moment it has given up the right to abort on its own, and it keeps the lock on w-17."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"payouts prepares too and votes yes. Neither server has committed.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">prepared</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">voted yes</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">keeps lock on w-17</text><rect class=\"box\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">asks: prepare?</text><rect class=\"box-dim\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-m\" x=\"340\" y=\"156\" text-anchor=\"middle\">(empty)</text><rect class=\"box-a\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">PREPARE TRANSACTION</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">on disk: voted yes</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">keeps lock on m-cafe</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 100.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">both have promised; nobody has committed</text><line class=\"ln-a\" x1=\"422\" y1=\"64\" x2=\"460\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "`payouts` does the same and answers yes. Both servers have promised that they can commit, whatever happens to them next, a crash included. Neither has committed, and neither knows what the other answered."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"The coordinator writes txf-1 COMMIT to its log and flushes it: the commit point.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">prepared</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">waiting for outcome</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">keeps lock on w-17</text><rect class=\"box-a\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">decides: COMMIT</text><rect class=\"box-a\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-code t-a\" x=\"340\" y=\"156\" text-anchor=\"middle\">txf-1 COMMIT</text><rect class=\"box\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">prepared</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">waiting for outcome</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">keeps lock on m-cafe</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 100.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">the transfer is now committed</text><line class=\"ln-a\" x1=\"340\" y1=\"92\" x2=\"340\" y2=\"108\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Every vote is yes, so the coordinator appends `txf-1 COMMIT` to its own log and fsyncs it. **This line is the commit point.** Neither server has changed yet, but the outcome is fixed: if the coordinator crashes now, it must commit both when it comes back."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"wallets commits and releases its lock. A reader of both servers sees the debit without the credit.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">COMMIT PREPARED</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">committed</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">lock on w-17 released</text><rect class=\"box\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">phase two: commit</text><rect class=\"box-b\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-code t-b\" x=\"340\" y=\"156\" text-anchor=\"middle\">txf-1 COMMIT</text><rect class=\"box\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">prepared</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">waiting for outcome</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">keeps lock on m-cafe</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s t-bad\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 70.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">for a moment, half the transfer shows</text><line class=\"ln-a\" x1=\"258\" y1=\"64\" x2=\"220\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Phase two. The coordinator sends `COMMIT PREPARED` to `wallets`, which commits and releases its lock. For a moment, a reader that queries both servers sees the debit without the credit. Two-phase commit makes the outcome atomic. It doesn't make both servers show it at the same instant."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"payouts commits and releases its lock. Both changes are visible.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">committed</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\"></text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">lock on w-17 released</text><rect class=\"box\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">phase two: commit</text><rect class=\"box-b\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-code t-b\" x=\"340\" y=\"156\" text-anchor=\"middle\">txf-1 COMMIT</text><rect class=\"box-ok\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">COMMIT PREPARED</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">committed</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">lock on m-cafe released</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 70.00, m-cafe 30.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">done: the log line can be cleaned up later</text><line class=\"ln-a\" x1=\"422\" y1=\"64\" x2=\"460\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "`payouts` commits too. If it had been unreachable, the coordinator would keep resending `COMMIT PREPARED` until it answered: once the decision is written, the only way is forward. When every participant has acknowledged, the coordinator can drop the log line."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 260\" role=\"img\" aria-label=\"Another run: payouts votes no, so the coordinator writes nothing and rolls wallets back.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"16\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"116\" y=\"60\" text-anchor=\"middle\">wallets</text><text class=\"t-s\" x=\"116\" y=\"84\" text-anchor=\"middle\">ROLLBACK PREPARED</text><text class=\"t-s\" x=\"116\" y=\"106\" text-anchor=\"middle\">undone</text><text class=\"t-s t-m\" x=\"116\" y=\"128\" text-anchor=\"middle\">lock on w-17 released</text><rect class=\"box-a\" x=\"260\" y=\"36\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"60\" text-anchor=\"middle\">Coordinator</text><text class=\"t-s\" x=\"340\" y=\"80\" text-anchor=\"middle\">decides: abort</text><rect class=\"box-dim\" x=\"260\" y=\"112\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"136\" text-anchor=\"middle\">Decision log</text><text class=\"t-s t-m\" x=\"340\" y=\"156\" text-anchor=\"middle\">(no line: abort)</text><rect class=\"box-bad\" x=\"464\" y=\"36\" width=\"200\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"564\" y=\"60\" text-anchor=\"middle\">payouts</text><text class=\"t-s\" x=\"564\" y=\"84\" text-anchor=\"middle\">INSERT failed</text><text class=\"t-s\" x=\"564\" y=\"106\" text-anchor=\"middle\">voted no, rolled back</text><text class=\"t-s t-m\" x=\"564\" y=\"128\" text-anchor=\"middle\">lock on m-cafe released</text><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">wallets server</text><text class=\"t-s t-m\" x=\"664\" y=\"22\" text-anchor=\"end\">payouts server</text><line class=\"ln-d\" x1=\"16\" y1=\"186\" x2=\"664\" y2=\"186\"/><text class=\"t-s\" x=\"340\" y=\"212\" text-anchor=\"middle\">readers see: w-17 100.00, m-cafe 0.00</text><text class=\"t-s t-m\" x=\"340\" y=\"236\" text-anchor=\"middle\">a no vote, or no answer in time, aborts everyone</text><line class=\"ln-a\" x1=\"258\" y1=\"64\" x2=\"220\" y2=\"64\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Back to frame 3, in a different run. The payout entry for `txf-1` already exists, so the INSERT on `payouts` fails and it votes no. The coordinator writes nothing and sends `ROLLBACK PREPARED` to `wallets`. A transfer with no line in the log is treated as aborted: that rule is called **presumed abort**. A participant that doesn't answer in time counts as a no, as long as the decision hasn't been written yet."
+          }
+        ]
+      },
+      "try": {
+        "title": "Run two-phase commit by hand",
+        "minutes": 5,
+        "steps": [
+          "In the psql prompt (in `wallets`), try to prepare a transaction. It fails, and the failed PREPARE rolls the transaction back. Switch the feature on and restart the server from the `labs` folder: `docker compose -f env/postgres.yml restart db`.",
+          "Open terminal 1 on `wallets` and terminal 2 on `payouts` (`docker compose -f env/postgres.yml exec db psql -U sfz -d wallets`, and `-d payouts`). You are the coordinator: run phase one in both, then look at `pg_prepared_xacts`. Predict what terminal 1's SELECT shows right after its PREPARE.",
+          "Run phase two: commit each prepared transaction. Note that terminal 1 commits from a new statement after its own transaction ended: any session in the right database can finish a prepared transaction."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "two psql sessions",
+          "src": "-- in wallets: the feature is off\nBEGIN;\nUPDATE wallets SET balance_minor = balance_minor - 3000 WHERE id = 'w-17';\nPREPARE TRANSACTION 'txf-1@wallets';\nALTER SYSTEM SET max_prepared_transactions = 10;\n-- now restart: docker compose -f env/postgres.yml restart db\n\n-- terminal 1 (wallets): phase one\nSHOW max_prepared_transactions;\nBEGIN;\nUPDATE wallets SET balance_minor = balance_minor - 3000 WHERE id = 'w-17';\nPREPARE TRANSACTION 'txf-1@wallets';\nSELECT balance_minor FROM wallets WHERE id = 'w-17';\n\n-- terminal 2 (payouts): phase one\nBEGIN;\nUPDATE merchant_balances SET balance_minor = balance_minor + 3000 WHERE id = 'm-cafe';\nINSERT INTO payout_entries VALUES ('txf-1', 'm-cafe', 3000);\nPREPARE TRANSACTION 'txf-1@payouts';\nSELECT gid, database, prepared FROM pg_prepared_xacts ORDER BY gid;\n\n-- the coordinator would write \"txf-1 COMMIT\" to its log here. Phase two:\n-- terminal 2\nCOMMIT PREPARED 'txf-1@payouts';\n-- terminal 1\nCOMMIT PREPARED 'txf-1@wallets';\nSELECT balance_minor FROM wallets WHERE id = 'w-17';\nSELECT count(*) FROM pg_prepared_xacts;"
+        },
+        "expect": "The first PREPARE fails:\n\n```text\nERROR:  prepared transactions are disabled\nHINT:  Set \"max_prepared_transactions\" to a nonzero value.\n```\n\nAfter the restart, `SHOW` prints 10. Terminal 1's PREPARE prints `PREPARE TRANSACTION`, and its SELECT then shows `10000`: the session is no longer in a transaction, and the prepared change isn't visible to anyone, itself included, until it commits. Terminal 2 lists both:\n\n```text\n      gid      | database |           prepared\n---------------+----------+-------------------------------\n txf-1@payouts | payouts  | 2026-11-08 05:39:20.755114+00\n txf-1@wallets | wallets  | 2026-11-08 05:39:20.604174+00\n(2 rows)\n```\n\n`pg_prepared_xacts` shows the whole server, every database. Each `COMMIT PREPARED` prints `COMMIT PREPARED`, terminal 1 then reads `7000`, and the count is 0. Your timestamps differ."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: PREPARE TRANSACTION",
+          "url": "https://www.postgresql.org/docs/18/sql-prepare-transaction.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: pg_prepared_xacts",
+          "url": "https://www.postgresql.org/docs/18/view-pg-prepared-xacts.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "If the coordinator dies, participants wait in doubt and keep their locks",
+      "body": "Now the failure the protocol was built around. Both servers voted yes, and then the coordinator's process dies before it tells anyone the outcome. Look at it from `payouts`. It promised to commit if told to, and nobody is telling it anything. Such a participant is **in doubt**.\n\nCan it decide on its own? From where `payouts` sits, it can't see what happened elsewhere. Committing is unsafe: for all it knows, `wallets` voted no or answered too late, and the coordinator decided abort. Aborting is unsafe too: maybe the coordinator wrote COMMIT and `wallets` has already committed. Asking `wallets` helps only sometimes. If `wallets` has committed, `payouts` can commit too; if `wallets` is also just prepared, neither knows whether the log line exists. So an in-doubt participant waits for the coordinator. Two-phase commit is a **blocking** protocol: one dead coordinator can stop the participants indefinitely.\n\nWhile it waits, it holds its locks. The Try it shows what that means on PostgreSQL. Plain reads still work: under MVCC, from lesson 4, they see the last committed version. But every writer that touches an in-doubt row, w-17 on `wallets` or m-cafe on `payouts`, queues behind the prepared transaction until its own `lock_timeout` fires. m-cafe is a merchant: every purchase at that cafe would queue. `pg_blocking_pids` reports the blocker as process 0, because a prepared transaction belongs to no session, and there is no session to kill. VACUUM can't remove dead row versions newer than the prepared transaction, since lesson 4's horizon can't pass a transaction that is still running. Restarting the database doesn't help either: the prepared transaction is on disk, comes back at startup with its locks, and the log says so (`recovering prepared transaction 767`).\n\nHow long does this last? As long as the coordinator is gone. If it restarts in 20 seconds, that is 20 seconds of locked rows. If its disk is gone, it lasts until a person picks an outcome by hand, what XA calls a heuristic decision. A person who guesses wrong breaks atomicity: one side committed, the other rolled back.\n\nSo recovery is the coordinator's first job when it starts. It reads its log, asks every participant for its in-doubt gids (`pg_prepared_xacts` in PostgreSQL), commits the ones its log says COMMIT, and rolls back the rest. That is the lab. It works only if the log never forgets a decision it acted on. If the COMMIT line wasn't flushed before the first `COMMIT PREPARED` went out, a crash can lose the line after one side committed, and recovery would roll back the other side. That is why the lab's `recordCommit` calls `force(true)` before it returns.",
+      "try": {
+        "title": "Leave a transfer in doubt",
+        "minutes": 6,
+        "steps": [
+          "Terminals 1 and 2 play the coordinator again, and this time it dies after phase one: prepare `txf-2` on both, and don't commit. Open terminal 3 on `wallets` and update w-17. It waits.",
+          "In terminal 1, find out who it waits for, then make some dead row versions on w-18 and vacuum. Predict whether VACUUM can remove them. Watch terminal 3 give up after 10 seconds.",
+          "Restart the server from the `labs` folder (`docker compose -f env/postgres.yml restart db`), reconnect terminal 1 and check `pg_prepared_xacts` again. Then resolve both as the coordinator's log would: commit."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "three psql sessions",
+          "src": "-- terminal 1 (wallets) and terminal 2 (payouts): phase one only\nBEGIN;\nUPDATE wallets SET balance_minor = balance_minor - 3000 WHERE id = 'w-17';\nPREPARE TRANSACTION 'txf-2@wallets';\n-- terminal 2\nBEGIN;\nUPDATE merchant_balances SET balance_minor = balance_minor + 3000 WHERE id = 'm-cafe';\nINSERT INTO payout_entries VALUES ('txf-2', 'm-cafe', 3000);\nPREPARE TRANSACTION 'txf-2@payouts';\n\n-- terminal 3 (wallets): another payment from the same wallet\nSET lock_timeout = '10s';\nUPDATE wallets SET balance_minor = balance_minor - 500 WHERE id = 'w-17';   -- waits\n\n-- terminal 1\nSELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event FROM pg_stat_activity WHERE wait_event_type = 'Lock';\nSELECT pid, locktype, transactionid AS xid, mode, granted FROM pg_locks\nWHERE locktype = 'transactionid' ORDER BY granted DESC, pid NULLS FIRST;\nSELECT gid, transaction FROM pg_prepared_xacts ORDER BY gid;\nUPDATE wallets SET balance_minor = balance_minor + 1 WHERE id = 'w-18';\nUPDATE wallets SET balance_minor = balance_minor + 1 WHERE id = 'w-18';\nUPDATE wallets SET balance_minor = balance_minor + 1 WHERE id = 'w-18';\nVACUUM (VERBOSE) wallets;\n\n-- after the restart, terminal 1 again\nSELECT gid, database FROM pg_prepared_xacts ORDER BY gid;\nCOMMIT PREPARED 'txf-2@payouts';\n\\c payouts\nCOMMIT PREPARED 'txf-2@payouts';\n\\c wallets\nCOMMIT PREPARED 'txf-2@wallets';\nSELECT balance_minor FROM wallets WHERE id = 'w-17';"
+        },
+        "expect": "Terminal 1 sees terminal 3 waiting, blocked by process 0, and the prepared transactions' locks with no pid:\n\n```text\n pid | blocked_by |  wait_event\n-----+------------+---------------\n  85 | {0}        | transactionid\n\n pid |   locktype    | xid |     mode      | granted\n-----+---------------+-----+---------------+---------\n     | transactionid | 767 | ExclusiveLock | t\n     | transactionid | 768 | ExclusiveLock | t\n  85 | transactionid | 769 | ExclusiveLock | t\n  85 | transactionid | 767 | ShareLock     | f\n\n      gid      | transaction\n---------------+-------------\n txf-2@payouts |         768\n txf-2@wallets |         767\n```\n\nTerminal 3 waits on transaction 767, `txf-2@wallets`. VACUUM can't clean up behind it (output trimmed to two lines):\n\n```text\ntuples: 4 removed, 5 remain, 3 are dead but not yet removable\nremovable cutoff: 767, which was 6 XIDs old when operation ended\n```\n\nAfter 10 seconds terminal 3 fails with `ERROR:  canceling statement due to lock timeout`. After the restart both gids are still listed; the server log says `recovering prepared transaction 767 from shared memory`. The first `COMMIT PREPARED` fails with `ERROR:  prepared transaction belongs to another database`: you finish a prepared transaction from its own database. Then both commit, and w-17 reads `4000`. Your pids and ids differ."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: COMMIT PREPARED",
+          "url": "https://www.postgresql.org/docs/18/sql-commit-prepared.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "XA runs two-phase commit across products, and most teams avoid it",
+      "body": "So far both participants were PostgreSQL. In your services the second participant is often another product: an Oracle ledger and an IBM MQ queue, or PostgreSQL and ActiveMQ. Two-phase commit across different products needs a shared interface, and the standard one is **X/Open XA**, from 1991. XA isn't a network protocol. It is an API between a transaction manager and each resource, which the vendor's driver implements over its own wire protocol.\n\nIn Java, XA appears as JTA. Each resource gives the transaction manager an `XAResource` with `start`, `end`, `prepare`, `commit`, `rollback` and `recover`. Every branch is named by an `Xid`: a format id, a global transaction id and a branch qualifier, the same \"one id per participant\" idea as `txf-1@wallets`. In Quarkus, the `quarkus-narayana-jta` extension runs Narayana as the transaction manager inside your service, writes its decisions to a log directory on local disk, and starts a recovery service when it detects XA data sources. pgJDBC's `PGXADataSource` turns `prepare` into `PREPARE TRANSACTION`. The Try it runs both phases by hand and then recovers, as Narayana would after a restart.\n\nMost teams that try XA in production end up avoiding it, for four reasons.\n\n1. The coordinator is your service process, and its log sits on that pod's disk. Kubernetes reschedules the pod with a fresh disk, the log is gone, and the in-doubt branches in Oracle wait for a DBA to make a heuristic decision.\n2. Each resource sees only its own locks. If transaction A holds a row in Oracle and waits for a row in PostgreSQL that transaction B holds, while B waits for A's Oracle row, neither database sees a cycle. Lesson 5's deadlock detector never fires; a timeout ends it. The same blindness rules out SSI across products, since no database sees the other's read-write dependencies.\n3. Every transaction pays the extra round trips and flushes, and every lock is held until the slowest participant has prepared.\n4. Much of what you need to change doesn't speak XA at all: Redis, DynamoDB, a card issuer's HTTP API, an email. Kafka has an accepted proposal to take part in two-phase commit, KIP-939, but as of November 2026 it hasn't shipped in a release.\n\nWhat about removing the blocking? Three-phase commit (3PC) adds a round so that a participant that hears nothing can decide on its own after a timeout. That is safe only if every message and every pause has a known upper bound. Real networks and real processes have no such bound, which the Faults, time and truth track shows: a slow coordinator looks exactly like a dead one, and two participants that time out differently can decide differently. Instead of 3PC, systems that need atomic commit make the coordinator itself survive crashes, by replicating its log with consensus. The Consistency and consensus track builds that machinery.",
+      "try": {
+        "title": "Run XA by hand, then recover",
+        "minutes": 4,
+        "steps": [
+          "This uses the `wallets` and `payouts` databases from the earlier Try its, with prepared transactions switched on. Read `XaDemo.kt`. It runs `start`, the UPDATE, `end` and `prepare` on each database, closes its connections without committing (the coordinator dies), and then plays the restarted transaction manager: `recover` on each resource, then `commit`.",
+          "Before you run it, predict what the gids in `pg_prepared_xacts` look like: the demo's Xid has format id 1001, global id `txf-7` and the database name as the branch.",
+          "Run it from the `labs` folder. Then run it a second time: is there anything left from the first run to recover?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "XaDemo.kt (the two phases)",
+          "src": "for ((db, sql) in branches) {\n    val xa = source(db).xaConnection\n    val resource = xa.xaResource\n    val xid = TxXid(\"txf-7\", db)                    // same global id, one branch per database\n    resource.start(xid, XAResource.TMNOFLAGS)       // associate the connection with the branch\n    xa.connection.createStatement().use { it.executeUpdate(sql) }\n    resource.end(xid, XAResource.TMSUCCESS)         // the work for this branch is done\n    val vote = resource.prepare(xid)                // pgJDBC sends PREPARE TRANSACTION here\n    xa.close()                                      // the coordinator dies before phase 2\n}\n// ... later, a restarted transaction manager:\nfor (xid in resource.recover(XAResource.TMSTARTRSCAN or XAResource.TMENDRSCAN)) {\n    resource.commit(xid, false)                     // COMMIT PREPARED\n}",
+          "run": "./gradlew :sql:demo -Pmain=sfz.txn.l07.demo.XaDemoKt",
+          "file": "labs/sql/src/demo/kotlin/sfz/txn/l07/demo/XaDemo.kt"
+        },
+        "expect": "```text\n== phase 1: start, work, end and prepare each branch of txf-7\nwallets  prepare -> XA_OK, a yes vote\npayouts  prepare -> XA_OK, a yes vote\n== what PostgreSQL holds now\npayouts  1001_dHhmLTc=_cGF5b3V0cw==\nwallets  1001_dHhmLTc=_d2FsbGV0cw==\n== recovery: a restarted transaction manager asks each resource what is in doubt\nwallets  in doubt: formatId 1001, global id txf-7, branch wallets\nwallets  commit -> done\npayouts  in doubt: formatId 1001, global id txf-7, branch payouts\npayouts  commit -> done\nw-17 is now 2500\n```\n\npgJDBC writes the Xid into the gid as the format id, then the global id and the branch in Base64 (`dHhmLTc=` is `txf-7`), and `recover` decodes them again from `pg_prepared_xacts`. That listing is all a restarted transaction manager learns from the database. Whether to commit has to come from its own log; this demo just commits. The second run recovers only its own branches, since the first run left nothing behind, and w-17 reads `1000`. Each run moves 15.00.\n"
+      },
+      "refs": [
+        {
+          "title": "Quarkus: using transactions (Narayana, XA and recovery)",
+          "url": "https://quarkus.io/guides/transaction",
+          "kind": "docs"
+        },
+        {
+          "title": "KIP-939: Support participation in 2PC (Kafka)",
+          "url": "https://cwiki.apache.org/confluence/display/KAFKA/KIP-939%3A+Support+Participation+in+2PC",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Two ways around the coordinator: put the decision in the data, or give up atomic commit",
+      "body": "The weak spot of two-phase commit is the coordinator: a separate process holding the one record that decides, which participants must wait for. There are two ways around it.\n\nThe first moves the decision into the data. Google's Percolator (2010) added transactions to Bigtable, which can only change one row atomically. A Percolator transaction locks every cell it writes, and picks one lock as the **primary**; every other lock stores a pointer to it. To commit, the client replaces the primary lock with a commit record, in one single-row atomic write. That write is the commit point, doing the job of our log line, but stored next to the data where any reader can find it. The client then cleans up the other locks. If the client dies first, the next reader that meets a leftover lock follows the pointer to the primary. A commit record there means roll the lock forward; no commit record and an abandoned primary means roll it back. Nobody waits for a coordinator to return, because there is no separate coordinator. The price is paid elsewhere: a transaction that runs into a dead client's lock must clean it up first, and the paper says this lazy cleanup can delay a commit by tens of seconds. That was fine for building Google's web index and would be far too slow for payments. Percolator gives snapshot isolation, so lesson 3's write skew is possible. TiDB's storage layer, TiKV, uses a Percolator-style protocol. The Consistency and consensus track's lesson on distributed SQL shows how Spanner and CockroachDB keep two-phase commit and replicate every coordinator and participant with consensus.\n\nThe second gives up atomic commit and keeps the business rule. The Encoding, APIs and workflows track's lesson on durable execution covered workflows that survive crashes. A **saga**, an idea from Garcia-Molina and Salem in 1987, is such a workflow made of local transactions, each with a compensating step. The transfer becomes: debit w-17 and record the transfer as pending, in one local transaction on `wallets`; credit m-cafe with a payout entry keyed by the transfer id, in one local transaction on `payouts`; mark the transfer done. If the credit can never succeed, the compensation refunds w-17. Each step commits alone, so nothing is in doubt and no lock outlives its step. Each step is idempotent, so the workflow engine can retry it safely.\n\nWhat you give up is isolation. Between the steps, anyone can see the debit without the credit: lesson 1's dirty read, at business scale. And a compensation is a new action, not a rollback: the refund shows on the customer's statement, and an email already sent stays sent. So model \"pending\" as a real state that reports and support staff understand.\n\nChoose by where the participants live. Inside one distributed database, let its built-in commit protocol do the work. Across services and products, use a saga with idempotency keys. Use XA only when every participant supports it, the coordinator's log is durable and backed up, and contention is low.",
+      "refs": [
+        {
+          "title": "Peng and Dabek: Large-scale incremental processing using distributed transactions and notifications (Percolator, OSDI 2010)",
+          "url": "https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Peng.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Garcia-Molina and Salem: Sagas (Princeton TR-070-87, 1987)",
+          "url": "https://www.cs.princeton.edu/research/techreps/598",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Two-phase commit works like a property sale with an escrow agent. The agent asks the seller to sign the deed and the buyer to deposit the money, and once each has done so, neither can back out on their own: the signed deed and the deposit sit with the agent. When both are in, the agent stamps the file \"closed\", and from that stamp the sale has happened, even before the deed is registered and the money is paid out. If the agent vanishes after collecting both, the seller can't sell the house to anyone else and the buyer can't touch the money, because neither knows whether the file was stamped: they are in doubt. The analogy breaks on what the waiting costs. Real people would call a lawyer within a day, while an in-doubt database transaction blocks every writer of its rows the whole time, and a person who resolves it by guessing can leave the money paid on one side only.",
+  "in_your_world": "In a Quarkus service with `quarkus-narayana-jta`, a `@Transactional` method that touches an Oracle data source and a JMS queue, both XA, is two-phase commit with Narayana as the coordinator, and its log lives in the object store directory on the pod's disk. If the pod dies after prepare, Oracle keeps the rows locked until Narayana's recovery service comes back with the same log, which means a persistent volume and a stable node identifier, or a DBA resolves it from `DBA_2PC_PENDING`. Most payment teams avoid this path: the Oracle write and an outbox row commit in one local transaction, a relay publishes the event to Kafka, and multi-service flows such as authorize, capture and settle run as sagas in Temporal, with each step an idempotent local transaction keyed by the payment id. Keep XA for the rare case where every participant supports it and you can guarantee the coordinator's log survives.",
+  "mistake": "The common mistake is to treat a prepared or XA transaction like an ordinary one that a timeout will clean up. A team sees a row locked for an hour, finds a prepared transaction in `pg_prepared_xacts` or `DBA_2PC_PENDING`, and rolls it back to free the row. If the coordinator had already decided to commit and the other participant had committed, the transfer is now half done and nothing will ever report it. People do it because the lock is visible and urgent while the coordinator's log is out of sight. The fix: before resolving anything by hand, read the coordinator's log or check what the other participants did with the same global id, and pick that outcome; prevent it by keeping the coordinator's log on durable, backed-up storage and alerting on prepared transactions older than a minute.",
+  "compare": {
+    "title": "One transfer two ways: two-phase commit and a saga",
+    "a": {
+      "label": "Two-phase commit",
+      "lang": "text",
+      "title": "one distributed transaction",
+      "src": "wallets: BEGIN, debit w-17           lock w-17\npayouts: BEGIN, credit m-cafe        lock m-cafe\nwallets: PREPARE  -> yes             w-17 still locked\npayouts: PREPARE  -> yes             m-cafe still locked\ncoordinator log: txf-1 COMMIT        <- commit point\nwallets: COMMIT PREPARED             w-17 released\npayouts: COMMIT PREPARED             m-cafe released\n\ncoordinator dies after prepare:  both rows stay locked\nisolation:  nobody sees a debit without its credit*\nneeds:      XA or PREPARE on every participant"
+    },
+    "b": {
+      "label": "Saga",
+      "lang": "text",
+      "title": "three local transactions in a workflow",
+      "src": "wallets: debit w-17, transfer txf-1 = pending   commit\npayouts: credit m-cafe, entry txf-1             commit\nwallets: transfer txf-1 = done                  commit\nif the credit can never succeed:\nwallets: refund w-17, txf-1 = refunded          commit\n\nworkflow dies between steps:  it resumes; nothing locked\nisolation:  anyone can see txf-1 pending\nneeds:      idempotent steps and a durable workflow"
+    },
+    "note": "Two-phase commit keeps the transfer atomic and holds locks across both servers until the end, so a dead coordinator freezes rows. A saga commits each step at once, so nothing is ever in doubt and nothing stays locked, but the in-between state is visible and undoing means a new step, a refund, rather than a rollback. *Even 2PC shows half the transfer for a moment to a reader of both servers, between the two COMMIT PREPAREDs, as the stepper showed."
+  },
+  "worked": {
+    "title": "Recover after a crash: decide every in-doubt branch",
+    "steps": [
+      {
+        "say": "Gather what the restarted coordinator can see: its own log, and the prepared transactions on each participant.",
+        "lang": "text",
+        "code": "coordinator.log           wallets: pg_prepared_xacts      payouts: pg_prepared_xacts\ntxf-4 COMMIT              txf-5@wallets                   txf-5@payouts\ntxf-5 COMMIT              txf-6@wallets                   txf-6@payouts\n                          batch-9@ledger"
+      },
+      {
+        "say": "Apply one rule per gid. Our gids end with `@<participant>`. A COMMIT line for the transfer id means commit. No line means the coordinator never decided commit, so no participant can have committed, and rolling back is safe. A gid from another coordinator is not ours to touch.",
+        "lang": "text",
+        "code": "txf-5@wallets    log says COMMIT     -> COMMIT PREPARED\ntxf-6@wallets    no line             -> ROLLBACK PREPARED   (presumed abort)\nbatch-9@ledger   not ours            -> leave it alone\ntxf-5@payouts    log says COMMIT     -> COMMIT PREPARED\ntxf-6@payouts    no line             -> ROLLBACK PREPARED\ntxf-4            nothing prepared    -> already finished before the crash"
+      },
+      {
+        "say": "Write it as code. The loop is short because the hard part, deciding, was done before the crash and written down.",
+        "lang": "kotlin",
+        "code": "fun recover(): RecoveryReport {\n    val committed = mutableListOf<String>()\n    val rolledBack = mutableListOf<String>()\n    for (p in participants) {\n        val suffix = \"@${p.name}\"\n        for (gid in p.preparedGids().filter { it.endsWith(suffix) }) {   // only our branches\n            if (log.committed(gid.removeSuffix(suffix))) {\n                p.exec(\"COMMIT PREPARED '$gid'\"); committed += gid      // decided: finish it\n            } else {\n                p.exec(\"ROLLBACK PREPARED '$gid'\"); rolledBack += gid   // presumed abort\n            }\n        }\n    }\n    return RecoveryReport(committed, rolledBack)\n}"
+      },
+      {
+        "say": "Check why the order of operations in `run` makes this safe. The COMMIT line is flushed after every yes and before the first COMMIT PREPARED. If the coordinator flushed after sending commits, a crash could lose the line while one side had committed, and this loop would roll the other side back.",
+        "lang": "text",
+        "code": "safe:    prepare all -> fsync \"txf-5 COMMIT\" -> COMMIT PREPARED wallets -> COMMIT PREPARED payouts\nunsafe:  prepare all -> COMMIT PREPARED wallets -> crash (line never written)\n         recovery: no line for txf-5 -> ROLLBACK PREPARED txf-5@payouts -> half a transfer"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a two-phase commit coordinator that survives its own crash",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/kotlin/sfz/txn/l07/TwoPhaseCommit.kt",
+      "labs/sql/src/main/resources/sfz/txn/l07/in_doubt.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.txn.l07.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. They start a PostgreSQL 18 container of their own with `max_prepared_transactions = 10` and two databases, `wallets` and `payouts` (a few seconds, more on the first pull). All 10 fail.",
+      "Read `TwoPhaseCommit.kt`. `Participant`, `DecisionLog`, `CrashPoint` and `maybeCrash` are provided. `CoordinatorCrashed` extends `Error`, so a `catch (e: Exception)` can't hide a crash, just as no catch block runs when a process is killed.",
+      "Write `Coordinator.run` from its KDoc: phase one with `BEGIN`, the statements and `PREPARE TRANSACTION` on each participant; on a no vote, `ROLLBACK` and `ROLLBACK PREPARED`; then the log line, then `COMMIT PREPARED`, with the three `maybeCrash` calls. Four tests pass, including the one that checks a writer gets SQLSTATE 55P03 on a row an in-doubt transaction holds.",
+      "Write `Coordinator.recover`. Four more pass: after a crash before the decision, after it, between the two commits, and with another coordinator's gid on the same server.",
+      "Fix `in_doubt.sql`. It runs, and its numbers are wrong in three ways. The last two tests pass."
+    ],
+    "hints": [
+      "Catch only `SQLException` in phase one. `e.sqlState` gives `23505` for the duplicate payout entry and `23514` for the CHECK on the wallet balance.",
+      "After a failed statement inside BEGIN, `ROLLBACK` ends the aborted transaction. After a failed PREPARE, PostgreSQL has already rolled back, and a ROLLBACK only warns, so you can send it either way.",
+      "In `recover`, `p.preparedGids()` already filters to the participant's own database; you still have to keep only the gids that end with `@${p.name}`.",
+      "`in_doubt.sql`: the join must be a LEFT JOIN, so a transaction nobody waits for keeps its row; count `w.pid`, not `*`; skip granted locks (`NOT w.granted`), because each prepared transaction holds its own transaction id lock; and keep `p.database = current_database()`."
+    ],
+    "done_when": "All 10 tests in `TwoPhaseCommitTest` pass."
+  },
+  "drill": {
+    "title": "The coordinator's commit path from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write `run(txId, work)` for a coordinator over PostgreSQL participants: phase one, the abort path, the decision and phase two. Then answer: what is the commit point, and why must it come before the first `COMMIT PREPARED`?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun run(txId: String, work: Map<String, List<String>>): Outcome {\n    val prepared = mutableListOf<Participant>()\n    for (p in participants) {                                   // phase one: everyone votes\n        try {\n            p.exec(\"BEGIN\")\n            work[p.name].orEmpty().forEach { p.exec(it) }\n            p.exec(\"PREPARE TRANSACTION '${p.gid(txId)}'\")      // yes: durable, locks kept\n            prepared += p\n        } catch (e: SQLException) {                             // no: abort everyone\n            p.exec(\"ROLLBACK\")\n            prepared.forEach { it.exec(\"ROLLBACK PREPARED '${it.gid(txId)}'\") }\n            return Outcome.Aborted(p.name, e.sqlState)          // no log line: presumed abort\n        }\n    }\n    log.recordCommit(txId)                                      // fsync'd: the commit point\n    for (p in participants) p.exec(\"COMMIT PREPARED '${p.gid(txId)}'\")   // phase two, retried in real life\n    return Outcome.Committed\n}\n\n// The commit point is the flushed log line. It must come first: if a COMMIT PREPARED went out\n// and then the line was lost in a crash, recovery would find no decision and roll back the\n// other participant, leaving half a transfer."
+    }
+  },
+  "recap": [
+    "One machine commits with one record on one disk. Across two machines no single write covers both, so commit-one-then-the-other loses money whenever the second side fails.",
+    "Two-phase commit: every participant prepares (changes durable, locks kept, votes yes or no), the coordinator flushes one COMMIT line to its log (the commit point), then tells everyone. No line means abort.",
+    "PostgreSQL is a participant: `PREPARE TRANSACTION 'gid'`, `pg_prepared_xacts`, then `COMMIT PREPARED` or `ROLLBACK PREPARED` from the same database. `max_prepared_transactions` is 0 by default.",
+    "A participant whose coordinator died is in doubt: it can't decide alone, keeps its row locks across restarts, blocks writers and holds back VACUUM. Recovery reads the log and finishes every in-doubt gid.",
+    "XA is 2PC across products (JTA and Narayana in Java). Its log on a pod's disk, cross-system deadlocks nobody detects and the many systems without XA make teams avoid it. 3PC needs bounded delays that real networks don't give.",
+    "Percolator moves the commit point into the data (a primary lock), so any reader can finish a dead client's transaction. A saga gives up atomic commit for local steps with compensations, and pays with visible in-between states."
+  ],
+  "quiz": [
+    {
+      "q": "A coordinator crashes after both participants voted yes but before it wrote anything to its log. It restarts with its log intact. What does recovery do with the two prepared branches?",
+      "options": [
+        "Commits both: every participant voted yes, so the transfer can go through",
+        "Rolls back both: with no COMMIT line, the coordinator never decided commit, so nobody can have committed",
+        "Leaves both prepared and waits for an operator",
+        "Commits the one that prepared first and rolls back the other"
+      ],
+      "answer": 1,
+      "why": "Presumed abort: the COMMIT line is written only after all yes votes and before any COMMIT PREPARED, so its absence proves no participant committed. Rolling back both is consistent with every participant. Committing both would also be atomic here, which makes it tempting, but recovery can't tell this case from one where a third vote never arrived, so the rule has to be abort. Waiting for an operator throws away the information the log gives."
+    },
+    {
+      "q": "A payments database shows a prepared transaction `txf-5@payouts` that has held a merchant's row for an hour. A DBA runs `ROLLBACK PREPARED 'txf-5@payouts'` to unblock checkouts. The coordinator's log says `txf-5 COMMIT`, and `txf-5@wallets` committed an hour ago. What is the result?",
+      "options": [
+        "Nothing bad: the coordinator will notice and commit it again",
+        "The whole transfer is rolled back on both servers",
+        "Half a transfer: the wallet stays debited and the merchant is never credited, and nothing reports it",
+        "The ROLLBACK fails, because only the coordinator may finish its prepared transactions"
+      ],
+      "answer": 2,
+      "why": "Once rolled back, the branch is gone; the coordinator's recovery finds no prepared `txf-5@payouts` and has nothing to commit, while `wallets` committed long ago. This is the heuristic decision that breaks atomicity. Any superuser or the original user may run ROLLBACK PREPARED, so it doesn't fail. The right move was to read the log (or check `wallets`) and run COMMIT PREPARED."
+    },
+    {
+      "q": "A teammate proposes three-phase commit so that participants never block: one that hears nothing for 5 seconds will decide on its own. What does that rely on?",
+      "options": [
+        "That no message or pause ever takes longer than the timeout, so silence really means the coordinator is dead",
+        "That the coordinator's log is replicated",
+        "That every participant runs the same database product",
+        "Nothing extra: the third phase removes the blocking in every case"
+      ],
+      "answer": 0,
+      "why": "3PC's timeout rule is safe only with bounded delays. On a real network a coordinator stuck in a 6-second GC pause or behind a slow link looks dead, and participants that time out at different moments can reach different decisions. Replicating the coordinator's log with consensus is the fix that works, and it is a different design. The product doesn't matter."
+    },
+    {
+      "q": "From lesson 4: a prepared transaction has been in doubt since the weekend. On Monday, VACUUM on a busy table in the same database reports thousands of rows that \"are dead but not yet removable\", and the table keeps growing. Why?",
+      "options": [
+        "Prepared transactions disable autovacuum until they finish",
+        "The prepared transaction counts as still running, so the removable cutoff (the horizon) can't move past its id and nothing deleted after it can be removed",
+        "The dead rows belong to the prepared transaction",
+        "VACUUM needs the row locks the prepared transaction holds"
+      ],
+      "answer": 1,
+      "why": "VACUUM removes a version only when its deleter committed before every transaction still running. A prepared transaction is still running, so the cutoff stays at its id, as the Try it showed with `removable cutoff: 767`, and every version dead since then stays. The dead rows can belong to anyone. Autovacuum still runs; it just can't remove them. That is why the PostgreSQL docs warn about leaving transactions prepared.",
+      "from": "txn-04"
+    },
+    {
+      "q": "From lesson 5: two XA transactions run at once. T1 has updated a row in Oracle and now waits for a row in PostgreSQL that T2 updated. T2 now waits for T1's Oracle row. What ends this?",
+      "options": [
+        "PostgreSQL's deadlock detector, after `deadlock_timeout`",
+        "Oracle's deadlock detector, which raises ORA-00060",
+        "The transaction manager, which merges both waits-for graphs",
+        "A lock or transaction timeout, because neither database sees a cycle: each sees one transaction waiting for another"
+      ],
+      "answer": 3,
+      "why": "A deadlock detector searches its own waits-for graph. PostgreSQL sees T1 waiting for T2 and nothing more; Oracle sees T2 waiting for T1. The cycle exists only across the two, and XA gives no component the whole graph, so only a timeout breaks it: a lock wait timeout on either database, or the transaction manager's own transaction timeout. Expecting a local detector to fire is the tempting mistake.",
+      "from": "txn-05"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does a participant promise when it votes yes in two-phase commit?",
+      "back": "That it can and will commit if told to, even after a crash: its changes and a prepare record are on disk, it keeps its locks, and it can no longer abort on its own."
+    },
+    {
+      "front": "What is the commit point of two-phase commit?",
+      "back": "The coordinator's decision record (`txf-1 COMMIT`) reaching its log on disk, after every yes vote and before any participant is told to commit."
+    },
+    {
+      "front": "What does `PREPARE TRANSACTION 'gid'` do in PostgreSQL?",
+      "back": "It ends the session's transaction without finishing it: the work is saved to disk with its locks, listed in `pg_prepared_xacts`, until `COMMIT PREPARED` or `ROLLBACK PREPARED` from the same database."
+    },
+    {
+      "front": "Why can't an in-doubt participant just roll back after a timeout?",
+      "back": "The coordinator may have decided commit and another participant may have committed already. Rolling back would leave half the transaction. So it waits, holding its locks."
+    },
+    {
+      "front": "What is presumed abort?",
+      "back": "A transaction with no commit record in the coordinator's log is treated as aborted. It is safe because nobody commits until that record exists."
+    },
+    {
+      "front": "Why doesn't three-phase commit fix blocking on real networks?",
+      "back": "It is safe only if message delays and pauses are bounded. Without a bound, a slow coordinator looks dead and participants can decide differently."
+    },
+    {
+      "front": "What does a saga give up compared with two-phase commit?",
+      "back": "Isolation and atomic commit: each step commits alone, others can see the in-between state, and undoing means running a compensating step, not a rollback."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Atomic commit",
+      "plain": "Making a transaction that spans several machines commit on all of them or on none."
+    },
+    {
+      "term": "Two-phase commit (2PC)",
+      "plain": "Prepare everywhere, record one decision durably, then commit everywhere. Not the same as two-phase locking."
+    },
+    {
+      "term": "Coordinator (transaction manager)",
+      "plain": "The process that runs a distributed transaction, collects the votes and writes the decision."
+    },
+    {
+      "term": "Participant",
+      "plain": "A server that holds part of the data and votes yes or no in the prepare phase."
+    },
+    {
+      "term": "In doubt",
+      "plain": "A participant that voted yes and hasn't learned the outcome. It can't decide alone and keeps its locks."
+    },
+    {
+      "term": "Presumed abort",
+      "plain": "Treating a transaction with no commit record in the coordinator's log as aborted."
+    },
+    {
+      "term": "XA / JTA",
+      "plain": "The standard interface for two-phase commit across different products, and its Java form (`XAResource`, `Xid`)."
+    },
+    {
+      "term": "Saga",
+      "plain": "A sequence of local transactions, each with a compensating step, run by a durable workflow instead of one atomic commit."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate wants to wrap the Oracle ledger update and the IBM MQ publish in one XA transaction, \"so they commit together\". Explain what two-phase commit guarantees, what happens if our pod dies at the wrong moment, and what you would suggest instead.",
+    "answer": "XA runs two-phase commit with a transaction manager inside our service, Narayana in Quarkus. Both Oracle and MQ first prepare: they make the work durable, keep their locks and vote yes. Then Narayana writes one commit record to its log, and from that moment the transaction is committed; then it tells both to commit. That does make the outcome atomic. The catch is the coordinator. If the pod dies after both prepared, Oracle keeps the ledger rows locked and MQ keeps the message in limbo until Narayana comes back with the same log, and its log is on the pod's disk. If Kubernetes moves the pod to a fresh disk, a DBA has to guess the outcome, and a wrong guess breaks the very atomicity we wanted. We'd also pay extra round trips and flushes on every payment, and a deadlock between Oracle and MQ wouldn't be detected by either. Instead I'd write the ledger update and an outbox row in one local Oracle transaction, have a relay publish the outbox to the queue, and make the consumer idempotent by message id. Each piece commits locally, nothing is ever in doubt, and a crash only delays the message."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Making the coordinator survive.** Gray and Lamport's \"Consensus on Transaction Commit\" (2006) replaces the single coordinator's log with a group of acceptors that agree on the outcome with Paxos, so the commit decision survives as long as a majority is up. Spanner and CockroachDB take the same direction: every participant is itself a replicated group, so a participant never disappears and the coordinator's state is replicated with it. The Consistency and consensus track builds the consensus part.\n\n**Shortcuts real transaction managers take.** If only one resource is enlisted, there is nothing to coordinate: JTA commits it in one phase, `XAResource.commit(xid, true)`. A branch that changed nothing can vote read-only (`XA_RDONLY`) in prepare and skip phase two. Some managers support a \"last resource\": a single non-XA resource that is committed in the middle, after the others prepared, which works until that commit's outcome is lost on the network.\n\n**DynamoDB's version.** Lesson 8 of this track opens DynamoDB's transaction protocol: coordinators that record their decisions in a ledger table, and a recovery manager that hands a stalled transaction to another coordinator. It is two-phase commit with the coordinator's log stored in a replicated database instead of on one disk.\n\n**The book's framing.** Designing Data-Intensive Applications, 2nd edition, chapter 8, covers atomic commit, XA and exactly-once message processing, and explains why many cloud services choose not to offer distributed transactions at all."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18: PREPARE TRANSACTION",
+      "url": "https://www.postgresql.org/docs/18/sql-prepare-transaction.html"
+    },
+    {
+      "title": "Peng and Dabek: Large-scale Incremental Processing Using Distributed Transactions and Notifications (OSDI 2010)",
+      "url": "https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Peng.pdf"
+    },
+    {
+      "title": "Garcia-Molina and Salem: Sagas (Princeton TR-070-87)",
+      "url": "https://www.cs.princeton.edu/research/techreps/598"
+    },
+    {
+      "title": "Quarkus: Using transactions in Quarkus",
+      "url": "https://quarkus.io/guides/transaction"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 8",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

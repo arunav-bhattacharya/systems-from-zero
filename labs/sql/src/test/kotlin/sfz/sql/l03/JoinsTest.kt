@@ -12,7 +12,7 @@ class JoinsTest {
 
     @Test
     fun `never_referred_anyone returns the six customers nobody names as referrer`() = rollback {
-        val rows = exercise(3, "never_referred_anyone")
+        val rows = exercise("sql/l03", "never_referred_anyone")
         rows.assertColumns("customer_id", "full_name")
         // referred_by holds 1, 2, 3, 4, 5, 7, 8 and five NULLs
         rows.assertRowsInOrder(
@@ -32,7 +32,7 @@ class JoinsTest {
             "INSERT INTO customers (customer_id, email, full_name, country_code, referred_by, created_at) " +
                 "VALUES (14, 'nia.okafor@example.com', 'Nia Okafor', 'US', 13, '2026-07-01 10:00+00')",
         )
-        exercise(3, "never_referred_anyone").assertRowsInOrder(
+        exercise("sql/l03", "never_referred_anyone").assertRowsInOrder(
             row(6, "Farid Haddad"),
             row(9, "Ivy Chen"),
             row(10, "Jonas Weber"),
@@ -44,7 +44,7 @@ class JoinsTest {
 
     @Test
     fun `merchant_failed_payments keeps merchants that have no failed payment`() = rollback {
-        val rows = exercise(3, "merchant_failed_payments")
+        val rows = exercise("sql/l03", "merchant_failed_payments")
         rows.assertColumns("merchant_id", "name", "payment_id", "amount_minor")
         rows.assertRowsInOrder(
             row(1, "Northwind Grocers", null, null),     // only good payments
@@ -66,7 +66,7 @@ class JoinsTest {
             "INSERT INTO payments (payment_id, card_id, merchant_id, amount_minor, status, created_at) " +
                 "VALUES (100, 1, 8, 999, 'failed', '2026-07-01 12:00+00')",
         )
-        val rows = exercise(3, "merchant_failed_payments")
+        val rows = exercise("sql/l03", "merchant_failed_payments")
         rows.assertRowsInOrder(
             row(1, "Northwind Grocers", null, null),
             row(2, "Blue Fern Cafe", 6, 2150),
@@ -83,7 +83,7 @@ class JoinsTest {
 
     @Test
     fun `merchants_with_refunds lists each refunding merchant once`() = rollback {
-        val rows = exercise(3, "merchants_with_refunds")
+        val rows = exercise("sql/l03", "merchants_with_refunds")
         rows.assertColumns("merchant_id", "name")
         // merchant 4 has three refunded payments and merchant 5 has two refunds on one payment
         rows.assertRowsInOrder(
@@ -99,7 +99,7 @@ class JoinsTest {
             "INSERT INTO refunds (refund_id, payment_id, amount_minor, reason, created_at) " +
                 "VALUES (50, 2, 1890, 'customer_request', '2026-07-01 12:00+00')",   // payment 2 is at merchant 2
         )
-        exercise(3, "merchants_with_refunds").assertRowsInOrder(
+        exercise("sql/l03", "merchants_with_refunds").assertRowsInOrder(
             row(1, "Northwind Grocers"),
             row(2, "Blue Fern Cafe"),
             row(4, "Volt Electronics"),

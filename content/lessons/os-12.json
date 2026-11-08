@@ -1,449 +1,449 @@
 {
-  "id": "os-12",
-  "title": "Containers are processes: namespaces and cgroups",
-  "minutes": 40,
-  "goal": "By the end you can show that a container is an ordinary process on a shared kernel, build one by hand from namespaces, a cgroup and an overlay root, predict what happens when it hits pids.max or memory.max, and read the cgroup files the JVM reads to size itself.",
-  "warmup": {
-    "q": "A container started with `docker run --memory 1g --cpus 1.5` runs `java -jar ledger.jar` with no heap or GC flags, on a 12-CPU host with 8 GB of RAM. What does JDK 25 pick?",
-    "options": [
-      "A 2 GB heap (25% of the host's 8 GB) and G1, because the JVM sees the whole host",
-      "A 256 MB heap (25% of the 1 GB limit), 2 CPUs, and the Serial collector",
-      "A 1 GB heap, 1 CPU, and G1",
-      "A 768 MB heap (75% of the limit), 12 CPUs, and the Parallel collector"
-    ],
-    "answer": 1,
-    "why": "The JVM reads the container's cgroup files at start-up: `memory.max` says 1 GB, so the default heap is 25% of it, and `cpu.max` says 150 ms per 100 ms, which it rounds up to 2 CPUs. With less than 1,792 MB, the machine isn't \"server-class\", so it picks Serial over G1. The lab box printed exactly that. The 2 GB answer is what a JVM does when it fails to detect the container, which is a real bug the last section covers."
-  },
-  "sections": [
-    {
-      "h": "A container is a process on the host's kernel",
-      "body": "Start a container that runs `sleep`, and inside it `ps` shows `sleep` as PID 1. From the host's side (the Docker VM, which runs every container on your Mac), the same process is PID 40037, its status file says `NSpid: 40037 1`, and `uname -r` prints `6.12.76-linuxkit` in both places. There is no second kernel and nothing booted. A container is a process.\n\nThe problem containers solve is old: run many services on one machine so that each acts as if it were alone. The ledger service shouldn't see the fraud service's processes, files or ports. A memory leak in one shouldn't get the other killed. A compromised one shouldn't be able to change the machine's clock or load a kernel module.\n\nThe simplest complete answer is a virtual machine per service: each gets its own kernel on emulated hardware. That isolates almost everything, and it costs a kernel, a boot and a reserved slice of memory for every service. Docker Desktop on your Mac does use one VM, the Docker VM this track has used all along, and every container runs inside that one.\n\nContainers keep one kernel and use four things it already has. **Namespaces** give a process its own view of the system: its own PID numbers, hostname, network interfaces and mount table. A **cgroup** caps how much it can use: tasks, memory, CPU time. **Capabilities** and **seccomp** limit what it may ask the kernel to do. An **overlay** root filesystem gives it its own files on top of a shared, read-only image. Each one is an ordinary kernel feature you can use without Docker, and this lesson does.\n\nThe figure is the model for the whole lesson. One kernel serves everything, and a container is a few processes wrapped in those four layers. Lessons 1 to 11 still apply unchanged inside a container: the system calls, the scheduler, the page cache and the OOM killer are the same ones, because there is only one of each. That's also the price. A kernel bug that a container can reach is a bug in every container on the machine, which is why Docker's seccomp filter blocks dozens of system calls (lesson 1 of this track) and io_uring (lesson 11).",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 720 296\" role=\"img\" aria-label=\"A container process in the middle, surrounded by namespaces, a cgroup, capabilities and seccomp, and an overlay root, all on one shared Linux kernel\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"680\" height=\"200\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"42\" text-anchor=\"start\">container \"ledger\": a few processes, wrapped</text><rect class=\"box-a\" x=\"250\" y=\"92\" width=\"220\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"119.0\" text-anchor=\"middle\">process</text><text class=\"t-s t-m\" x=\"360.0\" y=\"139.0\" text-anchor=\"middle\">PID 1 inside, 40037 on host</text><rect class=\"box\" x=\"40\" y=\"60\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"140.0\" y=\"83.0\" text-anchor=\"middle\">namespaces</text><text class=\"t-s t-m\" x=\"140.0\" y=\"103.0\" text-anchor=\"middle\">what it can see</text><rect class=\"box\" x=\"480\" y=\"60\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"580.0\" y=\"83.0\" text-anchor=\"middle\">cgroup</text><text class=\"t-s t-m\" x=\"580.0\" y=\"103.0\" text-anchor=\"middle\">how much it can use</text><rect class=\"box\" x=\"40\" y=\"150\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"140.0\" y=\"173.0\" text-anchor=\"middle\">capabilities, seccomp</text><text class=\"t-s t-m\" x=\"140.0\" y=\"193.0\" text-anchor=\"middle\">what it may ask for</text><rect class=\"box\" x=\"480\" y=\"150\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"580.0\" y=\"173.0\" text-anchor=\"middle\">overlay root</text><text class=\"t-s t-m\" x=\"580.0\" y=\"193.0\" text-anchor=\"middle\">which files it sees</text><line class=\"ln\" x1=\"240\" y1=\"88\" x2=\"260\" y2=\"108\"/><line class=\"ln\" x1=\"480\" y1=\"88\" x2=\"460\" y2=\"108\"/><line class=\"ln\" x1=\"240\" y1=\"178\" x2=\"260\" y2=\"142\"/><line class=\"ln\" x1=\"480\" y1=\"178\" x2=\"460\" y2=\"142\"/><rect class=\"box-b\" x=\"20\" y=\"236\" width=\"680\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"360.0\" y=\"264.0\" text-anchor=\"middle\">one Linux kernel (6.12 in the Docker VM), shared by every container</text><line class=\"ln-a\" x1=\"360\" y1=\"156\" x2=\"360\" y2=\"236\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"372\" y=\"200\" text-anchor=\"start\">system calls</text></svg>",
-        "caption": "The model for this lesson: a container is ordinary processes plus four kernel features, and every container shares the one kernel underneath."
-      },
-      "try": {
-        "title": "Find a container's process from the host",
-        "minutes": 3,
-        "steps": [
-          "Run this on your Mac, from the `labs` folder. It starts a container that sleeps, asks Docker for its process's PID on the host, and looks at that process from a second container that shares the host's PID namespace (`--pid=host`).",
-          "Predict the PID `ps` shows inside, and the `NSpid` line outside. The last line removes the container."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "on your Mac, in the labs folder",
-          "src": "docker run -d --name sfz-os12-ledger --hostname ledger sfz-labbox:1 sleep 300 > /dev/null\ndocker exec sfz-os12-ledger ps -o pid,ppid,comm\npid=$(docker inspect -f '{{.State.Pid}}' sfz-os12-ledger); echo \"host PID: $pid\"\ndocker run --rm --pid=host --cap-add SYS_PTRACE sfz-labbox:1 bash -c \"\n  ps -o pid,ppid,comm -p $pid\n  grep NSpid /proc/$pid/status\n  readlink /proc/$pid/ns/pid /proc/$pid/ns/net /proc/$pid/ns/user /proc/1/ns/pid /proc/1/ns/net /proc/1/ns/user\n  uname -r\"\ndocker exec sfz-os12-ledger uname -r\ndocker rm -f sfz-os12-ledger > /dev/null"
-        },
-        "expect": "PIDs and namespace numbers differ on your machine:\n\n```text\n  PID  PPID COMMAND\n    1     0 sleep\n    7     0 ps\nhost PID: 40037\n  PID  PPID COMMAND\n40037 40008 sleep\nNSpid:\t40037\t1\npid:[4026532698]\nnet:[4026532700]\nuser:[4026531837]\npid:[4026531836]\nnet:[4026531840]\nuser:[4026531837]\n6.12.76-linuxkit\n6.12.76-linuxkit\n```\n\nInside, `sleep` is PID 1. The host knows it as 40037, a child of the container runtime's process, and `NSpid` lists both numbers, outermost first. Its PID and network namespaces have different numbers from the host's (`/proc/1` in a `--pid=host` container is the VM's own init). Its user namespace is the same one: Docker doesn't use user namespaces by default, so root in the container is root to the kernel. The kernel version is identical inside and out."
-      },
-      "refs": [
-        {
-          "title": "namespaces(7): overview of Linux namespaces",
-          "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Namespaces decide what a process can see",
-      "body": "In the privileged lab box, `unshare --pid --fork --mount-proc --uts --net --ipc bash` starts a shell that can set its hostname to `ledger-box` while the box keeps `box-priv`. Inside, `ps -e` lists two processes with `bash` as PID 1, and `ip link` finds a loopback device that's down and no `eth0` at all.\n\nThe kernel keeps many tables that used to be global: the list of process IDs, the hostname, the network interfaces with their addresses, ports and routes, the list of mounted file systems. A **namespace** is a separate copy of one of those tables. Every process belongs to exactly one namespace of each kind, which `/proc/<pid>/ns/` shows as numbers such as `pid:[4026532834]`. A child starts in its parent's namespaces. `unshare`, or `clone` with flags such as `CLONE_NEWPID`, puts a process into new ones, and `setns` joins existing ones, which is how `docker exec` gets a shell into a running container. Linux has eight kinds:\n\n| namespace | gives the process its own | in a container |\n|---|---|---|\n| pid | process numbers | the app is PID 1 |\n| mnt | mount table | its own root file system |\n| net | interfaces, IPs, ports, routes | its own `eth0` and `localhost` |\n| uts | hostname | the container ID as hostname |\n| ipc | System V IPC and POSIX message queues | no shared memory with neighbours |\n| user | mapping of user and group IDs | root inside, nobody outside (off in Docker by default) |\n| cgroup | view of the cgroup tree | its own cgroup looks like `/` |\n| time | offsets for the monotonic and boot clocks | rarely used |\n\nThe PID namespace has two consequences you met in lesson 2 of this track. Its first process is PID 1 and takes on init's jobs: it must reap orphans, and the kernel delivers it only the signals it has a handler for, apart from `SIGKILL` sent from outside. And when that PID 1 exits, the kernel kills every other process in the namespace. Nested namespaces give a process one PID per level, which is the `NSpid` line.\n\nNamespaces only change answers. A process in its own PID namespace sees 2 processes instead of 300, and it can still fork until the machine's task table is full, or allocate until the host runs out of RAM. Seeing less isn't the same as using less.",
-      "try": {
-        "title": "Make namespaces with unshare",
-        "minutes": 3,
-        "steps": [
-          "Creating namespaces needs the privileged box: from the `labs` folder, `docker compose -f env/labbox.yml run --rm box-priv`. (Docker's seccomp filter blocks `unshare` in the everyday box, as lesson 1 showed.)",
-          "The block prints the shell's hostname and namespace numbers, starts a shell in new PID, mount, UTS, network and IPC namespaces, and looks around. Predict which lines differ."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the privileged lab box",
-          "src": "echo \"outside: $(hostname), $(readlink /proc/self/ns/pid /proc/self/ns/uts /proc/self/ns/net | tr '\\n' ' ')\"\nunshare --pid --fork --mount-proc --uts --net --ipc bash -c '\n  hostname ledger-box\n  echo \"inside: $(hostname), $(readlink /proc/self/ns/pid /proc/self/ns/uts /proc/self/ns/net | tr \"\\n\" \" \")\"\n  ps -e\n  ip -brief link show lo\n  ip -brief link show eth0'\necho \"outside again: $(hostname)\""
-        },
-        "expect": "Namespace numbers differ:\n\n```text\noutside: box-priv, pid:[4026532698] uts:[4026532696] net:[4026532700] \ninside: ledger-box, pid:[4026532834] uts:[4026532832] net:[4026532835] \n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    7 ?        00:00:00 ps\nlo               DOWN           00:00:00:00:00:00 <LOOPBACK> \noutside again: box-priv\nDevice \"eth0\" does not exist.\n```\n\nEvery namespace number changed, the hostname changed only inside, and the new PID namespace holds two processes, numbered from 1. `--mount-proc` mounted a fresh `/proc` for that namespace, which is why `ps` sees nothing else. The new network namespace has only a loopback device, down; `eth0` doesn't exist there (the error line comes out last because it goes to standard error). Back outside, the hostname is untouched."
-      },
-      "refs": [
-        {
-          "title": "unshare(1)",
-          "url": "https://man7.org/linux/man-pages/man1/unshare.1.html",
-          "kind": "docs"
-        },
-        {
-          "title": "pid_namespaces(7): PID 1 and nesting",
-          "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "A cgroup decides how much it can use",
-      "body": "The same kind of shell, moved into a cgroup with `pids.max` set to 20 and `memory.max` to 64M, stops twice. `forks.c` gets 19 children, and then `fork number 20 failed: EAGAIN`. `hog.c` holds 48 MB, and its next 16 MB gets it killed with exit code 137.\n\nA **cgroup** (control group) is a set of processes that the kernel counts and limits together. You've used three of its controls in this track: `pids.max` in lesson 3, `cpu.max` in lesson 4 and `memory.max` in lesson 7. In cgroup v2, the default on current distributions and in the lab box, the groups form one tree of directories under `/sys/fs/cgroup`. Making a group is `mkdir`. Every process is in exactly one group, listed in that group's `cgroup.procs`, and writing a PID into that file moves the process. A group's limits apply to everything below it, so a limit on a parent group also caps every group under it.\n\nEach kind of resource has a controller, and each controller has files:\n\n| controller | limit | how much now | what happened |\n|---|---|---|---|\n| pids | `pids.max` | `pids.current` | `pids.events`: max |\n| memory | `memory.max`, `memory.high` | `memory.current`, `memory.stat` | `memory.events`: max, oom, oom_kill |\n| cpu | `cpu.max`, `cpu.weight` | `cpu.stat` | `cpu.stat`: nr_throttled |\n\nLimits act where the resource is spent. A `fork` or `clone`, threads included, that would pass `pids.max` fails with `EAGAIN`. A page fault that would push `memory.current` past `memory.max` makes the kernel reclaim inside the group first, and if that fails, run the OOM killer on the group's biggest process. A group that has used its `cpu.max` budget is throttled until the next period. `docker run --pids-limit 20 --memory 64m --cpus 0.5` writes exactly these files, and so does the kubelet from a pod's limits.\n\nOne rule shows up when you build a group by hand. In cgroup v2, a group that hands controllers down to child groups, through `cgroup.subtree_control`, can't hold processes itself. The Try-it moves the box's processes into a child called `init` before it creates `ledger` for that reason. The stepper builds a whole container this way and runs it into both limits.",
-      "stepper": {
-        "title": "Into a cgroup and new namespaces, then into the limits",
-        "intro": "The worked example's run in the privileged box, which plays the host. Left: processes as the box numbers them. Middle: inside the new namespaces. Right: the cgroup's files. Blank PIDs are ones the run didn't print.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Before: a shell on the host, and an empty cgroup with pids.max 20 and memory.max 64M\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box-dim\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><text class=\"t-s t-m\" x=\"365.0\" y=\"135.0\" text-anchor=\"middle\">not created yet</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 0</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">mkdir /sys/fs/cgroup/ledger, then two writes: pids.max and memory.max.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">No process is in the group yet, so nothing is limited.</text></svg>",
-            "say": "The privileged box's shell has made a cgroup by creating a directory, `/sys/fs/cgroup/ledger`, and writing two files: `pids.max` = 20 and `memory.max` = 64M (and `memory.swap.max` = 0). It has also built an image: a directory with `bash`, `ps`, `forks`, `hog` and their libraries, 8.3 MB, mounted with an overlay. No process is in the group yet."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"A shell writes its own PID into cgroup.procs and becomes the group's first task\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box-a\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box-dim\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><text class=\"t-s t-m\" x=\"365.0\" y=\"135.0\" text-anchor=\"middle\">not created yet</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 1</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">echo $$ &gt; /sys/fs/cgroup/ledger/cgroup.procs, then exec unshare.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">From now on, every task this one starts is counted in /ledger.</text></svg>",
-            "say": "A new shell writes its PID into `ledger/cgroup.procs`. That one write moves it into the group, and every child it makes from now on starts there too. It then `exec`s `unshare`, keeping its PID, 122. It still sees everything: the same PIDs, hostname, network and files as the host."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"unshare creates new namespaces and forks bash, which is PID 124 outside and PID 1 inside\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box-a\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box-a\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 2</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">unshare --pid --fork --mount --uts --net --ipc --cgroup --root=/c/root</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">One process, two PIDs: NSpid of 124 reads \"124 1\".</text></svg>",
-            "say": "`unshare` asks the kernel for new PID, mount, UTS, network, IPC and cgroup namespaces, then forks `bash` into them with the overlay as its root. The host numbers the new process 124; its own PID namespace numbers it 1, so `/proc/124/status` says `NSpid: 124 1`. It sets the hostname to `ledger-box`, which only its UTS namespace sees."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Inside, ps sees two processes, / holds four directories, and the cgroup looks like the root\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">ps</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\"></text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">ps</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\">PID 5</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 3</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">Inside: ps lists PIDs 1 and 5, ls / prints bin lib proc tmp,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">and /proc/self/cgroup says 0::/ because of the cgroup namespace.</text></svg>",
-            "say": "Inside, `ps -e` lists just `bash` (1) and `ps` (5): the new `/proc` shows only this PID namespace. `ls /` prints `bin lib proc tmp`, the 8.3 MB image. `/proc/self/cgroup` prints `0::/`, because the cgroup namespace makes `/ledger` look like the root. Nothing here was copied or emulated: it's the same kernel, answering the same calls with different tables."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"forks.c forks until fork number 18 fails with EAGAIN: the group holds 20 tasks\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">forks + 17</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\"></text><rect class=\"box\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">forks</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\"></text><rect class=\"box-bad\" x=\"260\" y=\"108\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"127\" text-anchor=\"start\">17 children</text><text class=\"t-s t-code\" x=\"458\" y=\"127\" text-anchor=\"end\"></text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box-bad\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 20</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">pids.events max 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">unshare + bash + forks + 17 children = 20 = pids.max. Fork 18: EAGAIN.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">The PID namespace renumbered them; only the cgroup stopped them.</text></svg>",
-            "say": "`forks` makes children that only sleep. With `unshare`, `bash` and `forks` already in the group, the 17th child brings it to 20 tasks, and the next `fork` fails with `EAGAIN`: the kernel's pids controller refused it, and `pids.events` counts `max 1`. The PID namespace gave the children small numbers, but it limits nothing. `forks` kills its children and exits."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"hog.c touches 16, 32, 48 MB; its next 16 MB would pass memory.max, and the OOM killer picks it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-bad\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">hog</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\">149</text><rect class=\"box\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box-bad\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">hog: 48 MB</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\">PID 26</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box-bad\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">memory.events</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">max 37, oom_kill 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">hog asks for its 4th 16 MB block: the group would pass 64M with no swap,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">reclaim finds nothing, and the OOM killer kills the biggest task: hog.</text></svg>",
-            "say": "`hog` takes 16 MB at a time and writes every page, so each page is charged to `/ledger` (lesson 7 of this track). After 48 MB, the next step's page faults would push the group past `memory.max`. With no swap allowed, reclaim frees almost nothing, the kernel counts `max` events, and the OOM killer kills the group's biggest task, `hog`: `SIGKILL`, exit code 137, `oom_kill 1`. `bash` survives."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Afterwards: the host still sees every number, and the file the container wrote is in the overlay's upper layer\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">batch.csv: in the upper dir</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">image directory: unchanged</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.events max 1</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">oom_kill 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">A container: namespaces for what it sees, a cgroup for what it uses,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">an overlay root for its files. One kernel the whole time.</text></svg>",
-            "say": "The shell wrote `/tmp/batch.csv`. It landed in the overlay's writable upper directory, `/c/upper/tmp/batch.csv`, and the image directory below didn't change. From the host, every process had a normal PID the whole time, and the cgroup files kept the score. That's a container: a few processes, some namespaces, a cgroup and a root filesystem, on the kernel everything else uses."
-          }
-        ]
-      },
-      "try": {
-        "title": "A fork bomb and a memory hog in a cgroup you made",
-        "minutes": 4,
-        "steps": [
-          "In the privileged box again. The block makes the cgroup `ledger` with `pids.max` 20, `memory.max` 64M and no swap, then runs `os/c/l12/forks.c` and `os/c/l12/hog.c` in it, each from a shell that first writes its own PID into `cgroup.procs`.",
-          "Predict the fork number that fails, the last \"holding\" line, and the exit code. The cgroup disappears when the box exits."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the privileged lab box",
-          "src": "gcc -O2 -o /tmp/forks os/c/l12/forks.c && gcc -O2 -o /tmp/hog os/c/l12/hog.c\ncd /sys/fs/cgroup\nmkdir init; for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done\necho \"+pids +memory +cpu\" > cgroup.subtree_control\nmkdir ledger\necho 20 > ledger/pids.max; echo 64M > ledger/memory.max; echo 0 > ledger/memory.swap.max\ncat ledger/pids.max ledger/memory.max\nbash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs; cat /proc/self/cgroup; /tmp/forks 500'\ncat ledger/pids.events\nbash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs; /tmp/hog 256; echo \"exit code $?\"'\ngrep -E '^(max|oom|oom_kill) ' ledger/memory.events"
-        },
-        "expect": "The `max` count in `memory.events` changes from run to run (18, 35 and 37 in mine):\n\n```text\n20\n67108864\n0::/ledger\nfork number 20 failed: EAGAIN (Resource temporarily unavailable)\n19 children running\nmax 1\nholding 16 MB\nholding 32 MB\nholding 48 MB\nexit code 137\nmax 18\noom 1\noom_kill 1\nbash: line 1:    45 Killed                  /tmp/hog 256\n```\n\n`bash -c` ran `forks` as its last command, so `forks` replaced it in the same task: 1 plus 19 children is 20, and fork number 20 failed with `EAGAIN`, counted once in `pids.events`. `hog` reached 48 MB. Its next block would have taken the group past 64 MB, reclaim found nothing to free, and the OOM killer sent it `SIGKILL`: exit code 137 and `oom_kill 1`. `max` counts every time the group hit its limit and reclaimed, not just kills. The `Killed` line from bash arrives last because it's written to standard error."
-      },
-      "refs": [
-        {
-          "title": "Control Group v2 (Linux kernel documentation)",
-          "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
-          "kind": "docs"
-        },
-        {
-          "title": "cgroups(7)",
-          "url": "https://man7.org/linux/man-pages/man7/cgroups.7.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Capabilities, seccomp and an overlay root finish the job",
-      "body": "Root in the lab box can `chown` a file, but `date -s 2030-01-01` fails with `cannot set date: Operation not permitted`. Start the container with `--cap-drop CHOWN`, and `chown` fails the same way, still as root.\n\nWithout a user namespace, which Docker doesn't use by default, root in a container is user 0 to the kernel, the same user as root on the host. What stops it is that Linux doesn't check \"is this user 0?\" for privileged operations. It splits root's power into about 40 **capabilities**, each guarding a group of operations: `CAP_CHOWN` for changing file owners, `CAP_NET_BIND_SERVICE` for ports below 1024, `CAP_SYS_TIME` for setting the clock, `CAP_SYS_ADMIN` for mounts and much more. A process has a set of them, and the kernel checks the one the operation needs. Docker gives a container 14 and drops the rest, so the `CapEff` mask in `/proc/self/status` decodes to `cap_chown`, `cap_kill`, `cap_net_bind_service` and 11 others, and no `cap_sys_time`. `--privileged` gives all of them and turns seccomp off; that's the `box-priv` you've used for this lesson's experiments.\n\nseccomp is the filter from lesson 1 of this track. It runs before every system call, and Docker's default profile refuses around 44 of them, including `mount`, `unshare` and the io_uring calls. Capabilities say which privileged operations a process may perform; seccomp removes whole system calls from reach, in case the kernel has a bug in one of them.\n\nLast, the files. An image is a stack of read-only layers: `sfz-labbox:1` has 7. A container's root is an **overlay** mount: the image layers as `lowerdir`, plus an empty writable `upperdir` of its own. A read finds the file in the topmost layer that has it. The first write to a file from a lower layer copies the whole file up into the upper directory and changes the copy, which is copy-on-write again (lesson 7 of this track), per file instead of per page. A delete writes a marker, a \"whiteout\", that hides the lower file. `docker diff` lists the upper directory, and `docker rm` throws it away, so a container never changes its image. A hundred containers from one image share its layers on disk and in the page cache.",
-      "try": {
-        "title": "Capabilities, then the writable layer",
-        "minutes": 3,
-        "steps": [
-          "On your Mac, from the `labs` folder. The first command decodes the container's capabilities and tries one allowed and one forbidden operation. The second drops `CHOWN`.",
-          "The rest starts a container, changes one file from the image, deletes another and creates a third, and asks Docker what's in its upper layer. Predict the letters `docker diff` prints."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "on your Mac, in the labs folder",
-          "src": "docker run --rm sfz-labbox:1 bash -c 'grep CapEff /proc/self/status; capsh --decode=$(grep CapEff /proc/self/status | cut -f2); touch /tmp/x; chown nobody /tmp/x && echo \"chown: ok\"; date -s 2030-01-01 > /dev/null'\ndocker run --rm --cap-drop CHOWN sfz-labbox:1 bash -c 'touch /tmp/x; chown nobody /tmp/x'\ndocker run -d --name sfz-os12-diff sfz-labbox:1 sleep 120 > /dev/null\ndocker exec sfz-os12-diff bash -c 'echo \"ISSUER=acme-bank\" >> /etc/environment; rm /etc/legal; echo ok > /tmp/settle.csv'\ndocker diff sfz-os12-diff\ndocker rm -f sfz-os12-diff > /dev/null"
-        },
-        "expect": "```text\nCapEff:\t00000000a80425fb\n0x00000000a80425fb=cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap\nchown: ok\ndate: cannot set date: Operation not permitted\nchown: changing ownership of '/tmp/x': Operation not permitted\nC /tmp\nA /tmp/settle.csv\nC /etc\nC /etc/environment\nD /etc/legal\n```\n\nRoot had 14 capabilities: `cap_chown` was among them and `cap_sys_time` wasn't, so `chown` worked and `date -s` didn't. With `--cap-drop CHOWN`, the same root user can't `chown`. `docker diff` shows the upper layer: `C` for changed (`/etc/environment`, copied up and appended to, and its directory), `A` for added (`/tmp/settle.csv`) and `D` for deleted (`/etc/legal`, a whiteout). The image itself is unchanged, and the next container from it starts clean."
-      },
-      "refs": [
-        {
-          "title": "capabilities(7)",
-          "url": "https://man7.org/linux/man-pages/man7/capabilities.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Overlay Filesystem (Linux kernel documentation)",
-          "url": "https://docs.kernel.org/filesystems/overlayfs.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "The JVM reads the same cgroup files, and so should you",
-      "body": "Under `--memory 1g --cpus 1.5`, JDK 25 chose a 256 MB heap, 2 CPUs and the Serial collector. In the same container with container support turned off, it chose a 1,984 MB heap and G1: sized for the Docker VM's 7.9 GB and 12 CPUs, in a container that gets killed at 1 GB.\n\nAt start-up, the JVM finds its cgroup in `/proc/self/cgroup` and reads its files. The default maximum heap is 25% of `memory.max` (`-XX:MaxRAMPercentage`). The CPU count is `cpu.max`'s quota divided by its period, rounded up (lesson 4 of this track) and capped by the CPUs in its cpuset. That number sizes the GC threads, the JIT compiler threads, the common `ForkJoinPool` and the virtual-thread carriers. The collector is G1 only on a \"server-class machine\", at least 2 CPUs and 1,792 MB; below that, Serial. A 256 MB container gets a 126 MB heap, about half, because HotSpot keeps a floor under small heaps. `java -XshowSettings:system -version` prints what the JVM detected, and `-Xlog:os+container=debug` prints how.\n\nWhen detection fails, you get the 1,984 MB heap. That happened to real services: on Linux 6.12, the kernel stopped listing `cpuset` in `/proc/cgroups`, and JDK builds such as 17.0.12 and 21.0.5 treated that as a required controller gone missing. The bug report, JDK-8346874, shows the JVM logging \"One or more required controllers disabled at kernel level\" and sizing the heap from the host's memory, and an early JDK 25 build printing \"System not containerized\". JDK 25 has the fix (JDK-8347129); the lab box runs kernel 6.12, and its log says `Detected optional cpuset controller entry`. On JDK 17 or 21, run `-XshowSettings:system` in the real image on the real nodes, and look for `System not containerized`.\n\nThe same files answer production questions, which is the last tool for this track. Brendan Gregg's **USE method** checks every resource for utilization, saturation and errors. In a container, each has a file. CPU: `cpu.stat`'s `usage_usec` for utilization, `nr_throttled` and `cpu.pressure` for saturation. Memory: `memory.current` against `memory.max`, then `memory.pressure`, then `oom_kill` in `memory.events`. Tasks: `pids.current`, and `max` in `pids.events`. The `*.pressure` files are **PSI** (pressure stall information): the share of time tasks in the group waited for that resource, `some` when at least one waited and `full` when all did, as averages over 10, 60 and 300 seconds and a running total in microseconds. Two busy workers under `--cpus 0.5` stalled 6.2 s of 11. Inside a container, `/proc/pressure`, `free` and `/proc/meminfo` describe the whole VM, like `top`; the cgroup files describe your container.",
-      "try": {
-        "title": "Read the limits the way the JVM does",
-        "minutes": 4,
-        "steps": [
-          "On your Mac, from the `labs` folder. The first loop starts two containers with different limits and prints the cgroup files next to the heap, collector and CPU count the JVM chose. Then the JVM runs once more with container support switched off.",
-          "The second part runs two busy workers in a container with half a CPU for 11 seconds and reads its CPU pressure and throttling counters. Predict the heap for each run, and roughly what share of the time the workers stalled."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "on your Mac, in the labs folder",
-          "src": "for limits in \"--memory 1g --cpus 1.5\" \"--memory 4g --cpus 4\"; do\n  echo \"== $limits\"\n  docker run --rm $limits sfz-labbox:1 bash -c 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max\n    java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E \" (MaxHeapSize|UseSerialGC|UseG1GC) \"\n    java -XshowSettings:system -version 2>&1 | grep -E \"Effective CPU|Memory Limit\"'\ndone\necho \"== --memory 1g --cpus 1.5, container support off\"\ndocker run --rm --memory 1g --cpus 1.5 sfz-labbox:1 bash -c 'java -XX:-UseContainerSupport -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E \" (MaxHeapSize|UseG1GC) \"'\ndocker run --rm --cpus 0.5 sfz-labbox:1 bash -c '\n  stress-ng --cpu 2 --timeout 12s --quiet & sleep 11\n  cat /sys/fs/cgroup/cpu.pressure\n  grep -E \"nr_periods|nr_throttled\" /sys/fs/cgroup/cpu.stat\n  wait'"
-        },
-        "expect": "The pressure numbers vary with how busy the VM is:\n\n```text\n== --memory 1g --cpus 1.5\n1073741824\n150000 100000\n   size_t MaxHeapSize                              = 268435456                                 {product} {ergonomic}\n     bool UseG1GC                                  = false                                     {product} {default}\n     bool UseSerialGC                              = true                                      {product} {ergonomic}\n    Effective CPU Count: 2\n    Memory Limit: 1.00G\n== --memory 4g --cpus 4\n4294967296\n400000 100000\n   size_t MaxHeapSize                              = 1073741824                                {product} {ergonomic}\n     bool UseG1GC                                  = true                                      {product} {ergonomic}\n     bool UseSerialGC                              = false                                     {product} {default}\n    Effective CPU Count: 4\n    Memory Limit: 4.00G\n== --memory 1g --cpus 1.5, container support off\n   size_t MaxHeapSize                              = 2080374784                                {product} {ergonomic}\n     bool UseG1GC                                  = true                                      {product} {ergonomic}\nsome avg10=34.77 avg60=8.92 avg300=1.98 total=6195106\nfull avg10=34.77 avg60=8.92 avg300=1.98 total=6194445\nnr_periods 126\nnr_throttled 120\n```\n\n1 GB and 1.5 CPUs gave a 256 MB heap, 2 CPUs (1.5 rounded up) and Serial; 4 GB and 4 CPUs gave 1 GB and G1. With `-XX:-UseContainerSupport`, the JVM sized itself from the VM's 7.9 GB: a heap twice the container's limit. In the last run, `total=6195106` means tasks in the group waited 6.2 s for CPU during the 11 s, and `nr_throttled` shows the group ran out of its 50 ms budget in 120 of 126 periods. `avg10` is still climbing, because it's a moving average over 10 seconds."
-      },
-      "refs": [
-        {
-          "title": "JDK-8346874: Linux kernel version 6.12 and newer breaks JVM container support",
-          "url": "https://bugs.openjdk.org/browse/JDK-8346874",
-          "kind": "read"
-        },
-        {
-          "title": "PSI: Pressure Stall Information (Linux kernel documentation)",
-          "url": "https://docs.kernel.org/accounting/psi.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Brendan Gregg: The USE Method",
-          "url": "https://www.brendangregg.com/usemethod.html",
-          "kind": "read"
-        }
-      ]
-    }
+ "id": "os-12",
+ "title": "Containers are processes: namespaces and cgroups",
+ "minutes": 40,
+ "goal": "By the end you can show that a container is an ordinary process on a shared kernel, build one by hand from namespaces, a cgroup and an overlay root, predict what happens when it hits pids.max or memory.max, and read the cgroup files the JVM reads to size itself.",
+ "warmup": {
+  "q": "A container started with `docker run --memory 1g --cpus 1.5` runs `java -jar ledger.jar` with no heap or GC flags, on a 12-CPU host with 8 GB of RAM. What does JDK 25 pick?",
+  "options": [
+   "A 2 GB heap (25% of the host's 8 GB) and G1, because the JVM sees the whole host",
+   "A 256 MB heap (25% of the 1 GB limit), 2 CPUs, and the Serial collector",
+   "A 1 GB heap, 1 CPU, and G1",
+   "A 768 MB heap (75% of the limit), 12 CPUs, and the Parallel collector"
   ],
-  "analogy": "A container is a tenant in a building, not a house of its own. Namespaces are the walls and the private mailbox: the tenant sees only their own rooms and their own post, and can paint the door number 1. The cgroup is the metered supply: so much water, so much power, and the breaker trips for this flat only. Capabilities and seccomp are the house rules at the front desk: you may hang pictures, you may not touch the boiler. The overlay is a furnished flat: the furniture comes with the building and stays when you leave, and anything you change is yours until you move out. The analogy breaks at the foundations. Real buildings have separate wiring per flat, but every container shares the one kernel, so a fault in the kernel is a fault under every tenant at once. That's the line where a VM, or a sandbox such as gVisor or Firecracker, starts to make sense.",
-  "in_your_world": "Every pod you deploy is this lesson. The kubelet turns `limits.memory` into `memory.max` and `limits.cpu` into `cpu.max`, so a payment service's 137 with `OOMKilled` is lesson 7's OOM killer inside the pod's cgroup, and a p99 that jumps when a batch starts is lesson 4's throttling. Your Quarkus or Temporal worker JVM sizes its heap, GC and thread pools from those same files, which makes two checks worth doing once per base image: `java -XshowSettings:system -version` must show the container's limits, not the node's, and the heap should be set on purpose (`-XX:MaxRAMPercentage=60` to `75` is common for a JVM-only container) instead of left at 25%. When a pod is slow and its graphs look fine, read its PSI files: `cpu.pressure` and `memory.pressure` say how long it waited, which a utilization graph can't.",
-  "mistake": "Treating a container as a small VM: assuming that root inside it is harmless, that `free` and `top` describe it, and that its kernel settings are its own. Root in a default Docker container is user 0 to the shared kernel, held back only by 14 capabilities and a seccomp filter, which is why `--privileged` or extra capabilities like `SYS_ADMIN` should be treated as handing over the host. `free`, `top`, `/proc/meminfo` and `/proc/pressure` describe the whole VM or node, so a container that looks idle in `top` may be throttled to death in `cpu.stat`. And `sysctl` settings like `vm.overcommit_memory` or `kernel.io_uring_disabled` belong to the node. Read limits and pressure from `/sys/fs/cgroup`, and decide privileges as if the container were a process on the host, because it is.",
-  "compare": {
-    "title": "A namespace against a cgroup",
-    "a": {
-      "label": "Namespace: what it sees",
-      "lang": "text",
-      "title": "unshare --pid --uts --net ... in box-priv",
-      "src": "outside: box-priv, pid:[4026532698] uts:[4026532696] net:[4026532700] \ninside: ledger-box, pid:[4026532834] uts:[4026532832] net:[4026532835] \n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    7 ?        00:00:00 ps\nlo               DOWN           00:00:00:00:00:00 <LOOPBACK> \noutside again: box-priv\nDevice \"eth0\" does not exist."
-    },
-    "b": {
-      "label": "Cgroup: what it uses",
-      "lang": "text",
-      "title": "pids.max 20, memory.max 64M in box-priv",
-      "src": "20\n67108864\n0::/ledger\nfork number 20 failed: EAGAIN (Resource temporarily unavailable)\n19 children running\nmax 1\nholding 16 MB\nholding 32 MB\nholding 48 MB\nexit code 137\nmax 18\noom 1\noom_kill 1\nbash: line 1:    45 Killed                  /tmp/hog 256"
-    },
-    "note": "A namespace changes the answers the kernel gives: which PIDs exist, what the hostname is, which interfaces there are. It never makes a call fail for using too much. A cgroup changes nothing a process can see, apart from its own cgroup files, and makes calls fail or processes die when they use too much: `fork` returns `EAGAIN`, a page fault ends in `SIGKILL`, a busy thread gets throttled. A container needs both: the left side alone can fork-bomb the host, and the right side alone sees and can signal every process on it."
-  },
-  "worked": {
-    "title": "Build a container by hand",
+  "answer": 1,
+  "why": "The JVM reads the container's cgroup files at start-up: `memory.max` says 1 GB, so the default heap is 25% of it, and `cpu.max` says 150 ms per 100 ms, which it rounds up to 2 CPUs. With less than 1,792 MB, the machine isn't \"server-class\", so it picks Serial over G1. The lab box printed exactly that. The 2 GB answer is what a JVM does when it fails to detect the container, which is a real bug the last section covers."
+ },
+ "sections": [
+  {
+   "h": "A container is a process on the host's kernel",
+   "body": "Start a container that runs `sleep`, and inside it `ps` shows `sleep` as PID 1. From the host's side (the Docker VM, which runs every container on your Mac), the same process is PID 40037, its status file says `NSpid: 40037 1`, and `uname -r` prints `6.12.76-linuxkit` in both places. There is no second kernel and nothing booted. A container is a process.\n\nThe problem containers solve is old: run many services on one machine so that each acts as if it were alone. The ledger service shouldn't see the fraud service's processes, files or ports. A memory leak in one shouldn't get the other killed. A compromised one shouldn't be able to change the machine's clock or load a kernel module.\n\nThe simplest complete answer is a virtual machine per service: each gets its own kernel on emulated hardware. That isolates almost everything, and it costs a kernel, a boot and a reserved slice of memory for every service. Docker Desktop on your Mac does use one VM, the Docker VM this track has used all along, and every container runs inside that one.\n\nContainers keep one kernel and use four things it already has. **Namespaces** give a process its own view of the system: its own PID numbers, hostname, network interfaces and mount table. A **cgroup** caps how much it can use: tasks, memory, CPU time. **Capabilities** and **seccomp** limit what it may ask the kernel to do. An **overlay** root filesystem gives it its own files on top of a shared, read-only image. Each one is an ordinary kernel feature you can use without Docker, and this lesson does.\n\nThe figure is the model for the whole lesson. One kernel serves everything, and a container is a few processes wrapped in those four layers. Lessons 1 to 11 still apply unchanged inside a container: the system calls, the scheduler, the page cache and the OOM killer are the same ones, because there is only one of each. That's also the price. A kernel bug that a container can reach is a bug in every container on the machine, which is why Docker's seccomp filter blocks dozens of system calls (lesson 1 of this track) and io_uring (lesson 11).",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 720 296\" role=\"img\" aria-label=\"A container process in the middle, surrounded by namespaces, a cgroup, capabilities and seccomp, and an overlay root, all on one shared Linux kernel\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"680\" height=\"200\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"42\" text-anchor=\"start\">container \"ledger\": a few processes, wrapped</text><rect class=\"box-a\" x=\"250\" y=\"92\" width=\"220\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"119.0\" text-anchor=\"middle\">process</text><text class=\"t-s t-m\" x=\"360.0\" y=\"139.0\" text-anchor=\"middle\">PID 1 inside, 40037 on host</text><rect class=\"box\" x=\"40\" y=\"60\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"140.0\" y=\"83.0\" text-anchor=\"middle\">namespaces</text><text class=\"t-s t-m\" x=\"140.0\" y=\"103.0\" text-anchor=\"middle\">what it can see</text><rect class=\"box\" x=\"480\" y=\"60\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"580.0\" y=\"83.0\" text-anchor=\"middle\">cgroup</text><text class=\"t-s t-m\" x=\"580.0\" y=\"103.0\" text-anchor=\"middle\">how much it can use</text><rect class=\"box\" x=\"40\" y=\"150\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"140.0\" y=\"173.0\" text-anchor=\"middle\">capabilities, seccomp</text><text class=\"t-s t-m\" x=\"140.0\" y=\"193.0\" text-anchor=\"middle\">what it may ask for</text><rect class=\"box\" x=\"480\" y=\"150\" width=\"200\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"580.0\" y=\"173.0\" text-anchor=\"middle\">overlay root</text><text class=\"t-s t-m\" x=\"580.0\" y=\"193.0\" text-anchor=\"middle\">which files it sees</text><line class=\"ln\" x1=\"240\" y1=\"88\" x2=\"260\" y2=\"108\"/><line class=\"ln\" x1=\"480\" y1=\"88\" x2=\"460\" y2=\"108\"/><line class=\"ln\" x1=\"240\" y1=\"178\" x2=\"260\" y2=\"142\"/><line class=\"ln\" x1=\"480\" y1=\"178\" x2=\"460\" y2=\"142\"/><rect class=\"box-b\" x=\"20\" y=\"236\" width=\"680\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"360.0\" y=\"264.0\" text-anchor=\"middle\">one Linux kernel (6.12 in the Docker VM), shared by every container</text><line class=\"ln-a\" x1=\"360\" y1=\"156\" x2=\"360\" y2=\"236\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"372\" y=\"200\" text-anchor=\"start\">system calls</text></svg>",
+    "caption": "The model for this lesson: a container is ordinary processes plus four kernel features, and every container shares the one kernel underneath."
+   },
+   "try": {
+    "title": "Find a container's process from the host",
+    "minutes": 3,
     "steps": [
-      {
-        "say": "An image is just a directory. Copy a few programs into one, with the shared libraries `ldd` says they need. In the privileged box, on a scratch `tmpfs`:",
-        "code": "mkdir -p /c && mount -t tmpfs -o size=200m tmpfs /c\nmkdir -p /c/image/bin /c/image/proc /c/image/tmp\ncp /tmp/forks /tmp/hog /c/image/bin/                     # built from os/c/l12/\nfor b in bash ls cat hostname ps; do cp $(command -v $b) /c/image/bin/; done\nfor lib in $(ldd /c/image/bin/* 2>/dev/null | grep -o '/[^ ]*\\.so[^ ]*' | sort -u); do\n  mkdir -p /c/image$(dirname $lib); cp $lib /c/image$lib\ndone\ndu -sh /c/image\n# 8.3M\t/c/image",
-        "lang": "bash"
-      },
-      {
-        "say": "Give it a writable layer. The overlay merges the read-only image with an empty upper directory; writes go up there.",
-        "code": "mkdir -p /c/upper /c/work /c/root\nmount -t overlay overlay -o lowerdir=/c/image,upperdir=/c/upper,workdir=/c/work /c/root",
-        "lang": "bash"
-      },
-      {
-        "say": "Make the cgroup and set its limits. First move the box's own processes into a child group, because a group that enables controllers for its children can't hold processes.",
-        "code": "cd /sys/fs/cgroup\nmkdir init; for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done\necho \"+pids +memory +cpu\" > cgroup.subtree_control\nmkdir ledger\necho 20 > ledger/pids.max; echo 64M > ledger/memory.max; echo 0 > ledger/memory.swap.max",
-        "lang": "bash"
-      },
-      {
-        "say": "Join the cgroup, then let `unshare` start a shell in new namespaces with the overlay as its root. `env -i` gives it an empty environment, as an image's entrypoint would get.",
-        "code": "bash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs\n  exec env -i PATH=/bin LC_ALL=C unshare --pid --fork --mount --uts --net --ipc --cgroup \\\n    --root=/c/root --mount-proc bash -c \"hostname ledger-box; ...; forks 500; hog 256\"' &",
-        "lang": "bash"
-      },
-      {
-        "say": "What the container printed, and what the host saw. Inside: PID 1, a four-directory root, a cgroup that looks like `/`, and both limits. Outside: each process with two PIDs, the events in the cgroup's files, and the container's one file in the upper layer.",
-        "code": "# inside (output trimmed)\npid 1 on ledger-box, / holds: bin lib proc tmp\n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    5 ?        00:00:00 ps\n0::/\nfork number 18 failed: EAGAIN (Resource temporarily unavailable)\nholding 48 MB\nhog exit code 137\n# outside\n/proc/124/status:NSpid:\t124\t1\n/proc/149/status:NSpid:\t149\t26\nmax 1                      # pids.events\noom_kill 1                 # memory.events\n/c/upper/tmp/batch.csv",
-        "lang": "text"
-      }
+     "Run this on your Mac, from the `labs` folder. It starts a container that sleeps, asks Docker for its process's PID on the host, and looks at that process from a second container that shares the host's PID namespace (`--pid=host`).",
+     "Predict the PID `ps` shows inside, and the `NSpid` line outside. The last line removes the container."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "on your Mac, in the labs folder",
+     "src": "docker run -d --name sfz-os12-ledger --hostname ledger sfz-labbox:1 sleep 300 > /dev/null\ndocker exec sfz-os12-ledger ps -o pid,ppid,comm\npid=$(docker inspect -f '{{.State.Pid}}' sfz-os12-ledger); echo \"host PID: $pid\"\ndocker run --rm --pid=host --cap-add SYS_PTRACE sfz-labbox:1 bash -c \"\n  ps -o pid,ppid,comm -p $pid\n  grep NSpid /proc/$pid/status\n  readlink /proc/$pid/ns/pid /proc/$pid/ns/net /proc/$pid/ns/user /proc/1/ns/pid /proc/1/ns/net /proc/1/ns/user\n  uname -r\"\ndocker exec sfz-os12-ledger uname -r\ndocker rm -f sfz-os12-ledger > /dev/null"
+    },
+    "expect": "PIDs and namespace numbers differ on your machine:\n\n```text\n  PID  PPID COMMAND\n    1     0 sleep\n    7     0 ps\nhost PID: 40037\n  PID  PPID COMMAND\n40037 40008 sleep\nNSpid:\t40037\t1\npid:[4026532698]\nnet:[4026532700]\nuser:[4026531837]\npid:[4026531836]\nnet:[4026531840]\nuser:[4026531837]\n6.12.76-linuxkit\n6.12.76-linuxkit\n```\n\nInside, `sleep` is PID 1. The host knows it as 40037, a child of the container runtime's process, and `NSpid` lists both numbers, outermost first. Its PID and network namespaces have different numbers from the host's (`/proc/1` in a `--pid=host` container is the VM's own init). Its user namespace is the same one: Docker doesn't use user namespaces by default, so root in the container is root to the kernel. The kernel version is identical inside and out."
+   },
+   "refs": [
+    {
+     "title": "namespaces(7): overview of Linux namespaces",
+     "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Namespaces decide what a process can see",
+   "body": "In the privileged lab box, `unshare --pid --fork --mount-proc --uts --net --ipc bash` starts a shell that can set its hostname to `ledger-box` while the box keeps `box-priv`. Inside, `ps -e` lists two processes with `bash` as PID 1, and `ip link` finds a loopback device that's down and no `eth0` at all.\n\nThe kernel keeps many tables that used to be global: the list of process IDs, the hostname, the network interfaces with their addresses, ports and routes, the list of mounted file systems. A **namespace** is a separate copy of one of those tables. Every process belongs to exactly one namespace of each kind, which `/proc/<pid>/ns/` shows as numbers such as `pid:[4026532834]`. A child starts in its parent's namespaces. `unshare`, or `clone` with flags such as `CLONE_NEWPID`, puts a process into new ones, and `setns` joins existing ones, which is how `docker exec` gets a shell into a running container. Linux has eight kinds:\n\n| namespace | gives the process its own | in a container |\n|---|---|---|\n| pid | process numbers | the app is PID 1 |\n| mnt | mount table | its own root file system |\n| net | interfaces, IPs, ports, routes | its own `eth0` and `localhost` |\n| uts | hostname | the container ID as hostname |\n| ipc | System V IPC and POSIX message queues | no shared memory with neighbours |\n| user | mapping of user and group IDs | root inside, nobody outside (off in Docker by default) |\n| cgroup | view of the cgroup tree | its own cgroup looks like `/` |\n| time | offsets for the monotonic and boot clocks | rarely used |\n\nThe PID namespace has two consequences you met in lesson 2 of this track. Its first process is PID 1 and takes on init's jobs: it must reap orphans, and the kernel delivers it only the signals it has a handler for, apart from `SIGKILL` sent from outside. And when that PID 1 exits, the kernel kills every other process in the namespace. Nested namespaces give a process one PID per level, which is the `NSpid` line.\n\nNamespaces only change answers. A process in its own PID namespace sees 2 processes instead of 300, and it can still fork until the machine's task table is full, or allocate until the host runs out of RAM. Seeing less isn't the same as using less.",
+   "try": {
+    "title": "Make namespaces with unshare",
+    "minutes": 3,
+    "steps": [
+     "Creating namespaces needs the privileged box: from the `labs` folder, `docker compose -f env/labbox.yml run --rm box-priv`. (Docker's seccomp filter blocks `unshare` in the everyday box, as lesson 1 showed.)",
+     "The block prints the shell's hostname and namespace numbers, starts a shell in new PID, mount, UTS, network and IPC namespaces, and looks around. Predict which lines differ."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the privileged lab box",
+     "src": "echo \"outside: $(hostname), $(readlink /proc/self/ns/pid /proc/self/ns/uts /proc/self/ns/net | tr '\\n' ' ')\"\nunshare --pid --fork --mount-proc --uts --net --ipc bash -c '\n  hostname ledger-box\n  echo \"inside: $(hostname), $(readlink /proc/self/ns/pid /proc/self/ns/uts /proc/self/ns/net | tr \"\\n\" \" \")\"\n  ps -e\n  ip -brief link show lo\n  ip -brief link show eth0'\necho \"outside again: $(hostname)\""
+    },
+    "expect": "Namespace numbers differ:\n\n```text\noutside: box-priv, pid:[4026532698] uts:[4026532696] net:[4026532700] \ninside: ledger-box, pid:[4026532834] uts:[4026532832] net:[4026532835] \n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    7 ?        00:00:00 ps\nlo               DOWN           00:00:00:00:00:00 <LOOPBACK> \noutside again: box-priv\nDevice \"eth0\" does not exist.\n```\n\nEvery namespace number changed, the hostname changed only inside, and the new PID namespace holds two processes, numbered from 1. `--mount-proc` mounted a fresh `/proc` for that namespace, which is why `ps` sees nothing else. The new network namespace has only a loopback device, down; `eth0` doesn't exist there (the error line comes out last because it goes to standard error). Back outside, the hostname is untouched."
+   },
+   "refs": [
+    {
+     "title": "unshare(1)",
+     "url": "https://man7.org/linux/man-pages/man1/unshare.1.html",
+     "kind": "docs"
+    },
+    {
+     "title": "pid_namespaces(7): PID 1 and nesting",
+     "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "A cgroup decides how much it can use",
+   "body": "The same kind of shell, moved into a cgroup with `pids.max` set to 20 and `memory.max` to 64M, stops twice. `forks.c` gets 19 children, and then `fork number 20 failed: EAGAIN`. `hog.c` holds 48 MB, and its next 16 MB gets it killed with exit code 137.\n\nA **cgroup** (control group) is a set of processes that the kernel counts and limits together. You've used three of its controls in this track: `pids.max` in lesson 3, `cpu.max` in lesson 4 and `memory.max` in lesson 7. In cgroup v2, the default on current distributions and in the lab box, the groups form one tree of directories under `/sys/fs/cgroup`. Making a group is `mkdir`. Every process is in exactly one group, listed in that group's `cgroup.procs`, and writing a PID into that file moves the process. A group's limits apply to everything below it, so a limit on a parent group also caps every group under it.\n\nEach kind of resource has a controller, and each controller has files:\n\n| controller | limit | how much now | what happened |\n|---|---|---|---|\n| pids | `pids.max` | `pids.current` | `pids.events`: max |\n| memory | `memory.max`, `memory.high` | `memory.current`, `memory.stat` | `memory.events`: max, oom, oom_kill |\n| cpu | `cpu.max`, `cpu.weight` | `cpu.stat` | `cpu.stat`: nr_throttled |\n\nLimits act where the resource is spent. A `fork` or `clone`, threads included, that would pass `pids.max` fails with `EAGAIN`. A page fault that would push `memory.current` past `memory.max` makes the kernel reclaim inside the group first, and if that fails, run the OOM killer on the group's biggest process. A group that has used its `cpu.max` budget is throttled until the next period. `docker run --pids-limit 20 --memory 64m --cpus 0.5` writes exactly these files, and so does the kubelet from a pod's limits.\n\nOne rule shows up when you build a group by hand. In cgroup v2, a group that hands controllers down to child groups, through `cgroup.subtree_control`, can't hold processes itself. The Try-it moves the box's processes into a child called `init` before it creates `ledger` for that reason. The stepper builds a whole container this way and runs it into both limits.",
+   "stepper": {
+    "title": "Into a cgroup and new namespaces, then into the limits",
+    "intro": "The worked example's run in the privileged box, which plays the host. Left: processes as the box numbers them. Middle: inside the new namespaces. Right: the cgroup's files. Blank PIDs are ones the run didn't print.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Before: a shell on the host, and an empty cgroup with pids.max 20 and memory.max 64M\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box-dim\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><text class=\"t-s t-m\" x=\"365.0\" y=\"135.0\" text-anchor=\"middle\">not created yet</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 0</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">mkdir /sys/fs/cgroup/ledger, then two writes: pids.max and memory.max.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">No process is in the group yet, so nothing is limited.</text></svg>",
+      "say": "The privileged box's shell has made a cgroup by creating a directory, `/sys/fs/cgroup/ledger`, and writing two files: `pids.max` = 20 and `memory.max` = 64M (and `memory.swap.max` = 0). It has also built an image: a directory with `bash`, `ps`, `forks`, `hog` and their libraries, 8.3 MB, mounted with an overlay. No process is in the group yet."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"A shell writes its own PID into cgroup.procs and becomes the group's first task\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box-a\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box-dim\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><text class=\"t-s t-m\" x=\"365.0\" y=\"135.0\" text-anchor=\"middle\">not created yet</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 1</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">echo $$ &gt; /sys/fs/cgroup/ledger/cgroup.procs, then exec unshare.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">From now on, every task this one starts is counted in /ledger.</text></svg>",
+      "say": "A new shell writes its PID into `ledger/cgroup.procs`. That one write moves it into the group, and every child it makes from now on starts there too. It then `exec`s `unshare`, keeping its PID, 122. It still sees everything: the same PIDs, hostname, network and files as the host."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"unshare creates new namespaces and forks bash, which is PID 124 outside and PID 1 inside\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box-a\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box-a\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 2</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">unshare --pid --fork --mount --uts --net --ipc --cgroup --root=/c/root</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">One process, two PIDs: NSpid of 124 reads \"124 1\".</text></svg>",
+      "say": "`unshare` asks the kernel for new PID, mount, UTS, network, IPC and cgroup namespaces, then forks `bash` into them with the overlay as its root. The host numbers the new process 124; its own PID namespace numbers it 1, so `/proc/124/status` says `NSpid: 124 1`. It sets the hostname to `ledger-box`, which only its UTS namespace sees."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Inside, ps sees two processes, / holds four directories, and the cgroup looks like the root\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">ps</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\"></text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">ps</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\">PID 5</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 3</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">events: none</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">Inside: ps lists PIDs 1 and 5, ls / prints bin lib proc tmp,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">and /proc/self/cgroup says 0::/ because of the cgroup namespace.</text></svg>",
+      "say": "Inside, `ps -e` lists just `bash` (1) and `ps` (5): the new `/proc` shows only this PID namespace. `ls /` prints `bin lib proc tmp`, the 8.3 MB image. `/proc/self/cgroup` prints `0::/`, because the cgroup namespace makes `/ledger` look like the root. Nothing here was copied or emulated: it's the same kernel, answering the same calls with different tables."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"forks.c forks until fork number 18 fails with EAGAIN: the group holds 20 tasks\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">forks + 17</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\"></text><rect class=\"box\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">forks</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\"></text><rect class=\"box-bad\" x=\"260\" y=\"108\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"127\" text-anchor=\"start\">17 children</text><text class=\"t-s t-code\" x=\"458\" y=\"127\" text-anchor=\"end\"></text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box-bad\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.current 20</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">pids.events max 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">unshare + bash + forks + 17 children = 20 = pids.max. Fork 18: EAGAIN.</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">The PID namespace renumbered them; only the cgroup stopped them.</text></svg>",
+      "say": "`forks` makes children that only sleep. With `unshare`, `bash` and `forks` already in the group, the 17th child brings it to 20 tasks, and the next `fork` fails with `EAGAIN`: the kernel's pids controller refused it, and `pids.events` counts `max 1`. The PID namespace gave the children small numbers, but it limits nothing. `forks` kills its children and exits."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"hog.c touches 16, 32, 48 MB; its next 16 MB would pass memory.max, and the OOM killer picks it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-bad\" x=\"30\" y=\"142\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"161\" text-anchor=\"start\">hog</text><text class=\"t-s t-code\" x=\"208\" y=\"161\" text-anchor=\"end\">149</text><rect class=\"box\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><rect class=\"box-bad\" x=\"260\" y=\"74\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"93\" text-anchor=\"start\">hog: 48 MB</text><text class=\"t-s t-code\" x=\"458\" y=\"93\" text-anchor=\"end\">PID 26</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">hostname ledger-box</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">/ = overlay: bin lib proc tmp</text><rect class=\"box-bad\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">memory.events</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">max 37, oom_kill 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">hog asks for its 4th 16 MB block: the group would pass 64M with no swap,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">reclaim finds nothing, and the OOM killer kills the biggest task: hog.</text></svg>",
+      "say": "`hog` takes 16 MB at a time and writes every page, so each page is charged to `/ledger` (lesson 7 of this track). After 48 MB, the next step's page faults would push the group past `memory.max`. With no swap allowed, reclaim frees almost nothing, the kernel counts `max` events, and the OOM killer kills the group's biggest task, `hog`: `SIGKILL`, exit code 137, `oom_kill 1`. `bash` survives."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"Afterwards: the host still sees every number, and the file the container wrote is in the overlay's upper layer\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the box's PID namespace</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">new namespaces</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">cgroup /ledger</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"210\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"30\" y=\"40\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"59\" text-anchor=\"start\">bash (the box)</text><text class=\"t-s t-code\" x=\"208\" y=\"59\" text-anchor=\"end\">1</text><rect class=\"box\" x=\"30\" y=\"74\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"93\" text-anchor=\"start\">unshare</text><text class=\"t-s t-code\" x=\"208\" y=\"93\" text-anchor=\"end\">122</text><rect class=\"box\" x=\"30\" y=\"108\" width=\"190\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"42\" y=\"127\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"208\" y=\"127\" text-anchor=\"end\">124</text><rect class=\"box-a\" x=\"250\" y=\"32\" width=\"230\" height=\"196\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"40\" width=\"210\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272\" y=\"59\" text-anchor=\"start\">bash</text><text class=\"t-s t-code\" x=\"458\" y=\"59\" text-anchor=\"end\">PID 1</text><text class=\"t-s t-m\" x=\"264\" y=\"198\" text-anchor=\"start\">batch.csv: in the upper dir</text><text class=\"t-s t-m\" x=\"264\" y=\"218\" text-anchor=\"start\">image directory: unchanged</text><rect class=\"box-a\" x=\"500\" y=\"32\" width=\"200\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"514\" y=\"60\" text-anchor=\"start\">pids.max 20</text><text class=\"t-s t-code\" x=\"514\" y=\"100\" text-anchor=\"start\">memory.max 64M</text><text class=\"t-s t-code\" x=\"514\" y=\"140\" text-anchor=\"start\">pids.events max 1</text><text class=\"t-s t-code\" x=\"514\" y=\"180\" text-anchor=\"start\">oom_kill 1</text><text class=\"t-s t-a\" x=\"20\" y=\"256\" text-anchor=\"start\">A container: namespaces for what it sees, a cgroup for what it uses,</text><text class=\"t-s t-m\" x=\"20\" y=\"278\" text-anchor=\"start\">an overlay root for its files. One kernel the whole time.</text></svg>",
+      "say": "The shell wrote `/tmp/batch.csv`. It landed in the overlay's writable upper directory, `/c/upper/tmp/batch.csv`, and the image directory below didn't change. From the host, every process had a normal PID the whole time, and the cgroup files kept the score. That's a container: a few processes, some namespaces, a cgroup and a root filesystem, on the kernel everything else uses."
+     }
     ]
-  },
-  "lab": {
-    "title": "Model cgroups, PID namespaces and the JVM's view of them",
-    "minutes": 15,
-    "files": [
-      "labs/os/src/main/kotlin/sfz/os/l12/Containers.kt",
-      "labs/os/src/test/resources/sfz/os/l12/cgroup-by-hand.txt",
-      "labs/os/src/test/resources/sfz/os/l12/jvm-limits.txt"
-    ],
-    "run": "./gradlew :os:test --tests 'sfz.os.l12.*'",
-    "steps": [
-      "Read `Containers.kt`. `Cgroup` is a directory with limits and event counters, `PidNamespace` numbers its tasks from 1, `Task` holds one PID per namespace level, and `Host` is the one kernel. Making tasks, moving them, `forkIntoNewPidNamespace` and `kill` (with the PID 1 rule) are written for you.",
-      "Run the tests from the `labs` folder. All nine fail.",
-      "Write `checkPids`: walk `cg.lineage()`, and the first group that one more task would take past `pidsMax` counts `pidsEventsMax` and throws `SysError(\"EAGAIN\", ...)`. `fork` and `startThread` already call it.",
-      "Write `touch`: charge the memory, then for each group in the lineage that is over `memoryMaxMb`, count `max` and `oom`, and kill the biggest task in that group's subtree until it fits, counting `oom_kill`.",
-      "Write `JvmView.availableProcessors` and `defaultGc`. The tests compare all of it with the files and JVM settings captured in the privileged box."
-    ],
-    "hints": [
-      "`c.pidsCurrent + 1 > max` is the check: the new task is the one that would pass the limit.",
-      "Pick the victim with `c.allTasks().maxWith(compareBy<Task> { it.rssMb }.thenBy { it.hostPid })`, so ties go to the newest task, and call `kill(victim, ...)`, which also zeroes its memory.",
-      "`\"150000 100000\".split(Regex(\"\\\\s+\"))` gives quota and period; `Math.ceil(quota / period)` turns 1.5 into 2. \"max\" as the quota means no limit.",
-      "Server-class means `cpus >= 2 && memoryMb >= 1792`: 2 GB minus 256 MB of slack."
-    ],
-    "done_when": "All nine tests in `ContainersTest` pass."
-  },
-  "drill": {
-    "title": "A cgroup from memory",
+   },
+   "try": {
+    "title": "A fork bomb and a memory hog in a cgroup you made",
     "minutes": 4,
-    "prompt": "As root on a Linux host with cgroup v2, where `/sys/fs/cgroup` is the real root of the tree, write the commands that create a group `settle` with at most 50 tasks, 256 MB of memory and no swap, and half a CPU, then start `java -jar settle.jar` inside it. Then write where you'd look to see whether it hit each limit.",
-    "answer": {
-      "lang": "bash",
-      "src": "cd /sys/fs/cgroup\n# (in the privileged lab box, first move its processes into a child group, as the Try-it does)\necho \"+pids +memory +cpu\" > cgroup.subtree_control   # controllers for the children\nmkdir settle\necho 50 > settle/pids.max\necho 256M > settle/memory.max\necho 0 > settle/memory.swap.max\necho \"50000 100000\" > settle/cpu.max              # 50 ms per 100 ms\nbash -c 'echo $$ > /sys/fs/cgroup/settle/cgroup.procs; exec java -jar settle.jar'\n\n# did it hit them?\ncat settle/pids.events          # max N: forks or threads refused with EAGAIN\ncat settle/memory.events        # oom_kill N: processes the OOM killer took\ngrep throttled settle/cpu.stat  # nr_throttled: periods it ran out of budget\ncat settle/cpu.pressure settle/memory.pressure   # how long tasks waited"
+    "steps": [
+     "In the privileged box again. The block makes the cgroup `ledger` with `pids.max` 20, `memory.max` 64M and no swap, then runs `os/c/l12/forks.c` and `os/c/l12/hog.c` in it, each from a shell that first writes its own PID into `cgroup.procs`.",
+     "Predict the fork number that fails, the last \"holding\" line, and the exit code. The cgroup disappears when the box exits."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the privileged lab box",
+     "src": "gcc -O2 -o /tmp/forks os/c/l12/forks.c && gcc -O2 -o /tmp/hog os/c/l12/hog.c\ncd /sys/fs/cgroup\nmkdir init; for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done\necho \"+pids +memory +cpu\" > cgroup.subtree_control\nmkdir ledger\necho 20 > ledger/pids.max; echo 64M > ledger/memory.max; echo 0 > ledger/memory.swap.max\ncat ledger/pids.max ledger/memory.max\nbash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs; cat /proc/self/cgroup; /tmp/forks 500'\ncat ledger/pids.events\nbash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs; /tmp/hog 256; echo \"exit code $?\"'\ngrep -E '^(max|oom|oom_kill) ' ledger/memory.events"
+    },
+    "expect": "The `max` count in `memory.events` changes from run to run (18, 35 and 37 in mine):\n\n```text\n20\n67108864\n0::/ledger\nfork number 20 failed: EAGAIN (Resource temporarily unavailable)\n19 children running\nmax 1\nholding 16 MB\nholding 32 MB\nholding 48 MB\nexit code 137\nmax 18\noom 1\noom_kill 1\nbash: line 1:    45 Killed                  /tmp/hog 256\n```\n\n`bash -c` ran `forks` as its last command, so `forks` replaced it in the same task: 1 plus 19 children is 20, and fork number 20 failed with `EAGAIN`, counted once in `pids.events`. `hog` reached 48 MB. Its next block would have taken the group past 64 MB, reclaim found nothing to free, and the OOM killer sent it `SIGKILL`: exit code 137 and `oom_kill 1`. `max` counts every time the group hit its limit and reclaimed, not just kills. The `Killed` line from bash arrives last because it's written to standard error."
+   },
+   "refs": [
+    {
+     "title": "Control Group v2 (Linux kernel documentation)",
+     "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
+     "kind": "docs"
+    },
+    {
+     "title": "cgroups(7)",
+     "url": "https://man7.org/linux/man-pages/man7/cgroups.7.html",
+     "kind": "docs"
     }
+   ]
   },
-  "recap": [
-    "A container is ordinary processes on the one shared kernel: `NSpid` shows each one's PID inside and on the host, and `uname -r` is the same everywhere.",
-    "Namespaces (pid, mnt, net, uts, ipc, user, cgroup, time) give a process its own view. They change what it sees, never how much it can use.",
-    "A cgroup v2 is a directory under `/sys/fs/cgroup`: `pids.max` makes `fork` fail with `EAGAIN`, `memory.max` ends in reclaim then the OOM killer inside the group, `cpu.max` throttles. The `*.events` and `cpu.stat` files count each hit.",
-    "Root in a default Docker container is user 0 to the kernel, held back by 14 capabilities and a seccomp filter. `--privileged` removes both.",
-    "The root file system is an overlay: read-only image layers plus a per-container upper layer; the first write copies a file up.",
-    "The JVM sizes heap (25% of `memory.max`), CPUs (quota / period, rounded up) and GC (G1 only from 2 CPUs and 1,792 MB) from these files. Check with `-XshowSettings:system`, and read saturation from `cpu.stat` and the PSI `*.pressure` files."
-  ],
-  "quiz": [
+  {
+   "h": "Capabilities, seccomp and an overlay root finish the job",
+   "body": "Root in the lab box can `chown` a file, but `date -s 2030-01-01` fails with `cannot set date: Operation not permitted`. Start the container with `--cap-drop CHOWN`, and `chown` fails the same way, still as root.\n\nWithout a user namespace, which Docker doesn't use by default, root in a container is user 0 to the kernel, the same user as root on the host. What stops it is that Linux doesn't check \"is this user 0?\" for privileged operations. It splits root's power into about 40 **capabilities**, each guarding a group of operations: `CAP_CHOWN` for changing file owners, `CAP_NET_BIND_SERVICE` for ports below 1024, `CAP_SYS_TIME` for setting the clock, `CAP_SYS_ADMIN` for mounts and much more. A process has a set of them, and the kernel checks the one the operation needs. Docker gives a container 14 and drops the rest, so the `CapEff` mask in `/proc/self/status` decodes to `cap_chown`, `cap_kill`, `cap_net_bind_service` and 11 others, and no `cap_sys_time`. `--privileged` gives all of them and turns seccomp off; that's the `box-priv` you've used for this lesson's experiments.\n\nseccomp is the filter from lesson 1 of this track. It runs before every system call, and Docker's default profile refuses around 44 of them, including `mount`, `unshare` and the io_uring calls. Capabilities say which privileged operations a process may perform; seccomp removes whole system calls from reach, in case the kernel has a bug in one of them.\n\nLast, the files. An image is a stack of read-only layers: `sfz-labbox:1` has 7. A container's root is an **overlay** mount: the image layers as `lowerdir`, plus an empty writable `upperdir` of its own. A read finds the file in the topmost layer that has it. The first write to a file from a lower layer copies the whole file up into the upper directory and changes the copy, which is copy-on-write again (lesson 7 of this track), per file instead of per page. A delete writes a marker, a \"whiteout\", that hides the lower file. `docker diff` lists the upper directory, and `docker rm` throws it away, so a container never changes its image. A hundred containers from one image share its layers on disk and in the page cache.",
+   "try": {
+    "title": "Capabilities, then the writable layer",
+    "minutes": 3,
+    "steps": [
+     "On your Mac, from the `labs` folder. The first command decodes the container's capabilities and tries one allowed and one forbidden operation. The second drops `CHOWN`.",
+     "The rest starts a container, changes one file from the image, deletes another and creates a third, and asks Docker what's in its upper layer. Predict the letters `docker diff` prints."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "on your Mac, in the labs folder",
+     "src": "docker run --rm sfz-labbox:1 bash -c 'grep CapEff /proc/self/status; capsh --decode=$(grep CapEff /proc/self/status | cut -f2); touch /tmp/x; chown nobody /tmp/x && echo \"chown: ok\"; date -s 2030-01-01 > /dev/null'\ndocker run --rm --cap-drop CHOWN sfz-labbox:1 bash -c 'touch /tmp/x; chown nobody /tmp/x'\ndocker run -d --name sfz-os12-diff sfz-labbox:1 sleep 120 > /dev/null\ndocker exec sfz-os12-diff bash -c 'echo \"ISSUER=acme-bank\" >> /etc/environment; rm /etc/legal; echo ok > /tmp/settle.csv'\ndocker diff sfz-os12-diff\ndocker rm -f sfz-os12-diff > /dev/null"
+    },
+    "expect": "```text\nCapEff:\t00000000a80425fb\n0x00000000a80425fb=cap_chown,cap_dac_override,cap_fowner,cap_fsetid,cap_kill,cap_setgid,cap_setuid,cap_setpcap,cap_net_bind_service,cap_net_raw,cap_sys_chroot,cap_mknod,cap_audit_write,cap_setfcap\nchown: ok\ndate: cannot set date: Operation not permitted\nchown: changing ownership of '/tmp/x': Operation not permitted\nC /tmp\nA /tmp/settle.csv\nC /etc\nC /etc/environment\nD /etc/legal\n```\n\nRoot had 14 capabilities: `cap_chown` was among them and `cap_sys_time` wasn't, so `chown` worked and `date -s` didn't. With `--cap-drop CHOWN`, the same root user can't `chown`. `docker diff` shows the upper layer: `C` for changed (`/etc/environment`, copied up and appended to, and its directory), `A` for added (`/tmp/settle.csv`) and `D` for deleted (`/etc/legal`, a whiteout). The image itself is unchanged, and the next container from it starts clean."
+   },
+   "refs": [
     {
-      "q": "From lesson 7: two containers run on one node. Container A, limited to 512 MB, leaks memory until it hits its limit; container B has no limit and holds 3 GB. Which process does the kernel kill?",
-      "options": [
-        "B's biggest process, because it uses the most memory on the node",
-        "The biggest process in A's cgroup, because A's `memory.max` was hit and the OOM killer runs inside that group",
-        "Nothing: the kernel just refuses A's next `malloc`",
-        "Whichever process allocated last, in either container"
-      ],
-      "answer": 1,
-      "from": "os-07",
-      "why": "Hitting `memory.max` starts reclaim and then the OOM killer for that cgroup only, choosing the biggest process inside it, and `memory.events` in A counts `oom_kill`. B is outside the group and never a candidate. `malloc` doesn't fail on Linux here, because the memory was promised long before; the failure happens at the page fault, as lesson 7 showed."
+     "title": "capabilities(7)",
+     "url": "https://man7.org/linux/man-pages/man7/capabilities.7.html",
+     "kind": "docs"
     },
     {
-      "q": "A container is started with its own PID namespace but no `--pids-limit`. Someone runs a fork bomb in it. What stops the fork bomb?",
-      "options": [
-        "The PID namespace: it only has room for 32,768 PIDs",
-        "Nothing in the container: only a `pids.max` above it, or the host's own task limits, can stop it",
-        "The container's PID 1 reaps the children as they appear",
-        "seccomp blocks `fork` after the first thousand calls"
-      ],
-      "answer": 1,
-      "why": "A namespace renumbers processes; it doesn't count them against anything. Every child is still a task in the one kernel, so the bomb fills the host's task table until it hits `pids.max` of some cgroup above it or the kernel's global limits, and then every container suffers. That's what `--pids-limit` (and Kubernetes' pod PID limit) is for."
-    },
-    {
-      "q": "A pod runs JDK 25 with `limits.memory: 2Gi` and `limits.cpu: 500m`, and no JVM flags. What does the JVM choose?",
-      "options": [
-        "A 512 MB heap, 1 CPU, Serial GC",
-        "A 1 GB heap, 1 CPU, G1",
-        "A 512 MB heap, the node's CPU count, G1",
-        "A 2 GB heap, 1 CPU, G1"
-      ],
-      "answer": 0,
-      "why": "`memory.max` is 2 GB and the default `MaxRAMPercentage` is 25%, so 512 MB. `cpu.max` is `50000 100000`, which the JVM rounds up to 1 CPU. With fewer than 2 CPUs the machine isn't server-class, so the default collector is Serial, whatever the memory. Using all 2 GB as heap would get the pod OOM-killed, since metaspace, thread stacks and native memory come on top."
-    },
-    {
-      "q": "Why does Docker's default profile block system calls like `mount`, `unshare` and the io_uring calls, even though the container's processes run as root?",
-      "options": [
-        "Because root inside a container is a different, unprivileged user on the host",
-        "Because the calls would only affect the container itself",
-        "Because every container shares the host's kernel: without a user namespace, container root is user 0 to that kernel, and a bug in any reachable call is a bug for the whole host",
-        "Because those calls are too slow for containers"
-      ],
-      "answer": 2,
-      "why": "Docker doesn't use user namespaces by default; the Try-it showed the same user namespace inside and out. So the only things between a container's root and the kernel are its capability set and the seccomp filter. Removing whole system calls shrinks the kernel code a container can reach, which matters because that code is shared by everything on the machine."
-    },
-    {
-      "q": "A container edits `/etc/app.conf`, which came from its image. The container is removed and a new one starts from the same image. What does the new container find in `/etc/app.conf`?",
-      "options": [
-        "The edited version: the edit was written into the image",
-        "The original version: the edit went to a copy in the old container's upper layer, which was deleted with it",
-        "Nothing: the file was moved to the old container's layer",
-        "The edited version, if the old container stopped cleanly"
-      ],
-      "answer": 1,
-      "why": "Image layers are read-only. The first write copied the file up into the container's own upper directory and changed the copy there; `docker diff` would have shown `C /etc/app.conf`. `docker rm` deletes the upper directory, and the image underneath never changed. Data that must outlive a container goes on a volume."
+     "title": "Overlay Filesystem (Linux kernel documentation)",
+     "url": "https://docs.kernel.org/filesystems/overlayfs.html",
+     "kind": "docs"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "Namespace or cgroup: which one limits how much memory a container uses?",
-      "back": "The cgroup (`memory.max`). A namespace only changes what a process can see."
-    },
-    {
-      "front": "What does `NSpid: 40037 1` in `/proc/40037/status` mean?",
-      "back": "The process is PID 40037 in the host's PID namespace and PID 1 in its own, nested one."
-    },
-    {
-      "front": "What happens when a `fork` would pass `pids.max`?",
-      "back": "It fails with `EAGAIN`, and `pids.events` counts `max`. Threads count too."
-    },
-    {
-      "front": "What does `--privileged` change?",
-      "back": "It gives the container every capability (`CapEff` 000001ffffffffff) and switches its seccomp filter off."
-    },
-    {
-      "front": "What happens on the first write to a file from an image layer?",
-      "back": "overlayfs copies the whole file up into the container's upper directory, then changes the copy."
-    },
-    {
-      "front": "How does the JVM turn `cpu.max = 150000 100000` into a CPU count?",
-      "back": "Quota / period = 1.5, rounded up to 2, capped by the cpuset's CPUs."
-    },
-    {
-      "front": "What do `some` and `full` mean in a PSI `*.pressure` file?",
-      "back": "The share of time at least one task (`some`) or all tasks (`full`) in the group waited for that resource."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Container",
-      "plain": "One or more ordinary processes on the shared kernel, given their own namespaces, a cgroup, limited privileges and an overlay root."
-    },
-    {
-      "term": "Namespace",
-      "plain": "A separate copy of one kernel table, such as PIDs, mounts, network or hostname, that a group of processes sees instead of the global one."
-    },
-    {
-      "term": "cgroup",
-      "plain": "A directory under /sys/fs/cgroup holding processes that the kernel counts and limits together."
-    },
-    {
-      "term": "Controller",
-      "plain": "The part of cgroups that manages one resource, such as pids, memory or cpu, through its files."
-    },
-    {
-      "term": "Capability",
-      "plain": "One slice of root's power, such as CAP_CHOWN or CAP_SYS_TIME, that the kernel checks instead of user 0."
-    },
-    {
-      "term": "Overlay filesystem",
-      "plain": "A mount that stacks read-only lower layers under a writable upper one, copying a file up on its first write."
-    },
-    {
-      "term": "PSI",
-      "plain": "Pressure stall information: how much of the time tasks waited for CPU, memory or I/O, per cgroup and for the machine."
-    },
-    {
-      "term": "USE method",
-      "plain": "Checking every resource for utilization, saturation and errors."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A teammate says: \"containers are lightweight VMs, so our settlement container can't affect the payment API container next to it.\" Explain what a container actually is, which parts of that claim hold, and which don't.",
-    "answer": "A container is a set of ordinary processes on the node's one kernel. Namespaces give them their own view: their own PIDs, hostname, network interfaces and mount table, so the settlement job can't see or signal the API's processes or bind its ports. A cgroup limits what they use, so if the job has a memory limit, a leak ends in the OOM killer inside the job's cgroup, and the API isn't a candidate. The overlay root gives the job its own files over a shared read-only image. All of that holds. What doesn't hold is the VM part. There is no second kernel: both containers make system calls into the same one. Without user namespaces, root in the job is user 0 to that kernel, held back only by 14 capabilities and a seccomp filter, so a kernel bug reachable from one container affects both. Anything without a limit is shared too: a job with no `pids.max` can fill the node's task table, one with no memory limit can push the node into a global OOM, and CPU without `cpu.max` is shared by weight. And node-wide settings, like sysctls, the page cache and disk bandwidth, belong to everyone. So: set limits on every container, never run them privileged, and use a VM or sandbox if you need a security boundary."
+   ]
   },
-  "deeper": {
-    "minutes": 10,
-    "body": "User namespaces close the biggest gap in a default container. With one, root inside maps to an unprivileged user ID outside, so even an escape lands as nobody. Podman's rootless mode and Docker's `userns-remap` setting use them, and Kubernetes has been adding user namespace support for pods. They're not the default yet in most clusters because some volumes and images assume real root.\n\nWhere one kernel is too little isolation, sandboxes put something between the container and the host kernel: gVisor answers system calls in a user-space kernel of its own, and Kata Containers and Firecracker run each pod or function in a small VM with its own kernel. Both trade start-up time and some performance for a smaller shared attack surface.\n\nTwo more memory files are worth knowing. `memory.high` is a soft limit: above it, the kernel throttles the group's allocations and reclaims hard, but never calls the OOM killer, which gives a service a slow warning instead of a sudden death. `memory.oom.group`, set to 1, makes the OOM killer take every process in the group together, which suits a container whose processes are useless without each other.\n\nThe USE method has a classic first minute on a whole host, from Brendan Gregg: `uptime`, `dmesg | tail`, `vmstat 1`, `mpstat -P ALL 1`, `pidstat 1`, `iostat -xz 1`, `free -m`, `sar -n DEV 1`, `sar -n TCP,ETCP 1` and `top`. Each tool in that list reads files this track has opened: `/proc/stat`, `/proc/meminfo`, the per-process `/proc/<pid>/` directories and the network counters. In a container, check whether the tool reads the cgroup's files or the host's before you trust what it says."
-  },
-  "sources": [
+  {
+   "h": "The JVM reads the same cgroup files, and so should you",
+   "body": "Under `--memory 1g --cpus 1.5`, JDK 25 chose a 256 MB heap, 2 CPUs and the Serial collector. In the same container with container support turned off, it chose a 1,984 MB heap and G1: sized for the Docker VM's 7.9 GB and 12 CPUs, in a container that gets killed at 1 GB.\n\nAt start-up, the JVM finds its cgroup in `/proc/self/cgroup` and reads its files. The default maximum heap is 25% of `memory.max` (`-XX:MaxRAMPercentage`). The CPU count is `cpu.max`'s quota divided by its period, rounded up (lesson 4 of this track) and capped by the CPUs in its cpuset. That number sizes the GC threads, the JIT compiler threads, the common `ForkJoinPool` and the virtual-thread carriers. The collector is G1 only on a \"server-class machine\", at least 2 CPUs and 1,792 MB; below that, Serial. A 256 MB container gets a 126 MB heap, about half, because HotSpot keeps a floor under small heaps. `java -XshowSettings:system -version` prints what the JVM detected, and `-Xlog:os+container=debug` prints how.\n\nWhen detection fails, you get the 1,984 MB heap. That happened to real services: on Linux 6.12, the kernel stopped listing `cpuset` in `/proc/cgroups`, and JDK builds such as 17.0.12 and 21.0.5 treated that as a required controller gone missing. The bug report, JDK-8346874, shows the JVM logging \"One or more required controllers disabled at kernel level\" and sizing the heap from the host's memory, and an early JDK 25 build printing \"System not containerized\". JDK 25 has the fix (JDK-8347129); the lab box runs kernel 6.12, and its log says `Detected optional cpuset controller entry`. On JDK 17 or 21, run `-XshowSettings:system` in the real image on the real nodes, and look for `System not containerized`.\n\nThe same files answer production questions, which is the last tool for this track. Brendan Gregg's **USE method** checks every resource for utilization, saturation and errors. In a container, each has a file. CPU: `cpu.stat`'s `usage_usec` for utilization, `nr_throttled` and `cpu.pressure` for saturation. Memory: `memory.current` against `memory.max`, then `memory.pressure`, then `oom_kill` in `memory.events`. Tasks: `pids.current`, and `max` in `pids.events`. The `*.pressure` files are **PSI** (pressure stall information): the share of time tasks in the group waited for that resource, `some` when at least one waited and `full` when all did, as averages over 10, 60 and 300 seconds and a running total in microseconds. Two busy workers under `--cpus 0.5` stalled 6.2 s of 11. Inside a container, `/proc/pressure`, `free` and `/proc/meminfo` describe the whole VM, like `top`; the cgroup files describe your container.",
+   "try": {
+    "title": "Read the limits the way the JVM does",
+    "minutes": 4,
+    "steps": [
+     "On your Mac, from the `labs` folder. The first loop starts two containers with different limits and prints the cgroup files next to the heap, collector and CPU count the JVM chose. Then the JVM runs once more with container support switched off.",
+     "The second part runs two busy workers in a container with half a CPU for 11 seconds and reads its CPU pressure and throttling counters. Predict the heap for each run, and roughly what share of the time the workers stalled."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "on your Mac, in the labs folder",
+     "src": "for limits in \"--memory 1g --cpus 1.5\" \"--memory 4g --cpus 4\"; do\n  echo \"== $limits\"\n  docker run --rm $limits sfz-labbox:1 bash -c 'cat /sys/fs/cgroup/memory.max /sys/fs/cgroup/cpu.max\n    java -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E \" (MaxHeapSize|UseSerialGC|UseG1GC) \"\n    java -XshowSettings:system -version 2>&1 | grep -E \"Effective CPU|Memory Limit\"'\ndone\necho \"== --memory 1g --cpus 1.5, container support off\"\ndocker run --rm --memory 1g --cpus 1.5 sfz-labbox:1 bash -c 'java -XX:-UseContainerSupport -XX:+PrintFlagsFinal -version 2>/dev/null | grep -E \" (MaxHeapSize|UseG1GC) \"'\ndocker run --rm --cpus 0.5 sfz-labbox:1 bash -c '\n  stress-ng --cpu 2 --timeout 12s --quiet & sleep 11\n  cat /sys/fs/cgroup/cpu.pressure\n  grep -E \"nr_periods|nr_throttled\" /sys/fs/cgroup/cpu.stat\n  wait'"
+    },
+    "expect": "The pressure numbers vary with how busy the VM is:\n\n```text\n== --memory 1g --cpus 1.5\n1073741824\n150000 100000\n   size_t MaxHeapSize                              = 268435456                                 {product} {ergonomic}\n     bool UseG1GC                                  = false                                     {product} {default}\n     bool UseSerialGC                              = true                                      {product} {ergonomic}\n    Effective CPU Count: 2\n    Memory Limit: 1.00G\n== --memory 4g --cpus 4\n4294967296\n400000 100000\n   size_t MaxHeapSize                              = 1073741824                                {product} {ergonomic}\n     bool UseG1GC                                  = true                                      {product} {ergonomic}\n     bool UseSerialGC                              = false                                     {product} {default}\n    Effective CPU Count: 4\n    Memory Limit: 4.00G\n== --memory 1g --cpus 1.5, container support off\n   size_t MaxHeapSize                              = 2080374784                                {product} {ergonomic}\n     bool UseG1GC                                  = true                                      {product} {ergonomic}\nsome avg10=34.77 avg60=8.92 avg300=1.98 total=6195106\nfull avg10=34.77 avg60=8.92 avg300=1.98 total=6194445\nnr_periods 126\nnr_throttled 120\n```\n\n1 GB and 1.5 CPUs gave a 256 MB heap, 2 CPUs (1.5 rounded up) and Serial; 4 GB and 4 CPUs gave 1 GB and G1. With `-XX:-UseContainerSupport`, the JVM sized itself from the VM's 7.9 GB: a heap twice the container's limit. In the last run, `total=6195106` means tasks in the group waited 6.2 s for CPU during the 11 s, and `nr_throttled` shows the group ran out of its 50 ms budget in 120 of 126 periods. `avg10` is still climbing, because it's a moving average over 10 seconds."
+   },
+   "refs": [
     {
-      "title": "namespaces(7), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html"
+     "title": "JDK-8346874: Linux kernel version 6.12 and newer breaks JVM container support",
+     "url": "https://bugs.openjdk.org/browse/JDK-8346874",
+     "kind": "read"
     },
     {
-      "title": "Control Group v2 (Linux kernel documentation)",
-      "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
+     "title": "PSI: Pressure Stall Information (Linux kernel documentation)",
+     "url": "https://docs.kernel.org/accounting/psi.html",
+     "kind": "docs"
     },
     {
-      "title": "capabilities(7), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man7/capabilities.7.html"
-    },
-    {
-      "title": "JDK-8346874: Linux kernel version 6.12 and newer breaks JVM container support",
-      "url": "https://bugs.openjdk.org/browse/JDK-8346874"
-    },
-    {
-      "title": "The java command, JDK 25: container and ergonomics options",
-      "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html"
+     "title": "Brendan Gregg: The USE Method",
+     "url": "https://www.brendangregg.com/usemethod.html",
+     "kind": "read"
     }
+   ]
+  }
+ ],
+ "analogy": "A container is a tenant in a building, not a house of its own. Namespaces are the walls and the private mailbox: the tenant sees only their own rooms and their own post, and can paint the door number 1. The cgroup is the metered supply: so much water, so much power, and the breaker trips for this flat only. Capabilities and seccomp are the house rules at the front desk: you may hang pictures, you may not touch the boiler. The overlay is a furnished flat: the furniture comes with the building and stays when you leave, and anything you change is yours until you move out. The analogy breaks at the foundations. Real buildings have separate wiring per flat, but every container shares the one kernel, so a fault in the kernel is a fault under every tenant at once. That's the line where a VM, or a sandbox such as gVisor or Firecracker, starts to make sense.",
+ "in_your_world": "Every pod you deploy is this lesson. The kubelet turns `limits.memory` into `memory.max` and `limits.cpu` into `cpu.max`, so a payment service's 137 with `OOMKilled` is lesson 7's OOM killer inside the pod's cgroup, and a p99 that jumps when a batch starts is lesson 4's throttling. Your Quarkus or Temporal worker JVM sizes its heap, GC and thread pools from those same files, which makes two checks worth doing once per base image: `java -XshowSettings:system -version` must show the container's limits, not the node's, and the heap should be set on purpose (`-XX:MaxRAMPercentage=60` to `75` is common for a JVM-only container) instead of left at 25%. When a pod is slow and its graphs look fine, read its PSI files: `cpu.pressure` and `memory.pressure` say how long it waited, which a utilization graph can't.",
+ "mistake": "Treating a container as a small VM: assuming that root inside it is harmless, that `free` and `top` describe it, and that its kernel settings are its own. Root in a default Docker container is user 0 to the shared kernel, held back only by 14 capabilities and a seccomp filter, which is why `--privileged` or extra capabilities like `SYS_ADMIN` should be treated as handing over the host. `free`, `top`, `/proc/meminfo` and `/proc/pressure` describe the whole VM or node, so a container that looks idle in `top` may be throttled to death in `cpu.stat`. And `sysctl` settings like `vm.overcommit_memory` or `kernel.io_uring_disabled` belong to the node. Read limits and pressure from `/sys/fs/cgroup`, and decide privileges as if the container were a process on the host, because it is.",
+ "compare": {
+  "title": "A namespace against a cgroup",
+  "a": {
+   "label": "Namespace: what it sees",
+   "lang": "text",
+   "title": "unshare --pid --uts --net ... in box-priv",
+   "src": "outside: box-priv, pid:[4026532698] uts:[4026532696] net:[4026532700] \ninside: ledger-box, pid:[4026532834] uts:[4026532832] net:[4026532835] \n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    7 ?        00:00:00 ps\nlo               DOWN           00:00:00:00:00:00 <LOOPBACK> \noutside again: box-priv\nDevice \"eth0\" does not exist."
+  },
+  "b": {
+   "label": "Cgroup: what it uses",
+   "lang": "text",
+   "title": "pids.max 20, memory.max 64M in box-priv",
+   "src": "20\n67108864\n0::/ledger\nfork number 20 failed: EAGAIN (Resource temporarily unavailable)\n19 children running\nmax 1\nholding 16 MB\nholding 32 MB\nholding 48 MB\nexit code 137\nmax 18\noom 1\noom_kill 1\nbash: line 1:    45 Killed                  /tmp/hog 256"
+  },
+  "note": "A namespace changes the answers the kernel gives: which PIDs exist, what the hostname is, which interfaces there are. It never makes a call fail for using too much. A cgroup changes nothing a process can see, apart from its own cgroup files, and makes calls fail or processes die when they use too much: `fork` returns `EAGAIN`, a page fault ends in `SIGKILL`, a busy thread gets throttled. A container needs both: the left side alone can fork-bomb the host, and the right side alone sees and can signal every process on it."
+ },
+ "worked": {
+  "title": "Build a container by hand",
+  "steps": [
+   {
+    "say": "An image is just a directory. Copy a few programs into one, with the shared libraries `ldd` says they need. In the privileged box, on a scratch `tmpfs`:",
+    "code": "mkdir -p /c && mount -t tmpfs -o size=200m tmpfs /c\nmkdir -p /c/image/bin /c/image/proc /c/image/tmp\ncp /tmp/forks /tmp/hog /c/image/bin/                     # built from os/c/l12/\nfor b in bash ls cat hostname ps; do cp $(command -v $b) /c/image/bin/; done\nfor lib in $(ldd /c/image/bin/* 2>/dev/null | grep -o '/[^ ]*\\.so[^ ]*' | sort -u); do\n  mkdir -p /c/image$(dirname $lib); cp $lib /c/image$lib\ndone\ndu -sh /c/image\n# 8.3M\t/c/image",
+    "lang": "bash"
+   },
+   {
+    "say": "Give it a writable layer. The overlay merges the read-only image with an empty upper directory; writes go up there.",
+    "code": "mkdir -p /c/upper /c/work /c/root\nmount -t overlay overlay -o lowerdir=/c/image,upperdir=/c/upper,workdir=/c/work /c/root",
+    "lang": "bash"
+   },
+   {
+    "say": "Make the cgroup and set its limits. First move the box's own processes into a child group, because a group that enables controllers for its children can't hold processes.",
+    "code": "cd /sys/fs/cgroup\nmkdir init; for p in $(cat cgroup.procs); do echo $p > init/cgroup.procs 2>/dev/null; done\necho \"+pids +memory +cpu\" > cgroup.subtree_control\nmkdir ledger\necho 20 > ledger/pids.max; echo 64M > ledger/memory.max; echo 0 > ledger/memory.swap.max",
+    "lang": "bash"
+   },
+   {
+    "say": "Join the cgroup, then let `unshare` start a shell in new namespaces with the overlay as its root. `env -i` gives it an empty environment, as an image's entrypoint would get.",
+    "code": "bash -c 'echo $$ > /sys/fs/cgroup/ledger/cgroup.procs\n  exec env -i PATH=/bin LC_ALL=C unshare --pid --fork --mount --uts --net --ipc --cgroup \\\n    --root=/c/root --mount-proc bash -c \"hostname ledger-box; ...; forks 500; hog 256\"' &",
+    "lang": "bash"
+   },
+   {
+    "say": "What the container printed, and what the host saw. Inside: PID 1, a four-directory root, a cgroup that looks like `/`, and both limits. Outside: each process with two PIDs, the events in the cgroup's files, and the container's one file in the upper layer.",
+    "code": "# inside (output trimmed)\npid 1 on ledger-box, / holds: bin lib proc tmp\n  PID TTY          TIME CMD\n    1 ?        00:00:00 bash\n    5 ?        00:00:00 ps\n0::/\nfork number 18 failed: EAGAIN (Resource temporarily unavailable)\nholding 48 MB\nhog exit code 137\n# outside\n/proc/124/status:NSpid:\t124\t1\n/proc/149/status:NSpid:\t149\t26\nmax 1                      # pids.events\noom_kill 1                 # memory.events\n/c/upper/tmp/batch.csv",
+    "lang": "text"
+   }
   ]
+ },
+ "lab": {
+  "title": "Model cgroups, PID namespaces and the JVM's view of them",
+  "minutes": 15,
+  "files": [
+   "labs/os/src/main/kotlin/sfz/os/l12/Containers.kt",
+   "labs/os/src/test/resources/sfz/os/l12/cgroup-by-hand.txt",
+   "labs/os/src/test/resources/sfz/os/l12/jvm-limits.txt"
+  ],
+  "run": "./gradlew :os:test --tests 'sfz.os.l12.*'",
+  "steps": [
+   "Read `Containers.kt`. `Cgroup` is a directory with limits and event counters, `PidNamespace` numbers its tasks from 1, `Task` holds one PID per namespace level, and `Host` is the one kernel. Making tasks, moving them, `forkIntoNewPidNamespace` and `kill` (with the PID 1 rule) are written for you.",
+   "Run the tests from the `labs` folder. All nine fail.",
+   "Write `checkPids`: walk `cg.lineage()`, and the first group that one more task would take past `pidsMax` counts `pidsEventsMax` and throws `SysError(\"EAGAIN\", ...)`. `fork` and `startThread` already call it.",
+   "Write `touch`: charge the memory, then for each group in the lineage that is over `memoryMaxMb`, count `max` and `oom`, and kill the biggest task in that group's subtree until it fits, counting `oom_kill`.",
+   "Write `JvmView.availableProcessors` and `defaultGc`. The tests compare all of it with the files and JVM settings captured in the privileged box."
+  ],
+  "hints": [
+   "`c.pidsCurrent + 1 > max` is the check: the new task is the one that would pass the limit.",
+   "Pick the victim with `c.allTasks().maxWith(compareBy<Task> { it.rssMb }.thenBy { it.hostPid })`, so ties go to the newest task, and call `kill(victim, ...)`, which also zeroes its memory.",
+   "`\"150000 100000\".split(Regex(\"\\\\s+\"))` gives quota and period; `Math.ceil(quota / period)` turns 1.5 into 2. \"max\" as the quota means no limit.",
+   "Server-class means `cpus >= 2 && memoryMb >= 1792`: 2 GB minus 256 MB of slack."
+  ],
+  "done_when": "All nine tests in `ContainersTest` pass."
+ },
+ "drill": {
+  "title": "A cgroup from memory",
+  "minutes": 4,
+  "prompt": "As root on a Linux host with cgroup v2, where `/sys/fs/cgroup` is the real root of the tree, write the commands that create a group `settle` with at most 50 tasks, 256 MB of memory and no swap, and half a CPU, then start `java -jar settle.jar` inside it. Then write where you'd look to see whether it hit each limit.",
+  "answer": {
+   "lang": "bash",
+   "src": "cd /sys/fs/cgroup\n# (in the privileged lab box, first move its processes into a child group, as the Try-it does)\necho \"+pids +memory +cpu\" > cgroup.subtree_control   # controllers for the children\nmkdir settle\necho 50 > settle/pids.max\necho 256M > settle/memory.max\necho 0 > settle/memory.swap.max\necho \"50000 100000\" > settle/cpu.max              # 50 ms per 100 ms\nbash -c 'echo $$ > /sys/fs/cgroup/settle/cgroup.procs; exec java -jar settle.jar'\n\n# did it hit them?\ncat settle/pids.events          # max N: forks or threads refused with EAGAIN\ncat settle/memory.events        # oom_kill N: processes the OOM killer took\ngrep throttled settle/cpu.stat  # nr_throttled: periods it ran out of budget\ncat settle/cpu.pressure settle/memory.pressure   # how long tasks waited"
+  }
+ },
+ "recap": [
+  "A container is ordinary processes on the one shared kernel: `NSpid` shows each one's PID inside and on the host, and `uname -r` is the same everywhere.",
+  "Namespaces (pid, mnt, net, uts, ipc, user, cgroup, time) give a process its own view. They change what it sees, never how much it can use.",
+  "A cgroup v2 is a directory under `/sys/fs/cgroup`: `pids.max` makes `fork` fail with `EAGAIN`, `memory.max` ends in reclaim then the OOM killer inside the group, `cpu.max` throttles. The `*.events` and `cpu.stat` files count each hit.",
+  "Root in a default Docker container is user 0 to the kernel, held back by 14 capabilities and a seccomp filter. `--privileged` removes both.",
+  "The root file system is an overlay: read-only image layers plus a per-container upper layer; the first write copies a file up.",
+  "The JVM sizes heap (25% of `memory.max`), CPUs (quota / period, rounded up) and GC (G1 only from 2 CPUs and 1,792 MB) from these files. Check with `-XshowSettings:system`, and read saturation from `cpu.stat` and the PSI `*.pressure` files."
+ ],
+ "quiz": [
+  {
+   "q": "From lesson 7: two containers run on one node. Container A, limited to 512 MB, leaks memory until it hits its limit; container B has no limit and holds 3 GB. Which process does the kernel kill?",
+   "options": [
+    "B's biggest process, because it uses the most memory on the node",
+    "The biggest process in A's cgroup, because A's `memory.max` was hit and the OOM killer runs inside that group",
+    "Nothing: the kernel just refuses A's next `malloc`",
+    "Whichever process allocated last, in either container"
+   ],
+   "answer": 1,
+   "from": "os-07",
+   "why": "Hitting `memory.max` starts reclaim and then the OOM killer for that cgroup only, choosing the biggest process inside it, and `memory.events` in A counts `oom_kill`. B is outside the group and never a candidate. `malloc` doesn't fail on Linux here, because the memory was promised long before; the failure happens at the page fault, as lesson 7 showed."
+  },
+  {
+   "q": "A container is started with its own PID namespace but no `--pids-limit`. Someone runs a fork bomb in it. What stops the fork bomb?",
+   "options": [
+    "The PID namespace: it only has room for 32,768 PIDs",
+    "Nothing in the container: only a `pids.max` above it, or the host's own task limits, can stop it",
+    "The container's PID 1 reaps the children as they appear",
+    "seccomp blocks `fork` after the first thousand calls"
+   ],
+   "answer": 1,
+   "why": "A namespace renumbers processes; it doesn't count them against anything. Every child is still a task in the one kernel, so the bomb fills the host's task table until it hits `pids.max` of some cgroup above it or the kernel's global limits, and then every container suffers. That's what `--pids-limit` (and Kubernetes' pod PID limit) is for."
+  },
+  {
+   "q": "A pod runs JDK 25 with `limits.memory: 2Gi` and `limits.cpu: 500m`, and no JVM flags. What does the JVM choose?",
+   "options": [
+    "A 512 MB heap, 1 CPU, Serial GC",
+    "A 1 GB heap, 1 CPU, G1",
+    "A 512 MB heap, the node's CPU count, G1",
+    "A 2 GB heap, 1 CPU, G1"
+   ],
+   "answer": 0,
+   "why": "`memory.max` is 2 GB and the default `MaxRAMPercentage` is 25%, so 512 MB. `cpu.max` is `50000 100000`, which the JVM rounds up to 1 CPU. With fewer than 2 CPUs the machine isn't server-class, so the default collector is Serial, whatever the memory. Using all 2 GB as heap would get the pod OOM-killed, since metaspace, thread stacks and native memory come on top."
+  },
+  {
+   "q": "Why does Docker's default profile block system calls like `mount`, `unshare` and the io_uring calls, even though the container's processes run as root?",
+   "options": [
+    "Because root inside a container is a different, unprivileged user on the host",
+    "Because the calls would only affect the container itself",
+    "Because every container shares the host's kernel: without a user namespace, container root is user 0 to that kernel, and a bug in any reachable call is a bug for the whole host",
+    "Because those calls are too slow for containers"
+   ],
+   "answer": 2,
+   "why": "Docker doesn't use user namespaces by default; the Try-it showed the same user namespace inside and out. So the only things between a container's root and the kernel are its capability set and the seccomp filter. Removing whole system calls shrinks the kernel code a container can reach, which matters because that code is shared by everything on the machine."
+  },
+  {
+   "q": "A container edits `/etc/app.conf`, which came from its image. The container is removed and a new one starts from the same image. What does the new container find in `/etc/app.conf`?",
+   "options": [
+    "The edited version: the edit was written into the image",
+    "The original version: the edit went to a copy in the old container's upper layer, which was deleted with it",
+    "Nothing: the file was moved to the old container's layer",
+    "The edited version, if the old container stopped cleanly"
+   ],
+   "answer": 1,
+   "why": "Image layers are read-only. The first write copied the file up into the container's own upper directory and changed the copy there; `docker diff` would have shown `C /etc/app.conf`. `docker rm` deletes the upper directory, and the image underneath never changed. Data that must outlive a container goes on a volume."
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "Namespace or cgroup: which one limits how much memory a container uses?",
+   "back": "The cgroup (`memory.max`). A namespace only changes what a process can see."
+  },
+  {
+   "front": "What does `NSpid: 40037 1` in `/proc/40037/status` mean?",
+   "back": "The process is PID 40037 in the host's PID namespace and PID 1 in its own, nested one."
+  },
+  {
+   "front": "What happens when a `fork` would pass `pids.max`?",
+   "back": "It fails with `EAGAIN`, and `pids.events` counts `max`. Threads count too."
+  },
+  {
+   "front": "What does `--privileged` change?",
+   "back": "It gives the container every capability (`CapEff` 000001ffffffffff) and switches its seccomp filter off."
+  },
+  {
+   "front": "What happens on the first write to a file from an image layer?",
+   "back": "overlayfs copies the whole file up into the container's upper directory, then changes the copy."
+  },
+  {
+   "front": "How does the JVM turn `cpu.max = 150000 100000` into a CPU count?",
+   "back": "Quota / period = 1.5, rounded up to 2, capped by the cpuset's CPUs."
+  },
+  {
+   "front": "What do `some` and `full` mean in a PSI `*.pressure` file?",
+   "back": "The share of time at least one task (`some`) or all tasks (`full`) in the group waited for that resource."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Container",
+   "plain": "One or more ordinary processes on the shared kernel, given their own namespaces, a cgroup, limited privileges and an overlay root."
+  },
+  {
+   "term": "Namespace",
+   "plain": "A separate copy of one kernel table, such as PIDs, mounts, network or hostname, that a group of processes sees instead of the global one."
+  },
+  {
+   "term": "cgroup",
+   "plain": "A directory under /sys/fs/cgroup holding processes that the kernel counts and limits together."
+  },
+  {
+   "term": "Controller",
+   "plain": "The part of cgroups that manages one resource, such as pids, memory or cpu, through its files."
+  },
+  {
+   "term": "Capability",
+   "plain": "One slice of root's power, such as CAP_CHOWN or CAP_SYS_TIME, that the kernel checks instead of user 0."
+  },
+  {
+   "term": "Overlay filesystem",
+   "plain": "A mount that stacks read-only lower layers under a writable upper one, copying a file up on its first write."
+  },
+  {
+   "term": "PSI",
+   "plain": "Pressure stall information: how much of the time tasks waited for CPU, memory or I/O, per cgroup and for the machine."
+  },
+  {
+   "term": "USE method",
+   "plain": "Checking every resource for utilization, saturation and errors."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate says: \"containers are lightweight VMs, so our settlement container can't affect the payment API container next to it.\" Explain what a container actually is, which parts of that claim hold, and which don't.",
+  "answer": "A container is a set of ordinary processes on the node's one kernel. Namespaces give them their own view: their own PIDs, hostname, network interfaces and mount table, so the settlement job can't see or signal the API's processes or bind its ports. A cgroup limits what they use, so if the job has a memory limit, a leak ends in the OOM killer inside the job's cgroup, and the API isn't a candidate. The overlay root gives the job its own files over a shared read-only image. All of that holds. What doesn't hold is the VM part. There is no second kernel: both containers make system calls into the same one. Without user namespaces, root in the job is user 0 to that kernel, held back only by 14 capabilities and a seccomp filter, so a kernel bug reachable from one container affects both. Anything without a limit is shared too: a job with no `pids.max` can fill the node's task table, one with no memory limit can push the node into a global OOM, and CPU without `cpu.max` is shared by weight. And node-wide settings, like sysctls, the page cache and disk bandwidth, belong to everyone. So: set limits on every container, never run them privileged, and use a VM or sandbox if you need a security boundary."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "User namespaces close the biggest gap in a default container. With one, root inside maps to an unprivileged user ID outside, so even an escape lands as nobody. Podman's rootless mode and Docker's `userns-remap` setting use them, and Kubernetes has been adding user namespace support for pods. They're not the default yet in most clusters because some volumes and images assume real root.\n\nWhere one kernel is too little isolation, sandboxes put something between the container and the host kernel: gVisor answers system calls in a user-space kernel of its own, and Kata Containers and Firecracker run each pod or function in a small VM with its own kernel. Both trade start-up time and some performance for a smaller shared attack surface.\n\nTwo more memory files are worth knowing. `memory.high` is a soft limit: above it, the kernel throttles the group's allocations and reclaims hard, but never calls the OOM killer, which gives a service a slow warning instead of a sudden death. `memory.oom.group`, set to 1, makes the OOM killer take every process in the group together, which suits a container whose processes are useless without each other.\n\nThe USE method has a classic first minute on a whole host, from Brendan Gregg: `uptime`, `dmesg | tail`, `vmstat 1`, `mpstat -P ALL 1`, `pidstat 1`, `iostat -xz 1`, `free -m`, `sar -n DEV 1`, `sar -n TCP,ETCP 1` and `top`. Each tool in that list reads files this track has opened: `/proc/stat`, `/proc/meminfo`, the per-process `/proc/<pid>/` directories and the network counters. In a container, check whether the tool reads the cgroup's files or the host's before you trust what it says."
+ },
+ "sources": [
+  {
+   "title": "namespaces(7), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man7/namespaces.7.html"
+  },
+  {
+   "title": "Control Group v2 (Linux kernel documentation)",
+   "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
+  },
+  {
+   "title": "capabilities(7), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man7/capabilities.7.html"
+  },
+  {
+   "title": "JDK-8346874: Linux kernel version 6.12 and newer breaks JVM container support",
+   "url": "https://bugs.openjdk.org/browse/JDK-8346874"
+  },
+  {
+   "title": "The java command, JDK 25: container and ergonomics options",
+   "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html"
+  }
+ ]
 }

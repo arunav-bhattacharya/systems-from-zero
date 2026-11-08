@@ -1,412 +1,412 @@
 {
-  "id": "os-11",
-  "title": "I/O models: blocking, epoll and io_uring",
-  "minutes": 40,
-  "goal": "By the end you can explain what a blocking read costs, how one thread waits on thousands of sockets with epoll, what level- and edge-triggered mean for your loop, what Java NIO and virtual threads do underneath, and why io_uring works differently and is often switched off.",
-  "warmup": {
-    "q": "A server holds 2,000 keep-alive connections that are idle most of the time. Written with one platform thread per connection, how many OS threads does it have, and what are they doing?",
-    "options": [
-      "About 12, one per CPU, taking turns over the connections",
-      "About 2,000, almost all asleep in `read()`, using no CPU",
-      "About 2,000, each spinning at full CPU to check its socket",
-      "One: the kernel shares a single thread between all the sockets"
-    ],
-    "answer": 1,
-    "why": "In the lab box that server had 2,028 threads, and `ps` showed 2,000 of them asleep in the kernel waiting for socket data. Sleeping threads cost no CPU, but each is a kernel task with a reserved stack: the server's RSS was about 190 to 230 MB. Sharing one thread between many sockets is what epoll and Java's `Selector` do, and the server has to be written for it."
-  },
-  "sections": [
-    {
-      "h": "A blocking read puts the thread to sleep until bytes arrive",
-      "body": "`wait.c` asks for a reply on a socket that a child process answers one second later. Its `read()` returns after 1.00 s, and the process used 0.00 s of CPU in that second. While it waited, `ps` showed it in state `S` (asleep), in the kernel function `unix_stream_read_generic`.\n\nBytes from the network don't go straight into your program. The kernel keeps a **receive queue** for every socket, and the network stack appends incoming data to it whether anyone is reading or not. `read()` copies from that queue. If the queue is empty, the kernel puts the calling thread on the socket's wait queue and runs some other task (lesson 4 of this track). When a packet arrives, the network stack appends the bytes and wakes the threads waiting on that socket. That's a **blocking read**, and it's the simplest model there is: a JDBC query on a platform thread waits for Oracle's answer exactly this way.\n\nThe queue has a size. In the lab box a TCP socket's receive buffer starts at 128 KB (`net.ipv4.tcp_rmem` reads `4096 131072 6291456`: minimum, default and maximum) and the kernel grows it for fast senders. When nobody reads and it fills up, TCP tells the sender to stop, so a slow reader slows the writer down instead of losing data. A server waits in one more place: a listening socket keeps its own queue of new connections, and `accept()` sleeps on it until a client connects.\n\nIts limit is that a thread waiting on one socket can't wait on anything else. A server that wants to serve 2,000 clients at once, most of them quiet, needs 2,000 threads: thread per connection. `EchoServers` in `threads` mode does that, and with 2,000 idle clients connected it had 2,028 threads, 2,000 of them asleep in `wait_woken`, and an RSS of about 190 to 230 MB.\n\nEach of those threads is a kernel task (lesson 3 of this track). Each reserves a stack, about 2 MB of addresses on arm64 Linux, and keeps the pages it touched. Each counts against the container's `pids.max`. And each wake-up is a context switch. At 10,000 connections the numbers get uncomfortable, which is why the problem got a name in 1999: C10K, ten thousand clients on one server.\n\nWhat we want instead is one thread that can wait on many sockets at once and be told which of them have data. Getting there takes two steps: a read that refuses to wait, and a call that waits on a whole set.",
-      "try": {
-        "title": "Watch a read sleep",
-        "minutes": 3,
-        "steps": [
-          "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
-          "Read `os/c/l11/wait.c`. A child process plays the card issuer and writes `APPROVED` one second after the start; the parent waits for it. Mode `block` is a plain `read()`.",
-          "Predict the process state that `ps` shows half a second in, and how long `strace -T` says the `read` took."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "gcc -O2 -o /tmp/wait os/c/l11/wait.c\n/tmp/wait block & sleep 0.5; ps -o pid,stat,wchan:22,comm -C wait; wait\nstrace -T -e trace=read /tmp/wait block 2>&1 | grep -E '^read|^block'"
-        },
-        "expect": "PIDs differ:\n\n```text\n  PID STAT WCHAN                  COMMAND\n   12 S    unix_stream_read_gener wait\n   14 S    hrtimer_nanosleep      wait\nblock got 8 bytes after 1.00 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\nread(3, \"\\177ELF\\2\\1\\1\\3\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\267\\0\\1\\0\\0\\0\\360\\206\\2\\0\\0\\0\\0\\0\"..., 832) = 832 <0.000469>\nread(3, \"APPROVED\", 64)                 = 8 <1.004026>\nblock got 8 bytes after 1.00 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\n```\n\nBoth processes are asleep (`S`). The parent waits in `unix_stream_read_generic`, the kernel's read for this kind of socket, and the child sleeps in a timer. `strace -T` prints the time spent inside each call: the read of the C library at start-up took half a millisecond, and the read of the reply took 1.004 s, all of it asleep. The CPU column stays at 0.00 s."
-      },
-      "refs": [
-        {
-          "title": "socket(7): blocking and non-blocking sockets",
-          "url": "https://man7.org/linux/man-pages/man7/socket.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "OSTEP chapter 33: Event-based Concurrency",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-events.pdf",
-          "kind": "read"
-        }
-      ]
-    },
-    {
-      "h": "Non-blocking reads return EAGAIN, and epoll says when to try again",
-      "body": "`wait.c spin` waits for the same reply with a non-blocking socket and a loop. In one second its `read()` failed 1,335,566 times with `EAGAIN` and burned a full second of CPU, for the same 8 bytes the blocking version got for free.\n\nA socket opened with `O_NONBLOCK` never puts a thread to sleep. `read()` returns data if the queue has some, and otherwise fails at once with `EAGAIN` (\"try again\"). Now one thread could serve 2,000 sockets by trying each in turn, but most tries fail, and the loop spins at 100% CPU even when every client is quiet. The missing piece is a call that sleeps until any socket in a set has data.\n\nThe first answer was `select()`, from BSD Unix in the early 1980s. You pass a bitmap of descriptors, the kernel checks each one, sleeps if none is ready, and hands back the bitmap of ready ones. It caps descriptor numbers at 1,024 (`FD_SETSIZE`), and every call copies the whole set into the kernel and checks every socket in it. `poll()` drops the cap but keeps the cost: each call is proportional to the number of connections, not to the number that have data. With 2,000 connections and 3 active, every wake-up checks 2,000.\n\nLinux 2.6 added **epoll**, which splits registration from waiting. `epoll_create1` makes an epoll instance. `epoll_ctl(ADD)` registers a socket once, in the instance's interest list, and the kernel hooks the socket's wake-up so that data arriving puts the socket on the instance's **ready list**. `epoll_wait` sleeps until that list is non-empty and returns only what's on it. Idle sockets cost nothing per call. On arm64 the system call is `epoll_pwait`, in the same way that `open` is `openat`. BSD and macOS have the same idea under the name `kqueue`.\n\nepoll can report a socket in two ways, and the difference bites. **Level-triggered**, the default, reports a socket for as long as it's readable: read half its data, and the next `epoll_wait` returns it again. **Edge-triggered** (`EPOLLET`) reports it once per arrival of new data. Read half and wait, and the other half sits in the queue until the client sends more, which it won't if it's waiting for your answer. Edge-triggered code must read every socket until `EAGAIN`. In exchange it gets fewer wake-ups, which some servers want, at the price of code that must never stop reading early. The stepper shows both servers and both modes.",
-      "stepper": {
-        "title": "A blocking server and an epoll loop, on the same four connections",
-        "intro": "Left: a thread per connection. Right: one thread with an epoll instance. Both get the same packets on their own sockets; the middle column shows the receive queues of the epoll server's sockets.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Four quiet connections: four threads asleep in read on the left, one thread asleep in epoll_wait on the right\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): asleep</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Four idle connections cost four sleeping threads on the left, one on the right.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">Each left-hand thread is a kernel task with its own stack (about 2 MB reserved).</text></svg>",
-            "say": "Four connections, nothing to read. On the left, a thread per connection, each asleep in `read()` on its own socket. On the right, one thread asleep in `epoll_wait` (`epoll_pwait` on arm64), after registering all four sockets once with `epoll_ctl`: that's the **interest list**. Nobody uses CPU on either side."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"A packet arrives for c3: the kernel queues the bytes, wakes T3, and puts c3 on the epoll ready list\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s\" x=\"70\" y=\"157\" text-anchor=\"start\">woken: runnable</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">10 bytes</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): woken</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c3</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-a\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Data for c3: the kernel appends it to c3's queue and wakes what waits on c3.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">On the left that's T3. On the right, epoll's callback puts c3 on the ready list.</text></svg>",
-            "say": "10 bytes arrive for connection c3. The network stack appends them to c3's **receive queue** and wakes whatever waits on that socket. On the left, that's thread T3. On the right, epoll registered a callback on every socket in its interest list, so the kernel puts c3 on the instance's **ready list** and wakes the loop thread."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"T3 reads its 10 bytes; the epoll loop gets [c3] back, reads 10 bytes, and its next read says EAGAIN\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s\" x=\"70\" y=\"157\" text-anchor=\"start\">read() = 10</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-m\" x=\"593\" y=\"78\" text-anchor=\"middle\">read = 10, then EAGAIN</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-a\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Both servers read c3. Only the loop's socket is non-blocking: its second read</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">returns EAGAIN at once, which tells it c3 is drained, and it calls epoll_pwait again.</text></svg>",
-            "say": "On the left, T3's `read()` returns 10 bytes and T3 handles the request. On the right, `epoll_wait` returns a list with one entry, c3, and the loop reads it. Its sockets are non-blocking, so it can read again to check for more: `EAGAIN` means empty, and it goes back to `epoll_wait`. It never touched c1, c2 or c4."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Data for c1 and c4 at once: two threads wake on the left, one wake-up returns both on the right\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box-a\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">woken: runnable</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">woken: runnable</text><rect class=\"box-a\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">8 bytes</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">10 KB</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait() = 2</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c1 c4</text><line class=\"ln-a\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-a\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Two connections get data. Left: two threads wake, two context switches.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">Right: one epoll_wait call returns both, and one thread handles them in turn.</text></svg>",
-            "say": "Requests arrive on c1 and c4 together. On the left, two threads wake up and the scheduler (lesson 4 of this track) switches to each. On the right, one `epoll_wait` returns both, and one thread handles them one after the other. With 2,000 connections, the left side has 2,000 threads; the right side has one, and its cost follows the number of ready sockets."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Level-triggered: the loop reads 4 KB of c4's 10 KB, and the next epoll_wait reports c4 again\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">read() = 8</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">read() = 10 KB</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">6 KB</text><rect class=\"box\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">read(4 KB) = 4 KB</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c4</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Level-triggered, the default: c4 stays on the ready list while it still has</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">bytes, so the next epoll_wait returns it again and the loop reads the rest.</text></svg>",
-            "say": "Suppose the loop reads c4 with a 4 KB buffer, once. 6 KB are left. In **level-triggered** mode, epoll's default, a socket stays on the ready list as long as it's readable, so the next `epoll_wait` returns c4 again and the loop reads more. Java's `Selector` behaves like this: a key keeps being selected while its channel has data."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Edge-triggered: the same partial read, and the next epoll_wait reports nothing; 6 KB wait for an edge that may never come\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">read() = 8</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">read() = 10 KB</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-bad\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">6 KB</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): asleep</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Edge-triggered (EPOLLET): a socket is reported once per arrival. The 6 KB left</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">in c4 get no new event, and a client waiting for the answer will wait forever.</text></svg>",
-            "say": "Same partial read in **edge-triggered** mode (`EPOLLET`). epoll reports a socket when new data arrives, once. The 6 KB still in c4 aren't new, so `epoll_wait` sleeps. If the client sent the whole request and now waits for the answer, nothing new will ever arrive. The rule for edge-triggered code: on every event, read until `EAGAIN`. The lab makes you write both loops."
-          }
-        ]
-      },
-      "try": {
-        "title": "Spin, then sleep in epoll",
-        "minutes": 3,
-        "steps": [
-          "Mode `spin` sets `O_NONBLOCK` and loops on `read()`. Mode `epoll` sets `O_NONBLOCK`, registers the socket with `epoll_ctl` and sleeps in `epoll_wait` before it reads.",
-          "Predict the `EAGAIN` count and the CPU time of each mode, then run them. The last line traces the epoll calls."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "gcc -O2 -o /tmp/wait os/c/l11/wait.c\n/tmp/wait spin\n/tmp/wait epoll\nstrace -T -e trace=epoll_create1,epoll_ctl,epoll_pwait,read /tmp/wait epoll 2>&1 | grep -E '^(epoll|read)'"
-        },
-        "expect": "The `EAGAIN` count depends on your CPU and how busy the VM is:\n\n```text\nspin  got 8 bytes after 1.01 s; read() failed with EAGAIN 1335566 times; CPU used 1.01 s\nepoll_wait returned 1 ready socket(s)\nepoll got 8 bytes after 1.01 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\nread(3, \"\\177ELF\\2\\1\\1\\3\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\267\\0\\1\\0\\0\\0\\360\\206\\2\\0\\0\\0\\0\\0\"..., 832) = 832 <0.001490>\nepoll_create1(0)                        = 4 <0.001164>\nepoll_ctl(4, EPOLL_CTL_ADD, 3, {events=EPOLLIN, data={u32=3, u64=3}}) = 0 <0.001480>\nepoll_pwait(4, [{events=EPOLLIN, data={u32=3, u64=3}}], 8, -1, NULL, 8) = 1 <1.034891>\nread(3, \"APPROVED\", 64)                 = 8 <0.000270>\nepoll_wait returned 1 ready socket(s)\nepoll got 8 bytes after 1.10 s; read() failed with EAGAIN 0 times; CPU used 0.01 s\n```\n\nSpinning took a whole CPU for a second and more than a million failed reads. The epoll version used no CPU and no failed reads: `epoll_pwait` slept for 1.03 s and returned 1, meaning one socket was ready, and the `read` that followed found the 8 bytes at once. The `read` of 832 bytes at the top is the loader reading the C library, not the program."
-      },
-      "refs": [
-        {
-          "title": "epoll(7): level-triggered and edge-triggered",
-          "url": "https://man7.org/linux/man-pages/man7/epoll.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "select(2): the FD_SETSIZE limit",
-          "url": "https://man7.org/linux/man-pages/man2/select.2.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Java's Selector is epoll, and virtual threads use it for you",
-      "body": "The same echo server, written three ways, with the same 2,000 mostly idle clients connected, in the lab box:\n\n| server | OS threads | RSS | system calls per echo |\n|---|---|---|---|\n| platform thread per connection | 2,028 | 189 to 228 MB | `read`, `write` |\n| one thread with a `Selector` | 19 | 51 MB | `epoll_pwait`, `read`, `write` |\n| virtual thread per connection | 33 | 67 to 75 MB | `read` (fails), `epoll_ctl`, `epoll_pwait`, `read`, `write` |\n\nThe middle one is Java NIO. On Linux, `Selector.open()` is `epoll_create1`, `channel.register(selector, OP_READ)` is `epoll_ctl(ADD)`, and `selector.select()` is `epoll_wait`. (On macOS the JDK uses `kqueue` instead.) The loop selects, walks the selected keys, accepts or reads each ready channel, and selects again. `strace -c` on it counts one `epoll_pwait`, one `read` and one `write` per echo, and the quiet connections cost nothing. This loop is under most of what you run: Netty, and Vert.x on top of it, which is the reactive core of Quarkus, and the network layer of every Kafka client and broker.\n\nThe price is in how you write code. Nothing in the loop may block, because one blocked handler stops all 2,000 connections. So work that waits, such as a call to the card issuer, has to be split into callbacks or reactive operators.\n\nThe third server is the first one's code, unchanged, started on virtual threads (lesson 3 of this track). Its `read()` looks blocking, but the JDK made every socket non-blocking underneath. When a read finds nothing, the JDK registers the socket with epoll, parks the virtual thread (it unmounts and frees its carrier) and moves on. One platform thread, `MasterPoller`, sleeps in `epoll_wait` for all of them, and when a socket becomes ready, it makes that virtual thread runnable again, which repeats the read. `strace` shows the pattern: 596 reads, half of them failing with `EAGAIN`, and 585 `epoll_ctl` calls. The kernel sees 12 carriers, the poller and the JVM's own threads.\n\nThat's why virtual threads suit services that wait on sockets: you write blocking code and the JDK runs an event loop for you. RSS lands between the other two, because each virtual thread keeps its stack frames on the heap while it's parked, which is small but not free.",
-      "try": {
-        "title": "One echo server, three ways, 2,000 clients",
-        "minutes": 5,
-        "steps": [
-          "Read `os/src/demo/java/sfz/os/l11/demo/EchoServers.java`: `blocking()` is the thread-per-connection server for both platform and virtual threads, and `nio()` is the `Selector` loop. `IdleClients` opens 2,000 connections and sends a line on 20 of them every 100 ms.",
-          "For each mode the block starts the server and the clients, prints the server's threads and RSS, then counts its system calls for a few seconds. Predict the thread counts. It takes about a minute and a half."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l11/demo/*.java\nfor mode in threads nio virtual; do\n  java -cp /tmp/out sfz.os.l11.demo.EchoServers $mode 9000 40 & spid=$!\n  sleep 1\n  java -cp /tmp/out sfz.os.l11.demo.IdleClients 2000 9000 20 > /dev/null & cpid=$!\n  sleep 8\n  echo \"$mode: $(grep -E '^(Threads|VmRSS)' /proc/$spid/status | tr -s ' \\t\\n' ' ')\"\n  timeout 6 strace -f -c -p $spid -o /tmp/sc.txt 2>/dev/null\n  sort -k4 -n -r /tmp/sc.txt | grep -E ' (read|write|epoll_pwait|epoll_ctl|futex)$' | cut -c1-80\n  kill $cpid $spid; wait 2>/dev/null\ndone",
-          "file": "labs/os/src/demo/java/sfz/os/l11/demo/EchoServers.java"
-        },
-        "expect": "RSS and call counts vary from run to run, and `strace` slows the first server down a lot:\n\n```text\npid 34: threads echo server on port 9000\nthreads: VmRSS: 188936 kB Threads: 2028 \n 94.15    5.784415       68862        84           read\n  0.13    0.008072          96        84           write\n  1.52    0.093178        4904        19         4 futex\npid 2100: nio echo server on port 9000\nnio: VmRSS: 51152 kB Threads: 19 \n  5.20    0.089521         155       574           epoll_pwait\n  2.89    0.049784          86       574           read\n  4.86    0.083594         145       573           write\n 60.41    1.040053       15294        68        31 futex\npid 2157: virtual echo server on port 9000\nvirtual: VmRSS: 66764 kB Threads: 33 \n 83.85   12.666342        4229      2995       222 futex\n  7.03    1.062089        1215       874           epoll_pwait\n  1.39    0.209861         352       596       298 read\n  1.46    0.220679         377       585           epoll_ctl\n  1.21    0.182125         611       298           write\n```\n\nThe platform-thread server spends its traced time inside `read`: 84 calls that each sat for tens of milliseconds, because `strace -c` counts time asleep in the call. The NIO server makes one `epoll_pwait`, one `read` and one `write` per echo, from one thread. The virtual-thread server shows the JDK at work: half its reads fail with `EAGAIN`, each followed by an `epoll_ctl` that registers the socket, and the `futex` calls are carriers parking and waking."
-      },
-      "refs": [
-        {
-          "title": "Selector (Java SE 25)",
-          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/Selector.html",
-          "kind": "docs"
-        },
-        {
-          "title": "JEP 444: Virtual Threads",
-          "url": "https://openjdk.org/jeps/444",
-          "kind": "read"
-        }
-      ]
-    },
-    {
-      "h": "io_uring hands the kernel the work itself",
-      "body": "`fio` reads random 4 KB blocks from a file, bypassing the page cache, from one thread. With plain `pread`, one read at a time, it managed 300 to 1,800 reads a second in the shared VM. With `io_uring` and 32 reads in flight, it managed 15,900 to 23,200.\n\nepoll answers one question: which sockets can I read without blocking? For a regular file it has no answer. A file is always \"ready\", and `epoll_ctl` refuses to watch one with `EPERM`. A `read()` of a file page that isn't cached (lesson 9 of this track) blocks in the kernel until the disk answers, whatever epoll says. So for file I/O, the only way to have 32 reads waiting on the disk at once was 32 threads. And with epoll, every read is still a system call of its own, after the call that said it was ready.\n\n**io_uring**, added in Linux 5.1 (2019), changes the question. The program and the kernel share two ring buffers in memory. The program writes requests into the **submission queue**: read this file descriptor at this offset into this buffer. The kernel performs them, from files or sockets, and writes a result for each into the **completion queue**. One `io_uring_enter` call can submit many requests and wait for many results, and in polling modes a busy program needs no system call at all. epoll is a readiness model: it tells you when you can act. io_uring is a completion model: it tells you the work is done. In one batched `fio` run under `strace`, 116,000 reads took 8,944 `io_uring_enter` calls.\n\nIt's also a large, young interface that does a lot of work in the kernel on a process's behalf, and it has had many security bugs. Google reported in June 2023 that \"60% of the submissions exploited the io_uring component\" of the kernel in its vulnerability rewards program, that it \"paid out around 1 million USD for io_uring alone\", and that io_uring \"is disabled on production Google servers\", as well as on ChromeOS and for Android apps. Docker 25 added the three io_uring system calls to its default seccomp filter (lesson 1 of this track), so in the lab box `io_uring_setup` fails with `EPERM`. The kernel has its own switch, `kernel.io_uring_disabled`: 0 allows everyone, 1 only privileged processes or members of `kernel.io_uring_group`, and 2 nobody.\n\nFor JVM services this is mostly a note to keep. The JDK's NIO and virtual threads use epoll on Linux. Netty offers an io_uring transport as an alternative to its epoll one; before you choose it, check that the seccomp profile your containers run with allows it.",
-      "try": {
-        "title": "io_uring, refused and then allowed",
-        "minutes": 4,
-        "steps": [
-          "Run the block in the everyday box first. It prints `io_uring_disabled`, tries to register a regular file with epoll, and runs `fio` with `psync` and then `io_uring`.",
-          "Then type `exit`, start the privileged box (`docker compose -f env/labbox.yml run --rm box-priv`, which runs without a seccomp filter) and run the same block. Predict which lines change."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box, then in the privileged box",
-          "src": "cat /proc/sys/kernel/io_uring_disabled\npython3 -c \"import select; select.epoll().register(open('/etc/hostname'), select.EPOLLIN)\" 2>&1 | tail -1\nfio --name=ledger --filename=/tmp/fio.dat --size=256m --rw=randread --bs=4k --direct=1 --time_based --runtime=5 --ioengine=psync --iodepth=1 2>&1 | grep -E 'IOPS|error='\nfio --name=ledger --filename=/tmp/fio.dat --size=256m --rw=randread --bs=4k --direct=1 --time_based --runtime=5 --ioengine=io_uring --iodepth=32 2>&1 | grep -E 'IOPS|error='\nrm -f /tmp/fio.dat"
-        },
-        "expect": "The IOPS move a lot with what else the Docker VM is doing. In the everyday box:\n\n```text\n0\nPermissionError: [Errno 1] Operation not permitted\n  read: IOPS=496, BW=1985KiB/s (2032kB/s)(9928KiB/5002msec)\nfio: pid=41, err=1/file:engines/io_uring.c:1049, func=io_queue_init, error=Operation not permitted\n```\n\nIn the privileged box:\n\n```text\n0\nPermissionError: [Errno 1] Operation not permitted\n  read: IOPS=319, BW=1279KiB/s (1309kB/s)(6396KiB/5002msec)\n  read: IOPS=15.9k, BW=62.1MiB/s (65.1MB/s)(310MiB/5001msec)\n```\n\n`io_uring_disabled` is 0 in both: the kernel allows io_uring, and the refusal in the everyday box came from Docker's seccomp filter, as `func=io_queue_init, error=Operation not permitted` shows. epoll refuses a regular file in both boxes, as `PermissionError` (`EPERM`). One thread with one `pread` at a time waits for every read. One thread with 32 reads in flight through io_uring kept the disk busy and did about 50 times as many."
-      },
-      "refs": [
-        {
-          "title": "io_uring(7)",
-          "url": "https://man7.org/linux/man-pages/man7/io_uring.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Documentation for /proc/sys/kernel: io_uring_disabled",
-          "url": "https://docs.kernel.org/admin-guide/sysctl/kernel.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Learnings from kCTF VRP's 42 Linux kernel exploits (oss-security copy)",
-          "url": "https://seclists.org/oss-sec/2023/q2/235",
-          "kind": "read"
-        }
-      ]
-    }
+ "id": "os-11",
+ "title": "I/O models: blocking, epoll and io_uring",
+ "minutes": 40,
+ "goal": "By the end you can explain what a blocking read costs, how one thread waits on thousands of sockets with epoll, what level- and edge-triggered mean for your loop, what Java NIO and virtual threads do underneath, and why io_uring works differently and is often switched off.",
+ "warmup": {
+  "q": "A server holds 2,000 keep-alive connections that are idle most of the time. Written with one platform thread per connection, how many OS threads does it have, and what are they doing?",
+  "options": [
+   "About 12, one per CPU, taking turns over the connections",
+   "About 2,000, almost all asleep in `read()`, using no CPU",
+   "About 2,000, each spinning at full CPU to check its socket",
+   "One: the kernel shares a single thread between all the sockets"
   ],
-  "analogy": "A blocking server is a restaurant with one waiter per table, each standing at the table until the guests decide: easy to run, and the waiters' wages grow with the number of tables, busy or not. epoll is one waiter and a bell on every table. The waiter registers each table's bell once, sits down, and walks only to the tables that rang; level-triggered means a table keeps ringing until it has ordered everything, edge-triggered means it rings once per new decision, so the waiter had better take the whole order. io_uring is ordering by slip: the waiter drops a stack of orders at the kitchen window and later collects a tray of finished dishes. The analogy breaks on cost. Waiters are expensive and threads are cheap until there are thousands of them; and a bell costs the restaurant nothing, while every socket in an epoll interest list costs the kernel a little memory.",
-  "in_your_world": "Most of your I/O already runs on epoll. A Quarkus REST endpoint is served by Vert.x event loops (Netty underneath), a few threads with a `Selector` each, which is why blocking one of them makes Vert.x log a \"has been blocked\" warning and stalls every request on that loop. The Kafka producer's network thread is a Java NIO `Selector` over its broker connections. Your JDBC calls to Oracle are the other model: a pool of 20 connections and 20 threads blocked in socket reads while queries run. Virtual threads let a Temporal activity or a REST handler block on the card issuer's 120 ms answer while the JDK parks it and waits in epoll, so 5,000 waiting authorizations cost a dozen carriers instead of 5,000 OS threads. The JDBC pool still caps how many hit Oracle at once.",
-  "mistake": "Blocking inside an event loop. It feels harmless: one `Thread.sleep`, one JDBC call, one synchronous HTTP call to the fraud service inside a Netty or Vert.x handler, and it works in tests with a handful of requests. But the loop thread serves thousands of connections, and while it's blocked none of them are read, so latency for unrelated requests jumps by the length of the call. Vert.x warns about it, and the warning gets ignored. Move blocking work off the loop, to a worker pool (`@Blocking` in Quarkus) or to virtual threads, and keep the loop for reads, writes and short computations. The edge-triggered version of the same mistake is reading once per event in hand-written epoll code; the rule there is to read until `EAGAIN`.",
-  "compare": {
-    "title": "Thread per connection against one Selector loop",
-    "a": {
-      "label": "Blocking, thread per connection",
-      "lang": "java",
-      "title": "EchoServers.blocking: 2,000 clients, 2,028 threads",
-      "src": "try (ServerSocket server = new ServerSocket(9000)) {\n    while (true) {\n        Socket s = server.accept();\n        Thread.ofPlatform().start(() -> echo(s));   // or Thread.ofVirtual()\n    }\n}\n\nstatic void echo(Socket s) {\n    byte[] buf = new byte[512];\n    try (s) {\n        int n;\n        while ((n = s.getInputStream().read(buf)) > 0) {   // asleep here when idle\n            s.getOutputStream().write(buf, 0, n);\n        }\n    } catch (IOException e) { /* client went away */ }\n}"
-    },
-    "b": {
-      "label": "Non-blocking, one Selector",
-      "lang": "java",
-      "title": "EchoServers.nio: 2,000 clients, 19 threads",
-      "src": "Selector selector = Selector.open();                 // epoll_create1\nserver.configureBlocking(false);\nserver.register(selector, SelectionKey.OP_ACCEPT);    // epoll_ctl(ADD)\nwhile (true) {\n    selector.select();                                // epoll_pwait\n    for (var it = selector.selectedKeys().iterator(); it.hasNext(); ) {\n        SelectionKey key = it.next();\n        it.remove();\n        if (key.isAcceptable()) {\n            SocketChannel c = server.accept();\n            c.configureBlocking(false);\n            c.register(selector, SelectionKey.OP_READ);\n        } else if (key.isReadable()) {\n            SocketChannel c = (SocketChannel) key.channel();\n            buf.clear();\n            if (c.read(buf) < 0) { key.cancel(); c.close(); continue; }\n            buf.flip();\n            while (buf.hasRemaining()) c.write(buf);\n        }\n    }\n}"
-    },
-    "note": "Both serve the same clients the same bytes. The left keeps each connection's state where code usually keeps it, in local variables on a thread's stack, so it needs a thread per connection, and with platform threads the kernel holds 2,000 sleeping tasks. The right keeps the state in the kernel's epoll instance and handles whichever channels are ready, so one thread does, but no handler may ever block. Running the left side on virtual threads gets you the right side's thread count with the left side's code: the JDK runs the epoll loop for you."
-  },
-  "worked": {
-    "title": "Tell from outside how a JVM waits on its sockets",
+  "answer": 1,
+  "why": "In the lab box that server had 2,028 threads, and `ps` showed 2,000 of them asleep in the kernel waiting for socket data. Sleeping threads cost no CPU, but each is a kernel task with a reserved stack: the server's RSS was about 190 to 230 MB. Sharing one thread between many sockets is what epoll and Java's `Selector` do, and the server has to be written for it."
+ },
+ "sections": [
+  {
+   "h": "A blocking read puts the thread to sleep until bytes arrive",
+   "body": "`wait.c` asks for a reply on a socket that a child process answers one second later. Its `read()` returns after 1.00 s, and the process used 0.00 s of CPU in that second. While it waited, `ps` showed it in state `S` (asleep), in the kernel function `unix_stream_read_generic`.\n\nBytes from the network don't go straight into your program. The kernel keeps a **receive queue** for every socket, and the network stack appends incoming data to it whether anyone is reading or not. `read()` copies from that queue. If the queue is empty, the kernel puts the calling thread on the socket's wait queue and runs some other task (lesson 4 of this track). When a packet arrives, the network stack appends the bytes and wakes the threads waiting on that socket. That's a **blocking read**, and it's the simplest model there is: a JDBC query on a platform thread waits for Oracle's answer exactly this way.\n\nThe queue has a size. In the lab box a TCP socket's receive buffer starts at 128 KB (`net.ipv4.tcp_rmem` reads `4096 131072 6291456`: minimum, default and maximum) and the kernel grows it for fast senders. When nobody reads and it fills up, TCP tells the sender to stop, so a slow reader slows the writer down instead of losing data. A server waits in one more place: a listening socket keeps its own queue of new connections, and `accept()` sleeps on it until a client connects.\n\nIts limit is that a thread waiting on one socket can't wait on anything else. A server that wants to serve 2,000 clients at once, most of them quiet, needs 2,000 threads: thread per connection. `EchoServers` in `threads` mode does that, and with 2,000 idle clients connected it had 2,028 threads, 2,000 of them asleep in `wait_woken`, and an RSS of about 190 to 230 MB.\n\nEach of those threads is a kernel task (lesson 3 of this track). Each reserves a stack, about 2 MB of addresses on arm64 Linux, and keeps the pages it touched. Each counts against the container's `pids.max`. And each wake-up is a context switch. At 10,000 connections the numbers get uncomfortable, which is why the problem got a name in 1999: C10K, ten thousand clients on one server.\n\nWhat we want instead is one thread that can wait on many sockets at once and be told which of them have data. Getting there takes two steps: a read that refuses to wait, and a call that waits on a whole set.",
+   "try": {
+    "title": "Watch a read sleep",
+    "minutes": 3,
     "steps": [
-      {
-        "say": "Count the server's threads by state and by the kernel function they sleep in (`wchan`). A thread-per-connection server has thousands asleep in a socket read: `wait_woken` here, with 2,000 clients connected.",
-        "code": "ps -L -o stat,wchan:22 -p $pid | sort | uniq -c | sort -rn | head -3\n#    2000 Sl   wait_woken\n#      27 Sl   futex_wait_queue\n#       1 Sl   inet_csk_accept",
-        "lang": "bash"
-      },
-      {
-        "say": "A selector-based or virtual-thread server has a few dozen threads, and one or a few asleep in `do_epoll_wait`. Pair each thread's name (`comm`) with its `wchan` to see which. The rest wait on futexes (lesson 5 of this track): carriers with nothing to run, GC and compiler threads. The virtual-thread server, with the same 2,000 clients:",
-        "code": "for t in /proc/$pid/task/*; do echo \"$(cat $t/comm) | $(cat $t/wchan)\"; done | sort | uniq -c | sort -rn\n# (output trimmed)\n#      12 ForkJoinPool-1- | futex_wait_queue\n#       1 VM Thread | futex_wait_queue\n#       1 VirtualThread-u | futex_wait_queue\n#       1 MasterPoller | do_epoll_wait\n#       1 java | inet_csk_accept",
-        "lang": "bash"
-      },
-      {
-        "say": "Name the epoll thread with a thread dump. `MasterPoller` running `sun.nio.ch.EPollPoller` is the JDK's poller for virtual threads. In a Netty or Vert.x service you'd find event-loop threads waiting in an epoll call instead, and in a Kafka producer its `kafka-producer-network-thread`.",
-        "code": "jcmd $pid Thread.print | grep -A3 MasterPoller\n# (long line trimmed)\n# \"MasterPoller\" #45 [92] daemon prio=5 os_prio=0 cpu=67.03ms elapsed=7.47s ... runnable\n#    java.lang.Thread.State: RUNNABLE\n# \tat sun.nio.ch.EPoll.wait(java.base@25.0.5/Native Method)\n# \tat sun.nio.ch.EPollPoller.poll(java.base@25.0.5/EPollPoller.java:74)",
-        "lang": "bash"
-      },
-      {
-        "say": "Confirm with a few seconds of `strace -c`. Readiness-based code shows `epoll_pwait` next to its reads; virtual threads add a failed `read` and an `epoll_ctl` for each wait. Keep `strace` short on a real service, since it slows every call.",
-        "code": "timeout 6 strace -f -c -p $pid -o /tmp/sc.txt\nsort -k4 -n -r /tmp/sc.txt | grep -E ' (read|epoll_pwait|epoll_ctl)$'\n#   7.03    1.062089        1215       874           epoll_pwait\n#   1.39    0.209861         352       596       298 read\n#   1.46    0.220679         377       585           epoll_ctl",
-        "lang": "bash"
-      }
+     "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
+     "Read `os/c/l11/wait.c`. A child process plays the card issuer and writes `APPROVED` one second after the start; the parent waits for it. Mode `block` is a plain `read()`.",
+     "Predict the process state that `ps` shows half a second in, and how long `strace -T` says the `read` took."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "gcc -O2 -o /tmp/wait os/c/l11/wait.c\n/tmp/wait block & sleep 0.5; ps -o pid,stat,wchan:22,comm -C wait; wait\nstrace -T -e trace=read /tmp/wait block 2>&1 | grep -E '^read|^block'"
+    },
+    "expect": "PIDs differ:\n\n```text\n  PID STAT WCHAN                  COMMAND\n   12 S    unix_stream_read_gener wait\n   14 S    hrtimer_nanosleep      wait\nblock got 8 bytes after 1.00 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\nread(3, \"\\177ELF\\2\\1\\1\\3\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\267\\0\\1\\0\\0\\0\\360\\206\\2\\0\\0\\0\\0\\0\"..., 832) = 832 <0.000469>\nread(3, \"APPROVED\", 64)                 = 8 <1.004026>\nblock got 8 bytes after 1.00 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\n```\n\nBoth processes are asleep (`S`). The parent waits in `unix_stream_read_generic`, the kernel's read for this kind of socket, and the child sleeps in a timer. `strace -T` prints the time spent inside each call: the read of the C library at start-up took half a millisecond, and the read of the reply took 1.004 s, all of it asleep. The CPU column stays at 0.00 s."
+   },
+   "refs": [
+    {
+     "title": "socket(7): blocking and non-blocking sockets",
+     "url": "https://man7.org/linux/man-pages/man7/socket.7.html",
+     "kind": "docs"
+    },
+    {
+     "title": "OSTEP chapter 33: Event-based Concurrency",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-events.pdf",
+     "kind": "read"
+    }
+   ]
+  },
+  {
+   "h": "Non-blocking reads return EAGAIN, and epoll says when to try again",
+   "body": "`wait.c spin` waits for the same reply with a non-blocking socket and a loop. In one second its `read()` failed 1,335,566 times with `EAGAIN` and burned a full second of CPU, for the same 8 bytes the blocking version got for free.\n\nA socket opened with `O_NONBLOCK` never puts a thread to sleep. `read()` returns data if the queue has some, and otherwise fails at once with `EAGAIN` (\"try again\"). Now one thread could serve 2,000 sockets by trying each in turn, but most tries fail, and the loop spins at 100% CPU even when every client is quiet. The missing piece is a call that sleeps until any socket in a set has data.\n\nThe first answer was `select()`, from BSD Unix in the early 1980s. You pass a bitmap of descriptors, the kernel checks each one, sleeps if none is ready, and hands back the bitmap of ready ones. It caps descriptor numbers at 1,024 (`FD_SETSIZE`), and every call copies the whole set into the kernel and checks every socket in it. `poll()` drops the cap but keeps the cost: each call is proportional to the number of connections, not to the number that have data. With 2,000 connections and 3 active, every wake-up checks 2,000.\n\nLinux 2.6 added **epoll**, which splits registration from waiting. `epoll_create1` makes an epoll instance. `epoll_ctl(ADD)` registers a socket once, in the instance's interest list, and the kernel hooks the socket's wake-up so that data arriving puts the socket on the instance's **ready list**. `epoll_wait` sleeps until that list is non-empty and returns only what's on it. Idle sockets cost nothing per call. On arm64 the system call is `epoll_pwait`, in the same way that `open` is `openat`. BSD and macOS have the same idea under the name `kqueue`.\n\nepoll can report a socket in two ways, and the difference bites. **Level-triggered**, the default, reports a socket for as long as it's readable: read half its data, and the next `epoll_wait` returns it again. **Edge-triggered** (`EPOLLET`) reports it once per arrival of new data. Read half and wait, and the other half sits in the queue until the client sends more, which it won't if it's waiting for your answer. Edge-triggered code must read every socket until `EAGAIN`. In exchange it gets fewer wake-ups, which some servers want, at the price of code that must never stop reading early. The stepper shows both servers and both modes.",
+   "stepper": {
+    "title": "A blocking server and an epoll loop, on the same four connections",
+    "intro": "Left: a thread per connection. Right: one thread with an epoll instance. Both get the same packets on their own sockets; the middle column shows the receive queues of the epoll server's sockets.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Four quiet connections: four threads asleep in read on the left, one thread asleep in epoll_wait on the right\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): asleep</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Four idle connections cost four sleeping threads on the left, one on the right.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">Each left-hand thread is a kernel task with its own stack (about 2 MB reserved).</text></svg>",
+      "say": "Four connections, nothing to read. On the left, a thread per connection, each asleep in `read()` on its own socket. On the right, one thread asleep in `epoll_wait` (`epoll_pwait` on arm64), after registering all four sockets once with `epoll_ctl`: that's the **interest list**. Nobody uses CPU on either side."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"A packet arrives for c3: the kernel queues the bytes, wakes T3, and puts c3 on the epoll ready list\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s\" x=\"70\" y=\"157\" text-anchor=\"start\">woken: runnable</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">10 bytes</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): woken</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c3</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-a\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Data for c3: the kernel appends it to c3's queue and wakes what waits on c3.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">On the left that's T3. On the right, epoll's callback puts c3 on the ready list.</text></svg>",
+      "say": "10 bytes arrive for connection c3. The network stack appends them to c3's **receive queue** and wakes whatever waits on that socket. On the left, that's thread T3. On the right, epoll registered a callback on every socket in its interest list, so the kernel puts c3 on the instance's **ready list** and wakes the loop thread."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"T3 reads its 10 bytes; the epoll loop gets [c3] back, reads 10 bytes, and its next read says EAGAIN\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s t-m\" x=\"70\" y=\"57\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s\" x=\"70\" y=\"157\" text-anchor=\"start\">read() = 10</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s t-m\" x=\"70\" y=\"207\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-m\" x=\"593\" y=\"78\" text-anchor=\"middle\">read = 10, then EAGAIN</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-a\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Both servers read c3. Only the loop's socket is non-blocking: its second read</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">returns EAGAIN at once, which tells it c3 is drained, and it calls epoll_pwait again.</text></svg>",
+      "say": "On the left, T3's `read()` returns 10 bytes and T3 handles the request. On the right, `epoll_wait` returns a list with one entry, c3, and the loop reads it. Its sockets are non-blocking, so it can read again to check for more: `EAGAIN` means empty, and it goes back to `epoll_wait`. It never touched c1, c2 or c4."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Data for c1 and c4 at once: two threads wake on the left, one wake-up returns both on the right\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box-a\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">woken: runnable</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box-a\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">woken: runnable</text><rect class=\"box-a\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">8 bytes</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">10 KB</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait() = 2</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c1 c4</text><line class=\"ln-a\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-a\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Two connections get data. Left: two threads wake, two context switches.</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">Right: one epoll_wait call returns both, and one thread handles them in turn.</text></svg>",
+      "say": "Requests arrive on c1 and c4 together. On the left, two threads wake up and the scheduler (lesson 4 of this track) switches to each. On the right, one `epoll_wait` returns both, and one thread handles them one after the other. With 2,000 connections, the left side has 2,000 threads; the right side has one, and its cost follows the number of ready sockets."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Level-triggered: the loop reads 4 KB of c4's 10 KB, and the next epoll_wait reports c4 again\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">read() = 8</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">read() = 10 KB</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-a\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">6 KB</text><rect class=\"box\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">read(4 KB) = 4 KB</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box-a\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-code\" x=\"593\" y=\"206\" text-anchor=\"middle\">c4</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Level-triggered, the default: c4 stays on the ready list while it still has</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">bytes, so the next epoll_wait returns it again and the loop reads the rest.</text></svg>",
+      "say": "Suppose the loop reads c4 with a 4 KB buffer, once. 6 KB are left. In **level-triggered** mode, epoll's default, a socket stays on the ready list as long as it's readable, so the next `epoll_wait` returns c4 again and the loop reads more. Java's `Selector` behaves like this: a key keeps being selected while its channel has data."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 284\" role=\"img\" aria-label=\"Edge-triggered: the same partial read, and the next epoll_wait reports nothing; 6 KB wait for an edge that may never come\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">blocking server: a thread each</text><text class=\"t-s t-m\" x=\"272\" y=\"22\" text-anchor=\"start\">kernel: receive queues</text><text class=\"t-s t-m\" x=\"486\" y=\"22\" text-anchor=\"start\">epoll server: one thread</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"57\" text-anchor=\"start\">T1</text><text class=\"t-s\" x=\"70\" y=\"57\" text-anchor=\"start\">read() = 8</text><rect class=\"box\" x=\"20\" y=\"82\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"107\" text-anchor=\"start\">T2</text><text class=\"t-s t-m\" x=\"70\" y=\"107\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"157\" text-anchor=\"start\">T3</text><text class=\"t-s t-m\" x=\"70\" y=\"157\" text-anchor=\"start\">asleep in read()</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"220\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"207\" text-anchor=\"start\">T4</text><text class=\"t-s\" x=\"70\" y=\"207\" text-anchor=\"start\">read() = 10 KB</text><rect class=\"box\" x=\"272\" y=\"32\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"57\" text-anchor=\"start\">c1</text><text class=\"t-s t-code\" x=\"438\" y=\"57\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"82\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"107\" text-anchor=\"start\">c2</text><text class=\"t-s t-code\" x=\"438\" y=\"107\" text-anchor=\"end\">empty</text><rect class=\"box\" x=\"272\" y=\"132\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"157\" text-anchor=\"start\">c3</text><text class=\"t-s t-code\" x=\"438\" y=\"157\" text-anchor=\"end\">empty</text><rect class=\"box-bad\" x=\"272\" y=\"182\" width=\"180\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"286\" y=\"207\" text-anchor=\"start\">c4</text><text class=\"t-s t-code\" x=\"438\" y=\"207\" text-anchor=\"end\">6 KB</text><rect class=\"box-a\" x=\"486\" y=\"32\" width=\"214\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"593\" y=\"56\" text-anchor=\"middle\">event loop thread</text><text class=\"t-s t-code\" x=\"593\" y=\"78\" text-anchor=\"middle\">epoll_pwait(): asleep</text><rect class=\"box\" x=\"486\" y=\"104\" width=\"214\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"129\" text-anchor=\"start\">interest list</text><text class=\"t-s t-code\" x=\"686\" y=\"129\" text-anchor=\"end\">c1 c2 c3 c4</text><rect class=\"box\" x=\"486\" y=\"156\" width=\"214\" height=\"66\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"178\" text-anchor=\"start\">ready list</text><text class=\"t-s t-m\" x=\"593\" y=\"206\" text-anchor=\"middle\">(empty)</text><line class=\"ln-d\" x1=\"240\" y1=\"52\" x2=\"272\" y2=\"52\"/><line class=\"ln-d\" x1=\"240\" y1=\"102\" x2=\"272\" y2=\"102\"/><line class=\"ln-d\" x1=\"240\" y1=\"152\" x2=\"272\" y2=\"152\"/><line class=\"ln-d\" x1=\"240\" y1=\"202\" x2=\"272\" y2=\"202\"/><text class=\"t-s t-a\" x=\"20\" y=\"250\" text-anchor=\"start\">Edge-triggered (EPOLLET): a socket is reported once per arrival. The 6 KB left</text><text class=\"t-s t-m\" x=\"20\" y=\"272\" text-anchor=\"start\">in c4 get no new event, and a client waiting for the answer will wait forever.</text></svg>",
+      "say": "Same partial read in **edge-triggered** mode (`EPOLLET`). epoll reports a socket when new data arrives, once. The 6 KB still in c4 aren't new, so `epoll_wait` sleeps. If the client sent the whole request and now waits for the answer, nothing new will ever arrive. The rule for edge-triggered code: on every event, read until `EAGAIN`. The lab makes you write both loops."
+     }
     ]
-  },
-  "lab": {
-    "title": "Build epoll's ready list, then a real Selector echo server",
-    "minutes": 15,
-    "files": [
-      "labs/os/src/main/kotlin/sfz/os/l11/Readiness.kt",
-      "labs/os/src/main/kotlin/sfz/os/l11/NioEcho.kt"
-    ],
-    "run": "./gradlew :os:test --tests 'sfz.os.l11.*'",
+   },
+   "try": {
+    "title": "Spin, then sleep in epoll",
+    "minutes": 3,
     "steps": [
-      "Read `Readiness.kt`. `Kernel` delivers bytes with `arrive`, reads with EAGAIN, and tells every `Epoll` about arrivals through `onArrive`. `Poll` is written for you, to compare.",
-      "Run the tests from the `labs` folder. All twelve fail.",
-      "Write `Epoll.wait`: walk the ready list oldest first and count each entry in `examined`. LEVEL reports a socket that is still readable and keeps it listed (and drops it silently once it isn't); EDGE reports it and removes it.",
-      "Write `EventLoop.turn`: one `wait`, then read `chunk` bytes from each ready socket, once, or with `drain` until the kernel says `Again`. Record data in `received`, and on `Eof` add the socket to `closed` and remove it from the epoll.",
-      "Write `NioEchoServer.loop` in `NioEcho.kt`, following its KDoc. The tests connect 200 real clients over localhost and check that one thread served them all."
+     "Mode `spin` sets `O_NONBLOCK` and loops on `read()`. Mode `epoll` sets `O_NONBLOCK`, registers the socket with `epoll_ctl` and sleeps in `epoll_wait` before it reads.",
+     "Predict the `EAGAIN` count and the CPU time of each mode, then run them. The last line traces the epoll calls."
     ],
-    "hints": [
-      "In `wait`, use the ready set's `iterator()` and `it.remove()`, so you can drop entries while you walk them.",
-      "`do { ... } while (drain && more)` reads at least once, and keeps going only in drain mode while the last read returned data.",
-      "In the NIO loop, call `keys.remove()` for every selected key. The `Selector` never clears the selected set itself, so a key you leave there is handled again on the next turn.",
-      "A read of -1 means the client closed: cancel the key, close the channel and decrement `connections`, or the third test waits forever for 0."
-    ],
-    "done_when": "All twelve tests in `ReadinessTest` and `NioEchoTest` pass."
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "gcc -O2 -o /tmp/wait os/c/l11/wait.c\n/tmp/wait spin\n/tmp/wait epoll\nstrace -T -e trace=epoll_create1,epoll_ctl,epoll_pwait,read /tmp/wait epoll 2>&1 | grep -E '^(epoll|read)'"
+    },
+    "expect": "The `EAGAIN` count depends on your CPU and how busy the VM is:\n\n```text\nspin  got 8 bytes after 1.01 s; read() failed with EAGAIN 1335566 times; CPU used 1.01 s\nepoll_wait returned 1 ready socket(s)\nepoll got 8 bytes after 1.01 s; read() failed with EAGAIN 0 times; CPU used 0.00 s\nread(3, \"\\177ELF\\2\\1\\1\\3\\0\\0\\0\\0\\0\\0\\0\\0\\3\\0\\267\\0\\1\\0\\0\\0\\360\\206\\2\\0\\0\\0\\0\\0\"..., 832) = 832 <0.001490>\nepoll_create1(0)                        = 4 <0.001164>\nepoll_ctl(4, EPOLL_CTL_ADD, 3, {events=EPOLLIN, data={u32=3, u64=3}}) = 0 <0.001480>\nepoll_pwait(4, [{events=EPOLLIN, data={u32=3, u64=3}}], 8, -1, NULL, 8) = 1 <1.034891>\nread(3, \"APPROVED\", 64)                 = 8 <0.000270>\nepoll_wait returned 1 ready socket(s)\nepoll got 8 bytes after 1.10 s; read() failed with EAGAIN 0 times; CPU used 0.01 s\n```\n\nSpinning took a whole CPU for a second and more than a million failed reads. The epoll version used no CPU and no failed reads: `epoll_pwait` slept for 1.03 s and returned 1, meaning one socket was ready, and the `read` that followed found the 8 bytes at once. The `read` of 832 bytes at the top is the loader reading the C library, not the program."
+   },
+   "refs": [
+    {
+     "title": "epoll(7): level-triggered and edge-triggered",
+     "url": "https://man7.org/linux/man-pages/man7/epoll.7.html",
+     "kind": "docs"
+    },
+    {
+     "title": "select(2): the FD_SETSIZE limit",
+     "url": "https://man7.org/linux/man-pages/man2/select.2.html",
+     "kind": "docs"
+    }
+   ]
   },
-  "drill": {
-    "title": "A Selector loop from memory",
+  {
+   "h": "Java's Selector is epoll, and virtual threads use it for you",
+   "body": "The same echo server, written three ways, with the same 2,000 mostly idle clients connected, in the lab box:\n\n| server | OS threads | RSS | system calls per echo |\n|---|---|---|---|\n| platform thread per connection | 2,028 | 189 to 228 MB | `read`, `write` |\n| one thread with a `Selector` | 19 | 51 MB | `epoll_pwait`, `read`, `write` |\n| virtual thread per connection | 33 | 67 to 75 MB | `read` (fails), `epoll_ctl`, `epoll_pwait`, `read`, `write` |\n\nThe middle one is Java NIO. On Linux, `Selector.open()` is `epoll_create1`, `channel.register(selector, OP_READ)` is `epoll_ctl(ADD)`, and `selector.select()` is `epoll_wait`. (On macOS the JDK uses `kqueue` instead.) The loop selects, walks the selected keys, accepts or reads each ready channel, and selects again. `strace -c` on it counts one `epoll_pwait`, one `read` and one `write` per echo, and the quiet connections cost nothing. This loop is under most of what you run: Netty, and Vert.x on top of it, which is the reactive core of Quarkus, and the network layer of every Kafka client and broker.\n\nThe price is in how you write code. Nothing in the loop may block, because one blocked handler stops all 2,000 connections. So work that waits, such as a call to the card issuer, has to be split into callbacks or reactive operators.\n\nThe third server is the first one's code, unchanged, started on virtual threads (lesson 3 of this track). Its `read()` looks blocking, but the JDK made every socket non-blocking underneath. When a read finds nothing, the JDK registers the socket with epoll, parks the virtual thread (it unmounts and frees its carrier) and moves on. One platform thread, `MasterPoller`, sleeps in `epoll_wait` for all of them, and when a socket becomes ready, it makes that virtual thread runnable again, which repeats the read. `strace` shows the pattern: 596 reads, half of them failing with `EAGAIN`, and 585 `epoll_ctl` calls. The kernel sees 12 carriers, the poller and the JVM's own threads.\n\nThat's why virtual threads suit services that wait on sockets: you write blocking code and the JDK runs an event loop for you. RSS lands between the other two, because each virtual thread keeps its stack frames on the heap while it's parked, which is small but not free.",
+   "try": {
+    "title": "One echo server, three ways, 2,000 clients",
     "minutes": 5,
-    "prompt": "Without looking, write the Kotlin for a single-threaded echo server with a `Selector` on port 9000: set it up, accept, read and echo, and handle a client that closes. Then say which line becomes which system call on Linux.",
-    "answer": {
-      "lang": "kotlin",
-      "src": "val selector = Selector.open()                                    // epoll_create1\nval server = ServerSocketChannel.open().bind(InetSocketAddress(9000))\nserver.configureBlocking(false)\nserver.register(selector, SelectionKey.OP_ACCEPT)                // epoll_ctl(ADD)\nval buf = ByteBuffer.allocateDirect(4096)\nwhile (true) {\n    selector.select()                                            // epoll_pwait\n    val keys = selector.selectedKeys().iterator()\n    while (keys.hasNext()) {\n        val key = keys.next()\n        keys.remove()                                            // or it comes back next turn\n        if (key.isAcceptable) {\n            val c = server.accept()                              // accept\n            c.configureBlocking(false)                           // fcntl(O_NONBLOCK)\n            c.register(selector, SelectionKey.OP_READ)           // epoll_ctl(ADD)\n        } else if (key.isReadable) {\n            val c = key.channel() as SocketChannel\n            buf.clear()\n            if (c.read(buf) < 0) { key.cancel(); c.close(); continue }   // read; close\n            buf.flip()\n            while (buf.hasRemaining()) c.write(buf)              // write\n        }\n    }\n}"
+    "steps": [
+     "Read `os/src/demo/java/sfz/os/l11/demo/EchoServers.java`: `blocking()` is the thread-per-connection server for both platform and virtual threads, and `nio()` is the `Selector` loop. `IdleClients` opens 2,000 connections and sends a line on 20 of them every 100 ms.",
+     "For each mode the block starts the server and the clients, prints the server's threads and RSS, then counts its system calls for a few seconds. Predict the thread counts. It takes about a minute and a half."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l11/demo/*.java\nfor mode in threads nio virtual; do\n  java -cp /tmp/out sfz.os.l11.demo.EchoServers $mode 9000 40 & spid=$!\n  sleep 1\n  java -cp /tmp/out sfz.os.l11.demo.IdleClients 2000 9000 20 > /dev/null & cpid=$!\n  sleep 8\n  echo \"$mode: $(grep -E '^(Threads|VmRSS)' /proc/$spid/status | tr -s ' \\t\\n' ' ')\"\n  timeout 6 strace -f -c -p $spid -o /tmp/sc.txt 2>/dev/null\n  sort -k4 -n -r /tmp/sc.txt | grep -E ' (read|write|epoll_pwait|epoll_ctl|futex)$' | cut -c1-80\n  kill $cpid $spid; wait 2>/dev/null\ndone",
+     "file": "labs/os/src/demo/java/sfz/os/l11/demo/EchoServers.java"
+    },
+    "expect": "RSS and call counts vary from run to run, and `strace` slows the first server down a lot:\n\n```text\npid 34: threads echo server on port 9000\nthreads: VmRSS: 188936 kB Threads: 2028 \n 94.15    5.784415       68862        84           read\n  0.13    0.008072          96        84           write\n  1.52    0.093178        4904        19         4 futex\npid 2100: nio echo server on port 9000\nnio: VmRSS: 51152 kB Threads: 19 \n  5.20    0.089521         155       574           epoll_pwait\n  2.89    0.049784          86       574           read\n  4.86    0.083594         145       573           write\n 60.41    1.040053       15294        68        31 futex\npid 2157: virtual echo server on port 9000\nvirtual: VmRSS: 66764 kB Threads: 33 \n 83.85   12.666342        4229      2995       222 futex\n  7.03    1.062089        1215       874           epoll_pwait\n  1.39    0.209861         352       596       298 read\n  1.46    0.220679         377       585           epoll_ctl\n  1.21    0.182125         611       298           write\n```\n\nThe platform-thread server spends its traced time inside `read`: 84 calls that each sat for tens of milliseconds, because `strace -c` counts time asleep in the call. The NIO server makes one `epoll_pwait`, one `read` and one `write` per echo, from one thread. The virtual-thread server shows the JDK at work: half its reads fail with `EAGAIN`, each followed by an `epoll_ctl` that registers the socket, and the `futex` calls are carriers parking and waking."
+   },
+   "refs": [
+    {
+     "title": "Selector (Java SE 25)",
+     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/Selector.html",
+     "kind": "docs"
+    },
+    {
+     "title": "JEP 444: Virtual Threads",
+     "url": "https://openjdk.org/jeps/444",
+     "kind": "read"
     }
+   ]
   },
-  "recap": [
-    "A blocking `read()` sleeps on the socket's wait queue until data reaches its receive queue. It costs no CPU, but one thread per connection: 2,000 clients meant 2,028 threads and about 200 MB.",
-    "`O_NONBLOCK` makes `read()` return `EAGAIN` instead of sleeping. A loop of failing reads burns a CPU; something must say which sockets are ready.",
-    "`select` and `poll` check every descriptor on every call. epoll registers sockets once (`epoll_ctl`) and keeps a ready list that `epoll_wait` returns, so idle sockets cost nothing.",
-    "Level-triggered reports a socket while it's readable; edge-triggered once per arrival, so edge-triggered code must read until `EAGAIN`.",
-    "Java's `Selector` is epoll on Linux (kqueue on macOS). Virtual threads use it underneath: a failed read, `epoll_ctl`, park, and the `MasterPoller` thread in `epoll_wait`.",
-    "io_uring is a completion model: shared submission and completion rings, many operations per system call, files included. Docker's default seccomp blocks it, Google disables it in production, and `kernel.io_uring_disabled` can turn it off."
-  ],
-  "quiz": [
+  {
+   "h": "io_uring hands the kernel the work itself",
+   "body": "`fio` reads random 4 KB blocks from a file, bypassing the page cache, from one thread. With plain `pread`, one read at a time, it managed 300 to 1,800 reads a second in the shared VM. With `io_uring` and 32 reads in flight, it managed 15,900 to 23,200.\n\nepoll answers one question: which sockets can I read without blocking? For a regular file it has no answer. A file is always \"ready\", and `epoll_ctl` refuses to watch one with `EPERM`. A `read()` of a file page that isn't cached (lesson 9 of this track) blocks in the kernel until the disk answers, whatever epoll says. So for file I/O, the only way to have 32 reads waiting on the disk at once was 32 threads. And with epoll, every read is still a system call of its own, after the call that said it was ready.\n\n**io_uring**, added in Linux 5.1 (2019), changes the question. The program and the kernel share two ring buffers in memory. The program writes requests into the **submission queue**: read this file descriptor at this offset into this buffer. The kernel performs them, from files or sockets, and writes a result for each into the **completion queue**. One `io_uring_enter` call can submit many requests and wait for many results, and in polling modes a busy program needs no system call at all. epoll is a readiness model: it tells you when you can act. io_uring is a completion model: it tells you the work is done. In one batched `fio` run under `strace`, 116,000 reads took 8,944 `io_uring_enter` calls.\n\nIt's also a large, young interface that does a lot of work in the kernel on a process's behalf, and it has had many security bugs. Google reported in June 2023 that \"60% of the submissions exploited the io_uring component\" of the kernel in its vulnerability rewards program, that it \"paid out around 1 million USD for io_uring alone\", and that io_uring \"is disabled on production Google servers\", as well as on ChromeOS and for Android apps. Docker 25 added the three io_uring system calls to its default seccomp filter (lesson 1 of this track), so in the lab box `io_uring_setup` fails with `EPERM`. The kernel has its own switch, `kernel.io_uring_disabled`: 0 allows everyone, 1 only privileged processes or members of `kernel.io_uring_group`, and 2 nobody.\n\nFor JVM services this is mostly a note to keep. The JDK's NIO and virtual threads use epoll on Linux. Netty offers an io_uring transport as an alternative to its epoll one; before you choose it, check that the seccomp profile your containers run with allows it.",
+   "try": {
+    "title": "io_uring, refused and then allowed",
+    "minutes": 4,
+    "steps": [
+     "Run the block in the everyday box first. It prints `io_uring_disabled`, tries to register a regular file with epoll, and runs `fio` with `psync` and then `io_uring`.",
+     "Then type `exit`, start the privileged box (`docker compose -f env/labbox.yml run --rm box-priv`, which runs without a seccomp filter) and run the same block. Predict which lines change."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box, then in the privileged box",
+     "src": "cat /proc/sys/kernel/io_uring_disabled\npython3 -c \"import select; select.epoll().register(open('/etc/hostname'), select.EPOLLIN)\" 2>&1 | tail -1\nfio --name=ledger --filename=/tmp/fio.dat --size=256m --rw=randread --bs=4k --direct=1 --time_based --runtime=5 --ioengine=psync --iodepth=1 2>&1 | grep -E 'IOPS|error='\nfio --name=ledger --filename=/tmp/fio.dat --size=256m --rw=randread --bs=4k --direct=1 --time_based --runtime=5 --ioengine=io_uring --iodepth=32 2>&1 | grep -E 'IOPS|error='\nrm -f /tmp/fio.dat"
+    },
+    "expect": "The IOPS move a lot with what else the Docker VM is doing. In the everyday box:\n\n```text\n0\nPermissionError: [Errno 1] Operation not permitted\n  read: IOPS=496, BW=1985KiB/s (2032kB/s)(9928KiB/5002msec)\nfio: pid=41, err=1/file:engines/io_uring.c:1049, func=io_queue_init, error=Operation not permitted\n```\n\nIn the privileged box:\n\n```text\n0\nPermissionError: [Errno 1] Operation not permitted\n  read: IOPS=319, BW=1279KiB/s (1309kB/s)(6396KiB/5002msec)\n  read: IOPS=15.9k, BW=62.1MiB/s (65.1MB/s)(310MiB/5001msec)\n```\n\n`io_uring_disabled` is 0 in both: the kernel allows io_uring, and the refusal in the everyday box came from Docker's seccomp filter, as `func=io_queue_init, error=Operation not permitted` shows. epoll refuses a regular file in both boxes, as `PermissionError` (`EPERM`). One thread with one `pread` at a time waits for every read. One thread with 32 reads in flight through io_uring kept the disk busy and did about 50 times as many."
+   },
+   "refs": [
     {
-      "q": "From lesson 3: a JDK 25 service on 8 CPUs runs 5,000 requests at once on virtual threads, each blocked reading the card issuer's HTTP response. About how many OS threads serve those reads, and what are they doing?",
-      "options": [
-        "5,000, each asleep in `read()`",
-        "About 8 carriers that are mostly idle, plus a poller thread asleep in `epoll_wait`; the 5,000 virtual threads are parked on the heap",
-        "One, spinning on non-blocking reads",
-        "About 8 carriers, each blocked in `read()` on one connection at a time"
-      ],
-      "answer": 1,
-      "from": "os-03",
-      "why": "A virtual thread's blocking read is a non-blocking read underneath. When it returns `EAGAIN`, the JDK registers the socket with epoll and parks the virtual thread, which frees its carrier. One poller thread waits in `epoll_wait` for all the sockets and unparks a virtual thread when its socket is ready. Carriers never block in `read()` on a socket, which is the point."
+     "title": "io_uring(7)",
+     "url": "https://man7.org/linux/man-pages/man7/io_uring.7.html",
+     "kind": "docs"
     },
     {
-      "q": "A hand-written edge-triggered epoll loop reads 4 KB from each socket it gets an event for. A client sends a 10 KB request and waits for the answer. What happens?",
-      "options": [
-        "The loop gets three events and reads all 10 KB",
-        "The kernel splits the request into 4 KB packets, one event each",
-        "The loop reads 4 KB, and the other 6 KB wait in the receive queue with no further event; the client hangs",
-        "`epoll_wait` returns an error because the buffer was too small"
-      ],
-      "answer": 2,
-      "why": "Edge-triggered epoll reports a socket once per arrival of new data, and the 10 KB may arrive together. After one 4 KB read, nothing new arrives, because the client is waiting, so there is no next event. Edge-triggered code must read until `EAGAIN`. Level-triggered epoll would report the socket again, which is why it's the forgiving default."
+     "title": "Documentation for /proc/sys/kernel: io_uring_disabled",
+     "url": "https://docs.kernel.org/admin-guide/sysctl/kernel.html",
+     "kind": "docs"
     },
     {
-      "q": "A gateway holds 10,000 connections; in a typical millisecond 5 have data. Which statement about the cost of one wake-up is right?",
-      "options": [
-        "`poll` and `epoll_wait` both check all 10,000 sockets",
-        "`poll` checks all 10,000 descriptors it was passed; `epoll_wait` returns the 5 on its ready list",
-        "`select` is fastest, because its bitmap is compact",
-        "`epoll_wait` checks all 10,000, but in the kernel, so it's free"
-      ],
-      "answer": 1,
-      "why": "`poll` and `select` take the whole set on every call and the kernel checks each descriptor, so the cost follows the number of connections. epoll registers sockets once and the kernel adds a socket to the ready list when data arrives, so `epoll_wait` only looks at what's ready. `select` also can't handle descriptor numbers above 1,023."
-    },
-    {
-      "q": "A service using Netty's io_uring transport starts fine on a developer's Linux laptop, but in a Docker container it fails at start-up with \"Operation not permitted\". What's the most likely cause?",
-      "options": [
-        "The container's kernel is too old for io_uring",
-        "Docker's default seccomp profile blocks `io_uring_setup`, so it fails with `EPERM`",
-        "io_uring needs more memory than the container's limit",
-        "Netty can't use io_uring inside a JVM"
-      ],
-      "answer": 1,
-      "why": "Containers share the host's kernel, and the lab box's `io_uring_disabled` is 0, so the kernel allows it. Docker 25 and later block the three io_uring system calls in the default seccomp filter, and the call fails with `EPERM`. Fall back to the epoll transport, or run with a seccomp profile that allows io_uring if you accept the risk."
-    },
-    {
-      "q": "A batch job reads thousands of large files from a network disk. A teammate wants to put the files in an epoll set so one thread can read them all without blocking. Why won't that work?",
-      "options": [
-        "epoll only works for TCP sockets, not Unix sockets",
-        "epoll has a limit of 1,024 descriptors",
-        "Regular files are always \"ready\": `epoll_ctl` refuses them with `EPERM`, and a read of an uncached page still blocks for the disk",
-        "Files must be opened with `O_APPEND` to be watched"
-      ],
-      "answer": 2,
-      "why": "epoll answers \"can I read without waiting?\", and for a regular file the kernel has no such notion: the read waits for the disk inside the kernel. The 1,024 limit belongs to `select`. Waiting on many file reads at once needs several threads or a completion API such as io_uring."
+     "title": "Learnings from kCTF VRP's 42 Linux kernel exploits (oss-security copy)",
+     "url": "https://seclists.org/oss-sec/2023/q2/235",
+     "kind": "read"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "What does `read()` on an empty non-blocking socket return?",
-      "back": "-1 with `errno` `EAGAIN` (\"try again\"), at once, instead of sleeping."
-    },
-    {
-      "front": "What does epoll keep that `poll` doesn't?",
-      "back": "An interest list registered once with `epoll_ctl`, and a ready list the kernel fills as data arrives. `epoll_wait` returns only ready sockets."
-    },
-    {
-      "front": "Level-triggered or edge-triggered: which one strands data if you read only part of it?",
-      "back": "Edge-triggered: it reports a socket once per arrival. Read until `EAGAIN` on every event."
-    },
-    {
-      "front": "Which system calls is Java's `Selector` made of on Linux?",
-      "back": "`epoll_create1` (open), `epoll_ctl` (register), `epoll_pwait` on arm64 (select). On macOS it uses kqueue."
-    },
-    {
-      "front": "What happens when a virtual thread's socket read finds no data?",
-      "back": "The JDK registers the socket with epoll, parks the virtual thread, and the poller thread unparks it when the socket is ready; then the read is retried."
-    },
-    {
-      "front": "Readiness model vs completion model?",
-      "back": "Readiness (epoll): the kernel says when you can do the I/O without blocking. Completion (io_uring): you submit the I/O and the kernel says when it's done."
-    },
-    {
-      "front": "Three ways io_uring gets switched off",
-      "back": "Docker's default seccomp profile (since Docker 25), Google's production and ChromeOS kernels, and `kernel.io_uring_disabled` = 1 or 2."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Receive queue",
-      "plain": "The kernel's buffer of bytes that arrived on a socket and haven't been read yet."
-    },
-    {
-      "term": "Blocking read",
-      "plain": "A read that puts the thread to sleep until data is in the receive queue."
-    },
-    {
-      "term": "O_NONBLOCK / EAGAIN",
-      "plain": "A socket flag that makes reads return at once; EAGAIN is the error meaning \"nothing yet, try again\"."
-    },
-    {
-      "term": "epoll",
-      "plain": "Linux's API for waiting on many descriptors: register them once, then sleep until some are ready and get only those."
-    },
-    {
-      "term": "Level-triggered",
-      "plain": "epoll reports a descriptor for as long as it stays ready."
-    },
-    {
-      "term": "Edge-triggered",
-      "plain": "epoll reports a descriptor once each time it becomes ready, so the program must drain it."
-    },
-    {
-      "term": "Event loop",
-      "plain": "One thread that waits for ready descriptors, handles each, and waits again; the core of NIO, Netty and Vert.x."
-    },
-    {
-      "term": "io_uring",
-      "plain": "A Linux API with shared submission and completion rings, where the kernel performs the I/O and reports when it's done."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A teammate asks why our gateway, rewritten from a thread-per-connection server to virtual threads, now runs with 30 OS threads instead of 2,000, although the code still calls blocking `read()`. Explain what happens underneath, and what it doesn't change.",
-    "answer": "With platform threads, each connection had an OS thread asleep in the kernel's `read()` until data arrived in that socket's receive queue. That's 2,000 kernel tasks with their own stacks, almost all asleep. On virtual threads, the JDK makes every socket non-blocking. When our code reads and the queue is empty, the read returns `EAGAIN` underneath; the JDK registers the socket with epoll, parks the virtual thread, and its carrier goes off to run another one. One poller thread sleeps in `epoll_wait` for all the sockets, and when one has data, the JDK makes its virtual thread runnable and the read is retried. So the OS sees the carriers (one per CPU), the poller and the JVM's own threads, about 30, and `strace` shows reads failing with `EAGAIN` followed by `epoll_ctl`. What doesn't change: the CPU work per request is the same, a parked virtual thread still keeps its stack on the heap, and anything downstream with a limit, like the JDBC pool's 20 connections, is still the bottleneck. And blocking that the JDK can't turn into a park, such as a native call, still holds a carrier."
+   ]
+  }
+ ],
+ "analogy": "A blocking server is a restaurant with one waiter per table, each standing at the table until the guests decide: easy to run, and the waiters' wages grow with the number of tables, busy or not. epoll is one waiter and a bell on every table. The waiter registers each table's bell once, sits down, and walks only to the tables that rang; level-triggered means a table keeps ringing until it has ordered everything, edge-triggered means it rings once per new decision, so the waiter had better take the whole order. io_uring is ordering by slip: the waiter drops a stack of orders at the kitchen window and later collects a tray of finished dishes. The analogy breaks on cost. Waiters are expensive and threads are cheap until there are thousands of them; and a bell costs the restaurant nothing, while every socket in an epoll interest list costs the kernel a little memory.",
+ "in_your_world": "Most of your I/O already runs on epoll. A Quarkus REST endpoint is served by Vert.x event loops (Netty underneath), a few threads with a `Selector` each, which is why blocking one of them makes Vert.x log a \"has been blocked\" warning and stalls every request on that loop. The Kafka producer's network thread is a Java NIO `Selector` over its broker connections. Your JDBC calls to Oracle are the other model: a pool of 20 connections and 20 threads blocked in socket reads while queries run. Virtual threads let a Temporal activity or a REST handler block on the card issuer's 120 ms answer while the JDK parks it and waits in epoll, so 5,000 waiting authorizations cost a dozen carriers instead of 5,000 OS threads. The JDBC pool still caps how many hit Oracle at once.",
+ "mistake": "Blocking inside an event loop. It feels harmless: one `Thread.sleep`, one JDBC call, one synchronous HTTP call to the fraud service inside a Netty or Vert.x handler, and it works in tests with a handful of requests. But the loop thread serves thousands of connections, and while it's blocked none of them are read, so latency for unrelated requests jumps by the length of the call. Vert.x warns about it, and the warning gets ignored. Move blocking work off the loop, to a worker pool (`@Blocking` in Quarkus) or to virtual threads, and keep the loop for reads, writes and short computations. The edge-triggered version of the same mistake is reading once per event in hand-written epoll code; the rule there is to read until `EAGAIN`.",
+ "compare": {
+  "title": "Thread per connection against one Selector loop",
+  "a": {
+   "label": "Blocking, thread per connection",
+   "lang": "java",
+   "title": "EchoServers.blocking: 2,000 clients, 2,028 threads",
+   "src": "try (ServerSocket server = new ServerSocket(9000)) {\n    while (true) {\n        Socket s = server.accept();\n        Thread.ofPlatform().start(() -> echo(s));   // or Thread.ofVirtual()\n    }\n}\n\nstatic void echo(Socket s) {\n    byte[] buf = new byte[512];\n    try (s) {\n        int n;\n        while ((n = s.getInputStream().read(buf)) > 0) {   // asleep here when idle\n            s.getOutputStream().write(buf, 0, n);\n        }\n    } catch (IOException e) { /* client went away */ }\n}"
   },
-  "deeper": {
-    "minutes": 10,
-    "body": "Edge-triggered mode has a sibling, `EPOLLONESHOT`: report the socket once, then disable it until the program re-arms it with `epoll_ctl(MOD)`. Thread pools that share one epoll instance use it so two threads never handle the same socket at once. `EPOLLEXCLUSIVE` attacks the opposite problem, the thundering herd: many threads waiting on one listening socket, all woken for a single new connection. And `SO_REUSEPORT` lets several sockets, one per thread, listen on the same port, with the kernel spreading new connections across them, which is how many servers scale `accept` across cores.\n\nWriting is the other half of a real event loop. `write()` on a non-blocking socket can write fewer bytes than you asked for, or fail with `EAGAIN`, when the socket's send queue is full because the client reads slowly. A server then keeps the rest, registers interest in writability (`OP_WRITE`, `EPOLLOUT`), and writes again when the kernel says there is room. The lab's echo server skips that because its messages are tiny; Netty's outbound buffer and its high and low water marks are the grown-up version.\n\nio_uring keeps growing past files and sockets. It has operations for `accept`, `connect`, `openat`, `fsync` and more, linked requests that run in order, registered buffers and files that skip per-call lookups, and an `SQPOLL` mode where a kernel thread watches the submission queue so the program makes no system calls at all while busy. That reach is also the security worry: each operation is kernel code running on the process's behalf, outside the paths that seccomp and other filters were built around.\n\nFinally, `strace -c` measures time inside system calls, including time asleep. That's why the platform-thread server's `read` looked like the most expensive call in the Try-it: it's where its threads wait. To find time spent waiting for the CPU instead, use lesson 4's `/proc/<pid>/schedstat`."
+  "b": {
+   "label": "Non-blocking, one Selector",
+   "lang": "java",
+   "title": "EchoServers.nio: 2,000 clients, 19 threads",
+   "src": "Selector selector = Selector.open();                 // epoll_create1\nserver.configureBlocking(false);\nserver.register(selector, SelectionKey.OP_ACCEPT);    // epoll_ctl(ADD)\nwhile (true) {\n    selector.select();                                // epoll_pwait\n    for (var it = selector.selectedKeys().iterator(); it.hasNext(); ) {\n        SelectionKey key = it.next();\n        it.remove();\n        if (key.isAcceptable()) {\n            SocketChannel c = server.accept();\n            c.configureBlocking(false);\n            c.register(selector, SelectionKey.OP_READ);\n        } else if (key.isReadable()) {\n            SocketChannel c = (SocketChannel) key.channel();\n            buf.clear();\n            if (c.read(buf) < 0) { key.cancel(); c.close(); continue; }\n            buf.flip();\n            while (buf.hasRemaining()) c.write(buf);\n        }\n    }\n}"
   },
-  "sources": [
-    {
-      "title": "epoll(7), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man7/epoll.7.html"
-    },
-    {
-      "title": "io_uring(7), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man7/io_uring.7.html"
-    },
-    {
-      "title": "Arpaci-Dusseau, OSTEP chapter 33: Event-based Concurrency",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-events.pdf"
-    },
-    {
-      "title": "JEP 444: Virtual Threads",
-      "url": "https://openjdk.org/jeps/444"
-    },
-    {
-      "title": "Seccomp security profiles for Docker",
-      "url": "https://docs.docker.com/engine/security/seccomp/"
-    }
+  "note": "Both serve the same clients the same bytes. The left keeps each connection's state where code usually keeps it, in local variables on a thread's stack, so it needs a thread per connection, and with platform threads the kernel holds 2,000 sleeping tasks. The right keeps the state in the kernel's epoll instance and handles whichever channels are ready, so one thread does, but no handler may ever block. Running the left side on virtual threads gets you the right side's thread count with the left side's code: the JDK runs the epoll loop for you."
+ },
+ "worked": {
+  "title": "Tell from outside how a JVM waits on its sockets",
+  "steps": [
+   {
+    "say": "Count the server's threads by state and by the kernel function they sleep in (`wchan`). A thread-per-connection server has thousands asleep in a socket read: `wait_woken` here, with 2,000 clients connected.",
+    "code": "ps -L -o stat,wchan:22 -p $pid | sort | uniq -c | sort -rn | head -3\n#    2000 Sl   wait_woken\n#      27 Sl   futex_wait_queue\n#       1 Sl   inet_csk_accept",
+    "lang": "bash"
+   },
+   {
+    "say": "A selector-based or virtual-thread server has a few dozen threads, and one or a few asleep in `do_epoll_wait`. Pair each thread's name (`comm`) with its `wchan` to see which. The rest wait on futexes (lesson 5 of this track): carriers with nothing to run, GC and compiler threads. The virtual-thread server, with the same 2,000 clients:",
+    "code": "for t in /proc/$pid/task/*; do echo \"$(cat $t/comm) | $(cat $t/wchan)\"; done | sort | uniq -c | sort -rn\n# (output trimmed)\n#      12 ForkJoinPool-1- | futex_wait_queue\n#       1 VM Thread | futex_wait_queue\n#       1 VirtualThread-u | futex_wait_queue\n#       1 MasterPoller | do_epoll_wait\n#       1 java | inet_csk_accept",
+    "lang": "bash"
+   },
+   {
+    "say": "Name the epoll thread with a thread dump. `MasterPoller` running `sun.nio.ch.EPollPoller` is the JDK's poller for virtual threads. In a Netty or Vert.x service you'd find event-loop threads waiting in an epoll call instead, and in a Kafka producer its `kafka-producer-network-thread`.",
+    "code": "jcmd $pid Thread.print | grep -A3 MasterPoller\n# (long line trimmed)\n# \"MasterPoller\" #45 [92] daemon prio=5 os_prio=0 cpu=67.03ms elapsed=7.47s ... runnable\n#    java.lang.Thread.State: RUNNABLE\n# \tat sun.nio.ch.EPoll.wait(java.base@25.0.5/Native Method)\n# \tat sun.nio.ch.EPollPoller.poll(java.base@25.0.5/EPollPoller.java:74)",
+    "lang": "bash"
+   },
+   {
+    "say": "Confirm with a few seconds of `strace -c`. Readiness-based code shows `epoll_pwait` next to its reads; virtual threads add a failed `read` and an `epoll_ctl` for each wait. Keep `strace` short on a real service, since it slows every call.",
+    "code": "timeout 6 strace -f -c -p $pid -o /tmp/sc.txt\nsort -k4 -n -r /tmp/sc.txt | grep -E ' (read|epoll_pwait|epoll_ctl)$'\n#   7.03    1.062089        1215       874           epoll_pwait\n#   1.39    0.209861         352       596       298 read\n#   1.46    0.220679         377       585           epoll_ctl",
+    "lang": "bash"
+   }
   ]
+ },
+ "lab": {
+  "title": "Build epoll's ready list, then a real Selector echo server",
+  "minutes": 15,
+  "files": [
+   "labs/os/src/main/kotlin/sfz/os/l11/Readiness.kt",
+   "labs/os/src/main/kotlin/sfz/os/l11/NioEcho.kt"
+  ],
+  "run": "./gradlew :os:test --tests 'sfz.os.l11.*'",
+  "steps": [
+   "Read `Readiness.kt`. `Kernel` delivers bytes with `arrive`, reads with EAGAIN, and tells every `Epoll` about arrivals through `onArrive`. `Poll` is written for you, to compare.",
+   "Run the tests from the `labs` folder. All twelve fail.",
+   "Write `Epoll.wait`: walk the ready list oldest first and count each entry in `examined`. LEVEL reports a socket that is still readable and keeps it listed (and drops it silently once it isn't); EDGE reports it and removes it.",
+   "Write `EventLoop.turn`: one `wait`, then read `chunk` bytes from each ready socket, once, or with `drain` until the kernel says `Again`. Record data in `received`, and on `Eof` add the socket to `closed` and remove it from the epoll.",
+   "Write `NioEchoServer.loop` in `NioEcho.kt`, following its KDoc. The tests connect 200 real clients over localhost and check that one thread served them all."
+  ],
+  "hints": [
+   "In `wait`, use the ready set's `iterator()` and `it.remove()`, so you can drop entries while you walk them.",
+   "`do { ... } while (drain && more)` reads at least once, and keeps going only in drain mode while the last read returned data.",
+   "In the NIO loop, call `keys.remove()` for every selected key. The `Selector` never clears the selected set itself, so a key you leave there is handled again on the next turn.",
+   "A read of -1 means the client closed: cancel the key, close the channel and decrement `connections`, or the third test waits forever for 0."
+  ],
+  "done_when": "All twelve tests in `ReadinessTest` and `NioEchoTest` pass."
+ },
+ "drill": {
+  "title": "A Selector loop from memory",
+  "minutes": 5,
+  "prompt": "Without looking, write the Kotlin for a single-threaded echo server with a `Selector` on port 9000: set it up, accept, read and echo, and handle a client that closes. Then say which line becomes which system call on Linux.",
+  "answer": {
+   "lang": "kotlin",
+   "src": "val selector = Selector.open()                                    // epoll_create1\nval server = ServerSocketChannel.open().bind(InetSocketAddress(9000))\nserver.configureBlocking(false)\nserver.register(selector, SelectionKey.OP_ACCEPT)                // epoll_ctl(ADD)\nval buf = ByteBuffer.allocateDirect(4096)\nwhile (true) {\n    selector.select()                                            // epoll_pwait\n    val keys = selector.selectedKeys().iterator()\n    while (keys.hasNext()) {\n        val key = keys.next()\n        keys.remove()                                            // or it comes back next turn\n        if (key.isAcceptable) {\n            val c = server.accept()                              // accept\n            c.configureBlocking(false)                           // fcntl(O_NONBLOCK)\n            c.register(selector, SelectionKey.OP_READ)           // epoll_ctl(ADD)\n        } else if (key.isReadable) {\n            val c = key.channel() as SocketChannel\n            buf.clear()\n            if (c.read(buf) < 0) { key.cancel(); c.close(); continue }   // read; close\n            buf.flip()\n            while (buf.hasRemaining()) c.write(buf)              // write\n        }\n    }\n}"
+  }
+ },
+ "recap": [
+  "A blocking `read()` sleeps on the socket's wait queue until data reaches its receive queue. It costs no CPU, but one thread per connection: 2,000 clients meant 2,028 threads and about 200 MB.",
+  "`O_NONBLOCK` makes `read()` return `EAGAIN` instead of sleeping. A loop of failing reads burns a CPU; something must say which sockets are ready.",
+  "`select` and `poll` check every descriptor on every call. epoll registers sockets once (`epoll_ctl`) and keeps a ready list that `epoll_wait` returns, so idle sockets cost nothing.",
+  "Level-triggered reports a socket while it's readable; edge-triggered once per arrival, so edge-triggered code must read until `EAGAIN`.",
+  "Java's `Selector` is epoll on Linux (kqueue on macOS). Virtual threads use it underneath: a failed read, `epoll_ctl`, park, and the `MasterPoller` thread in `epoll_wait`.",
+  "io_uring is a completion model: shared submission and completion rings, many operations per system call, files included. Docker's default seccomp blocks it, Google disables it in production, and `kernel.io_uring_disabled` can turn it off."
+ ],
+ "quiz": [
+  {
+   "q": "From lesson 3: a JDK 25 service on 8 CPUs runs 5,000 requests at once on virtual threads, each blocked reading the card issuer's HTTP response. About how many OS threads serve those reads, and what are they doing?",
+   "options": [
+    "5,000, each asleep in `read()`",
+    "About 8 carriers that are mostly idle, plus a poller thread asleep in `epoll_wait`; the 5,000 virtual threads are parked on the heap",
+    "One, spinning on non-blocking reads",
+    "About 8 carriers, each blocked in `read()` on one connection at a time"
+   ],
+   "answer": 1,
+   "from": "os-03",
+   "why": "A virtual thread's blocking read is a non-blocking read underneath. When it returns `EAGAIN`, the JDK registers the socket with epoll and parks the virtual thread, which frees its carrier. One poller thread waits in `epoll_wait` for all the sockets and unparks a virtual thread when its socket is ready. Carriers never block in `read()` on a socket, which is the point."
+  },
+  {
+   "q": "A hand-written edge-triggered epoll loop reads 4 KB from each socket it gets an event for. A client sends a 10 KB request and waits for the answer. What happens?",
+   "options": [
+    "The loop gets three events and reads all 10 KB",
+    "The kernel splits the request into 4 KB packets, one event each",
+    "The loop reads 4 KB, and the other 6 KB wait in the receive queue with no further event; the client hangs",
+    "`epoll_wait` returns an error because the buffer was too small"
+   ],
+   "answer": 2,
+   "why": "Edge-triggered epoll reports a socket once per arrival of new data, and the 10 KB may arrive together. After one 4 KB read, nothing new arrives, because the client is waiting, so there is no next event. Edge-triggered code must read until `EAGAIN`. Level-triggered epoll would report the socket again, which is why it's the forgiving default."
+  },
+  {
+   "q": "A gateway holds 10,000 connections; in a typical millisecond 5 have data. Which statement about the cost of one wake-up is right?",
+   "options": [
+    "`poll` and `epoll_wait` both check all 10,000 sockets",
+    "`poll` checks all 10,000 descriptors it was passed; `epoll_wait` returns the 5 on its ready list",
+    "`select` is fastest, because its bitmap is compact",
+    "`epoll_wait` checks all 10,000, but in the kernel, so it's free"
+   ],
+   "answer": 1,
+   "why": "`poll` and `select` take the whole set on every call and the kernel checks each descriptor, so the cost follows the number of connections. epoll registers sockets once and the kernel adds a socket to the ready list when data arrives, so `epoll_wait` only looks at what's ready. `select` also can't handle descriptor numbers above 1,023."
+  },
+  {
+   "q": "A service using Netty's io_uring transport starts fine on a developer's Linux laptop, but in a Docker container it fails at start-up with \"Operation not permitted\". What's the most likely cause?",
+   "options": [
+    "The container's kernel is too old for io_uring",
+    "Docker's default seccomp profile blocks `io_uring_setup`, so it fails with `EPERM`",
+    "io_uring needs more memory than the container's limit",
+    "Netty can't use io_uring inside a JVM"
+   ],
+   "answer": 1,
+   "why": "Containers share the host's kernel, and the lab box's `io_uring_disabled` is 0, so the kernel allows it. Docker 25 and later block the three io_uring system calls in the default seccomp filter, and the call fails with `EPERM`. Fall back to the epoll transport, or run with a seccomp profile that allows io_uring if you accept the risk."
+  },
+  {
+   "q": "A batch job reads thousands of large files from a network disk. A teammate wants to put the files in an epoll set so one thread can read them all without blocking. Why won't that work?",
+   "options": [
+    "epoll only works for TCP sockets, not Unix sockets",
+    "epoll has a limit of 1,024 descriptors",
+    "Regular files are always \"ready\": `epoll_ctl` refuses them with `EPERM`, and a read of an uncached page still blocks for the disk",
+    "Files must be opened with `O_APPEND` to be watched"
+   ],
+   "answer": 2,
+   "why": "epoll answers \"can I read without waiting?\", and for a regular file the kernel has no such notion: the read waits for the disk inside the kernel. The 1,024 limit belongs to `select`. Waiting on many file reads at once needs several threads or a completion API such as io_uring."
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "What does `read()` on an empty non-blocking socket return?",
+   "back": "-1 with `errno` `EAGAIN` (\"try again\"), at once, instead of sleeping."
+  },
+  {
+   "front": "What does epoll keep that `poll` doesn't?",
+   "back": "An interest list registered once with `epoll_ctl`, and a ready list the kernel fills as data arrives. `epoll_wait` returns only ready sockets."
+  },
+  {
+   "front": "Level-triggered or edge-triggered: which one strands data if you read only part of it?",
+   "back": "Edge-triggered: it reports a socket once per arrival. Read until `EAGAIN` on every event."
+  },
+  {
+   "front": "Which system calls is Java's `Selector` made of on Linux?",
+   "back": "`epoll_create1` (open), `epoll_ctl` (register), `epoll_pwait` on arm64 (select). On macOS it uses kqueue."
+  },
+  {
+   "front": "What happens when a virtual thread's socket read finds no data?",
+   "back": "The JDK registers the socket with epoll, parks the virtual thread, and the poller thread unparks it when the socket is ready; then the read is retried."
+  },
+  {
+   "front": "Readiness model vs completion model?",
+   "back": "Readiness (epoll): the kernel says when you can do the I/O without blocking. Completion (io_uring): you submit the I/O and the kernel says when it's done."
+  },
+  {
+   "front": "Three ways io_uring gets switched off",
+   "back": "Docker's default seccomp profile (since Docker 25), Google's production and ChromeOS kernels, and `kernel.io_uring_disabled` = 1 or 2."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Receive queue",
+   "plain": "The kernel's buffer of bytes that arrived on a socket and haven't been read yet."
+  },
+  {
+   "term": "Blocking read",
+   "plain": "A read that puts the thread to sleep until data is in the receive queue."
+  },
+  {
+   "term": "O_NONBLOCK / EAGAIN",
+   "plain": "A socket flag that makes reads return at once; EAGAIN is the error meaning \"nothing yet, try again\"."
+  },
+  {
+   "term": "epoll",
+   "plain": "Linux's API for waiting on many descriptors: register them once, then sleep until some are ready and get only those."
+  },
+  {
+   "term": "Level-triggered",
+   "plain": "epoll reports a descriptor for as long as it stays ready."
+  },
+  {
+   "term": "Edge-triggered",
+   "plain": "epoll reports a descriptor once each time it becomes ready, so the program must drain it."
+  },
+  {
+   "term": "Event loop",
+   "plain": "One thread that waits for ready descriptors, handles each, and waits again; the core of NIO, Netty and Vert.x."
+  },
+  {
+   "term": "io_uring",
+   "plain": "A Linux API with shared submission and completion rings, where the kernel performs the I/O and reports when it's done."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate asks why our gateway, rewritten from a thread-per-connection server to virtual threads, now runs with 30 OS threads instead of 2,000, although the code still calls blocking `read()`. Explain what happens underneath, and what it doesn't change.",
+  "answer": "With platform threads, each connection had an OS thread asleep in the kernel's `read()` until data arrived in that socket's receive queue. That's 2,000 kernel tasks with their own stacks, almost all asleep. On virtual threads, the JDK makes every socket non-blocking. When our code reads and the queue is empty, the read returns `EAGAIN` underneath; the JDK registers the socket with epoll, parks the virtual thread, and its carrier goes off to run another one. One poller thread sleeps in `epoll_wait` for all the sockets, and when one has data, the JDK makes its virtual thread runnable and the read is retried. So the OS sees the carriers (one per CPU), the poller and the JVM's own threads, about 30, and `strace` shows reads failing with `EAGAIN` followed by `epoll_ctl`. What doesn't change: the CPU work per request is the same, a parked virtual thread still keeps its stack on the heap, and anything downstream with a limit, like the JDBC pool's 20 connections, is still the bottleneck. And blocking that the JDK can't turn into a park, such as a native call, still holds a carrier."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "Edge-triggered mode has a sibling, `EPOLLONESHOT`: report the socket once, then disable it until the program re-arms it with `epoll_ctl(MOD)`. Thread pools that share one epoll instance use it so two threads never handle the same socket at once. `EPOLLEXCLUSIVE` attacks the opposite problem, the thundering herd: many threads waiting on one listening socket, all woken for a single new connection. And `SO_REUSEPORT` lets several sockets, one per thread, listen on the same port, with the kernel spreading new connections across them, which is how many servers scale `accept` across cores.\n\nWriting is the other half of a real event loop. `write()` on a non-blocking socket can write fewer bytes than you asked for, or fail with `EAGAIN`, when the socket's send queue is full because the client reads slowly. A server then keeps the rest, registers interest in writability (`OP_WRITE`, `EPOLLOUT`), and writes again when the kernel says there is room. The lab's echo server skips that because its messages are tiny; Netty's outbound buffer and its high and low water marks are the grown-up version.\n\nio_uring keeps growing past files and sockets. It has operations for `accept`, `connect`, `openat`, `fsync` and more, linked requests that run in order, registered buffers and files that skip per-call lookups, and an `SQPOLL` mode where a kernel thread watches the submission queue so the program makes no system calls at all while busy. That reach is also the security worry: each operation is kernel code running on the process's behalf, outside the paths that seccomp and other filters were built around.\n\nFinally, `strace -c` measures time inside system calls, including time asleep. That's why the platform-thread server's `read` looked like the most expensive call in the Try-it: it's where its threads wait. To find time spent waiting for the CPU instead, use lesson 4's `/proc/<pid>/schedstat`."
+ },
+ "sources": [
+  {
+   "title": "epoll(7), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man7/epoll.7.html"
+  },
+  {
+   "title": "io_uring(7), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man7/io_uring.7.html"
+  },
+  {
+   "title": "Arpaci-Dusseau, OSTEP chapter 33: Event-based Concurrency",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-events.pdf"
+  },
+  {
+   "title": "JEP 444: Virtual Threads",
+   "url": "https://openjdk.org/jeps/444"
+  },
+  {
+   "title": "Seccomp security profiles for Docker",
+   "url": "https://docs.docker.com/engine/security/seccomp/"
+  }
+ ]
 }

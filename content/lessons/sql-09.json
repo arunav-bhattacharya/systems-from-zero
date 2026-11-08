@@ -1,432 +1,435 @@
 {
-  "id": "sql-09",
-  "title": "LATERAL joins, top-N per group and keyset pagination",
-  "minutes": 40,
-  "goal": "By the end you can write a subquery in FROM that runs once per row of the tables before it (LATERAL), choose between a window filter, LATERAL with LIMIT and DISTINCT ON for the top N rows per group, and page through a large table with a keyset cursor that stays fast on page 5,001.",
-  "warmup": {
-    "q": "An admin screen lists 1,000,000 payments newest first, 20 per page, and an index on (created_at, payment_id) matches that order. Page 5,001 uses `LIMIT 20 OFFSET 100000`. About how many index entries does PostgreSQL read?",
-    "options": [
-      "20: the index lets it jump straight to entry 100,001",
-      "About 100,020",
-      "All 1,000,000",
-      "About 40: one descent of the index, then 20 entries"
-    ],
-    "answer": 1,
-    "why": "An index is sorted, but it does not store row numbers, so there is nothing to jump to. OFFSET makes PostgreSQL read the first 100,000 entries in order, throw them away, and return the next 20. On the large data set that is 100,020 rows and 2,865 buffers. The last option describes a keyset cursor, which seeks to the last row of the previous page instead of counting."
-  },
-  "sections": [
-    {
-      "h": "A subquery in FROM cannot see the row beside it, and LATERAL lets it",
-      "body": "The merchant dashboard shows each merchant with its three largest succeeded payments. The question is per merchant: for every merchant row, a small query that depends on that merchant.\n\nThe first attempt puts the small query in FROM, as a derived table (lesson 5), and refers to the merchant inside it:\n\n```sql\nSELECT m.merchant_id, t.payment_id, t.amount_minor\nFROM merchants m\nCROSS JOIN (SELECT payment_id, amount_minor\n            FROM payments p\n            WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n            ORDER BY amount_minor DESC, payment_id\n            LIMIT 3) AS t;\n```\n\nPostgreSQL rejects it, and its hint names the fix:\n\n```postgresql\nERROR:  invalid reference to FROM-clause entry for table \"m\"\nDETAIL:  There is an entry for table \"m\", but it cannot be referenced from this part of the query.\nHINT:  To reference that table, you must mark this subquery with LATERAL.\n```\n\nItems in FROM are independent: each is computed on its own, and then they are joined. So the subquery may not mention `m`, and without that condition it returns the three largest payments overall. A scalar subquery in the select list (lesson 5) may mention `m`, because it is correlated, but it must return one value, and three payments fail with `more than one row returned by a subquery used as an expression`.\n\nThe keyword `LATERAL` in front of a subquery in FROM lets it refer to the FROM items to its left. PostgreSQL then runs it once for each row of those items, with that row's values plugged in, and joins each row to whatever rows its run returned. Write `CROSS JOIN LATERAL (...)` in the query above and it works. A LATERAL subquery is a correlated subquery that returns rows instead of one value. In Kotlin it is a flatMap:\n\n```kotlin\nmerchants.flatMap { m ->\n    payments.filter { it.merchantId == m.id && it.status == \"succeeded\" }\n        .sortedWith(compareByDescending<Payment> { it.amountMinor }.thenBy { it.paymentId })\n        .take(3)\n        .map { m to it }                     // join each returned row to its merchant\n}\n```\n\nThat is the picture for this lesson: **for each outer row, run the inner query with that row's values, and join the rows it returns.** The stepper runs it merchant by merchant.\n\nThe result has 18 rows for 6 merchants. Paper Lantern Books (6) and Sunrise Grocers (8) are missing: their runs returned nothing, and CROSS JOIN, like an inner join (lesson 3), drops a row with no partner. `LEFT JOIN LATERAL (...) AS t ON true` keeps them, with NULLs. The `ON true` is there only because LEFT JOIN needs an ON clause; the subquery has already done the matching.\n\nYou may have used LATERAL without the keyword. A function call in FROM can always use earlier columns, so `CROSS JOIN LATERAL jsonb_array_elements_text(p.metadata -> 'risk' -> 'rules') AS r (rule)` turns each payment's list of fired risk rules into one row per rule.",
-      "stepper": {
-        "title": "One run of the subquery per merchant",
-        "intro": "Click Next to watch `CROSS JOIN LATERAL` run its subquery for each merchant, then `LEFT JOIN LATERAL` keep the empty ones.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><rect class=\"box\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><rect class=\"box\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = ?</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><text class=\"t-s t-m\" x=\"20\" y=\"330\" text-anchor=\"start\">Each merchant row will plug its merchant_id into the subquery.</text></svg>",
-            "say": "`merchants m` comes first in FROM, and the LATERAL subquery after it mentions `m.merchant_id`. That reference is what LATERAL allows. It also means the subquery cannot run until there is a merchant row to take the value from."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box-a\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code t-a\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><rect class=\"box\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><rect class=\"box-a\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code t-a\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = 1</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><line class=\"ln-a\" x1=\"200\" y1=\"69\" x2=\"216\" y2=\"70\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"353\" y=\"192\" text-anchor=\"middle\">returned:</text><rect class=\"box-ok\" x=\"278\" y=\"200\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"215.5\" text-anchor=\"middle\">7</text><text class=\"t-s t-code\" x=\"383\" y=\"215.5\" text-anchor=\"middle\">6120</text><rect class=\"box-ok\" x=\"278\" y=\"226\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"241.5\" text-anchor=\"middle\">34</text><text class=\"t-s t-code\" x=\"383\" y=\"241.5\" text-anchor=\"middle\">5875</text><rect class=\"box-ok\" x=\"278\" y=\"252\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"267.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"383\" y=\"267.5\" text-anchor=\"middle\">5310</text><line class=\"ln-a\" x1=\"432\" y1=\"228\" x2=\"504\" y2=\"69\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">Merchant 1: the subquery runs with merchant_id = 1 and returns 3 rows.</text></svg>",
-            "say": "PostgreSQL takes merchant 1 and runs the subquery with `p.merchant_id = 1`: Northwind's three largest succeeded payments, 7, 34 and 14. Each returned row is joined to merchant 1's row, so the result gets three rows for merchant 1."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box-a\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><text class=\"t-s t-code t-a\" x=\"510\" y=\"105.5\" text-anchor=\"start\">m2: 25, 2, 30</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><rect class=\"box\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><rect class=\"box-a\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code t-a\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = 2</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><line class=\"ln-a\" x1=\"200\" y1=\"101\" x2=\"216\" y2=\"101\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"353\" y=\"192\" text-anchor=\"middle\">returned:</text><rect class=\"box-ok\" x=\"278\" y=\"200\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"215.5\" text-anchor=\"middle\">25</text><text class=\"t-s t-code\" x=\"383\" y=\"215.5\" text-anchor=\"middle\">2275</text><rect class=\"box-ok\" x=\"278\" y=\"226\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"241.5\" text-anchor=\"middle\">2</text><text class=\"t-s t-code\" x=\"383\" y=\"241.5\" text-anchor=\"middle\">1890</text><rect class=\"box-ok\" x=\"278\" y=\"252\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"267.5\" text-anchor=\"middle\">30</text><text class=\"t-s t-code\" x=\"383\" y=\"267.5\" text-anchor=\"middle\">1640</text><line class=\"ln-a\" x1=\"432\" y1=\"228\" x2=\"504\" y2=\"101\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">Merchant 2: a fresh run, with merchant_id = 2. Three more rows.</text></svg>",
-            "say": "Merchant 2: the subquery runs again from the start, now with 2 plugged in. Nothing is shared between runs. It returns 25, 2 and 30."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><text class=\"t-s t-code\" x=\"510\" y=\"105.5\" text-anchor=\"start\">m2: 25, 2, 30</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><text class=\"t-s t-code t-a\" x=\"510\" y=\"137.5\" text-anchor=\"start\">m3: 32, 4, 9</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><rect class=\"box\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><rect class=\"box-a\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code t-a\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = 3</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><line class=\"ln-a\" x1=\"200\" y1=\"133\" x2=\"216\" y2=\"133\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"353\" y=\"192\" text-anchor=\"middle\">returned:</text><rect class=\"box-ok\" x=\"278\" y=\"200\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"215.5\" text-anchor=\"middle\">32</text><text class=\"t-s t-code\" x=\"383\" y=\"215.5\" text-anchor=\"middle\">550</text><rect class=\"box-ok\" x=\"278\" y=\"226\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"241.5\" text-anchor=\"middle\">4</text><text class=\"t-s t-code\" x=\"383\" y=\"241.5\" text-anchor=\"middle\">275</text><rect class=\"box-ok\" x=\"278\" y=\"252\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-code\" x=\"323\" y=\"267.5\" text-anchor=\"middle\">9</text><text class=\"t-s t-code\" x=\"383\" y=\"267.5\" text-anchor=\"middle\">275</text><line class=\"ln-a\" x1=\"432\" y1=\"228\" x2=\"504\" y2=\"133\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">Merchant 3: 550, then two of its three 275 rides. LIMIT cuts the tie.</text></svg>",
-            "say": "Merchant 3, Metro Transit, has a 550 ride and three 275 rides. ORDER BY amount_minor DESC, payment_id puts 4 before 9 before 26, and LIMIT 3 keeps 32, 4 and 9. The tiebreaker decided which 275 survives."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><text class=\"t-s t-code\" x=\"510\" y=\"105.5\" text-anchor=\"start\">m2: 25, 2, 30</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><text class=\"t-s t-code\" x=\"510\" y=\"137.5\" text-anchor=\"start\">m3: 32, 4, 9</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><text class=\"t-s t-code\" x=\"510\" y=\"169.5\" text-anchor=\"start\">m4: 3, 31, 8</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><text class=\"t-s t-code\" x=\"510\" y=\"201.5\" text-anchor=\"start\">m5: 23, 13, 22</text><rect class=\"box-a\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><text class=\"t-s t-bad\" x=\"510\" y=\"233.5\" text-anchor=\"start\">m6: (dropped)</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><rect class=\"box\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><rect class=\"box-a\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code t-a\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = 6</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><line class=\"ln-a\" x1=\"200\" y1=\"229\" x2=\"216\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"353\" y=\"192\" text-anchor=\"middle\">returned:</text><rect class=\"box-bad\" x=\"278\" y=\"200\" width=\"150\" height=\"22\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"353\" y=\"215.5\" text-anchor=\"middle\">no rows</text><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">Merchant 6 has no payments: its run returns nothing, and CROSS JOIN drops it.</text></svg>",
-            "say": "Merchants 4 and 5 return three rows each. Merchant 6, Paper Lantern Books, has no payments, so its run returns no rows. CROSS JOIN behaves like an inner join: a left row with nothing to pair with is dropped."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m CROSS JOIN LATERAL (...) t</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><text class=\"t-s t-code\" x=\"510\" y=\"105.5\" text-anchor=\"start\">m2: 25, 2, 30</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><text class=\"t-s t-code\" x=\"510\" y=\"137.5\" text-anchor=\"start\">m3: 32, 4, 9</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><text class=\"t-s t-code\" x=\"510\" y=\"169.5\" text-anchor=\"start\">m4: 3, 31, 8</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><text class=\"t-s t-code\" x=\"510\" y=\"201.5\" text-anchor=\"start\">m5: 23, 13, 22</text><rect class=\"box-bad\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><text class=\"t-s t-bad\" x=\"510\" y=\"233.5\" text-anchor=\"start\">m6: (dropped)</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><text class=\"t-s t-code\" x=\"510\" y=\"265.5\" text-anchor=\"start\">m7: 33, 12, 21</text><rect class=\"box-bad\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><text class=\"t-s t-bad\" x=\"510\" y=\"297.5\" text-anchor=\"start\">m8: (dropped)</text><rect class=\"box\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = ?</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><text class=\"t-s\" x=\"353\" y=\"210\" text-anchor=\"middle\">8 runs, 18 rows</text><text class=\"t-s t-bad\" x=\"353\" y=\"232\" text-anchor=\"middle\">merchants 6 and 8 dropped</text><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">Eight runs. 18 rows, for 6 of the 8 merchants.</text></svg>",
-            "say": "After eight runs the result has 18 rows: three each for six merchants. Merchants 6 and 8 are missing, though the dashboard should show them as \"no sales yet\"."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 340\" role=\"img\" aria-label=\"A LATERAL subquery runs once for each merchant with that merchant's id, and its rows are joined to that merchant\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code t-a\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM merchants m LEFT JOIN LATERAL (...) t ON true</text><text class=\"t-s t-m\" x=\"110\" y=\"46\" text-anchor=\"middle\">merchants m</text><text class=\"t-s t-m\" x=\"353\" y=\"46\" text-anchor=\"middle\">subquery, run per merchant</text><text class=\"t-s t-m\" x=\"590\" y=\"46\" text-anchor=\"middle\">result rows</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"73.5\" text-anchor=\"middle\">1  Northwind Grocers</text><text class=\"t-s t-code\" x=\"510\" y=\"73.5\" text-anchor=\"start\">m1: 7, 34, 14</text><rect class=\"box\" x=\"20\" y=\"88\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"105.5\" text-anchor=\"middle\">2  Blue Fern Cafe</text><text class=\"t-s t-code\" x=\"510\" y=\"105.5\" text-anchor=\"start\">m2: 25, 2, 30</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"137.5\" text-anchor=\"middle\">3  Metro Transit</text><text class=\"t-s t-code\" x=\"510\" y=\"137.5\" text-anchor=\"start\">m3: 32, 4, 9</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"169.5\" text-anchor=\"middle\">4  Volt Electronics</text><text class=\"t-s t-code\" x=\"510\" y=\"169.5\" text-anchor=\"start\">m4: 3, 31, 8</text><rect class=\"box\" x=\"20\" y=\"184\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"201.5\" text-anchor=\"middle\">5  Harbor Hotel</text><text class=\"t-s t-code\" x=\"510\" y=\"201.5\" text-anchor=\"start\">m5: 23, 13, 22</text><rect class=\"box-ok\" x=\"20\" y=\"216\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"233.5\" text-anchor=\"middle\">6  Paper Lantern Books</text><text class=\"t-s t-code t-ok\" x=\"510\" y=\"233.5\" text-anchor=\"start\">m6: NULL</text><rect class=\"box\" x=\"20\" y=\"248\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"265.5\" text-anchor=\"middle\">7  Quick Bite</text><text class=\"t-s t-code\" x=\"510\" y=\"265.5\" text-anchor=\"start\">m7: 33, 12, 21</text><rect class=\"box-ok\" x=\"20\" y=\"280\" width=\"180\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"110\" y=\"297.5\" text-anchor=\"middle\">8  Sunrise Grocers</text><text class=\"t-s t-code t-ok\" x=\"510\" y=\"297.5\" text-anchor=\"start\">m8: NULL</text><rect class=\"box\" x=\"218\" y=\"56\" width=\"272\" height=\"112\" rx=\"8\"/><text class=\"t-s t-code\" x=\"230\" y=\"75\" text-anchor=\"start\">SELECT payment_id, amount_minor</text><text class=\"t-s t-code\" x=\"230\" y=\"92\" text-anchor=\"start\">FROM payments p</text><text class=\"t-s t-code\" x=\"230\" y=\"109\" text-anchor=\"start\">WHERE p.merchant_id = ?</text><text class=\"t-s t-code\" x=\"230\" y=\"126\" text-anchor=\"start\">  AND p.status = 'succeeded'</text><text class=\"t-s t-code\" x=\"230\" y=\"143\" text-anchor=\"start\">ORDER BY amount_minor DESC</text><text class=\"t-s t-code\" x=\"230\" y=\"160\" text-anchor=\"start\">LIMIT 3</text><text class=\"t-s\" x=\"353\" y=\"210\" text-anchor=\"middle\">8 runs, 20 rows</text><text class=\"t-s t-ok\" x=\"353\" y=\"232\" text-anchor=\"middle\">6 and 8 kept with NULLs</text><text class=\"t-s t-a\" x=\"20\" y=\"330\" text-anchor=\"start\">LEFT JOIN LATERAL ... ON true keeps every merchant, with NULLs for 6 and 8.</text></svg>",
-            "say": "`LEFT JOIN LATERAL (...) AS t ON true` keeps every merchant row, and fills t's columns with NULL when the run returned nothing, like the outer joins of lesson 3. `ON true` is only there because LEFT JOIN requires an ON clause; the subquery already did the matching."
-          }
-        ]
-      },
-      "try": {
-        "title": "A subquery per merchant",
-        "minutes": 4,
-        "steps": [
-          "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-          "Run the first query and read the HINT.",
-          "Run the second, with CROSS JOIN LATERAL. How many merchants appear?",
-          "Run the third: LEFT JOIN LATERAL with LIMIT 1. Which merchants show empty columns?",
-          "Run the last: one row per fired risk rule, from a function in FROM."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SELECT m.merchant_id, t.payment_id, t.amount_minor\nFROM merchants m\nCROSS JOIN (SELECT payment_id, amount_minor\n            FROM payments p\n            WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n            ORDER BY amount_minor DESC, payment_id\n            LIMIT 3) AS t;\n\nSELECT m.merchant_id, m.name, t.payment_id, t.amount_minor\nFROM merchants m\nCROSS JOIN LATERAL (SELECT payment_id, amount_minor\n                    FROM payments p\n                    WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n                    ORDER BY amount_minor DESC, payment_id\n                    LIMIT 3) AS t\nORDER BY m.merchant_id, t.amount_minor DESC, t.payment_id;\n\nSELECT m.merchant_id, m.name, t.payment_id, t.amount_minor\nFROM merchants m\nLEFT JOIN LATERAL (SELECT payment_id, amount_minor\n                   FROM payments p\n                   WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n                   ORDER BY amount_minor DESC, payment_id\n                   LIMIT 1) AS t ON true\nORDER BY m.merchant_id;\n\nSELECT p.payment_id, r.rule\nFROM payments p\nCROSS JOIN LATERAL jsonb_array_elements_text(p.metadata -> 'risk' -> 'rules') AS r (rule)\nORDER BY p.payment_id;"
-        },
-        "expect": "The first query fails with the error and HINT above. The CROSS JOIN LATERAL query returns 18 rows, three for each of merchants 1, 2, 3, 4, 5 and 7 (trimmed):\n\n```postgresql\n merchant_id |       name        | payment_id | amount_minor\n-------------+-------------------+------------+--------------\n           1 | Northwind Grocers |          7 |         6120\n           1 | Northwind Grocers |         34 |         5875\n           1 | Northwind Grocers |         14 |         5310\n           2 | Blue Fern Cafe    |         25 |         2275\n...\n           7 | Quick Bite        |         21 |         1325\n(18 rows)\n```\n\nThe LEFT JOIN version returns 8 rows, one per merchant; Paper Lantern Books (6) and Sunrise Grocers (8) have empty payment_id and amount_minor. The rules query returns 5 rows: 3 velocity, 8 geo_mismatch, 15 velocity, 18 velocity, 31 geo_mismatch."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: LATERAL subqueries",
-          "url": "https://www.postgresql.org/docs/18/queries-table-expressions.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Top N per group, three ways, and what each does with ties",
-      "body": "The dashboard query is one case of a pattern you will write often: the top N rows of each group. The newest payment per card, the three biggest merchants per country, the latest login per customer. PostgreSQL gives you three ways to write it. They differ in what they do with ties, in which groups appear, and in cost.\n\nThe window way, from lesson 7, numbers the rows inside each group and keeps the first N one level up:\n\n```sql\nSELECT merchant_id, payment_id, amount_minor\nFROM (SELECT merchant_id, payment_id, amount_minor,\n             row_number() OVER (PARTITION BY merchant_id\n                                ORDER BY amount_minor DESC, payment_id) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place <= 3;\n```\n\nThe LATERAL way, from the first section, runs one small query per merchant with LIMIT 3.\n\nThe DISTINCT ON way works for N = 1. `SELECT DISTINCT ON (merchant_id) ...` keeps the first row of each set of rows with equal merchant_id, where \"first\" means first in the query's ORDER BY. So the ORDER BY must start with the DISTINCT ON columns and continue with whatever decides the winner: `ORDER BY merchant_id, amount_minor DESC, payment_id`. Start it with anything else and PostgreSQL refuses: `SELECT DISTINCT ON expressions must match initial ORDER BY expressions`. DISTINCT ON is PostgreSQL's own syntax, not standard SQL, and it is the shortest way to write \"the latest row per key\".\n\nThe three agree only if they agree on ties. Metro Transit (merchant 3) has one 5.50 ride and three 2.75 rides, so its top three cut through a tie: 550, then two of the three 275s. With `payment_id` as the tiebreaker, row_number and LIMIT both keep payments 4 and 9 and drop 26. Without it, which 275 survives is up to the plan. If tied rows should all stay, filter on `rank() <= 3`, which gives Metro Transit four rows, or write `FETCH FIRST 3 ROWS WITH TIES` inside the LATERAL subquery (lesson 1). Decide first, because none of the three fails when you forget: each one quietly keeps whichever rows the plan delivers first.\n\nThey also differ in which groups appear. The window and DISTINCT ON ways start from payments, so a merchant without payments has no rows to number and never appears. The LATERAL way starts from merchants, so LEFT JOIN LATERAL can keep every merchant. When the dashboard must list every merchant, start from the merchants table.",
-      "try": {
-        "title": "One question, three queries",
-        "minutes": 4,
-        "steps": [
-          "Run the window version for merchants 3 and 4. Which 275 ride is missing, and what decided that?",
-          "Run the rank version. How many rows does Metro Transit get now?",
-          "Run the DISTINCT ON query. Then move `amount_minor DESC` to the front of its ORDER BY and read the error."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SELECT merchant_id, payment_id, amount_minor, place\nFROM (SELECT merchant_id, payment_id, amount_minor,\n             row_number() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC, payment_id) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place <= 3 AND merchant_id IN (3, 4)\nORDER BY merchant_id, place;\n\nSELECT merchant_id, payment_id, amount_minor, place\nFROM (SELECT merchant_id, payment_id, amount_minor,\n             rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place <= 3 AND merchant_id IN (3, 4)\nORDER BY merchant_id, place, payment_id;\n\nSELECT DISTINCT ON (merchant_id) merchant_id, payment_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\nORDER BY merchant_id, amount_minor DESC, payment_id;"
-        },
-        "expect": "```postgresql\n merchant_id | payment_id | amount_minor | place\n-------------+------------+--------------+-------\n           3 |         32 |          550 |     1\n           3 |          4 |          275 |     2\n           3 |          9 |          275 |     3\n           4 |          3 |       129900 |     1\n           4 |         31 |        75000 |     2\n           4 |          8 |        54999 |     3\n(6 rows)\n```\n\nPayment 26 is missing: the tiebreaker `payment_id` put it last of the three 275s. The rank version returns 7 rows: 32 in place 1 and all three 275s in place 2 for Metro Transit. DISTINCT ON returns six rows, one per merchant with payments: 7, 25, 32, 3, 23 and 33. With the ORDER BY reordered it fails with `SELECT DISTINCT ON expressions must match initial ORDER BY expressions`."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: SELECT, DISTINCT ON",
-          "url": "https://www.postgresql.org/docs/18/sql-select.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Which way is fast depends on the index",
-      "body": "On 37 payments all three ways finish in a few milliseconds at most. On the large data set, a million payments at 2,500 merchants, they behave very differently, and the reason is how many rows each has to read.\n\nThe window way reads every succeeded payment, 930,826 rows, and sorts them all by merchant and amount before row_number can count. It does that work whether you want the top 3 or the top 300. It takes about 1 to 3 seconds on a laptop.\n\nThe LATERAL way runs its small query 2,500 times. With no help, each run reads the whole payments table to find one merchant's rows, then sorts them: 20 merchants took about 4 to 9 seconds, so all 2,500 would take many minutes. This is lesson 5's correlated subquery problem again: an inner query that runs once per outer row, and is a full table scan every time.\n\nAn index changes that. Lesson 11 builds indexes up properly. For now, an **index** is a separate structure that keeps chosen columns sorted, each entry with a pointer to its row. With an index on `(merchant_id, amount_minor DESC, payment_id)`, each merchant's payments sit next to each other in exactly the order the subquery wants. \"The three largest payments of merchant 1000\" becomes: find merchant 1000's first entry, read three entries, follow three pointers. EXPLAIN shows it as a Nested Loop over the 2,500 merchants with an Index Scan inside, `rows=3.00 loops=2500`. The whole query took between 0.04 and 0.7 seconds, depending on whether the index was already in memory.\n\nSo the rule of thumb: when the groups are big, you want a few rows from each, and an index matches the inner ORDER BY, use LATERAL with LIMIT. When there is no such index, or you need most of each group anyway, the window's single big sort is the cheaper way. Look at the plan before you decide.\n\nOne more measurement from the same session is worth knowing. With the index in place, the planner chose to feed the window version from the index too, to skip the sort, and it got slower: 5 to 10 seconds. Reading a whole table through an index visits the table's pages in index order, one row at a time, while a sequential scan reads them in order and the sort runs in memory and temporary files. An index helps when it lets you read less. When you have to read everything, reading the table in its own order and sorting is often faster.",
-      "try": {
-        "title": "Three seconds, nine seconds, a third of a second",
-        "minutes": 5,
-        "steps": [
-          "This Try it needs the large data set loaded (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute; skip this if an earlier lesson loaded it).",
-          "Run the block. It times the window version, then LATERAL for the first 20 merchants with no index, creates the index (a few seconds), shows the LATERAL plan for all 2,500 merchants, and drops the index again.",
-          "In the plan, find `loops=2500` and the rows per loop. Multiply them: that is all the payments the query read."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SET search_path = big, public;\n\\timing on\nSELECT count(*)\nFROM (SELECT merchant_id, payment_id,\n             row_number() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC, payment_id) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place <= 3;\n\nSELECT count(*)\nFROM merchants m\nCROSS JOIN LATERAL (SELECT payment_id\n                    FROM payments p\n                    WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n                    ORDER BY amount_minor DESC, payment_id\n                    LIMIT 3) AS t\nWHERE m.merchant_id <= 20;\n\nCREATE INDEX payments_merchant_amount_idx ON payments (merchant_id, amount_minor DESC, payment_id);\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT m.merchant_id, t.payment_id, t.amount_minor\nFROM merchants m\nCROSS JOIN LATERAL (SELECT payment_id, amount_minor\n                    FROM payments p\n                    WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n                    ORDER BY amount_minor DESC, payment_id\n                    LIMIT 3) AS t;\n\nDROP INDEX payments_merchant_amount_idx;\n\\timing off\nRESET search_path;"
-        },
-        "expect": "From one run (times vary with the machine and with whatever else Docker is doing):\n\n```postgresql\n count\n-------\n  7500\nTime: 3068.893 ms (00:03.069)           -- window: every succeeded payment sorted\n\n count\n-------\n    60\nTime: 8811.727 ms (00:08.812)           -- LATERAL, no index, only 20 merchants\n\nCREATE INDEX\nTime: 2687.312 ms (00:02.687)\n Nested Loop (actual time=0.661..340.829 rows=7500.00 loops=1)\n   ->  Seq Scan on merchants m (actual time=0.506..1.787 rows=2500.00 loops=1)\n   ->  Limit (actual time=0.067..0.134 rows=3.00 loops=2500)\n         ->  Index Scan using payments_merchant_amount_idx on payments p (actual time=0.067..0.133 rows=3.00 loops=2500)\n               Index Cond: (merchant_id = m.merchant_id)\n               Filter: (status = 'succeeded'::text)\n               Rows Removed by Filter: 0\n               Index Searches: 2500\n Execution Time: 342.072 ms\n```\n\n3 rows per loop times 2,500 loops: 7,500 index entries for 7,500 result rows. Run the EXPLAIN a second time before dropping the index and it drops to a few tens of milliseconds, because the index pages are now in memory."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Using EXPLAIN",
-          "url": "https://www.postgresql.org/docs/18/using-explain.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "OFFSET reads every row it skips",
-      "body": "The admin console lists payments newest first, 20 per page, with page numbers at the bottom. The obvious query for page n uses LIMIT and OFFSET:\n\n```sql\nSELECT payment_id, created_at, amount_minor\nFROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20 OFFSET 100000;          -- page 5,001\n```\n\nOFFSET 100000 means \"skip the first 100,000 rows of the result\". To skip a row, PostgreSQL has to produce it first; the documentation says the rows skipped by OFFSET still have to be computed inside the server. An index does not store row numbers, so there is no way to jump to the 100,001st entry. With an index on `(created_at, payment_id)`, page 1 reads the newest 20 entries and stops: 5 buffers (a buffer is one 8 KB page) and a fraction of a millisecond. Page 5,001 walks the index from the newest entry through 100,020 entries, fetches each row, throws away 100,000 and returns 20: 2,865 buffers and about 50 ms. Page 45,001 read 900,020 rows and took 1.2 seconds. The cost grows with the page number, and without the index it is worse: every page sorts the whole table.\n\nOFFSET is also wrong when rows arrive while someone pages, and in a payments system rows always arrive. Page 1 shows payments 37 to 33. A new payment comes in. Page 2, OFFSET 5, now starts one row earlier than it would have, so it shows payment 33 a second time. A deleted row does the opposite, and the next page skips a row nobody saw. An export job that pages with OFFSET can process a payment twice or miss one, and no error says so.\n\nThe figure shows both queries on the same index. The OFFSET query reads its way to the page. The second query, from the next section, jumps there.\n\nThe fix is to stop counting rows. The client already knows where the last page ended: the last row it showed. Ask for the rows after that row.",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"OFFSET reads 100,020 index entries to return 20; a keyset cursor seeks to the last row and reads 20\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">index on (created_at, payment_id), read newest first: 1,000,478 entries</text><text class=\"t-s t-code\" x=\"20\" y=\"58\" text-anchor=\"start\">LIMIT 20 OFFSET 100000</text><rect class=\"box\" x=\"40\" y=\"68\" width=\"600\" height=\"30\" rx=\"8\"/><rect class=\"box-bad\" x=\"40\" y=\"68\" width=\"59.97133370249021\" height=\"30\" rx=\"8\"/><rect class=\"box-ok\" x=\"99.97133370249021\" y=\"68\" width=\"6\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"40\" y=\"120\" text-anchor=\"start\">red: the newest 100,000 entries, read and thrown away</text><text class=\"t-s t-ok\" x=\"113.97133370249021\" y=\"87.5\" text-anchor=\"start\">20 returned</text><text class=\"t-s\" x=\"40\" y=\"144\" text-anchor=\"start\">2,865 buffers, about 50 ms. Page 45,001 (OFFSET 900000): 1.2 s.</text><text class=\"t-s t-code\" x=\"20\" y=\"184\" text-anchor=\"start\">WHERE (created_at, payment_id) &lt; cursor  LIMIT 20</text><rect class=\"box\" x=\"40\" y=\"194\" width=\"600\" height=\"30\" rx=\"8\"/><rect class=\"box-ok\" x=\"99.97133370249021\" y=\"194\" width=\"6\" height=\"30\" rx=\"8\"/><line class=\"ln-a\" x1=\"40\" y1=\"240\" x2=\"97.97133370249021\" y2=\"240\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"113.97133370249021\" y=\"213.5\" text-anchor=\"start\">20 returned</text><text class=\"t-s t-a\" x=\"113.97133370249021\" y=\"245\" text-anchor=\"start\">seek: one descent of the index to the cursor</text><text class=\"t-s\" x=\"40\" y=\"286\" text-anchor=\"start\">5 buffers, about a millisecond or less, on page 2 or page 5,001.</text></svg>",
-        "caption": "Drawn to scale on the 1,000,478-entry index: OFFSET reads the red tenth to reach page 5,001, the keyset query seeks straight to it."
-      },
-      "try": {
-        "title": "Page 5,001 the slow way",
-        "minutes": 5,
-        "steps": [
-          "Run the transaction at the top: page 1, a new payment, then page 2 with OFFSET. Which payment do you see twice? The ROLLBACK removes the new payment.",
-          "Then, with the large data set loaded (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute; skip this if an earlier lesson loaded it): the block creates an index on `(created_at, payment_id)` (a few seconds) and EXPLAINs page 1 and page 5,001. Leave the index in place for the next section.",
-          "Compare `rows` on the Index Scan and `Buffers` between the two plans."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "BEGIN;\nSELECT payment_id, created_at FROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 5;\nINSERT INTO payments (payment_id, card_id, merchant_id, amount_minor, status, created_at)\nVALUES (38, 1, 1, 999, 'succeeded', '2026-07-01 10:00+00');\nSELECT payment_id, created_at FROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 5 OFFSET 5;\nROLLBACK;\n\nSET search_path = big, public;\nCREATE INDEX payments_created_at_idx ON payments (created_at, payment_id);\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, created_at, amount_minor\nFROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, created_at, amount_minor\nFROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20 OFFSET 100000;\nRESET search_path;"
-        },
-        "expect": "Page 1 is 37, 36, 35, 34, 33. After the insert, page 2 is 33, 32, 31, 30, 29: payment 33 again. On the large data set:\n\n```postgresql\n Limit (actual time=0.080..0.091 rows=20.00 loops=1)\n   Buffers: shared hit=2 read=3\n   ->  Index Scan Backward using payments_created_at_idx on payments (actual time=0.078..0.086 rows=20.00 loops=1)\n Execution Time: 0.148 ms\n\n Limit (actual time=48.209..48.249 rows=20.00 loops=1)\n   Buffers: shared hit=2222 read=643\n   ->  Index Scan Backward using payments_created_at_idx on payments (actual time=0.013..39.857 rows=100020.00 loops=1)\n Execution Time: 48.271 ms\n```\n\n(plans trimmed). Both pages use the same index, read backward for the DESC order. Page 1 reads 20 rows and 5 buffers; page 5,001 reads 100,020 rows and 2,865 buffers, and returns the same number of rows."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: LIMIT and OFFSET",
-          "url": "https://www.postgresql.org/docs/18/queries-limit.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Keyset pagination starts after the last row you sent",
-      "body": "Send the client a cursor: the sort key of the last row on the page, here its created_at and payment_id. For the next page, ask for the rows that come after that key in the sort order:\n\n```sql\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE (created_at, payment_id) < (:last_created_at, :last_payment_id)\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20;\n```\n\n`(a, b) < (x, y)` is a **row comparison**; lesson 5 used one with `=`. With `<`, PostgreSQL compares the pairs left to right and stops at the first pair that differs, the way Kotlin's `compareBy({ it.createdAt }, { it.paymentId })` does. A payment comes before the cursor if its created_at is earlier, or if the created_at is equal and its payment_id is smaller. Because the order is descending, \"before\" in value means \"after\" on the screen.\n\nThis is **keyset pagination**, also called the seek method. With the index on `(created_at, payment_id)`, PostgreSQL descends the index once to the cursor's position and reads the next 20 entries. That is the same work on page 2 and on page 5,001: EXPLAIN shows the row comparison as an `Index Cond` and 5 buffers, about a millisecond or less, where OFFSET needed 2,865. New payments shift nothing: they sort before the cursor and show up on page 1.\n\nThree details decide whether it is correct. The ORDER BY must be unique, which is why payment_id is in it: two payments in the same microsecond are rare in a test and normal in a batch. The WHERE must use the whole row comparison: `WHERE created_at < :last_created_at` alone skips every remaining payment that shares the cursor's created_at, silently. And the ORDER BY, the row comparison and the index must agree in column order and direction. Mixed directions, such as created_at DESC with payment_id ASC, cannot be written as one row comparison.\n\nThe spelled-out form `created_at < :t OR (created_at = :t AND payment_id < :id)` returns the same rows, but PostgreSQL 18 did not seek with it. EXPLAIN showed it as a Filter that read and threw away 100,000 index entries, as many as OFFSET. So write the row comparison.\n\nYou give up page numbers. A cursor moves forward one page at a time, and backward if you flip the comparison and the sort, but it cannot jump to page 4,000. For an infinite scroll, an API with a `next` token or a batch export, that costs nothing. Return the cursor to API clients as an opaque token, for example the two values in base64, so they cannot build their own and come to depend on its format.",
-      "try": {
-        "title": "Page 5,001 the fast way",
-        "minutes": 4,
-        "steps": [
-          "This Try it uses the large data set and the index from the previous one.",
-          "The first statement reads the last row of page 5,000 and stores it in the psql variables `last_at` and `last_id` with `\\gset`, the way your API would keep the cursor. `:'last_at'` pastes it in as a quoted literal.",
-          "Compare the two plans: where does the condition appear, and how many buffers does each read? The last statements drop the index."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SET search_path = big, public;\nSELECT created_at AS last_at, payment_id AS last_id\nFROM payments\nORDER BY created_at DESC, payment_id DESC\nLIMIT 1 OFFSET 99999 \\gset\n\\echo :last_at :last_id\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE (created_at, payment_id) < (:'last_at', :last_id)\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at < :'last_at' OR (created_at = :'last_at' AND payment_id < :last_id)\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20;\nDROP INDEX payments_created_at_idx;\nRESET search_path;"
-        },
-        "expect": "The cursor is `2026-09-28 00:21:42.29383+00 900050` (the generator is seeded, so yours should match). Plans trimmed:\n\n```postgresql\n Limit (actual time=0.583..0.601 rows=20.00 loops=1)\n   Buffers: shared hit=4 read=1\n   ->  Index Scan Backward using payments_created_at_idx on payments (actual time=0.582..0.597 rows=20.00 loops=1)\n         Index Cond: (ROW(created_at, payment_id) < ROW('2026-09-28 00:21:42.29383+00'::timestamp with time zone, 900050))\n Execution Time: 0.723 ms\n\n Limit (actual time=21.687..21.696 rows=20.00 loops=1)\n   Buffers: shared hit=2865\n   ->  Index Scan Backward using payments_created_at_idx on payments (actual time=21.685..21.691 rows=20.00 loops=1)\n         Filter: ((created_at < '2026-09-28 00:21:42.29383+00'::timestamp with time zone) OR ((created_at = '2026-09-28 00:21:42.29383+00'::timestamp with time zone) AND (payment_id < 900050)))\n         Rows Removed by Filter: 100000\n Execution Time: 21.726 ms\n```\n\nThe row comparison is an Index Cond: one descent of the index and 5 buffers. The OR form is only a Filter, so the scan starts at the newest entry and discards 100,000 rows on the way: the same 2,865 buffers as OFFSET."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Row constructor comparison",
-          "url": "https://www.postgresql.org/docs/18/functions-comparisons.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Use The Index, Luke: Paging through results",
-          "url": "https://use-the-index-luke.com/sql/partial-results/fetch-next-page",
-          "kind": "read"
-        }
-      ]
-    }
+ "id": "sql-09",
+ "title": "JSONB, upserts and MERGE",
+ "minutes": 40,
+ "goal": "By the end you can store and query a JSON document in a jsonb column without the text-comparison trap, index it for containment with GIN, ingest a message that may arrive twice at the same moment with INSERT ... ON CONFLICT, and bring a summary table in line with its source in one MERGE.",
+ "warmup": {
+  "q": "Two Kafka consumers receive the same payment message at the same moment. Each runs `SELECT ... WHERE payment_uid = ?` and, if it finds nothing, `INSERT`s the payment. payment_uid has a UNIQUE constraint. What happens?",
+  "options": [
+   "One consumer's SELECT waits for the other's INSERT, so the second consumer sees the row and skips it",
+   "Both checks find nothing; the second INSERT waits for the first transaction and then fails with a duplicate key error",
+   "Both inserts succeed, because each check passed",
+   "PostgreSQL merges the two inserts into one row"
   ],
-  "analogy": "LATERAL is a receptionist working down a list of guests. For each guest, she phones their floor and asks for that guest's three newest messages, writes them next to the name, and moves on; a guest with no messages either gets crossed off the list (CROSS JOIN) or keeps a blank line (LEFT JOIN). OFFSET pagination is reading a phone book to someone page by page by counting lines from the first page every time: to read page 500 you count through 499 pages. A keyset cursor is a bookmark with the last name you read: you open the book at that name, which the alphabetical order lets you find directly, and read on. The analogy breaks for the receptionist: PostgreSQL does not always phone each floor. Without LATERAL in the query it is free to plan a join any way it likes, and even with LATERAL a cheap index is what makes each call quick.",
-  "in_your_world": "The N+1 query is the most common performance bug in JVM services: load 100 merchants, then call the database once per merchant for its latest payment, from a Kotlin loop or a JPA lazy collection. A LEFT JOIN LATERAL does the same per-row lookup inside one statement, one round trip instead of 101, with the same index doing the work. Keyset pagination is what every list endpoint and every batch export over payments, ledger entries or Kafka-outbox rows should use: a REST API returns a `next` cursor, a Temporal activity that exports a table in chunks stores the last key in its heartbeat details so a retry resumes where it stopped, and nothing is processed twice when new rows arrive mid-export. In Oracle the same per-row subquery is written with LATERAL or CROSS APPLY and OUTER APPLY, all three since 12c.",
-  "mistake": "Paginating with OFFSET because the UI has page numbers, or because the ORM makes it one call (`PageRequest.of(page, size)`). It looks fine in development with a few hundred rows. In production, deep pages get slower in proportion to the page number, crawlers and export jobs request exactly those pages, and rows inserted between requests shift every page, so exports duplicate or drop rows. The second most common mistake is a keyset cursor on a non-unique column: `WHERE created_at < :last` skips any row that shares the last row's timestamp, which batch inserts guarantee. Paginate with a cursor over a unique sort key, `(created_at, id)`, compare it with a row comparison, and back it with an index in the same column order.",
-  "compare": {
-    "title": "The next page with a keyset cursor: Oracle and PostgreSQL",
-    "a": {
-      "label": "Oracle",
-      "lang": "sql",
-      "title": "Oracle 12c and later",
-      "src": "-- Oracle cannot apply < to a row value (ORA-01796),\n-- so the cursor is spelled out: a range the index can\n-- use, minus the rows already shown\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at <= :last_created_at\n  AND NOT (created_at = :last_created_at\n           AND payment_id >= :last_payment_id)\nORDER BY created_at DESC, payment_id DESC\nFETCH FIRST 20 ROWS ONLY;"
-    },
-    "b": {
-      "label": "PostgreSQL 18",
-      "lang": "sql",
-      "title": "PostgreSQL 18",
-      "src": "-- one row comparison: the whole cursor is the\n-- Index Cond of a single index scan\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE (created_at, payment_id)\n      < (:last_created_at, :last_payment_id)\nORDER BY created_at DESC, payment_id DESC\nLIMIT 20;           -- FETCH FIRST 20 ROWS ONLY also works"
-    },
-    "note": "Both return the same page. Use The Index, Luke reports that Oracle supports row values but cannot apply range operators to them, failing with ORA-01796, and gives the left-hand form as the workaround: `created_at <= :t` is a plain range on the index's first column, so the index can seek to the cursor's timestamp, and the NOT removes the few rows at that timestamp that were already shown. PostgreSQL can use a row comparison directly as an index condition, so one condition says it. `FETCH FIRST n ROWS ONLY` is the standard spelling of LIMIT and works in both; old Oracle code pages with nested ROWNUM queries instead. For the per-row subqueries of this lesson, Oracle 12c added LATERAL inline views and CROSS APPLY and OUTER APPLY joins; OUTER APPLY is PostgreSQL's LEFT JOIN LATERAL ... ON true."
-  },
-  "worked": {
-    "title": "From N+1 queries to one: the latest payment for every merchant",
-    "steps": [
-      {
-        "say": "The dashboard service loads the merchants, then asks for each merchant's latest succeeded payment, one query per merchant. That is 1 + N round trips: 9 on the seed, 2,501 on the large data set, each paying the network latency between the service and the database.",
-        "code": "// 1. the N+1 version: one query for the merchants, then one per merchant\nval merchants = conn.prepareStatement(\"SELECT merchant_id, name FROM merchants ORDER BY merchant_id\")\n    .executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getLong(1) to rs.getString(2)) } }\nval latest = conn.prepareStatement(\n    \"SELECT payment_id, amount_minor FROM payments \" +\n        \"WHERE merchant_id = ? AND status = 'succeeded' \" +\n        \"ORDER BY created_at DESC, payment_id DESC LIMIT 1\")\nval rows = merchants.map { (id, name) ->\n    latest.setLong(1, id)                                     // one round trip per merchant\n    latest.executeQuery().use { rs -> Triple(id, name, if (rs.next()) rs.getLong(1) else null) }\n}",
-        "lang": "kotlin"
-      },
-      {
-        "say": "The loop body is the LATERAL subquery. The `?` becomes `m.merchant_id`, the loop becomes the outer table, and LEFT JOIN with `ON true` keeps the merchants whose query found nothing, as the Kotlin code kept them with a null.",
-        "code": "-- 2. the loop body, moved into the statement\nSELECT m.merchant_id, m.name, last.payment_id, last.amount_minor, last.created_at\nFROM merchants m\nLEFT JOIN LATERAL (\n    SELECT p.payment_id, p.amount_minor, p.created_at\n    FROM payments p\n    WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n    ORDER BY p.created_at DESC, p.payment_id DESC\n    LIMIT 1\n) AS last ON true",
-        "lang": "sql"
-      },
-      {
-        "say": "The dashboard also wants each merchant's number of succeeded payments in June. A second LATERAL can compute it. An aggregate without GROUP BY always returns exactly one row, even over no rows (count is then 0), so CROSS JOIN is safe here and drops no merchant.",
-        "code": "-- 3. a second per-merchant subquery: one aggregate row each\nCROSS JOIN LATERAL (\n    SELECT count(*) AS payments_30d\n    FROM payments p\n    WHERE p.merchant_id = m.merchant_id AND p.status = 'succeeded'\n      AND p.created_at >= timestamptz '2026-07-01' - interval '30 days'\n      AND p.created_at <  timestamptz '2026-07-01'\n) AS recent\nORDER BY m.merchant_id;   -- and add recent.payments_30d to the SELECT list",
-        "lang": "sql"
-      },
-      {
-        "say": "One statement, one round trip, all eight merchants. On the large data set the same statement is 2,500 index lookups inside the database instead of 2,501 network round trips, given an index on `(merchant_id, created_at, payment_id)` for the inner ORDER BY.",
-        "code": "--  merchant_id |        name         | payment_id | amount_minor |       created_at       | payments_30d\n-- -------------+---------------------+------------+--------------+------------------------+--------------\n--            1 | Northwind Grocers   |         34 |         5875 | 2026-06-04 18:05:00+00 |            1\n--            2 | Blue Fern Cafe      |         30 |         1640 | 2026-05-09 08:20:00+00 |            0\n--            3 | Metro Transit       |         32 |          550 | 2026-05-21 07:45:00+00 |            0\n--            4 | Volt Electronics    |         31 |        75000 | 2026-05-16 15:55:00+00 |            0\n--            5 | Harbor Hotel        |         35 |        41000 | 2026-06-12 21:30:00+00 |            1\n--            6 | Paper Lantern Books |            |              |                        |            0\n--            7 | Quick Bite          |         33 |         1720 | 2026-05-28 12:40:00+00 |            0\n--            8 | Sunrise Grocers     |            |              |                        |            0\n-- (8 rows)",
-        "lang": "sql"
-      }
-    ]
-  },
-  "lab": {
-    "title": "Three per merchant, the latest per customer, and the next page",
-    "minutes": 15,
-    "needs": [
-      "Docker"
-    ],
-    "files": [
-      "labs/sql/src/main/resources/sfz/sql/l09/top_payments_per_merchant.sql",
-      "labs/sql/src/main/resources/sfz/sql/l09/latest_login.sql",
-      "labs/sql/src/main/resources/sfz/sql/l09/payments_after_cursor.sql"
-    ],
-    "run": "./gradlew :sql:test --tests 'sfz.sql.l09.*'",
-    "steps": [
-      "With Docker running, run the tests from the `labs` folder. All six fail.",
-      "`top_payments_per_merchant.sql` takes the top 3 payments overall and joins them to merchants. Make it return each merchant's top 3, and keep the merchants that have none.",
-      "`latest_login.sql` takes max() of every column separately, so Elena's latest login gets the attacker's IP. Return each customer's whole latest row.",
-      "`payments_after_cursor.sql` ignores its cursor and returns page 1. Return the 5 payments after the cursor, without OFFSET, and without losing rows that tie with the cursor's created_at.",
-      "Run the tests until all six pass. The second test of each exercise adds rows first: a tie for first place and a merchant's first sale, two logins in the same instant, a new payment on page 1 and a payment that shares the cursor's timestamp."
-    ],
-    "hints": [
-      "`FROM merchants m LEFT JOIN LATERAL (SELECT ..., row_number() OVER (ORDER BY p.amount_minor DESC, p.payment_id) AS place FROM payments p WHERE p.merchant_id = m.merchant_id AND ... LIMIT 3) AS t ON true`. The window inside the subquery sees only that merchant's rows.",
-      "`SELECT DISTINCT ON (customer_id) customer_id, event_id, occurred_at, success, ip FROM login_events ORDER BY customer_id, occurred_at DESC, event_id DESC`.",
-      "`CROSS JOIN page_cursor c WHERE (p.created_at, p.payment_id) < (c.created_at, c.payment_id)`, then the same ORDER BY and `LIMIT 5`."
-    ],
-    "done_when": "All six tests in `LateralAndPagingTest` pass."
-  },
-  "drill": {
-    "title": "A keyset page for one card, from memory",
+  "answer": 1,
+  "why": "A SELECT never waits for an uncommitted INSERT: it reads committed data and finds nothing in both sessions. The unique index is what notices: the second INSERT finds the first one's uncommitted entry, waits for that transaction, and fails with 23505 once it commits. Without the unique constraint, the third option is what you would get: the same payment stored twice."
+ },
+ "sections": [
+  {
+   "h": "A jsonb column stores a parsed document, so SQL can look inside it",
+   "body": "Every payment carries what the risk engine said about it, and the shape of that keeps changing. A web payment gets a score and a list of rules that fired. Next month the fraud team adds a device fingerprint for mobile, then a 3-D Secure result. A column per field would mean a migration for every new rule, so `payments.metadata` holds the engine's JSON as it arrived:\n\n```json\n{\"channel\": \"web\", \"risk\": {\"score\": 91, \"rules\": [\"velocity\"]}}\n```\n\nThe simplest version stores it as `text`, and then PostgreSQL knows nothing about it. A truncated document is stored without complaint, and every question becomes string matching: `metadata LIKE '%velocity%'` also matches a rule called `velocity_hourly`, or a note that mentions the word.\n\nThe `jsonb` type parses the text once, when you write it, and rejects anything that is not valid JSON. It stores the result as a binary tree of keys and values, so a query can walk straight to `risk`, then to `score`, without parsing the document again. The older `json` type keeps the original text, with its whitespace, key order and duplicate keys. `jsonb` normalizes it: keys come back in its own order, and of two equal keys only the last one survives. Use `jsonb` unless you must return the exact bytes you were sent.\n\nTwo operators walk into a document. `->` takes a key, or an array position, and returns jsonb: still a document. `->>` does the same and returns text. So `metadata -> 'risk' -> 'score'` is the jsonb number 91, and `metadata -> 'risk' ->> 'score'` is the string `'91'`. In Kotlin terms, `->` is Jackson's `node.get(\"score\")`, still a `JsonNode`, and `->>` is `node.get(\"score\").asText()`.\n\nThe difference bites in comparisons. `metadata -> 'risk' ->> 'score' > '50'` compares strings, character by character, and `'8' > '50'` because `'8'` sorts after `'5'`. On the 37 seeded payments it finds 14 high-risk payments, and six of them score 6 to 9. Cast before you compare: `(metadata -> 'risk' ->> 'score')::int > 50` finds the right 8.\n\nThe operator to know best is containment, `@>`. `metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` asks whether the document contains that smaller document: a `risk` object whose `rules` array has the element `\"velocity\"`, whatever else is around it. It finds payments 3, 15 and 18, and never a rule that only starts with the same letters. Its cousin `?` asks whether a key, or a string element of an array, exists: `metadata -> 'risk' -> 'rules' ? 'velocity'`.",
+   "try": {
+    "title": "Inside a document, and the text trap",
     "minutes": 4,
-    "prompt": "Without looking, write the query for the next page of card 8's payments, newest first, 20 per page, after a page that ended with payment 18 (created 2026-03-12 16:42:10 UTC). Then write the index that lets PostgreSQL seek straight to the cursor.",
-    "answer": {
-      "lang": "sql",
-      "src": "SELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE card_id = 8                                                      -- the group being paged\n  AND (created_at, payment_id) < (timestamptz '2026-03-12 16:42:10+00', 18)   -- after the cursor\nORDER BY created_at DESC, payment_id DESC                              -- unique, same columns and direction\nLIMIT 20;\n-- 17 | 2026-03-12 16:40:00+00 | 18999\n--  6 | 2026-01-22 12:05:00+00 |  2150\n\n-- equality column first, then the sort key in the same order; read backward for DESC\nCREATE INDEX payments_card_created_idx ON payments (card_id, created_at, payment_id);"
+    "steps": [
+     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+     "Run the block. Compare the two arrows' types, then the two counts: why do they differ?",
+     "The last statement fails on purpose: read the error."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, metadata FROM payments WHERE payment_id IN (3, 8, 18);\n\nSELECT metadata -> 'risk' -> 'score'  AS arrow,\n       metadata -> 'risk' ->> 'score' AS double_arrow,\n       pg_typeof(metadata -> 'risk' -> 'score')  AS arrow_type,\n       pg_typeof(metadata -> 'risk' ->> 'score') AS double_arrow_type\nFROM payments WHERE payment_id = 3;\n\nSELECT count(*) FILTER (WHERE metadata -> 'risk' ->> 'score' > '50')      AS compared_as_text,\n       count(*) FILTER (WHERE (metadata -> 'risk' ->> 'score')::int > 50) AS compared_as_int\nFROM payments;\n\nSELECT payment_id, metadata -> 'risk' ->> 'score' AS score\nFROM payments\nWHERE metadata -> 'risk' ->> 'score' > '50' AND (metadata -> 'risk' ->> 'score')::int <= 50\nORDER BY payment_id;\n\nSELECT payment_id FROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'\nORDER BY payment_id;\n\nSELECT '{\"b\": 1, \"a\": 2, \"a\": 3}'::json AS as_json, '{\"b\": 1, \"a\": 2, \"a\": 3}'::jsonb AS as_jsonb;\nSELECT '{\"channel\": \"web\", \"risk\": {\"score\": 91'::jsonb;"
+    },
+    "expect": "```postgresql\n arrow | double_arrow | arrow_type | double_arrow_type\n-------+--------------+------------+-------------------\n 91    | 91           | jsonb      | text\n\n compared_as_text | compared_as_int\n------------------+-----------------\n               14 |               8\n\n payment_id | score\n------------+-------\n          2 | 8\n         12 | 7\n         14 | 6\n         21 | 9\n         25 | 6\n         34 | 7\n(6 rows)\n```\n\nThe two arrows print the same characters but return different types. Compared as text, six single-digit scores count as more than 50. The containment query returns 3, 15 and 18. `json` gives back the text exactly as written, `{\"b\": 1, \"a\": 2, \"a\": 3}`, while `jsonb` returns `{\"a\": 3, \"b\": 1}`: reordered, and only the last `a` kept. The truncated document fails with `invalid input syntax for type json` and `The input string ended unexpectedly.`"
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: JSON types",
+     "url": "https://www.postgresql.org/docs/18/datatype-json.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: JSON functions and operators",
+     "url": "https://www.postgresql.org/docs/18/functions-json.html",
+     "kind": "docs"
     }
+   ]
   },
-  "recap": [
-    "LATERAL lets a subquery in FROM use columns of the FROM items to its left. PostgreSQL runs it once per such row and joins each row to what its run returned.",
-    "CROSS JOIN LATERAL drops rows whose run returned nothing. LEFT JOIN LATERAL (...) ON true keeps them with NULLs.",
-    "Top N per group: row_number in a subquery, LATERAL with LIMIT, or DISTINCT ON for N = 1. Decide what ties mean and say it with a tiebreaker, rank or WITH TIES.",
-    "LATERAL with LIMIT is fast when an index matches its ORDER BY: a few index entries per group. Without one, the window's single sort is cheaper.",
-    "OFFSET reads and discards every skipped row and shifts when rows arrive. Keyset pagination seeks past the last row sent with a row comparison on a unique sort key, backed by an index in the same order."
-  ],
-  "quiz": [
+  {
+   "h": "A GIN index answers containment by looking up every key and value",
+   "body": "The large data set has 478 near-duplicate payments, flagged in their metadata with `\"injected_dup\": true`. Finding them with `metadata @> '{\"injected_dup\": true}'` reads all 23,818 pages of payments, which takes between half a second and a few seconds depending on how busy Docker is.\n\nA B-tree index (lesson 8 used one, and the Storage track builds them up properly) cannot help. It sorts whole values, and \"contains this key somewhere inside\" is not a range of sorted documents. What helps is the kind of index at the back of a book: every word, with the pages it appears on. A **GIN index** (generalized inverted index) is exactly that. For every key and every value that occurs in any document, it keeps a sorted list of the rows that contain it. For `@>`, PostgreSQL looks up each key and value of the query document, intersects their row lists, and reads only those rows.\n\n`CREATE INDEX payments_metadata_gin ON payments USING gin (metadata)` takes a few seconds and is under 9 MB, against 186 MB for the table. The same query becomes a Bitmap Index Scan on the GIN index and reads 17 pages: 3 of the index and the 14 table pages where the 478 rows live. It takes under a millisecond. The plan shows a `Recheck Cond` because the default GIN index stores keys and values without how they nest, so PostgreSQL checks each candidate row against the full condition.\n\nTwo limits. A GIN index on `metadata` serves only the jsonb operators `@>`, `?`, `?|`, `?&`, `@?` and `@@`. `metadata ->> 'injected_dup' = 'true'` means the same as the containment query and still reads every page, because `->>` produces text that the index does not hold. Write containment. And an index helps only when it lets PostgreSQL read less: the velocity rule fired on 5% of payments, 50,188 rows spread over 21,036 of the 23,818 pages, and counting them through the GIN index was slower than the sequential scan, since it visited almost every page anyway.\n\nIf you only ever query with `@>`, `USING gin (metadata jsonb_path_ops)` builds a smaller index, 4.5 MB here. It supports `@>`, `@?` and `@@`, and not the key-exists operators.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A GIN index lists, for every key and value, the payments that contain it; containment intersects the lists for risk, rules and velocity\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">three documents (payments.metadata)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"55\" text-anchor=\"start\">payment 3</text><text class=\"t-s t-m\" x=\"34\" y=\"73\" text-anchor=\"start\">web, score 91, rules: velocity</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"117\" text-anchor=\"start\">payment 8</text><text class=\"t-s t-m\" x=\"34\" y=\"135\" text-anchor=\"start\">web, score 67, rules: geo_mismatch</text><rect class=\"box\" x=\"20\" y=\"158\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"179\" text-anchor=\"start\">payment 18</text><text class=\"t-s t-m\" x=\"34\" y=\"197\" text-anchor=\"start\">android, score 79, rules: velocity</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"start\">GIN entries: key or value, then the rows</text><rect class=\"box-a\" x=\"310\" y=\"32\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"48.5\" text-anchor=\"start\">key   risk</text><text class=\"t-s t-code\" x=\"646\" y=\"48.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"61\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"77.5\" text-anchor=\"start\">key   rules</text><text class=\"t-s t-code\" x=\"646\" y=\"77.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"90\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"106.5\" text-anchor=\"start\">value velocity</text><text class=\"t-s t-code\" x=\"646\" y=\"106.5\" text-anchor=\"end\">3, 18</text><rect class=\"box\" x=\"310\" y=\"119\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"135.5\" text-anchor=\"start\">value geo_mismatch</text><text class=\"t-s t-code\" x=\"646\" y=\"135.5\" text-anchor=\"end\">8</text><rect class=\"box\" x=\"310\" y=\"148\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"164.5\" text-anchor=\"start\">value web</text><text class=\"t-s t-code\" x=\"646\" y=\"164.5\" text-anchor=\"end\">3, 8</text><rect class=\"box\" x=\"310\" y=\"177\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"193.5\" text-anchor=\"start\">value android</text><text class=\"t-s t-code\" x=\"646\" y=\"193.5\" text-anchor=\"end\">18</text><line class=\"ln-d\" x1=\"270\" y1=\"80\" x2=\"306\" y2=\"80\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"20\" y=\"222\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"241.5\" text-anchor=\"start\">metadata @&gt; '{\"risk\": {\"rules\": [\"velocity\"]}}'</text><rect class=\"box-ok\" x=\"440\" y=\"222\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"241.5\" text-anchor=\"middle\">intersect: rows 3, 18</text><line class=\"ln-a\" x1=\"420\" y1=\"237\" x2=\"436\" y2=\"237\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">The default GIN index keeps keys and values, not how they nest, so PostgreSQL rechecks rows 3 and 18.</text></svg>",
+    "caption": "Three seeded documents and some of their GIN entries: containment looks up risk, rules and velocity, intersects the row lists, and rechecks the rows it finds."
+   },
+   "try": {
+    "title": "478 rows out of a million",
+    "minutes": 5,
+    "steps": [
+     "This Try it uses the large data set. If an earlier lesson did not load it, load it now from the `labs` folder (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute). Then open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+     "Run the block. The `CREATE INDEX` takes a few seconds. Compare the Buffers of the three plans.",
+     "Why does the third query, which asks the same question, not use the index?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nCREATE INDEX payments_metadata_gin ON payments USING gin (metadata);\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata ->> 'injected_dup' = 'true';\n\nSELECT pg_size_pretty(pg_relation_size('payments_metadata_gin')) AS gin_index,\n       pg_size_pretty(pg_relation_size('payments')) AS payments_table;\nDROP INDEX payments_metadata_gin;\nRESET search_path;"
+    },
+    "expect": "Trimmed, from one run (the times depend on your machine and on how busy Docker is; the buffer counts do not):\n\n```postgresql\n Gather (actual time=2809.428..2860.989 rows=478.00 loops=1)\n   Buffers: shared hit=13166 read=10652\n   ->  Parallel Seq Scan on payments (actual time=2798.341..2806.396 rows=159.33 loops=3)\n         Filter: (metadata @> '{\"injected_dup\": true}'::jsonb)\n         Rows Removed by Filter: 333333\n\n Bitmap Heap Scan on payments (actual time=0.159..0.561 rows=478.00 loops=1)\n   Recheck Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n   Heap Blocks: exact=14\n   Buffers: shared hit=17\n   ->  Bitmap Index Scan on payments_metadata_gin (actual time=0.075..0.075 rows=478.00 loops=1)\n         Index Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n\n Gather (actual time=579.725..591.767 rows=478.00 loops=1)\n   Buffers: shared hit=13114 read=10704\n   ->  Parallel Seq Scan on payments (actual time=541.899..542.006 rows=159.33 loops=3)\n         Filter: ((metadata ->> 'injected_dup'::text) = 'true'::text)\n```\n\nAll 23,818 pages, then 17, then all 23,818 again for the `->>` version, though the index exists. The sizes are `8856 kB` for the index and `186 MB` for the table. The block drops the index at the end."
+   },
+   "refs": [
     {
-      "q": "The dashboard must list every merchant with its single largest payment, including merchants with no payments. Which FROM clause does that?",
-      "options": [
-        "`merchants m CROSS JOIN LATERAL (... WHERE p.merchant_id = m.merchant_id ORDER BY amount_minor DESC LIMIT 1) t`",
-        "`merchants m LEFT JOIN LATERAL (... WHERE p.merchant_id = m.merchant_id ORDER BY amount_minor DESC LIMIT 1) t ON true`",
-        "`(SELECT DISTINCT ON (merchant_id) ... FROM payments ORDER BY merchant_id, amount_minor DESC) t`",
-        "`merchants m JOIN (SELECT ... FROM payments ORDER BY amount_minor DESC LIMIT 1) t ON t.merchant_id = m.merchant_id`"
-      ],
-      "answer": 1,
-      "why": "LEFT JOIN LATERAL runs the subquery per merchant and keeps a merchant whose run returned nothing. CROSS JOIN LATERAL drops it. DISTINCT ON starts from payments, so merchants without payments never appear. The last one takes the single largest payment overall and joins one merchant to it."
+     "title": "PostgreSQL 18: jsonb indexing",
+     "url": "https://www.postgresql.org/docs/18/datatype-json.html#JSON-INDEXING",
+     "kind": "docs"
     },
     {
-      "q": "Which payment per card does `SELECT DISTINCT ON (card_id) card_id, payment_id FROM payments ORDER BY card_id, created_at` return?",
-      "options": [
-        "The card's latest payment",
-        "An arbitrary payment, because DISTINCT ON ignores ORDER BY",
-        "The card's earliest payment",
-        "None: it fails without DESC"
-      ],
-      "answer": 2,
-      "why": "DISTINCT ON keeps the first row of each card in the ORDER BY, and `created_at` ascending puts the earliest first. For the latest, write `ORDER BY card_id, created_at DESC, payment_id DESC`; the payment_id makes the winner fixed when two payments share a time."
-    },
-    {
-      "q": "A page ended with the payment (created_at 10:00:00, id 500). The next page uses `WHERE created_at < '10:00:00' ORDER BY created_at DESC, payment_id DESC LIMIT 20`. Payments 498 and 499 were also created at 10:00:00. What happens to them?",
-      "options": [
-        "They appear first on the next page",
-        "They appear on the next page in random order",
-        "The query fails because created_at is not unique",
-        "They are never shown: the condition excludes every row at 10:00:00"
-      ],
-      "answer": 3,
-      "why": "Comparing created_at alone treats the whole timestamp as seen, so rows that tie with the cursor but sort after it are skipped for good. `(created_at, payment_id) < ('10:00:00', 500)` includes them, because for equal times it compares the ids."
-    },
-    {
-      "q": "With an index on (created_at, payment_id), why does `ORDER BY created_at DESC, payment_id DESC LIMIT 20 OFFSET 100000` still read 100,020 index entries?",
-      "options": [
-        "The index keeps entries sorted but stores no positions, so PostgreSQL must count its way to entry 100,001",
-        "OFFSET disables the use of indexes",
-        "PostgreSQL locks the skipped rows first",
-        "The planner cannot read an index backward"
-      ],
-      "answer": 0,
-      "why": "An index can find a key quickly; it cannot find a position. OFFSET is a position, so the scan starts at the newest entry and counts. The plan in the Try it used the index, backward, and still read 100,020 rows. A keyset condition gives the scan a key to seek to instead."
-    },
-    {
-      "q": "Lesson 5 showed a correlated subquery as a SubPlan that runs once per outer row. How does a LATERAL subquery relate to it?",
-      "options": [
-        "It is uncorrelated and runs once, like an InitPlan",
-        "It is a correlated subquery placed in FROM: it runs per row of the items to its left and may return many rows and columns",
-        "PostgreSQL always turns it into a hash join",
-        "It can return only one row, like a scalar subquery"
-      ],
-      "answer": 1,
-      "why": "Both are correlated: they read values from an outer row. A scalar subquery must return one value; a LATERAL subquery returns a table, joined to the row it was run for. Like the SubPlan in lesson 5, it is cheap when each run uses an index and expensive when each run scans a big table.",
-      "from": "sql-05"
+     "title": "PostgreSQL 18: GIN indexes",
+     "url": "https://www.postgresql.org/docs/18/gin.html",
+     "kind": "docs"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "What does LATERAL allow?",
-      "back": "A subquery in FROM may use columns of the FROM items to its left. PostgreSQL runs it once per such row."
-    },
-    {
-      "front": "CROSS JOIN LATERAL or LEFT JOIN LATERAL ... ON true?",
-      "back": "CROSS drops outer rows whose run returned nothing. LEFT keeps them with NULLs; ON true is required syntax."
-    },
-    {
-      "front": "What must the ORDER BY of a DISTINCT ON query start with?",
-      "back": "The DISTINCT ON expressions. The columns after them decide which row of each group is kept."
-    },
-    {
-      "front": "Three ways to get the top N rows per group?",
-      "back": "row_number() in a subquery with `WHERE place <= N`; LATERAL with ORDER BY and LIMIT N; DISTINCT ON for N = 1."
-    },
-    {
-      "front": "Why is OFFSET slow on deep pages?",
-      "back": "Skipped rows are still produced and thrown away: page 5,001 of 20 reads 100,020 rows. An index stores keys, not positions."
-    },
-    {
-      "front": "What is the keyset condition for the next page, newest first?",
-      "back": "`WHERE (created_at, id) < (:last_created_at, :last_id) ORDER BY created_at DESC, id DESC LIMIT n`, with an index on (created_at, id)."
-    },
-    {
-      "front": "Why must a keyset cursor include a unique column?",
-      "back": "Without it, rows that tie with the cursor's value are skipped or repeated. The unique column makes every position exact."
-    }
-  ],
-  "terms": [
-    {
-      "term": "LATERAL",
-      "plain": "A keyword that lets a subquery in FROM refer to earlier FROM items; it runs once per row of them."
-    },
-    {
-      "term": "Top N per group",
-      "plain": "The first N rows of each group in some order, such as each merchant's three largest payments."
-    },
-    {
-      "term": "DISTINCT ON",
-      "plain": "PostgreSQL syntax that keeps the first row, by ORDER BY, of each set of rows with equal values."
-    },
-    {
-      "term": "OFFSET",
-      "plain": "Skips the first n rows of a result. The skipped rows are still produced."
-    },
-    {
-      "term": "Keyset pagination",
-      "plain": "Paging by remembering the sort key of the last row sent and asking for rows after it. Also called the seek method."
-    },
-    {
-      "term": "Cursor (in an API)",
-      "plain": "The last row's sort key, handed to the client as a token for the next page."
-    },
-    {
-      "term": "Row comparison",
-      "plain": "`(a, b) < (x, y)`: compares pairs left to right and stops at the first pair that differs."
-    },
-    {
-      "term": "Index",
-      "plain": "A separate structure that keeps chosen columns sorted with a pointer to each row. Lesson 11 builds it up."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A nightly export pages through a 50-million-row ledger_entries table with `ORDER BY entry_id LIMIT 1000 OFFSET :n`. It gets slower every hour and sometimes exports an entry twice. Explain both symptoms and what you would change.",
-    "answer": "OFFSET does not jump: to skip n rows PostgreSQL has to produce them, so batch k reads about k times 1,000 index entries and throws all but the last 1,000 away. The total work grows with the square of the number of batches, which is why each hour is slower than the last. The duplicates come from rows that change while the export runs. OFFSET counts positions, so an entry inserted with a lower entry_id after a batch was read pushes every later row one position down, and the next batch starts with the last row of the previous one; a deleted row does the opposite and one row is skipped. The fix is keyset pagination: remember the last entry_id of each batch and ask for `WHERE entry_id > :last ORDER BY entry_id LIMIT 1000`. The primary key index lets each batch seek straight to its start, so every batch costs the same, and a row can never be read twice. If the order were by created_at, the cursor would have to include entry_id as a tiebreaker in a row comparison, with an index on (created_at, entry_id)."
+   ]
   },
-  "deeper": {
-    "minutes": 8,
-    "body": "LATERAL does not always mean a loop. When the subquery has no LIMIT, no aggregate and no other reason to run per row, the planner can often pull it up into an ordinary join and choose a hash join, as it would for the same query written without LATERAL. The per-row plan appears when the subquery needs it, as LIMIT does. Read the plan: a Nested Loop with `loops` equal to the outer row count is the per-row form.\n\nGoing backward with a keyset cursor means flipping two things: the comparison and the sort. For the previous page, ask for `(created_at, payment_id) > (:first_created_at, :first_payment_id) ORDER BY created_at ASC, payment_id ASC LIMIT 20`, then reverse the 20 rows in the application. The same index serves both directions.\n\nA total count, \"page 3 of 51,231\", is its own problem. `count(*)` over a million rows reads them all on every request, whatever pagination you use. Most interfaces do better with \"more results\" than with an exact total; when an estimate is enough, the planner's row estimate from EXPLAIN, or `reltuples` in pg_class for a whole table, costs nothing.\n\nOFFSET has one more trap. With a locking clause, `SELECT ... FOR UPDATE ... OFFSET 100`, the rows that OFFSET skips are locked too, though they are not returned. Lesson 13 builds job queues with `FOR UPDATE SKIP LOCKED` and LIMIT, never OFFSET.\n\nFinally, every list query in this lesson, with or without a cursor, is only fast if an index matches its WHERE and ORDER BY in the right column order: equality columns first (card_id), then the sort key (created_at, payment_id). Lesson 11 explains why that order matters, and how to read the plans that show it."
-  },
-  "sources": [
-    {
-      "title": "PostgreSQL 18 documentation: Table expressions, LATERAL subqueries",
-      "url": "https://www.postgresql.org/docs/18/queries-table-expressions.html"
+  {
+   "h": "Check, then insert, lets one message in twice",
+   "body": "The card network delivers each payment message at least once. A Kafka consumer that crashes before it commits its offset gets the same message again after the rebalance, sometimes while the first consumer is still working on it. `payment_uid` is the network's idempotency key, so the ingest must store each uid once. The obvious code checks first:\n\n```kotlin\nif (payments.findByUid(msg.uid) == null) {     // both consumers: not found\n    payments.insert(msg)                       // both consumers: insert\n}\n```\n\nTwo consumers can both run the check before either inserts. Both find nothing, and both insert. Without a unique constraint on payment_uid, that stores one payment twice, and settlement pays the merchant twice. The course schema has the constraint (`payment_uid uuid NOT NULL UNIQUE`), and it saves you. The second `INSERT` finds the first consumer's uncommitted entry in the unique index and waits for that transaction to end. If it commits, the second fails with `duplicate key value violates unique constraint`, SQLSTATE 23505. If it rolls back, the second goes through. Either way, one row.\n\nCatching that error is clumsy. An error aborts the transaction it happens in, so a consumer that stores a batch of 500 messages in one transaction loses all 500 to one duplicate, unless it wraps each insert in a savepoint.\n\n`INSERT ... ON CONFLICT (payment_uid) DO NOTHING` moves the decision into the statement. The insert consults the unique index itself, in the same step as the write. When the key is already there, or is being inserted by a transaction still in progress (it waits for that one first), it skips the row instead of failing. Add `RETURNING payment_id` and you learn which happened: one row back means inserted, none means a repeat. For the DO UPDATE form, the PostgreSQL docs guarantee an insert or an update \"even under high concurrency\", and the stepper shows DO NOTHING holding up the same way.\n\nThat is the picture for this lesson: **the unique index is the referee**. A check in a separate statement answers a question that can be out of date before you act on it. Only a write that consults the index as it happens is safe against a twin arriving in the same millisecond. In Kotlin terms, check-then-insert is `if (!map.containsKey(k)) map[k] = v`, and `ON CONFLICT DO NOTHING` is `ConcurrentHashMap.putIfAbsent(k, v)`.",
+   "stepper": {
+    "title": "The same message on two consumers",
+    "intro": "Click Next. The middle column is the unique index on payment_uid; each side is one consumer's transaction.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The same payment message reaches two consumers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">the message arrives twice</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">message ...a001</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">message ...a001 again</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">After a rebalance, B was handed the message A is still working on.</text></svg>",
+      "say": "The network sent one payment message, uid `...a001`. A Kafka rebalance handed it to consumer B while consumer A was still processing it. Both are about to store it. The unique index on payment_uid has no entry for that uid yet."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"Both consumers check first and find nothing\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">Both checks run before either insert: both find nothing.</text></svg>",
+      "say": "Check, then insert. Each consumer runs `SELECT count(*) ... WHERE payment_uid = ...` in its own transaction. Neither has inserted yet, so both see 0 and both decide to insert. Whatever happens next, the check has already given its answer."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A inserts; B's insert waits on the unique index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-a\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"482\" y=\"134\" text-anchor=\"start\">INSERT: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">B's INSERT finds A's uncommitted entry for the same key and waits.</text></svg>",
+      "say": "A inserts. The new entry is in the unique index already, marked as belonging to A's open transaction. B's INSERT reaches the index, finds an entry for the same key from a transaction that has not finished, and waits: PostgreSQL cannot know yet whether A will commit."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits, B fails with a duplicate key error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s t-ok\" x=\"32\" y=\"160\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-bad\" x=\"478\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"134.5\" text-anchor=\"middle\">INSERT: ERROR 23505</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-bad\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits and B fails: duplicate key. Without the unique index</text><text class=\"t-s t-bad\" x=\"20\" y=\"274\" text-anchor=\"start\">B would have committed too: one payment stored twice.</text></svg>",
+      "say": "A commits, and B's INSERT fails with `duplicate key value violates unique constraint`, SQLSTATE 23505. The unique index kept the data right, and B's transaction is now aborted, along with anything else it held. Without the index, both inserts would have committed: the merchant gets paid twice."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"With ON CONFLICT, both consumers insert directly; B waits on the index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-a\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><text class=\"t-s t-m\" x=\"482\" y=\"108\" text-anchor=\"start\">DO NOTHING: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">No separate check. Each INSERT asks the unique index itself.</text></svg>",
+      "say": "Now each consumer sends one statement: `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id`. A's goes in and returns payment 40. B's reaches the same uncommitted entry and waits for A, exactly as before. The difference is what happens after the wait."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits and B's insert does nothing, without an error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-ok\" x=\"32\" y=\"134\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 0 rows</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits. B's INSERT sees the committed key and skips the row:</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">INSERT 0 0, no error, and RETURNING says it was a repeat.</text></svg>",
+      "say": "A commits. B's INSERT sees that the key now exists and skips the row: `INSERT 0 0`, no error, no aborted transaction. RETURNING gave B zero rows, which is how its code knows the message was a repeat. One payment."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"If A rolls back instead, B's insert succeeds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-bad\" x=\"32\" y=\"134\" text-anchor=\"start\">ROLLBACK</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: B's</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">Had A rolled back, B's INSERT would have gone ahead.</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">Either way, exactly one payment: the unique index is the referee.</text></svg>",
+      "say": "Had A crashed or rolled back instead, its entry would vanish and B's INSERT would insert the payment itself. Every interleaving ends with exactly one row, because the decision is taken by the unique index at the moment of the write, not by a check that ran earlier."
+     }
+    ]
+   },
+   "try": {
+    "title": "Race two inserts",
+    "minutes": 5,
+    "steps": [
+     "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database first if it is not running (`docker compose -f env/postgres.yml up -d --wait`).",
+     "Run part 1, switching terminals at each comment. B's INSERT hangs until A commits: what does it print then?",
+     "Run part 2 the same way. What does B's INSERT return after A's COMMIT?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, two sessions on database course",
+     "src": "-- part 1: check, then insert\n-- A\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- B\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- A\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- A\nCOMMIT;\n-- B\n\\echo :SQLSTATE\nROLLBACK;\n-- A: remove it again\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n\n-- part 2: let the unique index decide\n-- A\nBEGIN;\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- A\nCOMMIT;\nSELECT payment_id, status FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';"
     },
+    "expect": "In part 1 both counts are 0, and B's INSERT prints nothing until A commits. Then:\n\n```postgresql\n-- B\nERROR:  duplicate key value violates unique constraint \"payments_payment_uid_key\"\nDETAIL:  Key (payment_uid)=(019f1d1f-0500-7000-8000-0000000a0001) already exists.\n23505\n```\n\nIn part 2, A's INSERT returns one row, and B's waits again. When A commits, B's finishes without an error:\n\n```postgresql\n-- B\n payment_id\n------------\n(0 rows)\n\nINSERT 0 0\n```\n\nThe final SELECT shows a single pending payment. Its payment_id was 40 on a fresh database: part 1 used up 38 and 39, although only one of those inserts survived, and B's skipped insert in part 2 took 41. Each part deletes the payment again, so the seed stays as it was."
+   },
+   "refs": [
     {
-      "title": "PostgreSQL 18 documentation: LIMIT and OFFSET",
-      "url": "https://www.postgresql.org/docs/18/queries-limit.html"
-    },
-    {
-      "title": "PostgreSQL 18 documentation: Row and array comparisons",
-      "url": "https://www.postgresql.org/docs/18/functions-comparisons.html"
-    },
-    {
-      "title": "Use The Index, Luke: Paging through results (the seek method)",
-      "url": "https://use-the-index-luke.com/sql/partial-results/fetch-next-page"
-    },
-    {
-      "title": "Oracle AI Database SQL Language Reference: SELECT (LATERAL, CROSS APPLY, OUTER APPLY)",
-      "url": "https://docs.oracle.com/en/database/oracle/oracle-database/26/sqlrf/SELECT.html"
+     "title": "PostgreSQL 18: INSERT, the ON CONFLICT clause",
+     "url": "https://www.postgresql.org/docs/18/sql-insert.html",
+     "kind": "docs"
     }
+   ]
+  },
+  {
+   "h": "ON CONFLICT DO UPDATE turns the second message into an update",
+   "body": "Not every repeat is a duplicate. Payment 20 is `pending`: the network authorized it and will send the capture later, a second message with the same uid and the status `succeeded`. This time the conflict should update the row:\n\n```sql\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n```\n\n`EXCLUDED` is the row the INSERT proposed and could not insert. The `WHERE` decides whether the existing row changes at all. Without it, a late `pending`, an authorization message that arrives after its capture, would set a succeeded payment back to pending. With it, only a pending payment moves, and only to a final status. Any other repeat leaves the row alone and returns nothing.\n\n`RETURNING old.status, new.status` is new in PostgreSQL 18: `old` is the row before the statement and `new` the row after. For an insert, `old` is all NULL; for an update, both are filled. One statement now tells the consumer what it did: inserted, updated, or nothing.\n\nThree rules decide whether the statement works at all:\n\n- The conflict target names a unique index or constraint. `ON CONFLICT (payment_uid)` works because payment_uid is UNIQUE; a clash on any other unique index, the primary key for example, still raises an error.\n- One statement may not change the same row twice. A batch that carries one uid twice fails with `ON CONFLICT DO UPDATE command cannot affect row a second time`, so deduplicate the batch first.\n- Every attempted insert takes a value from the payment_id sequence, including the ones that end in a conflict. Ids get gaps, so never use them as a count.\n\n`DO UPDATE` writes a new version of the row, as every UPDATE does (lesson 1), even when the new values equal the old ones. The `WHERE` saves those writes too.",
+   "try": {
+    "title": "Capture, repeat, late message, new payment",
+    "minutes": 4,
+    "steps": [
+     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Type `\\pset null '∅'` if you have not.",
+     "Run the block one statement at a time and predict each result before you run it.",
+     "Statement 5 fails on purpose. The ROLLBACK at the end undoes everything."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "\\pset null '∅'\nBEGIN;\n-- 1. the capture for payment 20, which is pending\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 2. the same capture again\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 3. a late 'pending' for the same payment, without the WHERE guard\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'pending', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 4. a payment nobody has seen\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 5. one batch that carries payment 20 twice\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00'),\n       ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'failed',    '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status;\nROLLBACK;"
+    },
+    "expect": "```postgresql\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | pending    | succeeded\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n(0 rows)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | succeeded  | pending\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         45 | ∅          | pending\n(1 row)\n\nERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time\nHINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.\n```\n\nStatement 2 changed nothing, so it returned nothing. Statement 3, without the guard, moved a succeeded payment back to pending: that is the bug the WHERE prevents. The new payment got id 45 on a fresh database after the previous Try it: statements 1 to 3 each used up a sequence value though none inserted a row. The ROLLBACK undoes all of it."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18 release notes: OLD and NEW in RETURNING",
+     "url": "https://www.postgresql.org/docs/18/release-18.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "MERGE brings a table in line with its source in one statement",
+   "body": "Every night a job recomputes each merchant's monthly gross from the succeeded payments into `merchant_month_totals (merchant_id, month, gross_minor, payment_count)`. Since the last run, three things can have happened to a month. A merchant's first payment came in: a row to insert. A late payment arrived: a row to correct. A payment was reversed and the merchant has no sales left that month: a row to delete. `ON CONFLICT` can insert and update, but it cannot delete. `MERGE` does all three in one statement:\n\n```sql\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded' AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action(), t.merchant_id, old.gross_minor, new.gross_minor;\n```\n\nMERGE joins the target to the source on the `ON` condition and puts every row into one of three classes. MATCHED rows are on both sides. NOT MATCHED rows are only in the source. NOT MATCHED BY SOURCE rows are only in the target; that clause came in PostgreSQL 17. For each row, the first WHEN clause whose class and extra condition fit decides what happens. A matched row whose numbers already agree fits no clause and is left alone.\n\nMind the condition on the DELETE. The source holds February only, so every January row is \"not matched by source\" too. Leave out `AND t.month = ...` and the MERGE deletes all of January, as the Try it shows. `RETURNING` on MERGE, with `merge_action()` to say which branch produced each row, came in PostgreSQL 17, and PostgreSQL 18 added `old` and `new`. If two source rows match the same target row, MERGE fails with `MERGE command cannot affect row a second time`.\n\nMERGE has one weakness. It sorts rows into MATCHED and NOT MATCHED from its snapshot, and it has no arbiter index that makes a concurrent insert of the same key wait. When two sessions merge the same new (merchant, month) at once, the second fails with 23505, and the PostgreSQL docs point to `INSERT ... ON CONFLICT` for concurrent upserts. Use MERGE for a batch sync that one job runs at a time, and ON CONFLICT for messages that can arrive twice at once.",
+   "try": {
+    "title": "Sync February's totals",
+    "minutes": 5,
+    "steps": [
+     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+     "Run the block. It creates a totals table inside a transaction, fills it with last night's numbers for January and February, and merges February's payments into it.",
+     "Before the second MERGE, predict which rows it will delete."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "\\pset null '∅'\nBEGIN;\nCREATE TABLE merchant_month_totals (\n    merchant_id    bigint NOT NULL REFERENCES merchants,\n    month          date   NOT NULL,\n    gross_minor    bigint NOT NULL,\n    payment_count  int    NOT NULL,\n    PRIMARY KEY (merchant_id, month)\n);\nINSERT INTO merchant_month_totals VALUES\n    (1, '2026-01-01',   4250, 1), (4, '2026-01-01', 129900, 1),\n    (1, '2026-02-01',   6120, 1),     -- payment 11 arrived after last night's run\n    (2, '2026-02-01',   3400, 1),     -- payment 10 was later reported failed\n    (4, '2026-02-01',  54999, 1),\n    (7, '2026-02-01',   1450, 1);     -- merchant 3 has no February row yet\n\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT (merchant_id, month, gross_minor, payment_count)\n    VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month,\n          old.gross_minor AS old_gross, new.gross_minor AS new_gross;\n\nSELECT * FROM merchant_month_totals ORDER BY month, merchant_id;\n\n-- the same MERGE without \"AND t.month = ...\" on the DELETE branch\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN NOT MATCHED BY SOURCE THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month;\nROLLBACK;"
+    },
+    "expect": "```postgresql\n action | merchant_id |   month    | old_gross | new_gross\n--------+-------------+------------+-----------+-----------\n UPDATE |           1 | 2026-02-01 |      6120 |      8620\n DELETE |           2 | 2026-02-01 |      3400 |         ∅\n INSERT |           3 | 2026-02-01 |         ∅ |       275\n(3 rows)\n\nMERGE 3\n```\n\nMerchants 4 and 7 were already right and are not in the output: the `IS DISTINCT FROM` test left them alone. The SELECT shows the two January rows untouched and four February rows. The second MERGE, without the month test, returns `DELETE | 1 | 2026-01-01` and `DELETE | 4 | 2026-01-01`: it deleted January because January is not in February's source. The ROLLBACK removes the table again."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: MERGE",
+     "url": "https://www.postgresql.org/docs/18/sql-merge.html",
+     "kind": "docs"
+    }
+   ]
+  }
+ ],
+ "analogy": "The unique index is the doorman with the guest list. Check-then-insert is two friends each phoning the venue to ask whether a name is on the list, both hearing no, and both turning up to write it in. ON CONFLICT is walking up to the doorman, who checks and writes in one movement; if someone ahead of you is writing the same name, you wait, and then he tells you the name is already in. MERGE is the manager going through the whole list against the booking system at the end of the night: add the missing names, correct the misspelled ones, cross out the cancellations. jsonb is the guest's form filled in on the venue's own template, so anyone can find the dietary field without reading the whole letter. The analogy breaks on timing: a real doorman serves one person at a time, while PostgreSQL lets thousands of inserts with different keys go through the same index at once and only makes the ones with the same key wait.",
+ "in_your_world": "Every Kafka consumer that writes to a database is at-least-once, so its write must be idempotent: an upsert keyed on the message's idempotency key, inside the same transaction as the business change, and the offset committed after the database commit. A Temporal activity that stores a payment needs the same thing, because Temporal retries an activity after a timeout even when the first attempt reached the database. On Oracle there is no ON CONFLICT, so the upsert is a MERGE, and two sessions merging the same new key can still collide with ORA-00001; catch it and retry, or insert first and treat the duplicate key error as \"already done\". Beware of JPA's EntityManager.merge(): it loads the entity and then inserts or updates, which is check-then-insert with the same race. For the risk engine's payloads, a jsonb column with a GIN index lets the fraud team query new fields the day they appear, and it is no excuse to keep the amount, the status or the merchant inside JSON: those stay real columns with real constraints.",
+ "mistake": "Making an ingest idempotent with a lookup before the insert: findByUid, then insert if absent, or a NOT EXISTS subquery in the INSERT. It works in every test, because tests deliver one message at a time, and it fails in production when a rebalance or a retry delivers the same message to two workers at once: both checks pass, and either the unique constraint throws a duplicate key error that aborts the whole batch, or, without the constraint, the payment is stored twice. The fix is to let the write itself consult the unique index: INSERT ... ON CONFLICT (payment_uid) DO NOTHING, or DO UPDATE with a WHERE that only moves a row forward, and RETURNING to learn what happened.",
+ "compare": {
+  "title": "An idempotent upsert of one payment message: Oracle and PostgreSQL",
+  "a": {
+   "label": "Oracle",
+   "lang": "sql",
+   "title": "Oracle: MERGE is the upsert",
+   "src": "MERGE INTO payments p\nUSING (SELECT :uid AS payment_uid, :card AS card_id,\n              :merchant AS merchant_id, :amount AS amount_minor,\n              :status AS status, :created AS created_at\n       FROM dual) m\nON (p.payment_uid = m.payment_uid)\nWHEN MATCHED THEN\n    UPDATE SET p.status = m.status\n    WHERE p.status = 'pending' AND m.status <> 'pending'\nWHEN NOT MATCHED THEN\n    INSERT (payment_uid, card_id, merchant_id,\n            amount_minor, status, created_at)\n    VALUES (m.payment_uid, m.card_id, m.merchant_id,\n            m.amount_minor, m.status, m.created_at);\n-- two sessions inserting the same new uid at once:\n-- the second can fail with ORA-00001; catch and retry"
+  },
+  "b": {
+   "label": "PostgreSQL 18",
+   "lang": "sql",
+   "title": "PostgreSQL: INSERT ... ON CONFLICT",
+   "src": "INSERT INTO payments AS p\n       (payment_uid, card_id, merchant_id,\n        amount_minor, status, created_at)\nVALUES (:uid, :card, :merchant,\n        :amount, :status, :created)\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending'\n  AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id,\n          old.status, new.status;\n-- a concurrent insert of the same uid makes this\n-- one wait, then take the DO UPDATE branch:\n-- no error to catch"
+  },
+  "note": "Oracle has no ON CONFLICT clause, so Oracle code spells the upsert as a MERGE against a one-row source, often from DUAL. PostgreSQL has MERGE too, since version 15, and the same race: MERGE decides MATCHED or NOT MATCHED before it writes, so two concurrent MERGEs of the same new key can both choose INSERT, and the unique index rejects the second. INSERT ... ON CONFLICT is different because the unique index arbitrates inside the write: the second session waits for the first and then takes the DO UPDATE or DO NOTHING branch. The WHERE clause on the update branch exists in both, and does the same job: a late message never moves a payment backward. PostgreSQL 18 adds RETURNING old and new on both statements, which Oracle 23ai also added for UPDATE and MERGE."
+ },
+ "worked": {
+  "title": "An idempotent Kafka batch: one statement, one round trip",
+  "steps": [
+   {
+    "say": "The consumer polls 500 messages. They may repeat each other (the producer retried), repeat payments already stored (a rebalance redelivered them), or bring the capture of a pending payment. First collapse repeats inside the batch, keeping a final status over `pending`, because one statement may not touch the same row twice:",
+    "code": "// 1. one message per uid; a final status beats 'pending'\nval batch = records.map { it.value() }                        // List<PaymentMessage>\n    .sortedByDescending { it.status != \"pending\" }             // final statuses first\n    .distinctBy { it.uid }                                     // keeps the first of each uid",
+    "lang": "kotlin"
+   },
+   {
+    "say": "Send the whole batch as arrays and unnest them into rows on the server: one statement and one network round trip for 500 messages, instead of 500. The ON CONFLICT clause is the one from this lesson.",
+    "code": "-- 2. the statement: unnest turns six arrays into rows\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nSELECT * FROM unnest(?::uuid[], ?::bigint[], ?::bigint[], ?::bigint[], ?::text[], ?::timestamptz[])\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status, new.status",
+    "lang": "sql"
+   },
+   {
+    "say": "Bind each column as a JDBC array. The rows that come back are exactly the changes: an insert has a NULL old status, a capture has `pending`, and repeats return nothing.",
+    "code": "// 3. bind the arrays and read what changed\nval changes = conn.prepareStatement(UPSERT_BATCH).use { ps ->\n    ps.setArray(1, conn.createArrayOf(\"uuid\", batch.map { it.uid }.toTypedArray()))\n    ps.setArray(2, conn.createArrayOf(\"bigint\", batch.map { it.cardId }.toTypedArray()))\n    ps.setArray(3, conn.createArrayOf(\"bigint\", batch.map { it.merchantId }.toTypedArray()))\n    ps.setArray(4, conn.createArrayOf(\"bigint\", batch.map { it.amountMinor }.toTypedArray()))\n    ps.setArray(5, conn.createArrayOf(\"text\", batch.map { it.status }.toTypedArray()))\n    ps.setArray(6, conn.createArrayOf(\"timestamptz\", batch.map { Timestamp.from(it.createdAt) }.toTypedArray()))\n    ps.executeQuery().use { rs ->\n        buildList { while (rs.next()) add(Change(rs.getLong(1), rs.getString(2), rs.getString(3))) }\n    }\n}",
+    "lang": "kotlin"
+   },
+   {
+    "say": "Commit the database first and the Kafka offset second. If the consumer dies between the two, Kafka redelivers the batch, and the upsert turns every message in it into a no-op. At-least-once delivery plus an idempotent write is how you get each payment stored exactly once.",
+    "code": "// 4. order of the two commits\nconn.commit()                      // the payments are durable\nconsumer.commitSync()              // only now tell Kafka the batch is done\n// a crash between the two lines: the batch comes back, and every row in it\n// hits ON CONFLICT and changes nothing",
+    "lang": "kotlin"
+   }
   ]
+ },
+ "lab": {
+  "title": "The fraud queue, an idempotent ingest and the monthly MERGE",
+  "minutes": 15,
+  "needs": [
+   "Docker"
+  ],
+  "files": [
+   "labs/sql/src/main/resources/sfz/sql/l09/risky_payments.sql",
+   "labs/sql/src/main/resources/sfz/sql/l09/ingest_payment.sql",
+   "labs/sql/src/main/resources/sfz/sql/l09/settle_month.sql"
+  ],
+  "run": "./gradlew :sql:test --tests 'sfz.sql.l09.*'",
+  "steps": [
+   "With Docker running, run the tests from the `labs` folder. Seven of the eight fail. The one that passes inserts a new message twice, one delivery after the other, which the placeholder handles; its trouble starts when two deliveries overlap.",
+   "`risky_payments.sql` compares the score as text and searches the document as a string. Return the payments with a score of 50 or more, or with the velocity rule, comparing numbers and using containment.",
+   "`ingest_payment.sql` reads messages from a temporary table `inbound` and checks before it inserts. Make it one INSERT ... ON CONFLICT statement that inserts new payments, moves a pending payment to its final status, ignores everything else, and returns one row per change. One test runs it in two sessions at the same moment.",
+   "`settle_month.sql` is a MERGE that rewrites every March row, even correct ones, and deletes every month that March's source lacks. Make it change only the March rows that are wrong, missing or gone.",
+   "Run the tests until all eight pass. The second test of each exercise adds rows first: a high score of 100 and a rule named velocity_hourly, a batch mixing new, repeated, late and final messages, and new March payments next to a February one."
+  ],
+  "hints": [
+   "`WHERE (metadata -> 'risk' ->> 'score')::int >= 50 OR metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'`. A document without a score gives NULL for the cast, which is neither >= 50 nor an error.",
+   "`INSERT INTO payments AS p (...) SELECT ... FROM inbound ON CONFLICT (payment_uid) DO UPDATE SET status = EXCLUDED.status WHERE p.status = 'pending' AND EXCLUDED.status <> 'pending' RETURNING p.payment_id, old.status AS old_status, new.status AS new_status`.",
+   "Add `AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count)` to WHEN MATCHED, and `AND t.month = date '2026-03-01'` to WHEN NOT MATCHED BY SOURCE."
+  ],
+  "done_when": "All eight tests in `JsonbUpsertMergeTest` pass."
+ },
+ "drill": {
+  "title": "The ingest statement, from memory",
+  "minutes": 4,
+  "prompt": "Without looking, write the statement that stores one payment message (uid, card, merchant, amount, status, created_at) so that a repeat changes nothing, a capture moves a pending payment to its final status, a late 'pending' never moves a payment backward, and the statement reports whether it inserted, updated or did nothing. Then write the query for the payments whose risk rules include \"geo_mismatch\", in a form a GIN index on metadata can serve.",
+  "answer": {
+   "lang": "sql",
+   "src": "INSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (payment_uid) DO UPDATE          -- the unique index decides, even mid-race\nSET status = EXCLUDED.status                 -- EXCLUDED: the row the INSERT proposed\nWHERE p.status = 'pending'                   -- only pending payments move,\n  AND EXCLUDED.status <> 'pending'           -- and only forward\nRETURNING p.payment_id,\n          old.status AS old_status,          -- NULL: inserted\n          new.status AS new_status;          -- no row at all: a repeat\n\nSELECT payment_id\nFROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"geo_mismatch\"]}}';   -- containment: GIN can answer it\n-- payments 8 and 31 on the seed"
+  }
+ },
+ "recap": [
+  "jsonb parses JSON once on write, rejects invalid documents and lets SQL walk inside: -> returns jsonb, ->> returns text. Compare ->> results as text only when you mean text; cast numbers first.",
+  "@> asks whether a document contains a smaller one. A GIN index lists every key and value with the rows that hold it, so containment reads only matching rows; ->> conditions cannot use it.",
+  "Check-then-insert is a race: two sessions both find nothing. The unique index is the referee, and INSERT ... ON CONFLICT asks it in the same step as the write.",
+  "ON CONFLICT DO UPDATE SET ... = EXCLUDED.col WHERE ... updates only when the row should move; PostgreSQL 18's RETURNING old and new says what happened. One statement cannot touch the same row twice.",
+  "MERGE inserts, updates and deletes against a source in one statement (NOT MATCHED BY SOURCE since 17, RETURNING since 17, old and new since 18). Guard its DELETE, and use ON CONFLICT when two sessions may write the same new key at once."
+ ],
+ "quiz": [
+  {
+   "q": "Which scores does `WHERE metadata -> 'risk' ->> 'score' >= '70'` let through?",
+   "options": [
+    "Only scores of 70 and above",
+    "70 to 99, and also 8 and 9, but not 100",
+    "Every score, because text sorts after numbers",
+    "None: comparing text with a number raises an error"
+   ],
+   "answer": 1,
+   "why": "->> returns text, and '70' is a text literal, so PostgreSQL compares strings character by character: '8' and '9' sort after '7', and '100' sorts before it because '1' < '7'. Cast first, `(metadata -> 'risk' ->> 'score')::int >= 70`, or compare jsonb with jsonb, `metadata -> 'risk' -> 'score' >= '70'`, which compares numbers."
+  },
+  {
+   "q": "payments has `CREATE INDEX ... USING gin (metadata)`. Which condition can the index serve?",
+   "options": [
+    "`metadata ->> 'channel' = 'pos'`",
+    "`(metadata -> 'risk' ->> 'score')::int > 90`",
+    "`metadata::text LIKE '%pos%'`",
+    "`metadata @> '{\"channel\": \"pos\"}'`"
+   ],
+   "answer": 3,
+   "why": "A GIN index on a jsonb column serves the jsonb operators such as @>, ? and @?. The other three apply a function or a cast to the column first, so they produce values the index does not contain, and the plan is a sequential scan. The first one asks the same question as the containment query; only the containment form can use the index."
+  },
+  {
+   "q": "Session A runs `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id` for a new uid and has not committed. Session B runs the same statement for the same uid. What does B see?",
+   "options": [
+    "B waits; when A commits, B's statement returns no rows and no error",
+    "B returns no rows at once, because A's row is already in the index",
+    "B inserts a second row, because A has not committed",
+    "B fails with a duplicate key error when A commits"
+   ],
+   "answer": 0,
+   "why": "B finds A's uncommitted entry in the unique index and cannot know yet whether A will commit, so it waits. When A commits, B takes the DO NOTHING branch: no rows, no error. Had A rolled back, B would have inserted. The duplicate key error is what a plain INSERT, without ON CONFLICT, gets in the same situation."
+  },
+  {
+   "q": "A nightly MERGE syncs March's totals with `WHEN NOT MATCHED BY SOURCE THEN DELETE` and no further condition. The target holds rows for January, February and March. What does it delete?",
+   "options": [
+    "Only March rows whose merchant had no March payments",
+    "Nothing, because NOT MATCHED BY SOURCE needs a condition to run",
+    "Every January and February row, plus the March rows with no March payments",
+    "Only rows of merchants with no payments at all"
+   ],
+   "answer": 2,
+   "why": "The source holds only March, so every January and February row has no source match and falls in NOT MATCHED BY SOURCE. Without a condition such as `AND t.month = date '2026-03-01'`, the DELETE applies to all of them. The clause runs without a condition; that is exactly the danger."
+  },
+  {
+   "q": "A Kafka batch carries some payment_uids more than once, because the producer retried, and the upsert fails with \"cannot affect row a second time\". Which source query keeps one row per uid, the most recently received?",
+   "options": [
+    "`SELECT DISTINCT payment_uid, status, received_at FROM batch`",
+    "`SELECT DISTINCT ON (payment_uid) * FROM batch ORDER BY payment_uid, received_at DESC`",
+    "`SELECT payment_uid, max(status), max(received_at) FROM batch GROUP BY payment_uid`",
+    "`SELECT * FROM batch ORDER BY received_at DESC LIMIT 1`"
+   ],
+   "answer": 1,
+   "why": "DISTINCT ON keeps the first row of each uid in the ORDER BY, here the latest, as lesson 8 did for the latest login. DISTINCT over all columns keeps all three rows, because their statuses differ. max() of each column mixes values from different rows, the trap of lesson 8's latest_login exercise. LIMIT 1 keeps one row for the whole batch.",
+   "from": "sql-08"
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "json or jsonb?",
+   "back": "jsonb: parsed once on write, validated, stored as a tree, indexable. json keeps the exact text, including duplicate keys."
+  },
+  {
+   "front": "What do -> and ->> return?",
+   "back": "-> returns jsonb (still a document), ->> returns text. Cast ->> results before comparing numbers."
+  },
+  {
+   "front": "What does `doc @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` ask?",
+   "back": "Whether doc contains that smaller document: a risk object whose rules array includes \"velocity\"."
+  },
+  {
+   "front": "Which conditions can a GIN index on a jsonb column serve?",
+   "back": "The jsonb operators: @>, ?, ?|, ?& and the jsonpath ones @? and @@. Not ->> comparisons."
+  },
+  {
+   "front": "Why is check-then-insert unsafe, and what replaces it?",
+   "back": "Two sessions can both find nothing before either inserts. INSERT ... ON CONFLICT lets the unique index decide inside the write."
+  },
+  {
+   "front": "In ON CONFLICT DO UPDATE, what is EXCLUDED?",
+   "back": "The row the INSERT proposed and could not insert, so SET status = EXCLUDED.status takes the new message's value."
+  },
+  {
+   "front": "Why prefer ON CONFLICT over MERGE for concurrent upserts in PostgreSQL?",
+   "back": "MERGE has no arbiter index: two sessions merging the same new key can both choose INSERT, and one fails with 23505."
+  }
+ ],
+ "terms": [
+  {
+   "term": "jsonb",
+   "plain": "PostgreSQL's binary JSON type: parsed and validated on write, stored as a tree of keys and values."
+  },
+  {
+   "term": "Containment (@>)",
+   "plain": "The test of whether one JSON document contains another, nesting included."
+  },
+  {
+   "term": "GIN index",
+   "plain": "Generalized inverted index: for every key and value, the sorted list of rows that contain it."
+  },
+  {
+   "term": "Idempotency key",
+   "plain": "A unique id that the sender attaches to a message so the receiver can tell a repeat from a new request."
+  },
+  {
+   "term": "Upsert",
+   "plain": "Insert a row, or update it if a row with the same key already exists, as one atomic operation."
+  },
+  {
+   "term": "EXCLUDED",
+   "plain": "In ON CONFLICT DO UPDATE, the row that was proposed for insertion."
+  },
+  {
+   "term": "MERGE",
+   "plain": "A statement that joins a target to a source and inserts, updates or deletes target rows by class: matched, not matched, not matched by source."
+  },
+  {
+   "term": "merge_action()",
+   "plain": "A function in MERGE ... RETURNING that says which action produced the row: INSERT, UPDATE or DELETE."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate's Kafka consumer stores payments with `if (repo.findByUid(uid) == null) repo.insert(msg)` inside a transaction per batch. It passes every test, but once a week a batch fails with a duplicate key error and is retried. Explain what is happening and what you would change.",
+  "answer": "The weekly failure is two deliveries of the same message overlapping, usually after a rebalance or a producer retry. Each transaction runs its findByUid before the other has committed, so both see nothing and both insert. The unique constraint on payment_uid catches it: the second insert waits for the first transaction and then fails with 23505. Because the error aborts the whole transaction, the consumer loses the entire batch and retries it, and if the constraint were missing, the payment would simply be stored twice. Tests never show this because they deliver one message at a time. I would remove the check and let the insert consult the unique index itself: INSERT ... ON CONFLICT (payment_uid) DO NOTHING, or DO UPDATE SET status = EXCLUDED.status WHERE the stored payment is still pending and the message carries a final status, with RETURNING to know whether it inserted, updated or did nothing. The second session then waits and takes the conflict branch instead of failing. I would also deduplicate the batch by uid before sending it, since one statement may not touch the same row twice, and commit the Kafka offset only after the database commit, so a crash in between means a harmless redelivery."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "`DO NOTHING` does not return the existing row, so a caller that needs the id of a repeat has to run a second query: `SELECT payment_id FROM payments WHERE payment_uid = $1`. A common workaround is `DO UPDATE SET status = p.status`, an update that changes nothing so that RETURNING has a row, but it writes a new row version on every repeat. PostgreSQL 19, at release candidate as this lesson is written, is set to add `ON CONFLICT DO SELECT`, which hands the existing row to RETURNING without writing a new version of it. Check the final release notes before you rely on it.\n\n`ON CONFLICT DO UPDATE` locks the conflicting row while it updates it, so concurrent upserts of one key queue up one behind the other. That is what you want for a capture racing its own repeat. It also means a very hot key, such as a single counter row upserted by every request, becomes a queue. The Transactions track's lesson on row locks covers those waits.\n\nBefore PostgreSQL 18 there was no `old` in RETURNING, and people told inserts from updates with `RETURNING (xmax = 0) AS inserted`: a freshly inserted row version has no deleting transaction recorded. It works, but it reads a system column whose meaning is an implementation detail. Use `old` on 18.\n\nPostgreSQL 17 brought the SQL/JSON standard functions. `JSON_TABLE` turns a document into rows and typed columns inside FROM, the standard spelling of what lesson 8 did with `jsonb_array_elements_text`:\n\n```sql\nSELECT p.payment_id, r.rule\nFROM payments p,\n     JSON_TABLE(p.metadata, '$.risk.rules[*]' COLUMNS (rule text PATH '$')) AS r\nORDER BY p.payment_id;\n-- 3 velocity, 8 geo_mismatch, 15 velocity, 18 velocity, 31 geo_mismatch\n```\n\njsonpath, the small query language inside that `'$.risk.rules[*]'`, also works with the `@?` operator: `metadata @? '$.risk.score ? (@ > 50)'` finds the same 8 payments as the cast, and a GIN index can serve it.\n\nA unique index on an expression works as a conflict target too. For case-insensitive emails, `CREATE UNIQUE INDEX ON customers (lower(email))` and then `ON CONFLICT ((lower(email))) DO NOTHING`."
+ },
+ "sources": [
+  {
+   "title": "PostgreSQL 18 documentation: INSERT (ON CONFLICT)",
+   "url": "https://www.postgresql.org/docs/18/sql-insert.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: MERGE",
+   "url": "https://www.postgresql.org/docs/18/sql-merge.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: JSON types and jsonb indexing",
+   "url": "https://www.postgresql.org/docs/18/datatype-json.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: GIN indexes",
+   "url": "https://www.postgresql.org/docs/18/gin.html"
+  },
+  {
+   "title": "PostgreSQL 18 release notes",
+   "url": "https://www.postgresql.org/docs/18/release-18.html"
+  }
+ ]
 }

@@ -1,4 +1,4 @@
--- Lesson nosql-12: 100,000 made-up "embeddings" of 32 numbers, in 200 clusters (like texts about
+-- Lesson store-08: 100,000 made-up "embeddings" of 32 numbers, in 200 clusters (like texts about
 -- 200 topics), and 20 query vectors. Load: psql -U sfz -f /sfz/nosql-12-vectors.sql (safe to run again)
 CREATE EXTENSION IF NOT EXISTS vector;
 DROP TABLE IF EXISTS items, queries, centres;

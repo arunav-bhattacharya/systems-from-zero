@@ -1,0 +1,127 @@
+{
+  "id": "txn",
+  "intro": "By the end of this track you can say exactly what a transaction promises and what it doesn't, draw every isolation anomaly as a timeline of two sessions, and predict what PostgreSQL's Read Committed, Repeatable Read and Serializable do about each, and what Oracle and MySQL do under the same names. You can stop lost updates, write skew and phantoms with the cheapest fix that works (a relative UPDATE, a row lock, SKIP LOCKED, a constraint, or SERIALIZABLE with a retry loop), explain how MVCC, two-phase locking, SSI and plain serial execution each make transactions serializable and what each costs, and commit one change on two machines with two-phase commit, knowing what an in-doubt transaction does to your locks and when a saga is the better design. The last lesson applies all of it to DynamoDB, MongoDB and Cassandra.\n\nYou need the earlier parts of the course: the write-ahead log from the Storage engines track, Redis's single thread from the Caching track, and replicas and partitions from the Replication and Partitioning tracks, which lessons 6 to 8 lean on. Lesson 1 sets up the picture the whole track uses: a transaction's changes take effect at one moment, when its commit record reaches the log, and everything else is about what other transactions see around that moment, on one machine and then on several.\n\nThe labs follow the concepts to the module that fits. Lessons 1 to 3 and 7 use the `sql` module against PostgreSQL 18 in Testcontainers: SQL exercise files, a retry loop and a two-phase commit coordinator, tested with real concurrent sessions. Lessons 4 and 5 build a multi-version store and a lock manager in plain Kotlin, no Docker. Lesson 6 runs Redis 8.10 and pairs Java with Kotlin. Lesson 8 builds Paxos compare-and-set in Kotlin and a MongoDB 9.0 transfer. Try-its run in psql, redis-cli, mongosh and cqlsh against the Compose services in `labs/env/` (`postgres.yml`, `redis.yml`, `mongo.yml`, `cassandra.yml`, and `cassandra6.yml` for the optional Accord step).",
+  "cheatsheet": "## The picture\n\nA transaction's changes take effect at one moment, when its commit record reaches the write-ahead log, or not at all. Isolation decides what concurrent transactions see before and after that moment. Serializable means the result equals some one-at-a-time order. Across machines there is no single commit record, so every participant promises first and one durable decision commits them all.\n\n## Anomalies and PostgreSQL's levels (lessons 1 to 3)\n\n| anomaly | the interleaving | Read Committed | Repeatable Read (snapshot isolation) | Serializable (SSI) |\n|---|---|---|---|---|\n| dirty read | read a value that is later rolled back | never | never | never |\n| read skew | two reads in one transaction disagree | allowed | prevented | prevented |\n| lost update | two read-modify-writes, one write erased | allowed, silently | 40001 for the second writer | 40001 |\n| write skew | both check a rule, each writes a different row | allowed | allowed | 40001 |\n| phantom | both check that no row exists, both insert | allowed | allowed | 40001 |\n\nNames differ by vendor: PostgreSQL, Oracle and SQL Server default to Read Committed. Oracle's SERIALIZABLE is snapshot isolation. MySQL's default REPEATABLE READ loses updates silently, and its SERIALIZABLE is two-phase locking.\n\n## Fixes, cheapest first (lessons 2 and 3)\n\n| problem | fix |\n|---|---|\n| lost update | `UPDATE ... SET x = x - n`; `SELECT ... FOR UPDATE` then compute; `UPDATE ... WHERE version = :v` and retry on 0 rows; Repeatable Read plus retry |\n| job queue | `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1`; `NOWAIT` fails at once with 55P03 |\n| write skew over rows that exist | `SELECT ... FOR UPDATE` the rows the rule reads |\n| phantom (a rule about absence) | lock a parent row or a slot row; `UNIQUE`; `EXCLUDE USING gist`; `WITHOUT OVERLAPS` (PostgreSQL 18); or SERIALIZABLE |\n| deadlock | lock rows in a fixed order (ascending id); bound waits with `lock_timeout` |\n\n## MVCC (lesson 4)\n\n- An UPDATE writes a new version and stamps the old one's `xmax`. Readers don't block writers and writers don't block readers; writers still block writers.\n- A version is visible if the snapshot sees its `xmin` committed and its `xmax` is 0 or not seen. Read Committed takes a snapshot per statement, Repeatable Read one per transaction.\n- VACUUM removes versions dead below the horizon, the oldest transaction still running. A long transaction, or a prepared one, holds it back everywhere. Autovacuum freezes at 200 million transaction ids of age.\n- PostgreSQL keeps old versions in the table; InnoDB and Oracle rebuild them from undo.\n\n## Three roads to serializable (lessons 5 and 6)\n\n| approach | how | cost | where |\n|---|---|---|---|\n| serial execution | one thread per partition runs each transaction to the end; transactions arrive as stored procedures | one core per partition; a slow transaction stalls all; cross-partition work about 1,000 writes/s in VoltDB | Redis, VoltDB |\n| strict two-phase locking | shared and exclusive locks held to commit | readers block writers; deadlocks; RUBiS 208 requests/s | MySQL SERIALIZABLE, SQL Server |\n| SSI | snapshot plus non-blocking SIREAD notes; abort a pivot (an rw-edge in and out) | false positives and retries; RUBiS 422 requests/s against 435 for snapshot isolation | PostgreSQL SERIALIZABLE |\n\n| SQLSTATE | meaning | what your code does |\n|---|---|---|\n| 40001 | serialization failure | retry the whole transaction, reads included |\n| 40P01 | deadlock detected (after `deadlock_timeout`, 1 s) | retry the whole transaction |\n| 55P03 | lock not available (`NOWAIT`, `lock_timeout`) | back off; don't hold the line |\n| 23505 | unique violation | an answer, not a glitch: don't retry |\n\nRedis: each command runs alone. `MULTI`/`EXEC` is an atomic batch with no rollback; `WATCH` makes EXEC return nil if a watched key changed; `EVALSHA` runs a cached Lua script, reload on `NOSCRIPT`; `FUNCTION LOAD` persists; a pipeline saves round trips and is not atomic; Redis Cluster refuses keys from different slots with `CROSSSLOT`.\n\n## Atomic commit across machines (lesson 7)\n\n1. Prepare: each participant makes its work durable, keeps its locks and votes yes or no. `PREPARE TRANSACTION 'txf-1@wallets'`.\n2. Decide: the coordinator flushes `txf-1 COMMIT` to its log. That is the commit point. No line means abort (presumed abort).\n3. Commit: `COMMIT PREPARED 'gid'` on each participant, retried until it answers, from a session in the same database.\n\n`max_prepared_transactions` is 0 by default and needs a restart. `pg_prepared_xacts` lists in-doubt work; its locks show with no pid, and `pg_blocking_pids` reports them as 0. In-doubt transactions survive restarts, block writers and hold back VACUUM. XA (JTA, Narayana in Quarkus) puts the coordinator and its log in your service. 3PC needs bounded delays. Percolator stores the commit point in a primary lock next to the data. A saga commits each step locally and undoes with compensations, with no isolation between steps.\n\n## NoSQL transactions (lesson 8)\n\n| store | scope | when two writers collide |\n|---|---|---|\n| DynamoDB | `TransactWriteItems`: up to 100 items, 4 MB, one Region; two writes per item | `TransactionCanceledException` with `TransactionConflict`; retry with the same client token (valid 10 minutes) |\n| MongoDB 9.0 | multi-document, replica set or sharded cluster; 60 s default; at most 10,000 open | `WriteConflict` labelled `TransientTransactionError`: rerun the whole transaction |\n| Cassandra 5.0 | lightweight transaction on one partition, Paxos, 4 round trips | `[applied] = False` and the current row |\n| Cassandra 6.0 (alpha) | Accord: `BEGIN TRANSACTION ... COMMIT TRANSACTION` across partitions | ordered before it runs |\n\n## Retries\n\nRetry the whole transaction on 40001, 40P01, `TransientTransactionError`, `TransactionConflict` and lost connections, a few times with jittered backoff. A COMMIT whose reply was lost may have committed, so a retry is safe only with an idempotency key under a UNIQUE constraint.",
+  "recap": [
+    "A transaction's changes take effect at one moment, when its commit record reaches the log. ACID's I is the hard part, and \"ACID compliant\" says little about which isolation level you get by default.",
+    "Every anomaly is an interleaving: a lost update (two read-modify-writes), write skew (both check a rule, each writes a different row), a phantom (both check for absence). PostgreSQL's Repeatable Read stops lost updates but not write skew; Serializable stops all three, at the price of retries.",
+    "Fix in the data first: relative UPDATEs, `FOR UPDATE` on the rows a rule reads, `SKIP LOCKED` for queues, and constraints (UNIQUE, EXCLUDE, WITHOUT OVERLAPS) for rules about rows that don't exist yet.",
+    "MVCC keeps old versions so readers never wait for writers; writers still lock. One long-open or prepared transaction holds VACUUM back for the whole database.",
+    "Three roads to serializable: serial execution (one thread, stored procedures, partitions), strict two-phase locking (blocking and deadlocks), and SSI (non-blocking reads, aborts at commit, a few percent slower than snapshot isolation in its authors' tests).",
+    "Deadlocks are cycles in the waits-for graph: the database detects one and aborts a transaction, and you prevent them by locking in a fixed order. Every transaction needs a retry loop, and an idempotency key for a commit whose reply was lost.",
+    "Across machines, two-phase commit: every participant promises, one durable record decides, then all commit. A dead coordinator leaves participants in doubt holding locks, and XA puts that coordinator inside your service.",
+    "NoSQL transactions exist with scopes and prices: DynamoDB's ledger-backed two-phase commit, MongoDB's snapshot transactions, Cassandra's single-partition Paxos and alpha Accord. Often one document, one conditional write or a saga is the better design."
+  ],
+  "quiz": [
+    {
+      "q": "A transfer's COMMIT was sent, and the connection dropped before the reply arrived. The client retries the whole transfer. What makes that retry safe?",
+      "options": [
+        "Nothing extra: a transaction that didn't confirm was rolled back",
+        "Running the retry at SERIALIZABLE",
+        "An idempotency key stored under a UNIQUE constraint in the same transaction, because the first COMMIT may have succeeded",
+        "Waiting `deadlock_timeout` before the retry"
+      ],
+      "answer": 2,
+      "why": "The commit may have reached the log before the connection died, so the retry could apply the transfer twice. A unique idempotency key makes the second attempt fail with 23505, which the client reads as \"already done\". Assuming an unconfirmed commit rolled back is the tempting mistake. Isolation levels and deadlock settings don't address a lost acknowledgement."
+    },
+    {
+      "q": "Ten workers each run `SELECT job_id FROM jobs WHERE status = 'queued' ORDER BY job_id LIMIT 1 FOR UPDATE`, then mark the job running and commit. Throughput is no better than with one worker. Why, and what is the fix?",
+      "options": [
+        "Every worker picks the same first row and waits for the worker holding it; `FOR UPDATE SKIP LOCKED` lets each take the next job nobody holds",
+        "FOR UPDATE locks the whole table; use FOR SHARE",
+        "The pool has too few connections; raise it to ten",
+        "The query needs SERIALIZABLE to let workers run in parallel"
+      ],
+      "answer": 0,
+      "why": "All ten see the same oldest job and queue on its row lock, so they run one at a time. SKIP LOCKED steps over rows other transactions hold. FOR UPDATE locks rows, not the table, and FOR SHARE would let two workers take the same job. More connections or a stricter level don't remove the queue."
+    },
+    {
+      "q": "A booking service checks for overlaps with `SELECT booking_id FROM bookings WHERE room_id = 4 AND during && :slot FOR UPDATE`, finds none, and inserts, all under Repeatable Read. Two overlapping bookings for room 4 arrive at once. What happens?",
+      "options": [
+        "The second one waits on the first one's FOR UPDATE lock, then sees the booking and refuses",
+        "Both commit: the check found no rows, so FOR UPDATE locked nothing, and the two inserts don't conflict",
+        "The second insert fails with 40001, because Repeatable Read detects the conflict",
+        "Both fail with a deadlock"
+      ],
+      "answer": 1,
+      "why": "This is a phantom: the rule is about rows that don't exist yet, and there is nothing to lock. Repeatable Read only catches two writers of the same row, and these inserts write different rows. An exclusion constraint (`EXCLUDE USING gist`) or PostgreSQL 18's `WITHOUT OVERLAPS` makes the database refuse the second insert; SERIALIZABLE would also catch it with 40001."
+    },
+    {
+      "q": "A Repeatable Read reporting transaction has been open for three hours while transfers keep updating `accounts`. What happens to the table?",
+      "options": [
+        "Nothing: the report holds no locks, so it costs nothing",
+        "The transfers wait until the report commits",
+        "The report's snapshot starts seeing the new versions after an hour",
+        "VACUUM can't remove versions that died after the report's snapshot, so dead versions pile up and the table grows"
+      ],
+      "answer": 3,
+      "why": "VACUUM can remove a version only once no running transaction might still need it, and the report keeps that horizon pinned at its start. Readers never block writers under MVCC, so the transfers keep going, and the snapshot never changes during a Repeatable Read transaction. A prepared transaction left in doubt has the same effect."
+    },
+    {
+      "q": "Under PostgreSQL's SERIALIZABLE, a 20-second report reads `settlements` while 1,000 inserts into it commit. What do the report's SIREAD locks do to the inserts?",
+      "options": [
+        "Nothing during the inserts: SIREAD locks never block. A dangerous pattern may still make one transaction fail with 40001 later",
+        "They make each insert wait until the report commits",
+        "They make each insert fail with 40001 at once",
+        "They upgrade to a table lock after 1,000 rows"
+      ],
+      "answer": 0,
+      "why": "SSI's SIREAD locks only record what a transaction read. Writers never wait for them, and they can't cause a deadlock; the check for read-write dependencies decides at write or commit time whether someone must abort. Waiting on read locks is what strict two-phase locking does, the tempting answer from MySQL's SERIALIZABLE."
+    },
+    {
+      "q": "On Redis Cluster, a Lua script that moves money from `wallet:7:main` to `wallet:9:main` fails with `CROSSSLOT`. What does this say about serial execution in general?",
+      "options": [
+        "Lua scripts can't write two keys",
+        "The cluster is misconfigured and should allow cross-slot scripts",
+        "A serial engine runs each partition on its own thread; a transaction across partitions needs coordination that Redis Cluster refuses and VoltDB runs at about 1,000 writes a second. Keep a transaction's keys in one partition (hash tags) or change the design",
+        "The script must be sent with EVALSHA instead of EVAL"
+      ],
+      "answer": 2,
+      "why": "Serial execution is fast because each partition's thread needs no locks. Crossing partitions brings coordination back, so VoltDB runs such transactions in lockstep at a small fraction of its normal rate and Redis Cluster rejects them. Hash tags such as `{wallet:7}:main` and `{wallet:7}:hold` group one customer's keys; a transfer between two customers' wallets needs another design, such as a saga."
+    },
+    {
+      "q": "A coordinator prepared a transfer on two PostgreSQL databases, flushed `txf-5 COMMIT` to its log, committed the first database, and crashed. What should happen to `txf-5@payouts`, still listed in `pg_prepared_xacts` and holding a merchant's row?",
+      "options": [
+        "Roll it back, since its coordinator is gone and the row is blocking checkouts",
+        "Leave it: PostgreSQL rolls back prepared transactions after `idle_in_transaction_session_timeout`",
+        "Restart the database, which clears prepared transactions",
+        "Commit it: recovery reads the COMMIT line and runs `COMMIT PREPARED 'txf-5@payouts'` in the payouts database"
+      ],
+      "answer": 3,
+      "why": "The decision was made and written, and one side already committed, so the only consistent outcome is commit. Rolling it back would leave half a transfer, the classic heuristic mistake. Prepared transactions survive restarts and have no timeout; they wait for someone to finish them."
+    },
+    {
+      "q": "A MongoDB transaction read A-1001's balance, decided to debit it, and its update failed with `WriteConflict` labelled `TransientTransactionError`. What should the code do?",
+      "options": [
+        "Retry just the failed update in the same session",
+        "Abort, then run the whole transaction again, reads and decision included, on a new snapshot",
+        "Wait for the other transaction to commit, then continue",
+        "Give up: write conflicts are permanent"
+      ],
+      "answer": 1,
+      "why": "Another transaction changed the document after this one's snapshot, so the balance it read is stale, and the decision must be taken again. MongoDB doesn't queue transactional writers; the first writer wins. `withTransaction` in the Java driver runs this loop for you."
+    },
+    {
+      "q": "Which way of making transactions serializable makes a long report block every writer of the rows it has read?",
+      "options": [
+        "Serializable snapshot isolation",
+        "Snapshot isolation with first-updater-wins",
+        "Strict two-phase locking: the report holds a shared lock on each row it read until it commits",
+        "Two-phase commit"
+      ],
+      "answer": 2,
+      "why": "Under strict 2PL, reads take shared locks held to commit, and a writer needs an exclusive lock, so it waits for the report. SSI and snapshot isolation let readers and writers pass each other. Two-phase commit is about committing on several machines, not about isolation."
+    },
+    {
+      "q": "A transfer debits a wallet in the wallet service's PostgreSQL and credits a merchant in the ledger service's DynamoDB table. Which design fits?",
+      "options": [
+        "One XA transaction across PostgreSQL and DynamoDB",
+        "A saga run by a durable workflow: a local debit recorded as pending, an idempotent credit keyed by the transfer id, and a compensating refund if the credit can never succeed",
+        "A DynamoDB transaction that includes the PostgreSQL row",
+        "Commit PostgreSQL first, then DynamoDB, and alert if the second fails"
+      ],
+      "answer": 1,
+      "why": "DynamoDB doesn't take part in XA, and its transactions cover only DynamoDB items, so no shared atomic commit exists here. A saga commits each step locally, makes each one safe to retry, and repairs a permanent failure with a compensation, at the price of a visible pending state. Committing one side then the other is lesson 7's version 1, which loses money whenever the second side fails."
+    }
+  ]
+}

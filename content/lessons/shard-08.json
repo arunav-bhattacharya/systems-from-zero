@@ -1,0 +1,462 @@
+{
+  "id": "shard-08",
+  "title": "DynamoDB under the hood: partitions, routers and capacity",
+  "minutes": 40,
+  "goal": "By the end you can trace a DynamoDB write through a request router to a partition's leader and its two followers, explain DynamoDB's partitions as hash ranges that split and its adaptive capacity as automatic hot-spot relief, say when a request is throttled, choose between provisioned and on-demand capacity, and create a production payments table with the AWS CLI or Terraform knowing what each flag controls.",
+  "warmup": {
+    "q": "A provisioned table has 40,000 WCU and uses about 6,000. Every payment also adds to one item, `MERCH#M-0042#TOTAL`, and on Black Friday that item gets 1,500 updates a second. What happens to those updates?",
+    "options": [
+      "Nothing bad: 7,500 used of 40,000 provisioned is well within capacity",
+      "Adaptive capacity gives the item a partition of its own and lends it the table's 32,500 spare units",
+      "About 500 a second are throttled: one item lives in one partition, and a partition takes at most 1,000 write units a second",
+      "DynamoDB splits the item's partition until the load fits, within a few minutes"
+    ],
+    "answer": 2,
+    "why": "The table's capacity is a sum over partitions; the per-partition ceiling isn't. An item lives in exactly one partition, and a partition serves at most 1,000 WCU however much the table has. Adaptive capacity can isolate a hot item in a partition of its own, but that partition still tops out at 1,000. A split divides key ranges, and one key can't be divided: the 2022 paper says a partition receiving high traffic to a single item won't benefit from a split. So about 500 updates a second are throttled, with the reason `TableWriteKeyRangeThroughputExceeded`."
+  },
+  "sections": [
+    {
+      "h": "What runs when you call PutItem",
+      "body": "This case study shows the track's partitioning ideas run as a managed service. DynamoDB cuts a table into ranges of hash values that split as they grow, lesson 1's hash-range scheme. It rebalances by splitting, by size and by traffic, instead of moving fixed shards (lesson 3). A tier of routers finds each key in a map kept by a metadata service (lesson 3 again). It relieves hot spots by itself up to a hard ceiling (lesson 2), and its global secondary indexes lag (lesson 4). Each partition is a small single-leader group, the replication of the Replication track's first lesson. The Data models track called DynamoDB a hash map of small sorted maps and designed one table for payments. Neither looked at the machines, and you can't log into them: AWS runs the servers. So setting up DynamoDB means designing the table and choosing its capacity, and both choices only make sense once you know what runs underneath. The 2022 USENIX ATC paper by Elhemali and others describes it. Build it up.\n\nVersion 1 is one server holding the whole table. The Data models track's first lesson showed where that ends: one disk, one CPU, and an outage when it dies.\n\nVersion 2 cuts the table into partitions. DynamoDB hashes the partition key, and each partition owns a contiguous range of hash values, lesson 1's hash-range sharding, stored as a B-tree (the Storage engines track's B+tree lesson) on a storage node's SSD. One storage node holds replicas of many partitions, from many tables of many customers. Now every request must find its partition, so a fleet of request routers sits in front, lesson 3's routing tier. A router authenticates the request (it caches IAM results, so an IAM hiccup doesn't stall it), checks the table's throughput budget, hashes the key and looks the partition up in a partition map. At launch each router downloaded a table's whole map on first use, and a fleet of cold routers flooded the metadata store. The fix the paper describes is MemDS, an in-memory metadata service, with a small cache on each router that refreshes in the background.\n\nVersion 3 copies every partition three times, one replica in each of three availability zones (separate data centres in one AWS Region). The three form a replication group that runs Multi-Paxos, a consensus protocol in the same family as Raft (the Consensus track builds Raft): replicas agree on one leader and one order of writes by majority vote. One replica is elected leader and holds a lease, a time-limited right to lead, that it keeps renewing. Only the leader takes writes and strongly consistent reads. For a write, it appends a record to its write-ahead log (the append-only record of changes from the Storage engines track's write-ahead logging lesson), sends it to its two peers, and acknowledges once two of the three, itself included, have it on disk. An eventually consistent read may go to any replica, which is why it can miss a write that just finished. If the leader dies, a follower calls an election, and the winner waits for the old leader's lease to expire, a couple of seconds, before it takes writes.\n\nVersion 4 heals quickly. Rebuilding a lost replica means copying its B-tree, which takes minutes, so the leader first adds a log replica that stores only recent log records. It joins in seconds, and writes can again get two of three acknowledgements while the full replica is rebuilt.\n\n**A table is a set of key ranges. Each range is a three-replica Paxos group with a leader and its own ceiling, and a fleet of routers looks up which group owns each key.** Splits, capacity, indexes and global tables below all hang off that picture. The stepper follows one write through it.",
+      "stepper": {
+        "title": "One write through a router to a partition's leader",
+        "intro": "Partition P7 of the payments table: three replicas in three availability zones. Then a failover, a split and a hot key.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"A PutItem goes from the payment service to a request router\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box-a\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"35.0\" text-anchor=\"middle\">request router</text><text class=\"t-s\" x=\"330.0\" y=\"53.0\" text-anchor=\"middle\">checks auth and tokens</text><rect class=\"box\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">partition map</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">(MemDS, cached)</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><rect class=\"box\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><line class=\"ln-a\" x1=\"166\" y1=\"40\" x2=\"228\" y2=\"40\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Your service sends `PutItem` for `ACCT#A-1001` to the regional endpoint, and a load balancer hands it to one of many request routers. Any router can take any request. It checks the signature against IAM results it has cached, and takes write units from the table's token bucket (global admission control, section 3). It holds no data."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"The router hashes the partition key and looks up which partition owns it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box-a\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"35.0\" text-anchor=\"middle\">request router</text><text class=\"t-s\" x=\"330.0\" y=\"53.0\" text-anchor=\"middle\">hash(ACCT#A-1001)</text><rect class=\"box-a\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">key range -&gt; P7</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">leader in AZ b</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><rect class=\"box\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><line class=\"ln-a\" x1=\"430\" y1=\"40\" x2=\"492\" y2=\"40\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The router hashes the partition key. Each partition owns a contiguous range of hash values, and the partition map, cached on the router and kept in an in-memory metadata service called MemDS, says which partition owns this hash: P7. It also says where P7's three replicas are, one per availability zone, and which one is the leader."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"The router sends the write to P7's leader, which logs it and sends it to both followers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"44.0\" text-anchor=\"middle\">request router</text><rect class=\"box\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">partition map</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">(MemDS, cached)</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><rect class=\"box-a\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">log 1042: put</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">log to 1041</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><line class=\"ln-a\" x1=\"340\" y1=\"64\" x2=\"340\" y2=\"106\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"248\" y1=\"133\" x2=\"214\" y2=\"133\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"133\" x2=\"466\" y2=\"133\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Only the leader takes writes. P7's leader, in AZ b, checks any condition on the request, gives the write the next log position, 1042, writes a write-ahead log record and sends it to the two followers in AZ a and AZ c. The leader was chosen by Multi-Paxos, a consensus protocol in the same family as Raft."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"One follower persists the record; with the leader that is two of three, so the write is acknowledged\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">200 OK</text><rect class=\"box-ok\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"35.0\" text-anchor=\"middle\">request router</text><text class=\"t-s\" x=\"330.0\" y=\"53.0\" text-anchor=\"middle\">200 OK</text><rect class=\"box\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">partition map</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">(MemDS, cached)</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box-a\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">has 1042</text><rect class=\"box-a\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">1042 committed</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">still at 1041</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><line class=\"ln-a\" x1=\"340\" y1=\"106\" x2=\"340\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"228\" y1=\"40\" x2=\"168\" y2=\"40\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "AZ a's follower writes 1042 to its own log and acknowledges. Leader plus one follower is two of three, a quorum, so the leader answers OK, and the router returns HTTP 200. AZ c's copy is a few milliseconds behind. The write is durable because two AZs have it on disk; losing any one AZ can't lose it."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"A strongly consistent read goes to the leader; an eventually consistent read can go to any replica, which may lag\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"35.0\" text-anchor=\"middle\">request router</text><text class=\"t-s\" x=\"330.0\" y=\"53.0\" text-anchor=\"middle\">two GetItems</text><rect class=\"box\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">partition map</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">(MemDS, cached)</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">has 1042</text><rect class=\"box-a\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">strong read: 1 RCU</text><rect class=\"box-b\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">eventual: 0.5 RCU</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><line class=\"ln-a\" x1=\"340\" y1=\"64\" x2=\"340\" y2=\"106\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"420\" y1=\"64\" x2=\"530\" y2=\"106\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "A `GetItem` with `ConsistentRead` goes to the leader, which has every acknowledged write: 1 read unit per 4 KB. The default, eventually consistent, may go to any replica, such as AZ c's, which might not have 1042 yet: half a read unit. A GSI read is always the second kind."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"The leader fails; a follower is elected but waits for the old leader's lease to expire\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"44.0\" text-anchor=\"middle\">request router</text><rect class=\"box-a\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">P7 leader</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">now in AZ a</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box-a\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7 new leader</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">waits out old lease</text><rect class=\"box-bad\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"340.0\" y=\"128.0\" text-anchor=\"middle\">P7 replica</text><text class=\"t-s t-bad\" x=\"340.0\" y=\"146.0\" text-anchor=\"middle\">down</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"128.0\" text-anchor=\"middle\">P7 follower</text><text class=\"t-s\" x=\"560.0\" y=\"146.0\" text-anchor=\"middle\">eventual reads go on</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text></svg>",
+            "say": "AZ b's storage node fails. A follower that stops hearing the leader first asks the other replica whether it still sees the leader, which avoids needless elections on a flaky link, then starts a Multi-Paxos election and wins it with AZ c's vote. The new leader waits for the old leader's lease to run out, a couple of seconds, before it takes writes or strong reads. Eventually consistent reads never stop. The control plane then builds a new replica in place of the dead one."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"P7 gets too busy and splits into P7a and P7b, each with its own replicas and its own ceiling\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"44.0\" text-anchor=\"middle\">request router</text><rect class=\"box-a\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">P7 split in two</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">P7a, P7b</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box-a\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7a leader</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">1,000 WCU ceiling</text><rect class=\"box\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"137.0\" text-anchor=\"middle\">P7a follower</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"137.0\" text-anchor=\"middle\">P7a follower</text><rect class=\"box\" x=\"28\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"197.0\" text-anchor=\"middle\">P7b follower</text><rect class=\"box\" x=\"248\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"197.0\" text-anchor=\"middle\">P7b follower</text><rect class=\"box-a\" x=\"468\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"188.0\" text-anchor=\"middle\">P7b leader</text><text class=\"t-s\" x=\"560.0\" y=\"206.0\" text-anchor=\"middle\">1,000 WCU ceiling</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text></svg>",
+            "say": "Months later P7 is busy: its writes approach the 1,000 WCU a partition can take. DynamoDB splits it for consumption: it picks a split point from the keys P7 has seen used, and makes two partitions, each with three replicas, a leader and its own 1,000 WCU and 3,000 RCU ceiling. A split takes minutes, nobody is told, and partitions never merge back."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 310\" role=\"img\" aria-label=\"One hot key lives in one partition; above 1,000 WCU the router throttles it whatever the table has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"16\" y=\"16\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"91.0\" y=\"44.0\" text-anchor=\"middle\">payment service</text><rect class=\"box-bad\" x=\"230\" y=\"16\" width=\"200\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"330.0\" y=\"35.0\" text-anchor=\"middle\">request router</text><text class=\"t-s\" x=\"330.0\" y=\"53.0\" text-anchor=\"middle\">500 a second: HTTP 400</text><rect class=\"box-b\" x=\"494\" y=\"16\" width=\"170\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"579.0\" y=\"35.0\" text-anchor=\"middle\">MERCH#M-0042#TOTAL</text><text class=\"t-s\" x=\"579.0\" y=\"53.0\" text-anchor=\"middle\">-&gt; P7b only</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"292\" text-anchor=\"start\">AZ a: storage nodes</text><rect class=\"box\" x=\"236\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"292\" text-anchor=\"start\">AZ b: storage nodes</text><rect class=\"box\" x=\"456\" y=\"96\" width=\"208\" height=\"206\" rx=\"8\"/><text class=\"t-s t-m\" x=\"468\" y=\"292\" text-anchor=\"start\">AZ c: storage nodes</text><rect class=\"box\" x=\"28\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"128.0\" text-anchor=\"middle\">P7a leader</text><text class=\"t-s\" x=\"120.0\" y=\"146.0\" text-anchor=\"middle\">quiet</text><rect class=\"box\" x=\"248\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"137.0\" text-anchor=\"middle\">P7a follower</text><rect class=\"box\" x=\"468\" y=\"108\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"560.0\" y=\"137.0\" text-anchor=\"middle\">P7a follower</text><rect class=\"box\" x=\"28\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"120.0\" y=\"197.0\" text-anchor=\"middle\">P7b follower</text><rect class=\"box\" x=\"248\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340.0\" y=\"197.0\" text-anchor=\"middle\">P7b follower</text><rect class=\"box-bad\" x=\"468\" y=\"168\" width=\"184\" height=\"50\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"560.0\" y=\"188.0\" text-anchor=\"middle\">P7b leader</text><text class=\"t-s t-bad\" x=\"560.0\" y=\"206.0\" text-anchor=\"middle\">1,500 asked, 1,000 in</text><text class=\"t-s t-m\" x=\"120.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"340.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text><text class=\"t-s t-m\" x=\"560.0\" y=\"256\" text-anchor=\"middle\">replicas of other partitions</text></svg>",
+            "say": "Now every payment updates one running-total item, `MERCH#M-0042#TOTAL`, 1,500 times a second. One item has one key, so it lives in one partition, and no split can divide it: the paper says a partition receiving high traffic to a single item won't benefit from a split. 1,000 writes a second get in and 500 are throttled, however much capacity the table has. Lesson 2's write sharding is the fix."
+          }
+        ]
+      },
+      "try": {
+        "title": "Create a provisioned table in DynamoDB Local and look for its partitions",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start DynamoDB Local: `docker compose -f env/dynamodb.yml up -d`. Leave it running for this lesson's Try-its.",
+          "Open a new terminal, so your real AWS settings stay untouched, and give the AWS CLI some credentials. Local accepts any: `export AWS_ACCESS_KEY_ID=sfz AWS_SECRET_ACCESS_KEY=sfz AWS_REGION=us-east-1`. Every command below names `--endpoint-url http://localhost:8000`, so nothing goes to AWS.",
+          "Run the commands. Before the `describe-table`, predict how many partitions real DynamoDB would create for 12,000 RCU and 3,200 WCU, and where the output shows them."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in a new terminal",
+          "src": "aws dynamodb create-table --endpoint-url http://localhost:8000 \\\n  --table-name ledger \\\n  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \\\n  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \\\n  --billing-mode PROVISIONED \\\n  --provisioned-throughput ReadCapacityUnits=12000,WriteCapacityUnits=3200 \\\n  --query 'TableDescription.{status: TableStatus, rcu: ProvisionedThroughput.ReadCapacityUnits, wcu: ProvisionedThroughput.WriteCapacityUnits}'\n\n# everything DescribeTable says about where the data lives\naws dynamodb describe-table --endpoint-url http://localhost:8000 --table-name ledger \\\n  --query 'Table.{status: TableStatus, items: ItemCount, bytes: TableSizeBytes, arn: TableArn}'\n\n# one write, then the same item read both ways: what does each cost?\naws dynamodb put-item --endpoint-url http://localhost:8000 --table-name ledger \\\n  --item '{\"pk\": {\"S\": \"ACCT#A-1001\"}, \"sk\": {\"S\": \"LEDGER#2026-11-07T10:15:03.120Z#pay-81723\"}, \"amountMinor\": {\"N\": \"-4250\"}}' \\\n  --return-consumed-capacity TOTAL --query 'ConsumedCapacity.CapacityUnits'\naws dynamodb get-item --endpoint-url http://localhost:8000 --table-name ledger \\\n  --key '{\"pk\": {\"S\": \"ACCT#A-1001\"}, \"sk\": {\"S\": \"LEDGER#2026-11-07T10:15:03.120Z#pay-81723\"}}' \\\n  --consistent-read --return-consumed-capacity TOTAL --query '[Item.amountMinor.N, ConsumedCapacity.CapacityUnits]' --output text\naws dynamodb get-item --endpoint-url http://localhost:8000 --table-name ledger \\\n  --key '{\"pk\": {\"S\": \"ACCT#A-1001\"}, \"sk\": {\"S\": \"LEDGER#2026-11-07T10:15:03.120Z#pay-81723\"}}' \\\n  --no-consistent-read --return-consumed-capacity TOTAL --query '[Item.amountMinor.N, ConsumedCapacity.CapacityUnits]' --output text\n"
+        },
+        "expect": "```text\n{\n    \"status\": \"ACTIVE\",\n    \"rcu\": 12000,\n    \"wcu\": 3200\n}\n{\n    \"status\": \"ACTIVE\",\n    \"items\": 0,\n    \"bytes\": 0,\n    \"arn\": \"arn:aws:dynamodb:ddblocal:000000000000:table/ledger\"\n}\n1.0\n-4250\t1.0\n-4250\t0.5\n```\n\nReal DynamoDB would answer `CREATING` while it allocates partitions: 12,000 / 3,000 and 3,200 / 1,000 both say 4. Nothing in the API names a partition, though: not `create-table`, not `describe-table`. Local says `ACTIVE` at once, in a Region it calls `ddblocal`, because it's one process with nothing to allocate. It still reports what each call would cost: the write of a small item is 1 write unit, the strongly consistent read 1 read unit, the eventually consistent read half of one. On real DynamoDB the first read goes to the partition's leader and the second to any of its three replicas."
+      },
+      "refs": [
+        {
+          "title": "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service (USENIX ATC 2022)",
+          "url": "https://www.usenix.org/conference/atc22/presentation/elhemali",
+          "kind": "read"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: read consistency",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Every partition has a ceiling, so partitions split",
+      "body": "A partition serves at most 3,000 read units and 1,000 write units a second, and holds about 10 GB. (From the Data models track's DynamoDB lesson: a write unit is one write a second of up to 1 KB; a read unit is one strongly consistent read a second of up to 4 KB, or two eventually consistent ones.) Those three numbers are why partitions split. Lesson 3 set fixed shard counts against shards that split as they grow; DynamoDB is the second kind, and it has three reasons to split.\n\nAt creation, a provisioned table gets enough partitions for its throughput, and each gets an equal share. The paper's example: 3,200 WCU needs 4 partitions of 800. Raise the table to 3,600 and each share becomes 900. Raise it to 6,000 and four partitions can't carry that, so each splits in two: 8 partitions of 750. Lower it to 5,000 and you keep 8, at 625 each, because partitions only ever split. They never merge.\n\nData splits partitions too. When one nears 10 GB it splits in two, and in the original design its share of the table's throughput was divided between the halves. A table with 1,000 WCU and 15 GB had two partitions of 500, and a key range taking 800 writes a second was throttled while the other half idled. The paper calls this throughput dilution.\n\nTraffic splits partitions as well. When a partition's consumed throughput stays high, DynamoDB splits it for consumption, at a point chosen from the keys it has seen used rather than the middle of the range, so the busy keys land on both sides. That takes minutes. Two patterns can't be helped, and the paper names both: one item that takes the traffic, and a key range written in order, such as one partition key with a timestamp sort key, where every new write lands at the same end however you cut.\n\nWhen a request needs more than its partition or table may give, DynamoDB throttles it: it refuses the request with HTTP 400 and changes nothing. The AWS SDK retries throttled requests with exponential backoff, so you first see higher latency, then an exception. The exception carries `ThrottlingReasons` naming the limit. `TableWriteKeyRangeThroughputExceeded` is a hot partition. `TableWriteProvisionedThroughputExceeded` is the table's provisioned capacity. An `Index...` reason is a GSI (section 4). More provisioned capacity fixes the second, and does nothing for the first.\n\nDynamoDB Local does none of this. It's a single Java process for development. The docs say it ignores provisioned throughput, and it has no partitions, so it never splits and never throttles. The Try-it proves it. Test your throttling behaviour against the lab's model, or a real table.",
+      "try": {
+        "title": "Overload a 1 WCU table in Local, then read a real throttle",
+        "minutes": 4,
+        "steps": [
+          "With DynamoDB Local still running, read `LocalNeverThrottlesDemo.kt`. It provisions a table with one write unit a second, turns off the SDK's retries, and sends 1,000 writes from eight threads. Predict how many are throttled.",
+          "Run it from the `labs` folder.",
+          "Then read the second block, from the AWS docs. That's what a throttle looks like on real DynamoDB; Local can't produce one."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "LocalNeverThrottlesDemo.kt",
+          "file": "labs/nosql/src/demo/kotlin/sfz/shard/l08/demo/LocalNeverThrottlesDemo.kt",
+          "run": "./gradlew :nosql:demo -Pmain=sfz.shard.l08.demo.LocalNeverThrottlesDemoKt",
+          "src": "package sfz.shard.l08.demo\n\nimport software.amazon.awssdk.auth.credentials.AwsBasicCredentials\nimport software.amazon.awssdk.auth.credentials.StaticCredentialsProvider\nimport software.amazon.awssdk.awscore.retry.AwsRetryStrategy\nimport software.amazon.awssdk.regions.Region\nimport software.amazon.awssdk.services.dynamodb.DynamoDbClient\nimport software.amazon.awssdk.services.dynamodb.model.AttributeDefinition\nimport software.amazon.awssdk.services.dynamodb.model.AttributeValue\nimport software.amazon.awssdk.services.dynamodb.model.BillingMode\nimport software.amazon.awssdk.services.dynamodb.model.KeySchemaElement\nimport software.amazon.awssdk.services.dynamodb.model.KeyType\nimport software.amazon.awssdk.services.dynamodb.model.ProvisionedThroughputExceededException\nimport software.amazon.awssdk.services.dynamodb.model.ReturnConsumedCapacity\nimport software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType\nimport java.net.URI\nimport java.util.concurrent.Executors\nimport java.util.concurrent.TimeUnit\nimport java.util.concurrent.atomic.AtomicInteger\nimport java.util.concurrent.atomic.DoubleAdder\n\n/**\n * A table provisioned with ONE write unit a second, then 1,000 writes from eight threads, as fast as\n * they can send them. Real DynamoDB would admit about one a second plus a few hundred saved-up burst units, and\n * throttle the rest. DynamoDB Local is one process with no partitions and no admission control.\n */\nfun main() {\n    val ddb = DynamoDbClient.builder()\n        .endpointOverride(URI.create(\"http://localhost:8000\"))\n        .region(Region.US_EAST_1)\n        .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(\"sfz\", \"sfz\")))\n        // no SDK retries: a throttle would reach this code instead of being retried quietly\n        .overrideConfiguration { it.retryStrategy(AwsRetryStrategy.doNotRetry()) }\n        .build()\n    val table = \"one-wcu\"\n    if (table in ddb.listTables().tableNames()) ddb.deleteTable { it.tableName(table) }\n\n    // provisioned mode: 1 read unit and 1 write unit a second for the whole table\n    ddb.createTable {\n        it.tableName(table)\n            .attributeDefinitions(AttributeDefinition.builder().attributeName(\"pk\").attributeType(ScalarAttributeType.S).build())\n            .keySchema(KeySchemaElement.builder().attributeName(\"pk\").keyType(KeyType.HASH).build())\n            .billingMode(BillingMode.PROVISIONED)\n            .provisionedThroughput { p -> p.readCapacityUnits(1).writeCapacityUnits(1) }\n    }\n    val provisioned = ddb.describeTable { it.tableName(table) }.table().provisionedThroughput()\n    println(\"provisioned: ${provisioned.readCapacityUnits()} RCU, ${provisioned.writeCapacityUnits()} WCU\")\n\n    val consumed = DoubleAdder()\n    val throttled = AtomicInteger()\n    val started = System.nanoTime()\n    val pool = Executors.newFixedThreadPool(8)\n    for (i in 0 until 1_000) pool.execute {\n        try {\n            val r = ddb.putItem {\n                it.tableName(table)\n                    .item(mapOf(\n                        \"pk\" to AttributeValue.fromS(\"PAY#pay-%06d\".format(i)),\n                        \"amountMinor\" to AttributeValue.fromN((500 + i * 7919 % 9501).toString()),\n                    ))\n                    .returnConsumedCapacity(ReturnConsumedCapacity.TOTAL)\n            }\n            consumed.add(r.consumedCapacity().capacityUnits())\n        } catch (e: ProvisionedThroughputExceededException) {\n            throttled.incrementAndGet() // what real DynamoDB sends when a table or a partition is out of tokens\n        }\n    }\n    pool.shutdown()\n    pool.awaitTermination(1, TimeUnit.MINUTES)\n    val seconds = (System.nanoTime() - started) / 1e9\n    println(\"wrote 1,000 items in %.1f s, about %,d a second\".format(seconds, (1_000 / seconds).toLong()))\n    println(\"write units consumed: %,.1f\".format(consumed.sum()))\n    println(\"throttled: $throttled\")\n\n    ddb.deleteTable { it.tableName(table) }\n    ddb.close()\n}\n"
+        },
+        "expect": "```text\nprovisioned: 1 RCU, 1 WCU\nwrote 1,000 items in 3.0 s, about 336 a second\nwrite units consumed: 1,000.0\nthrottled: 0\n```\n\nThe rate depends on your machine; the 0 doesn't. The table took 1,000 write units in three seconds against 1 provisioned, because Local ignores provisioned throughput: one Java process, no partitions, no token buckets. Real DynamoDB would admit about one write a second plus whatever burst capacity the table had saved (at most 300 units for a 1 WCU table), and throttle the rest.\n\nOn real DynamoDB a throttle reaches the SDK as an exception with reasons. This example is from the AWS docs' throttling diagnosis page (trimmed), not from Local; it's a GSI out of provisioned write capacity:\n\n```json\n{\n    \"ThrottlingReasons\": [\n        {\n            \"reason\": \"IndexWriteProvisionedThroughputExceeded\",\n            \"resource\": \"arn:aws:dynamodb:us-west-2:123456789012:table/CustomerOrders/index/OrderDateIndex\"\n        }\n    ],\n    \"awsErrorDetails\": {\n        \"errorCode\": \"ProvisionedThroughputExceeded\",\n        \"errorMessage\": \"The level of configured provisioned throughput for the index was exceeded\",\n        ...\n    }\n}\n```\n\nThe HTTP status is 400.\n\nIn Kotlin that's a `ProvisionedThroughputExceededException` (a hot partition gives the reason `TableWriteKeyRangeThroughputExceeded`; an on-demand limit gives a `ThrottlingException`). The reason, not the exception class, tells you which fix applies."
+      },
+      "refs": [
+        {
+          "title": "Amazon DynamoDB Developer Guide: partitions and data distribution",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.Partitions.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: diagnosing throttling (ThrottlingReasons)",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/throttling-diagnosing-workflow.html",
+          "kind": "docs"
+        },
+        {
+          "title": "AWS Database Blog: scaling DynamoDB, how partitions, hot keys and split for heat impact performance (part 3)",
+          "url": "https://aws.amazon.com/blogs/database/part-3-scaling-dynamodb-how-partitions-hot-keys-and-split-for-heat-impact-performance/",
+          "kind": "read"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: DynamoDB local usage notes",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.UsageNotes.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Capacity: provisioned with burst and adaptive capacity, or on-demand",
+      "body": "Capacity is the number of read and write units DynamoDB admits for a table each second. You choose one of two modes, and the history of the first explains how both behave today.\n\nIn provisioned mode you set RCU and WCU and pay for them by the hour, used or not. The 2012 design enforced each partition's share at the partition with a token bucket: a counter refilled at the share's rate, which each request pays from. The AWS docs' example shows the flaw. 400 WCU over 4 partitions gives each 100. Send partition 4 150 writes a second and the others 50, and partition 4 is throttled 50 a second while the table uses 300 of its 400.\n\nBurst capacity came first. A partition saves up to 300 seconds of its unused share and spends it on spikes. A partition that ran at 50 of its 100 for five minutes saved 15,000 units, enough for 150 a second for another 300 seconds. Then it throttles again. Burst covers spikes, not a partition that's always busy.\n\nAdaptive capacity came next. Lesson 2 spread a hot key by hand; this is DynamoDB doing part of that job for you. When a partition is throttled while the table has unused units, DynamoDB raises that partition's share, as long as the table stays within its provisioned total and the partition within 1,000 WCU. Partition 4 gets its 150, because 50 + 50 + 50 + 150 = 300 fits in 400. The paper says this removed over 99.99% of the throttling from skewed access. It can also move a very busy item into a partition of its own, so that item gets the full 1,000 WCU.\n\nToday's design is global admission control. A central service tracks the table's budget as tokens. Each request router keeps a local token bucket and refills it from that service every few seconds. Partitions keep buckets of their own as a second line of defence, capped so no table can take over a storage node. So a hot partition can use the table's spare units at once, and one key above 1,000 WCU is still throttled: the partition ceiling never moves.\n\nIn on-demand mode you set nothing and pay per request. A new on-demand table takes up to 4,000 writes and 12,000 reads a second. After that, DynamoDB admits up to double your previous peak at once and splits partitions ahead of the next peak. Beyond double it adds capacity as traffic grows, but the docs warn you can be throttled if you pass double your previous peak within 30 minutes. A per-table quota caps it, 40,000 units of each by default, and you can set your own lower maximum as a guard against a runaway bill. For a known launch you can pre-warm the table by raising its warm throughput.\n\nChoose on-demand for new tables, for spiky traffic and for anything you can't forecast, such as a payments API whose evening peak is ten times its night. Choose provisioned, with auto scaling, for steady load that you can forecast and that runs most of the day: per unit it costs less. You can switch a table from provisioned to on-demand up to four times in 24 hours, and back at any time.",
+      "refs": [
+        {
+          "title": "Amazon DynamoDB Developer Guide: burst and adaptive capacity",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/burst-adaptive-capacity.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: on-demand capacity mode",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: warm throughput",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/warm-throughput.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Work that happens after the partition: GSIs, streams, TTL, backups, global tables",
+      "body": "Several features copy each write somewhere else, after the partition has acknowledged it. Knowing that they're asynchronous explains how each one behaves.\n\nA global secondary index is lesson 4's global index: a second table, partitioned by the indexed attribute, with partitions of its own. After a write commits, DynamoDB sends the change on to the index's partitions. The Data models track showed the result: an index can lag, so it answers only eventually consistent reads. It didn't show back-pressure. If an index can't keep up, because its provisioned write capacity is too low or its key is hot (`merchantId` with M-0042, or `status` with three values), DynamoDB throttles writes to the base table, and the exception names the index: `IndexWriteKeyRangeThroughputExceeded`. Give each GSI at least the base table's write capacity, and choose its key as carefully as the table's. Every index that holds an item costs a write when the item changes, which the Try-it counts.\n\nDynamoDB Streams is the table's change log. Each insert, update or delete becomes a record, kept 24 hours, appearing exactly once, in order for each item (not across items). Each open shard belongs to one partition, so the stream grows shards as the table splits. Use it to feed Kafka or a reporting store; as the Data models track warned, a transaction's writes arrive as separate records.\n\nTTL deletes items whose expiry attribute, a Number of epoch seconds, has passed, typically within a few days, without charging write units. Until then the expired item is still there, so reads must filter it out. The deletes reach the stream marked as service deletions, so a consumer can tell them from yours.\n\nPoint-in-time recovery keeps continuous backups for 1 to 35 days (35 by default) at one-second granularity. A restore builds a new table from partition snapshots plus the write-ahead logs DynamoDB archives to S3, and never touches the live table. It's the answer to a bad deploy that deleted payments.\n\nGlobal tables copy a table to other Regions, and the Replication track's lesson on many leaders took them apart: MREC accepts writes in every Region and settles conflicts by last writer wins, and MRSC (generally available since June 2025) replicates each write to at least one other Region before it returns, across exactly three Regions. Underneath, each Region's replica is an ordinary table, with its own partitions, routers and ceilings from this lesson, so a hot key is just as hot in every Region.",
+      "try": {
+        "title": "Count the index's writes, then read the stream",
+        "minutes": 5,
+        "steps": [
+          "In the same terminal, with DynamoDB Local still running, run the commands. Predict what each write costs the table and the index, and what the stream holds after an insert and an update.",
+          "When you're done with the lesson's Try-its, stop Local from the `labs` folder: `docker compose -f env/dynamodb.yml down -v`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the same terminal",
+          "src": "# a small on-demand table with one GSI and a stream of old and new images\naws dynamodb create-table --endpoint-url http://localhost:8000 --table-name pay-demo \\\n  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S AttributeName=paymentId,AttributeType=S \\\n  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \\\n  --billing-mode PAY_PER_REQUEST \\\n  --global-secondary-indexes 'IndexName=byPayment,KeySchema=[{AttributeName=paymentId,KeyType=HASH}],Projection={ProjectionType=ALL}' \\\n  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \\\n  --query 'TableDescription.TableStatus'\n\n# a payment, then its settlement: what does each write cost the table and the index?\naws dynamodb put-item --endpoint-url http://localhost:8000 --table-name pay-demo \\\n  --item '{\"pk\": {\"S\": \"ACCT#A-1001\"}, \"sk\": {\"S\": \"PAY#2026-11-07T10:15:03.120Z#pay-81723\"}, \"paymentId\": {\"S\": \"pay-81723\"}, \"status\": {\"S\": \"AUTHORIZED\"}}' \\\n  --return-consumed-capacity INDEXES --query 'ConsumedCapacity.{table: Table.CapacityUnits, index: GlobalSecondaryIndexes.byPayment.CapacityUnits}'\naws dynamodb update-item --endpoint-url http://localhost:8000 --table-name pay-demo \\\n  --key '{\"pk\": {\"S\": \"ACCT#A-1001\"}, \"sk\": {\"S\": \"PAY#2026-11-07T10:15:03.120Z#pay-81723\"}}' \\\n  --update-expression 'SET #s = :settled' --expression-attribute-names '{\"#s\": \"status\"}' \\\n  --expression-attribute-values '{\":settled\": {\"S\": \"SETTLED\"}}' \\\n  --return-consumed-capacity INDEXES --query 'ConsumedCapacity.{table: Table.CapacityUnits, index: GlobalSecondaryIndexes.byPayment.CapacityUnits}'\n\n# the index answers eventually consistent reads only\naws dynamodb query --endpoint-url http://localhost:8000 --table-name pay-demo --index-name byPayment \\\n  --key-condition-expression 'paymentId = :p' --expression-attribute-values '{\":p\": {\"S\": \"pay-81723\"}}' \\\n  --query 'Items[].status.S' --output text\naws dynamodb query --endpoint-url http://localhost:8000 --table-name pay-demo --index-name byPayment \\\n  --key-condition-expression 'paymentId = :p' --expression-attribute-values '{\":p\": {\"S\": \"pay-81723\"}}' \\\n  --consistent-read\n\n# the change log: find the stream and its first shard, then read from the start\nARN=$(aws dynamodb describe-table --endpoint-url http://localhost:8000 --table-name pay-demo --query Table.LatestStreamArn --output text)\nSHARD=$(aws dynamodbstreams describe-stream --endpoint-url http://localhost:8000 --stream-arn \"$ARN\" --query 'StreamDescription.Shards[0].ShardId' --output text)\nIT=$(aws dynamodbstreams get-shard-iterator --endpoint-url http://localhost:8000 --stream-arn \"$ARN\" --shard-id \"$SHARD\" --shard-iterator-type TRIM_HORIZON --query ShardIterator --output text)\naws dynamodbstreams get-records --endpoint-url http://localhost:8000 --shard-iterator \"$IT\" \\\n  --query 'Records[].[eventName, dynamodb.OldImage.status.S, dynamodb.NewImage.status.S]' --output text\n"
+        },
+        "expect": "```text\n\"ACTIVE\"\n{\n    \"table\": 1.0,\n    \"index\": 1.0\n}\n{\n    \"table\": 1.0,\n    \"index\": 1.0\n}\nSETTLED\n\naws: [ERROR]: An error occurred (ValidationException) when calling the Query operation: Consistent reads are not supported on global secondary indexes\nINSERT\tNone\tAUTHORIZED\nMODIFY\tAUTHORIZED\tSETTLED\n```\n\nEach write cost one unit on the table and one on the index. The update changed only `status`, which isn't an index key, but the index holds a full copy of the item (`ProjectionType` ALL), so its copy had to change too. The index answered the eventually consistent query, and refused the strongly consistent one, because its copy can lag. The stream has one record per change, in order for this item: the insert with no old image, then the update with both. On real DynamoDB that record order holds per item only, and the stream would have one shard per partition."
+      },
+      "refs": [
+        {
+          "title": "Amazon DynamoDB Developer Guide: GSI write throttling and back pressure",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/gsi-throttling.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: change data capture for DynamoDB Streams",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: point-in-time backups",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Point-in-time-recovery.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: how global tables work (MREC and MRSC)",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Set up the payments table for real",
+      "body": "Every flag in a production `create-table` now maps to something above. Here is the payments table from the Data models track's single-table lesson, as you'd create it for real:\n\n```bash\naws dynamodb create-table --table-name payments \\\n  --attribute-definitions \\\n      AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \\\n      AttributeName=paymentId,AttributeType=S AttributeName=merchantId,AttributeType=S \\\n      AttributeName=status,AttributeType=S AttributeName=createdAt,AttributeType=S \\\n  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \\\n  --billing-mode PAY_PER_REQUEST \\\n  --on-demand-throughput MaxReadRequestUnits=24000,MaxWriteRequestUnits=8000 \\\n  --warm-throughput ReadUnitsPerSecond=24000,WriteUnitsPerSecond=8000 \\\n  --global-secondary-indexes file://payments-gsis.json \\\n  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \\\n  --deletion-protection-enabled\naws dynamodb update-time-to-live --table-name payments \\\n  --time-to-live-specification Enabled=true,AttributeName=expiresAt\naws dynamodb update-continuous-backups --table-name payments \\\n  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true,RecoveryPeriodInDays=35\n```\n\nThe key schema is the Data models track's design: `pk` spreads accounts over partitions, `sk` orders an account's items. Only key attributes are declared; every other attribute is up to each item. `PAY_PER_REQUEST` is on-demand, right for a payments API whose Black Friday is many times its night. The on-demand maximum caps the table at 8,000 writes a second, so a runaway retry loop gets throttled instead of billed; leave room above the real peak. Warm throughput lets a new table take the expected launch peak at once instead of growing into it; AWS charges for raising it, and it can't be lowered. The file holds the two GSIs, `byPayment` and `byMerchant`, with the multi-attribute sort key from the single-table lesson; each costs a write per item it holds. The stream with old and new images feeds the outbox to Kafka. Deletion protection makes `delete-table` fail until someone turns it off. TTL and point-in-time recovery need calls of their own.\n\nThe same table in Terraform, the way most teams keep it:\n\n```text\nresource \"aws_dynamodb_table\" \"payments\" {\n  name                        = \"payments\"\n  billing_mode                = \"PAY_PER_REQUEST\"\n  hash_key                    = \"pk\"\n  range_key                   = \"sk\"\n  stream_enabled              = true\n  stream_view_type            = \"NEW_AND_OLD_IMAGES\"\n  deletion_protection_enabled = true\n\n  attribute {\n    name = \"pk\"\n    type = \"S\"\n  }\n  # ...one attribute block each for sk, paymentId, merchantId, status, createdAt\n\n  on_demand_throughput {\n    max_read_request_units  = 24000\n    max_write_request_units = 8000\n  }\n  global_secondary_index {\n    name            = \"byPayment\"\n    projection_type = \"ALL\"\n    key_schema {\n      attribute_name = \"paymentId\"\n      key_type       = \"HASH\"\n    }\n    key_schema {\n      attribute_name = \"sk\"\n      key_type       = \"RANGE\"\n    }\n  }\n  # ...byMerchant: merchantId HASH, then status and createdAt RANGE\n  ttl {\n    attribute_name = \"expiresAt\"\n    enabled        = true\n  }\n  point_in_time_recovery {\n    enabled                 = true\n    recovery_period_in_days = 35\n  }\n}\n```\n\nFor steady load, provisioned is the other shape: `--provisioned-throughput` on the table and on each GSI, auto scaling registered through Application Auto Scaling, and every GSI's write capacity at least the table's. Before production, also check the key against your peak per key (no item or partition key above 1,000 WCU), turn on CloudWatch Contributor Insights to see the busiest and most throttled keys, and alarm on the throttle metrics, split by reason.",
+      "try": {
+        "title": "Run the production create-table against Local",
+        "minutes": 3,
+        "steps": [
+          "With DynamoDB Local running, run the commands: the `create-table` from the text with its GSIs inline, the two follow-up calls, and a `delete-table`. Predict which of them Local accepts.",
+          "Stop Local from the `labs` folder: `docker compose -f env/dynamodb.yml down -v`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the same terminal",
+          "src": "aws dynamodb create-table --endpoint-url http://localhost:8000 \\\n  --table-name payments \\\n  --attribute-definitions \\\n      AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \\\n      AttributeName=paymentId,AttributeType=S AttributeName=merchantId,AttributeType=S \\\n      AttributeName=status,AttributeType=S AttributeName=createdAt,AttributeType=S \\\n  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \\\n  --billing-mode PAY_PER_REQUEST \\\n  --on-demand-throughput MaxReadRequestUnits=24000,MaxWriteRequestUnits=8000 \\\n  --warm-throughput ReadUnitsPerSecond=24000,WriteUnitsPerSecond=8000 \\\n  --global-secondary-indexes '[\n      {\"IndexName\": \"byPayment\", \"Projection\": {\"ProjectionType\": \"ALL\"},\n       \"KeySchema\": [{\"AttributeName\": \"paymentId\", \"KeyType\": \"HASH\"}, {\"AttributeName\": \"sk\", \"KeyType\": \"RANGE\"}]},\n      {\"IndexName\": \"byMerchant\", \"Projection\": {\"ProjectionType\": \"ALL\"},\n       \"KeySchema\": [{\"AttributeName\": \"merchantId\", \"KeyType\": \"HASH\"},\n                     {\"AttributeName\": \"status\", \"KeyType\": \"RANGE\"}, {\"AttributeName\": \"createdAt\", \"KeyType\": \"RANGE\"}]}]' \\\n  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \\\n  --deletion-protection-enabled \\\n  --query 'TableDescription.{status: TableStatus, billing: BillingModeSummary.BillingMode, max: OnDemandThroughput, warm: WarmThroughput, indexes: GlobalSecondaryIndexes[].IndexName, stream: StreamSpecification.StreamViewType, protected: DeletionProtectionEnabled}'\n\n# two settings that need calls of their own\naws dynamodb update-time-to-live --endpoint-url http://localhost:8000 --table-name payments \\\n  --time-to-live-specification Enabled=true,AttributeName=expiresAt\naws dynamodb update-continuous-backups --endpoint-url http://localhost:8000 --table-name payments \\\n  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true,RecoveryPeriodInDays=35\n\n# deletion protection at work\naws dynamodb delete-table --endpoint-url http://localhost:8000 --table-name payments\n"
+        },
+        "expect": "```text\n{\n    \"status\": \"ACTIVE\",\n    \"billing\": \"PAY_PER_REQUEST\",\n    \"max\": {\n        \"MaxReadRequestUnits\": 24000,\n        \"MaxWriteRequestUnits\": 8000\n    },\n    \"warm\": null,\n    \"indexes\": [\n        \"byPayment\",\n        \"byMerchant\"\n    ],\n    \"stream\": \"NEW_AND_OLD_IMAGES\",\n    \"protected\": true\n}\n{\n    \"TimeToLiveSpecification\": {\n        \"Enabled\": true,\n        \"AttributeName\": \"expiresAt\"\n    }\n}\n\naws: [ERROR]: An error occurred (UnknownOperationException) when calling the UpdateContinuousBackups operation: An unknown operation was requested.\n\naws: [ERROR]: An error occurred (ValidationException) when calling the DeleteTable operation: Resource cannot be deleted as it is currently protected against deletion. Disable deletion protection first.\n```\n\nLocal accepted the shape of the table: billing mode, the on-demand maximum, both indexes (including the three-attribute `byMerchant` key), the stream and deletion protection, which then refused the `delete-table`. It accepted the warm throughput but reports `null`, because there's nothing to warm in one process. Point-in-time recovery is an unknown operation: the docs list it as unsupported in Local. TTL is accepted; in my run an item that had expired ten minutes earlier was still there, so don't use Local to test when TTL deletes happen."
+      },
+      "refs": [
+        {
+          "title": "AWS CLI reference: dynamodb create-table",
+          "url": "https://docs.aws.amazon.com/cli/latest/reference/dynamodb/create-table.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Terraform AWS provider: aws_dynamodb_table (source of the registry page)",
+          "url": "https://github.com/hashicorp/terraform-provider-aws/blob/main/website/docs/r/dynamodb_table.html.markdown",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: service quotas",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/ServiceQuotas.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of a bank with thousands of numbered safe-deposit vaults. You never go to a vault yourself: you hand your slip to any clerk at the front desk (a request router), who checks your ID, looks up which vault holds your box in a ledger of vault ranges (the partition map) and sends a runner. Each vault has three keyholders in three different buildings, and one of them, the head keyholder, must sign every change, with one other keyholder countersigning before you get a receipt. A vault has a fixed door: only so many visits a minute, however empty the rest of the bank is. When a vault gets too full or too busy, the bank splits its boxes into two new vaults overnight. The analogy breaks at the busiest single box: a real bank would let a crowd queue at one box, while DynamoDB turns the excess away at once with a throttle, and no split can help, because one box can't be in two vaults.",
+  "in_your_world": "Your Quarkus payment service talks to DynamoDB through the AWS SDK, so a throttle first shows up as latency (the SDK retries with backoff) and only then as a `ProvisionedThroughputExceededException` or `ThrottlingException`. Log the throttling reason, not just the class: a key-range reason means a key design problem, and raising capacity won't fix it. Temporal activity retries on top of SDK retries multiply load on a hot partition, so cap them. The stream with old and new images is your outbox into Kafka; partition the Kafka topic by the same account key so per-item order survives. A nightly settlement batch that writes in sort-key order (all of one merchant, then the next) is the sequential pattern that splits can't help: shuffle the order, or spread the writes over many partition keys at once, and rate-limit to stay under 1,000 WCU per key range.",
+  "mistake": "The most common mistake is treating the table's capacity as one pool: \"we provisioned 40,000 WCU and use 6,000, so we can't be throttled.\" Teams then raise capacity when throttles appear, see no improvement, and raise it again. The table total is a sum of partition ceilings, and one partition key, or one GSI key such as `status`, can't exceed 1,000 WCU or 3,000 RCU. People make the mistake because the console shows table-level numbers and DynamoDB hides partitions entirely, and because DynamoDB Local never throttles, so nothing in development warns them. The fix: read the `ThrottlingReasons` (a `KeyRange` reason is a hot key, not a capacity shortfall), find the key with Contributor Insights, and spread it, either with a better key or with lesson 2's write sharding for counters and hot merchants.",
+  "compare": {
+    "title": "The same jobs in a MongoDB sharded cluster and in DynamoDB",
+    "a": {
+      "label": "MongoDB sharded cluster (lesson 7)",
+      "lang": "text",
+      "src": "route a request   mongos, which you run, near the app\nthe map           config server replica set: config.chunks\nunit of data      chunk: a range of shard key values, 128 MB\nreplication       replica set per shard: primary + oplog,\n                  Raft-derived elections, w: \"majority\"\nsplit             balancer cuts ranges as it migrates them\nmove              balancer: moveRange, 3 x chunk size apart\nhot single key    one chunk on one shard; jumbo if it grows\nyou choose        shard key, members, oplog size, hardware"
+    },
+    "b": {
+      "label": "DynamoDB (this lesson)",
+      "lang": "text",
+      "src": "route a request   request routers, run by AWS\nthe map           partition metadata in MemDS\nunit of data      partition: a hash range, about 10 GB,\n                  3,000 RCU and 1,000 WCU\nreplication       three replicas in three AZs: Multi-Paxos\n                  leader, write acked by 2 of 3\nsplit             by size, by throughput, for consumption\nmove              DynamoDB places replicas by load\nhot single key    one partition: 1,000 WCU, then throttled\nyou choose        key design, capacity mode, indexes"
+    },
+    "note": "The machinery is the same shape: a router that looks keys up in a map kept in replicated metadata, ranges of keys as the unit of placement, and a consensus group per range that orders writes. The difference is who runs it and what you're allowed to touch. In MongoDB you run every box, so you size the oplog, place the members and choose when the balancer works; the shard key is the one decision that's expensive to undo. In DynamoDB you touch only the key and the capacity, and in exchange you get hard per-partition ceilings that no setting can raise. A hot key fails the same way in both: one key can't be split, so its writes stay on one machine's leader."
+  },
+  "worked": {
+    "title": "Size a payments table from the numbers, then check the hot keys",
+    "steps": [
+      {
+        "say": "Start from the traffic you expect. A steady 2,000 payments a second at peak, items of about 600 bytes, each payment also writing two GSIs, and 6,000 strongly consistent reads a second of items under 4 KB.",
+        "lang": "text",
+        "code": "writes   2,000/s x 1 WCU (under 1 KB)         = 2,000 WCU on the table\n         2,000/s x 1 WCU x 2 GSIs              = 4,000 WCU on the indexes\nreads    6,000/s x 1 RCU (strong, under 4 KB)  = 6,000 RCU\nBlack Friday: 5x  ->  10,000 WCU table, 20,000 WCU indexes, 30,000 RCU"
+      },
+      {
+        "say": "Check the per-partition ceilings against the busiest key, not the table. An account makes a few payments a day, so `ACCT#` keys are fine. The busiest merchant is the risk: M-0042 takes a fifth of Black Friday's 10,000 payments a second, and `byMerchant` has `merchantId` as its partition key.",
+        "lang": "text",
+        "code": "M-0042 on byMerchant:  10,000/s x 1/5 = 2,000 WCU on ONE index key\nper-partition ceiling:  1,000 WCU\n-> GSI back-pressure throttles the base table's writes\n-> shard the index key: merchantId#0 .. merchantId#3 (lesson 2), 500 WCU each"
+      },
+      {
+        "say": "Pick the mode. The peak is five times the normal level and hard to forecast, so on-demand. A new table takes 4,000 writes a second, far below 10,000, so pre-warm it before launch instead of growing into it, and cap it with a maximum as a cost guard.",
+        "lang": "bash",
+        "code": "aws dynamodb update-table --table-name payments \\\n  --warm-throughput ReadUnitsPerSecond=30000,WriteUnitsPerSecond=12000\naws dynamodb update-table --table-name payments \\\n  --on-demand-throughput MaxReadRequestUnits=40000,MaxWriteRequestUnits=16000"
+      },
+      {
+        "say": "Turn on the visibility you need to find the next hot key, and alarm on throttles by reason.",
+        "lang": "bash",
+        "code": "aws dynamodb update-contributor-insights --table-name payments \\\n  --contributor-insights-action ENABLE\naws dynamodb update-contributor-insights --table-name payments --index-name byMerchant \\\n  --contributor-insights-action ENABLE\n# CloudWatch alarms: WriteKeyRangeThroughputThrottleEvents (table and each GSI) > 0"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Model DynamoDB partitions: splits, throttling, burst, adaptive capacity and on-demand",
+    "minutes": 15,
+    "files": [
+      "labs/nosql/src/main/kotlin/sfz/shard/l08/PartitionModel.kt"
+    ],
+    "run": "./gradlew :nosql:test --tests 'sfz.shard.l08.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All eleven fail with `NotImplementedError`.",
+      "Read `PartitionModel.kt`. The limits, `partitionOf` (equal slices of the hash space, so a split turns slice i into 2i and 2i + 1), the table classes and their `updateProvisioned` and `grow` are given. The model counts writes only; reads work the same with 3,000.",
+      "Write `Partitions.forNewTable` and `Partitions.afterSplits`. Three tests pass, including the paper's example: 3,200 WCU is 4 partitions of 800, 6,000 is 8 of 750, and back down to 5,000 keeps 8, at 625.",
+      "Write `ProvisionedTable.serve` in the order of its KDoc: share, adaptive capacity, burst, save, throttle. The docs' example now behaves as in the text: without adaptive capacity partition 3 is throttled 50 a second while the table uses 250 of 400; burst covers a 150 a second spike for exactly 300 seconds; with adaptive capacity nothing is throttled.",
+      "Write `OnDemandTable.serve`. The on-demand tests pass: a new table admits 4,000 of 6,000, then 8,000 once its peak is 4,000; and the hot key test passes in both modes, 500 throttled every second.",
+      "Experiment: in the hot key test, raise the provisioned table to 400,000 WCU. It still throttles 5,000 over ten seconds. Then spread the key over four keys (`MERCH#M-0042#TOTAL#0` to `#3`, 375 each) and watch it drop to 0."
+    ],
+    "hints": [
+      "Round up with Longs: `(a + b - 1) / b`. `bytes` is a `Long`, and `rcu` and `wcu` fit in one once you call `toLong()`.",
+      "Demand per partition: `val demand = IntArray(partitions); for ((pk, units) in writes) demand[partitionOf(pk, partitions)] += units`.",
+      "`minOf` takes three arguments: `minOf(demand[p], share, PARTITION_MAX_WCU)`. Adaptive and burst extras are `minOf(what's still wanted, room under the partition max, what's available)`.",
+      "`burst` is a `MutableList<Long>`; convert with `toLong()` and `toInt()` at the edges, and cap it at `BURST_SECONDS.toLong() * share`.",
+      "On-demand, take the excess back from the highest partition down: `for (p in partitions - 1 downTo 0)`. Split ahead with `Partitions.afterSplits(partitions, (ceiling() + PARTITION_MAX_WCU - 1) / PARTITION_MAX_WCU)` after updating `previousPeak`."
+    ],
+    "done_when": "All eleven tests in `PartitionModelTest` pass."
+  },
+  "drill": {
+    "title": "The table, its settings and its ceilings, from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write the AWS CLI calls that create an on-demand `payments` table with `pk`/`sk`, a `NEW_AND_OLD_IMAGES` stream and deletion protection, then turn on TTL on `expiresAt` and point-in-time recovery. Then one line each: a partition's three ceilings, what a new on-demand table admits and how that grows, and why one hot item is throttled whatever the table's capacity.",
+    "answer": {
+      "lang": "bash",
+      "src": "aws dynamodb create-table --table-name payments \\\n  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \\\n  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \\\n  --billing-mode PAY_PER_REQUEST \\\n  --stream-specification StreamEnabled=true,StreamViewType=NEW_AND_OLD_IMAGES \\\n  --deletion-protection-enabled\naws dynamodb update-time-to-live --table-name payments \\\n  --time-to-live-specification Enabled=true,AttributeName=expiresAt\naws dynamodb update-continuous-backups --table-name payments \\\n  --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true\n\n# a partition: 3,000 RCU, 1,000 WCU, about 10 GB; past those it splits (or throttles)\n# on-demand: 4,000 writes and 12,000 reads a second when new, then double the\n#   previous peak at once; beyond double within 30 minutes may throttle\n# one hot item: one key lives in one partition, and no split can divide a key,\n#   so it gets 1,000 WCU at most"
+    }
+  },
+  "recap": [
+    "A request goes to any request router, which authenticates it, checks admission tokens, hashes the partition key and finds the partition in a map cached from MemDS.",
+    "Each partition is three replicas in three availability zones running Multi-Paxos. The leader takes writes and strongly consistent reads and acknowledges once 2 of 3 have the log record; eventually consistent reads may come from any replica.",
+    "A partition takes at most 3,000 RCU, 1,000 WCU and about 10 GB. Partitions split by size, by provisioned throughput and for consumption, never merge, and can't split one hot item or an in-order key range.",
+    "Throttling refuses a request with HTTP 400; `ThrottlingReasons` names the limit. Provisioned capacity gained burst (300 s of savings), adaptive capacity (spare table units to a hot partition) and global admission control; on-demand admits double the previous peak and starts at 4,000 writes a second.",
+    "GSIs, streams, TTL, PITR and global tables work after the partition commits: a GSI is a global index that lags and can back-pressure the table, streams order records per item for 24 hours, and global tables (the Replication track) run these same partitions in every Region.",
+    "DynamoDB Local is one process: it accepts every setting but models no partitions, splits, throttling or PITR."
+  ],
+  "quiz": [
+    {
+      "q": "A provisioned table is created at 3,200 WCU, raised to 6,000 for a sale, then lowered to 5,000. How many partitions does it have, and what is each partition's share?",
+      "options": [
+        "4 partitions of 1,250",
+        "5 partitions of 1,000",
+        "8 partitions of 625",
+        "6 partitions of about 833"
+      ],
+      "answer": 2,
+      "why": "3,200 WCU needs 4 partitions (800 each). 6,000 doesn't fit in 4 at 1,000 each, so each splits in two: 8 of 750. Lowering to 5,000 doesn't merge anything, so it stays 8, each with 625. Five or six partitions can't happen because splits go in twos, and 1,250 per partition is above the 1,000 ceiling. This is the paper's example; the lab's first tests check it."
+    },
+    {
+      "q": "Your service updates a payment to SETTLED, gets HTTP 200, and immediately reads it back with a default `GetItem`. It sees AUTHORIZED. What happened?",
+      "options": [
+        "The update wasn't durable yet: HTTP 200 only means the router queued it",
+        "The default read is eventually consistent, so it may be answered by a replica that hasn't applied the update yet; `ConsistentRead` would have gone to the leader",
+        "A GSI answered the read",
+        "The update went to a different partition than the read"
+      ],
+      "answer": 1,
+      "why": "HTTP 200 means two of three replicas have the update in their logs, so it's durable. But a default read may be served by any replica, including the third, which can be a few milliseconds behind. With `ConsistentRead` the read goes to the leader, which has every acknowledged write, and costs 1 read unit instead of half. `GetItem` never reads a GSI, and a key always maps to one partition."
+    },
+    {
+      "q": "Base table writes are throttled although the table uses a third of its provisioned WCU. The exception's reason is `IndexWriteKeyRangeThroughputExceeded` on `byStatus`, a GSI keyed on `status` (AUTHORIZED, SETTLED, FAILED). What is the fix?",
+      "options": [
+        "Raise the table's provisioned WCU",
+        "Switch the table to on-demand",
+        "Change the index's key so writes spread over many partition key values (or add a shard suffix), because one status value is one hot key range on the index",
+        "Retry the writes with longer backoff"
+      ],
+      "answer": 2,
+      "why": "GSI back-pressure: the index can't absorb the updates, so DynamoDB throttles writes to the base table, and the exception names the index. `KeyRange` means a partition ceiling, not a capacity setting, so more WCU or on-demand changes nothing: every SETTLED payment still lands on one index key. With three values, the index's busiest key gets a large share of all writes. Spread the key; retries only add load."
+    },
+    {
+      "q": "An on-demand table has served a peak of 10,000 writes a second. A product launch suddenly sends 50,000 a second. What should you expect?",
+      "options": [
+        "All 50,000 are admitted at once: on-demand has no limits",
+        "About 20,000 a second are admitted at once, double the previous peak; the rest may be throttled while DynamoDB adds capacity, so pre-warm the table before the launch",
+        "Exactly 10,000 a second, the previous peak, until you raise it",
+        "The table switches itself to provisioned mode"
+      ],
+      "answer": 1,
+      "why": "On-demand instantly accommodates up to double the previous peak. Above that, DynamoDB adds capacity as traffic grows, but the docs warn of throttling if you exceed double the previous peak within 30 minutes. Warm throughput exists for exactly this: raise it before the launch and the table can take the new peak at once. The per-table quota, 40,000 units by default, would also cap 50,000 until raised."
+    },
+    {
+      "q": "From lesson 2: you split M-0042's 4,000 writes a second over `MERCH#M-0042#0` to `#9`. In this lesson's picture, why does that work when adaptive capacity on its own didn't?",
+      "options": [
+        "Ten keys hash to ten places in the key space, so splits can put them on different partitions, each with its own 1,000 WCU ceiling; adaptive capacity only raises one partition's share, never above 1,000",
+        "Adaptive capacity only works for reads",
+        "Sharded keys are stored in a different table with more capacity",
+        "Write sharding turns the writes into eventually consistent ones, which cost half"
+      ],
+      "answer": 0,
+      "why": "A partition key's hash decides its partition, so ten suffixes are ten keys spread over the hash space. DynamoDB can split for consumption and put them on different partitions, and the busiest one in lesson 2's demo got 454 writes, under the ceiling. Adaptive capacity lends unused table units to a hot partition, but the partition ceiling of 1,000 WCU never moves, and one key can't be split. Consistency mode only applies to reads.",
+      "from": "shard-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does a DynamoDB request router do?",
+      "back": "Authenticates the request (with cached IAM results), checks admission tokens, hashes the partition key, finds the partition in its map (cached from MemDS) and sends the request to that partition's leader or a replica."
+    },
+    {
+      "front": "How is a DynamoDB partition replicated?",
+      "back": "Three replicas in three availability zones form a Multi-Paxos group. The leader takes writes and strong reads; a write is acknowledged when 2 of 3 have the log record."
+    },
+    {
+      "front": "What are a partition's ceilings?",
+      "back": "3,000 RCU, 1,000 WCU and about 10 GB. Splits keep each partition under them; a single key can never exceed them."
+    },
+    {
+      "front": "What can't a partition split help?",
+      "back": "One item that takes the traffic, and a key range written in order (for example a timestamp sort key), where every new write lands at the same end."
+    },
+    {
+      "front": "What do burst and adaptive capacity do?",
+      "back": "Burst: a partition spends up to 300 seconds of its saved unused share on a spike. Adaptive: a throttled partition gets the table's unused units, within the table total and 1,000 WCU per partition."
+    },
+    {
+      "front": "What does a new on-demand table admit, and how does it grow?",
+      "back": "4,000 writes and 12,000 reads a second; then up to double the previous peak at once. Beyond double within 30 minutes may throttle; pre-warm with warm throughput."
+    },
+    {
+      "front": "What does DynamoDB Local not model?",
+      "back": "Partitions, splits, provisioned throughput, throttling and point-in-time recovery. It's one process for development."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Request router",
+      "plain": "The front-end service that authenticates each request, checks its throughput budget and sends it to the partition that owns the key."
+    },
+    {
+      "term": "Replication group",
+      "plain": "A partition's three replicas, one per availability zone, running Multi-Paxos to elect a leader and order writes."
+    },
+    {
+      "term": "Leader lease",
+      "plain": "Time-limited leadership the leader keeps renewing; a new leader waits for the old lease to expire before it takes writes."
+    },
+    {
+      "term": "Throttling",
+      "plain": "DynamoDB refusing a request (HTTP 400) because a partition, the table or a quota has no capacity left this second."
+    },
+    {
+      "term": "Split for consumption",
+      "plain": "Splitting a busy partition at a key chosen from the traffic it has seen, so the load lands on both halves."
+    },
+    {
+      "term": "Adaptive capacity",
+      "plain": "Giving a hot partition the table's unused throughput, within the table total and the partition ceiling."
+    },
+    {
+      "term": "Global admission control",
+      "plain": "Table-wide token buckets held by request routers and refilled from a central service, which decide what is admitted."
+    },
+    {
+      "term": "GSI back-pressure",
+      "plain": "Throttling of base-table writes because a global secondary index can't absorb the updates."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"We're on on-demand now, so we can't be throttled. Throttling is a provisioned-mode problem.\" Explain what a partition is, which limits still apply in on-demand mode, and what you'd check when throttles appear.",
+    "answer": "DynamoDB cuts every table into partitions, each a range of partition key hashes held by three replicas in three availability zones, with a leader that takes the writes. Every partition has fixed ceilings in both modes: 3,000 read units and 1,000 write units a second and about 10 GB. On-demand removes the number we used to set, but it doesn't remove those ceilings, and it adds two table-level limits of its own: it admits up to double the previous peak at once (and may throttle if we pass double within 30 minutes), and there's a per-table quota, 40,000 units by default, plus any maximum we configure. So a single hot item, such as a merchant's running total at 1,500 writes a second, is throttled in on-demand exactly as in provisioned, because one key lives in one partition and no split can divide it. A GSI with a skewed key throttles our base-table writes too. When throttles appear I'd read the `ThrottlingReasons`: `KeyRange` means a hot key or range, so we fix the key or shard it; `MaxOnDemandThroughput` or `AccountLimit` means a limit we can raise; for a launch I'd pre-warm the table. Then I'd turn on Contributor Insights to find the keys."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "The paper spends as much time on correctness as on speed. The core replication protocol is specified in TLA+ and model checked, and new features that touch it are added to the specification first. Every log record and message carries a checksum; logs are archived to S3 with a manifest, and the archiver checks every entry belongs to the right table and partition and that sequence numbers have no holes. A background scrub compares the three live replicas with each other and with a replica rebuilt offline from the archived logs, to catch bit rot that nothing else would.\n\nBackups use the same logs. On-demand backups and point-in-time restore are built from the write-ahead logs archived in S3 plus periodic partition snapshots, so taking a backup costs the live table nothing. A restore picks the nearest snapshot before the requested second for every partition, replays the logs up to that second, and writes a new table.\n\nFailure detection has a subtle problem the paper calls gray failure (the Faults, time and truth track returns to it): a follower may lose contact with the leader while the leader is fine and serving everyone else. If that follower called an election, it would interrupt a healthy partition, and the new leader would wait out the old lease. So a follower that wants to call an election first asks the other replicas whether they can see the leader, and backs off if they can. That one change cut spurious elections sharply.\n\nThe metadata story is a lesson in caches. Routers that cache a whole table's map work at a hit rate of about 99.75%, but a fleet of cold routers sends every request to the metadata store at once. MemDS answers every lookup, and each router's cache refreshes asynchronously on every hit, so MemDS sees the same load whether caches are warm or cold. If a router's map is stale, the storage node it reached answers with the new membership or an error that sends the router back to MemDS: the same idea as MongoDB's StaleConfig in lesson 7."
+  },
+  "sources": [
+    {
+      "title": "Elhemali et al., Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service, USENIX ATC 2022",
+      "url": "https://www.usenix.org/conference/atc22/presentation/elhemali"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: burst and adaptive capacity",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/burst-adaptive-capacity.html"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: on-demand capacity mode",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/on-demand-capacity-mode.html"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: diagnosing throttling",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/throttling-diagnosing-workflow.html"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: how global tables work",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html"
+    }
+  ]
+}

@@ -7,12 +7,12 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:${versions["coroutines"]}")
     runtimeOnly("org.slf4j:slf4j-simple:${versions["slf4j"]}")
     testImplementation("org.apache.kafka:kafka-streams-test-utils:${versions["kafka"]}")
-    // the Kafka Streams demos of lesson 10 run topologies in TopologyTestDriver, with no broker
+    // the Kafka Streams demos of stream-05 run topologies in TopologyTestDriver, with no broker
     "demoImplementation"("org.apache.kafka:kafka-streams-test-utils:${versions["kafka"]}")
-    // lesson 11: Avro's own reader/writer schema resolution, for the schema demos and to check the lab's model
+    // stream-02: Avro's own reader/writer schema resolution, for the schema demos and to check the lab's model
     "demoImplementation"("org.apache.avro:avro:1.12.2")
     testImplementation("org.apache.avro:avro:1.12.2")
-    // lesson 11: the outbox demo writes a payment and its event to PostgreSQL in one transaction
+    // stream-02: the outbox demo writes a payment and its event to PostgreSQL in one transaction
     "demoImplementation"("org.postgresql:postgresql:${versions["postgres"]}")
     testImplementation("org.testcontainers:testcontainers-kafka:${versions["testcontainers"]}")
     testImplementation("org.testcontainers:testcontainers-junit-jupiter:${versions["testcontainers"]}")

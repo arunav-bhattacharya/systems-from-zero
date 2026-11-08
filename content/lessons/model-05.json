@@ -1,0 +1,406 @@
+{
+  "id": "model-05",
+  "title": "Wide-column stores with Cassandra",
+  "minutes": 40,
+  "goal": "By the end you can read a CQL primary key as a sorted partition on disk, size a partition with a time bucket, say what an insert, an update and a delete each leave in the SSTables, spot a tombstone storm before it happens, and choose between a query table, an SAI index, ALLOW FILTERING and a lightweight transaction.",
+  "warmup": {
+    "q": "A payout worker inserts each payout into one Cassandra partition per merchant and deletes the row once the payout is paid. Today 50,000 payouts came and went for M-0042, and 10 are waiting. What does reading the next 10 cost?",
+    "options": [
+      "About 10 rows: deleted rows are gone, so the partition holds 10",
+      "About 50,010 entries: every delete left a tombstone the read has to step over",
+      "Nothing extra after a few minutes, because compaction removes deleted rows right away",
+      "It depends only on the LIMIT, because Cassandra stops after 10 rows"
+    ],
+    "answer": 1,
+    "why": "A Cassandra delete writes a tombstone, and compaction may drop it only after `gc_grace_seconds`, 10 days by default, so other replicas can't bring the row back. A read from the front of the partition steps over every tombstone before it finds 10 live rows. Past 100,000 tombstones in one read, Cassandra aborts the read. The LIMIT counts live rows, not what the node had to read to find them."
+  },
+  "sections": [
+    {
+      "h": "A table is a map of partitions, and each partition is a sorted list of rows",
+      "body": "Lesson 4 packed a whole screen into one DynamoDB item collection: one partition key, many sorted items. Cassandra builds its entire data model on that shape, a partition of sorted rows, and the model is called wide-column. Lesson 2 gave the payment history its own Cassandra table:\n\n```sql\nCREATE TABLE payments_by_account (\n    account_id   text,\n    created_at   timestamp,\n    payment_id   text,\n    merchant_id  text,\n    status       text,\n    amount_minor bigint,\n    currency     text,\n    PRIMARY KEY ((account_id), created_at, payment_id)\n) WITH CLUSTERING ORDER BY (created_at DESC, payment_id ASC);\n```\n\nThe inner parentheses hold the partition key; the columns after it are clustering columns. This lesson opens the box: what that key means on one node, what a write leaves on disk, and why deleting rows can make reads slow.\n\nStart from the question the table answers: A-1001's 20 newest payments, out of 50 million. Every row with the same partition key belongs to one partition. The coordinator, whichever node took the request, hashes the partition key to a token, a 64-bit number (A-1001's is -4994511478997274402). The token's place on a ring like lesson 1's picks the nodes that keep copies of the partition, its replicas, usually three. Each replica holds the whole partition, so a query that names the partition key talks only to those nodes. The Partitioning track builds Cassandra's ring properly.\n\nInside the partition, the rows are kept sorted by the clustering columns: newest `created_at` first, with `payment_id` breaking ties. The order is how they sit in memory and on disk, so \"the 20 newest\" means \"the first 20 rows of one partition\", and a time window is one contiguous slice: the node seeks to the first row inside the window and reads until it leaves it. Oldest first is the same slice, read from the other end.\n\nThat shape gives the family its name, and the name misleads. A partition is Bigtable's row from lesson 1, and the clustering values play the part of its sorted column names, so a partition is a \"wide\" row that can hold many entries. It has nothing to do with a column store, which keeps each column's values together for reports. Stonebraker and Pavlo describe the wide-column model as a document model with one level of nesting: a partition key, then a sorted list of rows that each have their own columns.\n\nA partition never splits across nodes, so its size is your decision. The Cassandra docs advise under 100,000 rows and under 100 MB. Do the arithmetic before you pick the key: rows in a partition = write rate × how long the partition key stays the same. Keyed by merchant alone, AP3's table grows forever. Add the day, `((merchant_id, day), ...)`, and a merchant taking 40,000 payments a day fills a partition with 40,000 rows, about 6 MB at 150 bytes a row. The biggest merchant on Black Friday takes 5 a second, 432,000 a day, past the row guideline, so for that table an hour bucket (18,000 rows) is the safer choice. The bucket costs reads: a week of history is 7 day partitions or 168 hour partitions, read in parallel and merged. Size it for your busiest key, not your average one.\n\nThe query rules follow from the picture. The partition key needs `=` on every column, or there's no token and no node to ask. Clustering columns can be restricted only from the left, because that's the only order the rows are in, with at most one range at the end. Anything else means reading rows and throwing most of them away, and CQL refuses unless you add `ALLOW FILTERING` (section 4). So you build one table per query, and the service writes each payment to every table that needs it.\n\n**A partition is a sorted list of rows that Cassandra never edits in place: every write, updates and deletes included, adds a new timestamped piece, and every read merges the pieces it finds.** The stepper shows the sorted list. Sections 2 and 3 add the pieces.",
+      "stepper": {
+        "title": "A write lands in its sorted place, and a range read takes one slice",
+        "intro": "One partition of `payments_by_account` on one node. Click through an insert, two range reads and a query with no partition key.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Partition A-1001 holds four payment rows sorted newest first by created_at\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">PRIMARY KEY ((account_id),</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\">  created_at, payment_id)</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\">  ORDER BY created_at DESC</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code\" x=\"145\" y=\"175\" text-anchor=\"middle\">-4994511478997274402</text><text class=\"t-s t-m\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><rect class=\"box\" x=\"300\" y=\"236\" width=\"360\" height=\"70\" rx=\"8\"/><text class=\"t-s\" x=\"314\" y=\"262\" text-anchor=\"start\">the newest payment is the first row:</text><text class=\"t-s\" x=\"314\" y=\"284\" text-anchor=\"start\">LIMIT 20 reads the first 20 rows</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">partition key</text><text class=\"t-s\" x=\"258\" y=\"224\" text-anchor=\"end\">account_id</text><rect class=\"box\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">clustering</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">created_at, payment_id</text><rect class=\"box\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">rows in A-1001</text><text class=\"t-s\" x=\"258\" y=\"296\" text-anchor=\"end\">4</text></svg>",
+            "say": "All of A-1001's payments form one partition, and the node stores its rows sorted by the clustering columns: `created_at` newest first, then `payment_id`. The order is how the rows sit in memory and on disk. Nothing sorts them when you read."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"An insert for A-1001 arrives; hashing the partition key gives the token that picks the partition\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">INSERT ... VALUES ('A-1001',</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\">  '2026-11-07 09:00:00',</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\">  'pay-81723', 'AUTHORIZED')</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code t-a\" x=\"145\" y=\"175\" text-anchor=\"middle\">-4994511478997274402</text><text class=\"t-s t-a\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">hash of</text><text class=\"t-s t-a\" x=\"258\" y=\"224\" text-anchor=\"end\">'A-1001'</text><rect class=\"box\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">token picks</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">the replicas</text><rect class=\"box\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">other columns</text><text class=\"t-s\" x=\"258\" y=\"296\" text-anchor=\"end\">not hashed</text></svg>",
+            "say": "A new payment for A-1001 arrives. The coordinator hashes only the partition key, `'A-1001'`, to the token -4994511478997274402. The token's place on the ring picks the replicas, as in lesson 1, and on each one it picks this partition. The clustering columns aren't hashed: they only say where inside the partition the row goes."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"The new 09:00 row is placed between the 09:40 and 08:15 rows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">INSERT ... VALUES ('A-1001',</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\">  '2026-11-07 09:00:00',</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\">  'pay-81723', 'AUTHORIZED')</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code\" x=\"145\" y=\"175\" text-anchor=\"middle\">-4994511478997274402</text><text class=\"t-s t-m\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box-a\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 09:00:00  pay-81723  AUTHORIZED</text><rect class=\"box\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box\" x=\"300\" y=\"184\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"204\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">lands between</text><text class=\"t-s t-a\" x=\"258\" y=\"224\" text-anchor=\"end\">09:40 and 08:15</text><rect class=\"box\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">rows in A-1001</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">5</text><rect class=\"box\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">rows rewritten</text><text class=\"t-s\" x=\"258\" y=\"296\" text-anchor=\"end\">none</text></svg>",
+            "say": "The row goes straight to its sorted place, between 09:40:27 and 08:15:03, even though it arrived last. In memory the node inserts it into a sorted structure; section 2 shows how it reaches disk without rewriting the other rows."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A range read from 08:00 to 10:00 reads three neighbouring rows and stops\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">SELECT ... WHERE</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\"> account_id = 'A-1001' AND</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\"> 08:00 &lt;= created_at &lt; 10:00</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code t-a\" x=\"145\" y=\"175\" text-anchor=\"middle\">-4994511478997274402</text><text class=\"t-s t-m\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box-dim\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box-a\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box-a\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 09:00:00  pay-81723  AUTHORIZED</text><rect class=\"box-a\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box-dim\" x=\"300\" y=\"184\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"314\" y=\"204\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">seek to</text><text class=\"t-s t-a\" x=\"258\" y=\"224\" text-anchor=\"end\">first row &lt; 10:00</text><rect class=\"box\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">walk until</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">a row &lt; 08:00</text><rect class=\"box-a\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">rows read</text><text class=\"t-s t-a\" x=\"258\" y=\"296\" text-anchor=\"end\">3</text></svg>",
+            "say": "A time window is one contiguous slice. The node seeks to the first row before 10:00, reads forward while rows are inside the window, and stops at the first row before 08:00. It reads three rows to return three. The 10:30 row and yesterday's row are never touched."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"The same slice read oldest first is the same three rows read from the other end\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">... created_at &gt;= 08:00</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\">    AND created_at &lt; 10:00</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\">ORDER BY created_at ASC</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code t-a\" x=\"145\" y=\"175\" text-anchor=\"middle\">-4994511478997274402</text><text class=\"t-s t-m\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box-dim\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box-a\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box-a\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 09:00:00  pay-81723  AUTHORIZED</text><rect class=\"box-a\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box-dim\" x=\"300\" y=\"184\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"314\" y=\"204\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><line class=\"ln-a\" x1=\"672\" y1=\"180\" x2=\"672\" y2=\"116\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">same slice</text><text class=\"t-s t-a\" x=\"258\" y=\"224\" text-anchor=\"end\">3 rows</text><rect class=\"box\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">read</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">from the other end</text><rect class=\"box\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">sort step</text><text class=\"t-s\" x=\"258\" y=\"296\" text-anchor=\"end\">none</text></svg>",
+            "say": "`ORDER BY created_at ASC` asks for the reverse of the stored order. The node reads the same slice backwards, as the arrow shows: 08:15, 09:00, 09:40. Ordering by any column that isn't a clustering column is simply refused."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A query on status with no account has no token, so it would read every row of every partition\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"250\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"62\" text-anchor=\"start\">SELECT payment_id FROM</text><text class=\"t-s t-code\" x=\"34\" y=\"81\" text-anchor=\"start\">  payments_by_account</text><text class=\"t-s t-code\" x=\"34\" y=\"100\" text-anchor=\"start\">  WHERE status = 'FAILED'</text><rect class=\"box-bad\" x=\"20\" y=\"132\" width=\"250\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"154\" text-anchor=\"middle\">token(account_id)</text><text class=\"t-s t-code\" x=\"145\" y=\"175\" text-anchor=\"middle\">no account: no token</text><text class=\"t-s t-m\" x=\"300\" y=\"28\" text-anchor=\"start\">partition A-1001, newest first</text><rect class=\"box-bad\" x=\"300\" y=\"40\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"60\" text-anchor=\"start\">2026-11-07 10:30:12  pay-81730  SETTLED</text><rect class=\"box-bad\" x=\"300\" y=\"76\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"96\" text-anchor=\"start\">2026-11-07 09:40:27  pay-81720  FAILED</text><rect class=\"box-bad\" x=\"300\" y=\"112\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"132\" text-anchor=\"start\">2026-11-07 09:00:00  pay-81723  AUTHORIZED</text><rect class=\"box-bad\" x=\"300\" y=\"148\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"168\" text-anchor=\"start\">2026-11-07 08:15:03  pay-81701  SETTLED</text><rect class=\"box-bad\" x=\"300\" y=\"184\" width=\"360\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"314\" y=\"204\" text-anchor=\"start\">2026-11-06 23:59:58  pay-81655  SETTLED</text><rect class=\"box-bad\" x=\"300\" y=\"236\" width=\"360\" height=\"70\" rx=\"8\"/><text class=\"t-s\" x=\"314\" y=\"262\" text-anchor=\"start\">and every row of every other partition,</text><text class=\"t-s\" x=\"314\" y=\"284\" text-anchor=\"start\">on every node, to find two FAILED rows</text><rect class=\"box-bad\" x=\"20\" y=\"204\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"224\" text-anchor=\"start\">token</text><text class=\"t-s\" x=\"258\" y=\"224\" text-anchor=\"end\">none</text><rect class=\"box-bad\" x=\"20\" y=\"240\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"260\" text-anchor=\"start\">partitions to read</text><text class=\"t-s\" x=\"258\" y=\"260\" text-anchor=\"end\">all of them</text><rect class=\"box-bad\" x=\"20\" y=\"276\" width=\"250\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"296\" text-anchor=\"start\">CQL says</text><text class=\"t-s\" x=\"258\" y=\"296\" text-anchor=\"end\">use ALLOW FILTERING</text></svg>",
+            "say": "Now ask for FAILED payments without an account. There's no partition key, so no token and no slice. The only plan is to read every row of every partition on every node and filter. CQL refuses unless you add `ALLOW FILTERING`; section 4 measures what that costs."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch a write land in its sorted place",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start Cassandra 5.0: `docker compose -f env/cassandra.yml up -d --wait` (about one to two minutes). Load lesson 2's tables: `docker compose -f env/cassandra.yml exec cassandra cqlsh -f /sfz/nosql-02-payments.cql`.",
+          "Open a prompt with `docker compose -f env/cassandra.yml exec cassandra cqlsh` and run the four statements below. Before the third, predict which rows come back and in which order.",
+          "Leave Cassandra running: the next three Try-its use it."
+        ],
+        "code": {
+          "lang": "sql",
+          "title": "in cqlsh",
+          "src": "-- 1. A-1001's partition: one token, rows stored newest first\nSELECT token(account_id), account_id, created_at, payment_id\nFROM payments.payments_by_account WHERE account_id = 'A-1001';\n\n-- 2. a new payment from 09:00, written last\nINSERT INTO payments.payments_by_account\n    (account_id, created_at, payment_id, merchant_id, status, amount_minor, currency)\nVALUES ('A-1001', '2026-11-07 09:00:00+0000', 'pay-81723', 'M-0042', 'AUTHORIZED', 2500, 'EUR');\n\n-- 3. a time window: one slice of one partition\nSELECT created_at, payment_id, status FROM payments.payments_by_account\nWHERE account_id = 'A-1001'\n  AND created_at >= '2026-11-07 08:00:00+0000' AND created_at < '2026-11-07 10:00:00+0000';\n\n-- 4. the same slice, oldest first\nSELECT created_at, payment_id, status FROM payments.payments_by_account\nWHERE account_id = 'A-1001'\n  AND created_at >= '2026-11-07 08:00:00+0000' AND created_at < '2026-11-07 10:00:00+0000'\nORDER BY created_at ASC;\n"
+        },
+        "expect": "```text\n system.token(account_id) | account_id | created_at                      | payment_id\n--------------------------+------------+---------------------------------+------------\n     -4994511478997274402 |     A-1001 | 2026-11-07 10:30:12.000000+0000 |  pay-81730\n     -4994511478997274402 |     A-1001 | 2026-11-07 09:40:27.000000+0000 |  pay-81720\n     -4994511478997274402 |     A-1001 | 2026-11-07 08:15:03.000000+0000 |  pay-81701\n     -4994511478997274402 |     A-1001 | 2026-11-06 23:59:58.000000+0000 |  pay-81655\n\n created_at                      | payment_id | status\n---------------------------------+------------+------------\n 2026-11-07 09:40:27.000000+0000 |  pay-81720 |     FAILED\n 2026-11-07 09:00:00.000000+0000 |  pay-81723 | AUTHORIZED\n 2026-11-07 08:15:03.000000+0000 |  pay-81701 |    SETTLED\n\n created_at                      | payment_id | status\n---------------------------------+------------+------------\n 2026-11-07 08:15:03.000000+0000 |  pay-81701 |    SETTLED\n 2026-11-07 09:00:00.000000+0000 |  pay-81723 | AUTHORIZED\n 2026-11-07 09:40:27.000000+0000 |  pay-81720 |     FAILED\n```\n\n(Row counts trimmed.) Every row has the same token, because only `account_id` is hashed; you get this exact number on any machine, since Cassandra's Murmur3 hash is deterministic. The 09:00 payment was written last and comes back in its sorted place, between 09:40 and 08:15. Query 3 returns the slice in stored order with no `ORDER BY`, and query 4 reads the same three rows backwards."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: data modeling introduction (partitions, clustering, size guidance)",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Every write is an append: commit log, memtable, SSTable",
+      "body": "A payment changes state several times: AUTHORIZED, then CAPTURED, then SETTLED. An Oracle `UPDATE` finds the block that holds the row and changes it in place, keeping the old value in undo for readers who still need it. The block has to be in memory first, which often means a random read before the write. Cassandra, which Facebook first built for its inbox search, takes the other road: a write never reads anything first, and a file is never changed once it's written.\n\nThe write path is lesson 1's LSM tree in one line: the node appends the write to its commit log so it survives a crash, adds it to the memtable, a sorted structure in memory, and acknowledges. When the memtable is full, the node flushes it to disk as an SSTable, an immutable sorted file. Nothing is looked up first. Three things follow, and each one surprises people who come from SQL.\n\nFirst, `INSERT` and `UPDATE` are the same operation, an upsert. An `UPDATE` of a row that doesn't exist creates it. An `INSERT` of a primary key that already exists overwrites the columns it names, with no duplicate-key error. \"Insert only if absent\" needs a lightweight transaction (section 4).\n\nSecond, every cell carries its own write timestamp, in microseconds. The Java driver 4.19 stamps each statement with the application server's clock (its default, `AtomicTimestampGenerator`) unless the statement says `USING TIMESTAMP`. When a read finds two versions of a cell, the higher timestamp wins, column by column. That rule is called last write wins, and the Replication track's lesson on concurrent writes shows which writes it silently drops. An `UPDATE` of `status` writes only the status cell, so after two flushes the row exists as two pieces in two SSTables, and every read stitches them together. The Try-it dumps both pieces.\n\nThird, a read may have to look in the memtable and in several SSTables. Bloom filters, a small summary per file that can answer \"this partition is definitely not here\", let it skip SSTables, and compaction keeps the count of SSTables down: in the background it merges several into one new file, keeps the newest version of each cell and drops the rest. Which files it merges is the compaction strategy. Size-tiered (STCS) merges files of similar size, and it's still the default in the `cassandra.yaml` of 5.0.9. Leveled (LCS) arranges files in levels so a read touches fewer of them, at the price of rewriting data more often. Time-window (TWCS) groups data by write time, which suits rows that all expire after the same TTL. Cassandra 5.0 added the Unified Compaction Strategy (UCS), which can be tuned to behave like any of the three; its docs recommend it \"for most workloads\", and the `cassandra_latest.yaml` that ships with 5.0 makes it the default. For a new table on 5.0, start with UCS.",
+      "try": {
+        "title": "See the pieces a write leaves on disk",
+        "minutes": 5,
+        "steps": [
+          "Run the commands below from the `labs` folder, one block at a time. Before the dumps, predict: how many SSTables hold part of pay-81723, and which status does each one say?",
+          "Compare the two `WRITETIME` values: they belong to two cells of the same row."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "# flush the memtable: A-1001's partition becomes part of an SSTable\ndocker compose -f env/cassandra.yml exec cassandra nodetool flush payments payments_by_account\ndocker compose -f env/cassandra.yml exec cassandra nodetool tablestats payments.payments_by_account | grep 'SSTable count'\n\n# capture pay-81723: an UPDATE of one column, then read both cells' write timestamps\ndocker compose -f env/cassandra.yml exec cassandra cqlsh -e \"\n  UPDATE payments.payments_by_account SET status = 'CAPTURED'\n  WHERE account_id = 'A-1001' AND created_at = '2026-11-07 09:00:00+0000' AND payment_id = 'pay-81723';\n  SELECT payment_id, status, WRITETIME(status), WRITETIME(amount_minor) FROM payments.payments_by_account\n  WHERE account_id = 'A-1001' AND created_at = '2026-11-07 09:00:00+0000';\"\n\n# flush again and dump A-1001 from each SSTable, one CQL row per line\ndocker compose -f env/cassandra.yml exec cassandra nodetool flush payments payments_by_account\ndocker compose -f env/cassandra.yml exec cassandra bash -c 'cd /var/lib/cassandra/data/payments/payments_by_account-*/ &&\n  for f in *-Data.db; do echo \"== $f\"; /opt/cassandra/tools/bin/sstabledump $f -k A-1001 -d 2>/dev/null; done'\n\n# merge them: compact, count, and dump the merged row\ndocker compose -f env/cassandra.yml exec cassandra nodetool compact payments payments_by_account\ndocker compose -f env/cassandra.yml exec cassandra bash -c 'cd /var/lib/cassandra/data/payments/payments_by_account-*/ &&\n  ls *-Data.db && /opt/cassandra/tools/bin/sstabledump *-Data.db -k A-1001 -d 2>/dev/null | grep 81723'\n"
+        },
+        "expect": "Output trimmed to the lines that matter (the timestamps will differ on your machine):\n\n```text\n\t\tSSTable count: 1\n\n payment_id | status   | writetime(status) | writetime(amount_minor)\n------------+----------+-------------------+-------------------------\n  pay-81723 | CAPTURED |  1794081383953194 |        1794081362991451\n\n== nb-1-big-Data.db\n[A-1001]@20 Row[info=[ts=1794081361774060] ]: '2026-11-07T10:30:12.000Z', 'pay-81730' | [amount_minor=4250 ts=1794081361774060], ...\n[A-1001]@129 Row[info=[ts=1794081362991451] ]: '2026-11-07T09:00:00.000Z', 'pay-81723' | [amount_minor=2500 ts=1794081362991451], [currency=EUR ts=1794081362991451], [merchant_id=M-0042 ts=1794081362991451], [status=AUTHORIZED ts=1794081362991451]\n(three more rows)\n== nb-2-big-Data.db\n[A-1001]@20 Row[info=[ts=-9223372036854775808] ]: '2026-11-07T09:00:00.000Z', 'pay-81723' | [status=CAPTURED ts=1794081383953194]\n\nnb-3-big-Data.db\n[A-1001]@129 Row[info=[ts=1794081362991451] ]: '2026-11-07T09:00:00.000Z', 'pay-81723' | [amount_minor=2500 ts=1794081362991451], [currency=EUR ts=1794081362991451], [merchant_id=M-0042 ts=1794081362991451], [status=CAPTURED ts=1794081383953194]\n```\n\nThe two cells of one row have different timestamps: the status is about 21 seconds newer than the amount. The first SSTable still says AUTHORIZED; nothing changed it. The second holds only the new status cell, with no row marker (`ts=-9223372036854775808` means \"none\": an `UPDATE` doesn't write one). The `SELECT` merged the two pieces and kept the newer status. After `nodetool compact` there's one file, `nb-3`, and one merged row. `nb` is the SSTable format version and `big` the classic format, because 5.0.9's `cassandra.yaml` keeps `storage_compatibility_mode: CASSANDRA_4`."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: Unified Compaction Strategy",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/ucs.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A delete is a write too: tombstones, TTL and the tombstone storm",
+      "body": "Delete a test payment, pay-81655, from A-1001's history. Its three replicas are A, B and C, and C is down for an hour. The first version of a delete removes the row from A and B. Then C comes back, and repair runs. Cassandra compares the replicas' copies, during reads (read repair) and in a background job (anti-entropy repair), and copies over whatever one of them lacks; the Replication track's lesson on leaderless replication builds both. Repair finds that C has a row A and B don't have. Nothing tells repair whether A and B lost the row or deleted it, so it copies the row back. The deleted payment returns.\n\nSo Cassandra makes a delete a write. It writes a tombstone, a marker with a timestamp that says \"this row was deleted at t\". The tombstone takes the same write path to every replica and beats older versions by the same timestamp rule. Repair now has something to spread, and C gets the tombstone too.\n\nHow long must a tombstone stay? Until every replica has it. Cassandra can't know when that is, so it keeps each tombstone for `gc_grace_seconds`, 864,000 seconds (10 days) by default, and only after that lets compaction drop it. That gives operators a deadline: repair every node more often than every 10 days. A node that stays down longer, then rejoins and is repaired, still has the old row, and the tombstone that should shadow it is gone everywhere else. Repair copies the row back, and the delete is undone. Operators call those rows zombies.\n\nA TTL works the same way. `INSERT ... USING TTL 86400` gives the cells an expiry 24 hours out, which suits idempotency keys. After that the cells are dead: reads skip them and count them as tombstones, and compaction drops them once `gc_grace_seconds` have passed.\n\nNow the failure. A payout worker uses a table as a queue: one partition per merchant, one row per payout, sorted by payout id, and the worker deletes each row once the payout is paid. Every delete leaves a tombstone at the front of the partition, and the tombstones stay for 10 days. When the worker asks for the next 10 payouts, the read starts at the front and steps over every tombstone before it finds 10 live rows. After 1,990 paid payouts, it handles 2,000 entries to return 10. With more than 1,000 tombstones in one read Cassandra logs a warning (`tombstone_warn_threshold`), and with more than 100,000 it aborts the read (`tombstone_failure_threshold`). That's a tombstone storm, and the Try-it starts one.\n\nThere are two fixes. Start the slice after the tombstones: keep the last paid payout id and ask for `payout_id > ?`, so the node seeks past them, as the figure shows. On the same partition with 1,200 tombstones, that read reports \"Read 3 live rows and 0 tombstone cells\". Or don't delete at all: put a time bucket in the partition key and let old buckets expire with a TTL, on TWCS, which drops whole expired files. A real work queue belongs in Kafka, where reading a message doesn't delete anything.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"A queue partition: 1,990 tombstones at the front and 10 live payouts at the end; a read from the front steps over all the tombstones, a read that starts after the last paid payout seeks past them\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"26\" text-anchor=\"start\">partition M-0042 of payout_queue, sorted by payout_id</text><rect class=\"box-dim\" x=\"20\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"46.0\" y=\"65\" text-anchor=\"middle\">0</text><rect class=\"box-dim\" x=\"78\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"104.0\" y=\"65\" text-anchor=\"middle\">1</text><rect class=\"box-dim\" x=\"136\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"162.0\" y=\"65\" text-anchor=\"middle\">2</text><rect class=\"box-dim\" x=\"194\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"220.0\" y=\"65\" text-anchor=\"middle\">3</text><rect class=\"box-dim\" x=\"252\" y=\"40\" width=\"40\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"272.0\" y=\"65\" text-anchor=\"middle\">...</text><rect class=\"box-dim\" x=\"298\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"324.0\" y=\"65\" text-anchor=\"middle\">1988</text><rect class=\"box-dim\" x=\"356\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"382.0\" y=\"65\" text-anchor=\"middle\">1989</text><text class=\"t-s t-bad\" x=\"20\" y=\"100\" text-anchor=\"start\">1,990 tombstones: paid and deleted, kept for 10 days</text><rect class=\"box-ok\" x=\"422\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"448.0\" y=\"65\" text-anchor=\"middle\">1990</text><rect class=\"box-ok\" x=\"480\" y=\"40\" width=\"40\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"500.0\" y=\"65\" text-anchor=\"middle\">...</text><rect class=\"box-ok\" x=\"526\" y=\"40\" width=\"52\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"552.0\" y=\"65\" text-anchor=\"middle\">1999</text><text class=\"t-s t-ok\" x=\"422\" y=\"100\" text-anchor=\"start\">10 live</text><line class=\"ln-bad\" x1=\"20\" y1=\"132\" x2=\"640\" y2=\"132\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"20\" y=\"154\" text-anchor=\"start\">LIMIT 10 from the front: step over 1,990 tombstones, then return 10 rows</text><line class=\"ln-a\" x1=\"422\" y1=\"192\" x2=\"640\" y2=\"192\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"20\" y=\"214\" text-anchor=\"start\">payout_id &gt; 1989 LIMIT 10: seek straight to 1990, read 10 rows</text><text class=\"t-s t-m\" x=\"20\" y=\"238\" text-anchor=\"start\">more than 1,000 tombstones in one read: a warning; more than 100,000: the read fails</text></svg>",
+        "caption": "A queue in one partition: every paid payout leaves a tombstone at the front, and a read that starts at the front pays for all of them."
+      },
+      "try": {
+        "title": "Fill a partition with tombstones",
+        "minutes": 6,
+        "steps": [
+          "Read `TombstoneDemo.kt`. It creates `payments.payout_queue` (partition `merchant_id`, clustering `payout_id`), enqueues 2,000 payouts for M-0042, deletes the first 1,990 the way a worker would, and reads the next 10 with tracing on.",
+          "Predict how many tombstones that read steps over. Run the demo from the `labs` folder.",
+          "Optional, about a minute: run it again with `-Pargs=101000`, then look for the reason in the log: `docker compose -f env/cassandra.yml logs cassandra | grep -i tombstones | tail -1`.",
+          "Now a TTL. In cqlsh, run `CREATE TABLE IF NOT EXISTS payments.idempotency_keys (idem_key text PRIMARY KEY, payment_id text);` and `INSERT INTO payments.idempotency_keys (idem_key, payment_id) VALUES ('idem-9b21', 'pay-81724') USING TTL 10;` then `SELECT idem_key, payment_id, TTL(payment_id) FROM payments.idempotency_keys WHERE idem_key = 'idem-9b21';`. Wait 11 seconds, turn `TRACING ON` and run the `SELECT` again."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "TombstoneDemo.kt",
+          "src": "package sfz.model.l05.demo\n\nimport com.datastax.oss.driver.api.core.CqlSession\nimport com.datastax.oss.driver.api.core.config.DefaultDriverOption\nimport com.datastax.oss.driver.api.core.config.DriverConfigLoader\nimport com.datastax.oss.driver.api.core.cql.PreparedStatement\nimport com.datastax.oss.driver.api.core.cql.SimpleStatement\nimport com.datastax.oss.driver.api.core.servererrors.ReadFailureException\nimport java.net.InetSocketAddress\nimport java.time.Duration\n\n/**\n * A payout queue in one Cassandra partition: enqueue 2,000 payouts for M-0042, let a worker\n * delete the ones it has paid, then read the next 10. Run against env/cassandra.yml.\n * Optional argument: how many payouts the worker has processed (default 1990; try 101000).\n */\nfun main(args: Array<String>) {\n    val processed = args.getOrNull(0)?.toInt() ?: 1_990\n    val total = maxOf(2_000, processed + 10) // always leave 10 payouts waiting\n    val config = DriverConfigLoader.programmaticBuilder()\n        .withBoolean(DefaultDriverOption.REQUEST_LOG_WARNINGS, false) // we print the server's warnings ourselves\n        .withDuration(DefaultDriverOption.REQUEST_TIMEOUT, Duration.ofSeconds(10))\n        .build()\n    CqlSession.builder()\n        .addContactPoint(InetSocketAddress(\"localhost\", 9042))\n        .withLocalDatacenter(\"datacenter1\")\n        .withConfigLoader(config)\n        .build().use { session ->\n            session.execute(\"CREATE KEYSPACE IF NOT EXISTS payments WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}\")\n            session.execute(\n                \"CREATE TABLE IF NOT EXISTS payments.payout_queue (merchant_id text, payout_id int, amount_minor bigint, \" +\n                    \"PRIMARY KEY ((merchant_id), payout_id))\"\n            )\n            session.execute(\"TRUNCATE payments.payout_queue\")\n\n            // a queue: the producer appends payouts, the worker deletes each one once it's paid\n            val enqueue = session.prepare(\"INSERT INTO payments.payout_queue (merchant_id, payout_id, amount_minor) VALUES ('M-0042', ?, 500)\")\n            val done = session.prepare(\"DELETE FROM payments.payout_queue WHERE merchant_id = 'M-0042' AND payout_id = ?\")\n            runAll(session, enqueue, 0 until total)\n            runAll(session, done, 0 until processed)\n            println(\"enqueued $total payouts, processed and deleted $processed\")\n\n            // the worker asks for the next batch: the 10 oldest payouts still waiting\n            val next = SimpleStatement.newInstance(\"SELECT payout_id FROM payments.payout_queue WHERE merchant_id = 'M-0042' LIMIT 10\")\n                .setTracing(true)\n            val rs = try {\n                session.execute(next)\n            } catch (e: ReadFailureException) {\n                println(\"read failed: ${e.message}\")\n                return\n            }\n            val ids = rs.all().map { it.getInt(\"payout_id\") }\n            println(\"next batch: ${ids.size} payouts, ${ids.firstOrNull()} to ${ids.lastOrNull()}\")\n            val trace = rs.executionInfo.queryTrace\n            trace.events.map { it.activity ?: \"\" }\n                .filter { \"tombstone\" in it }\n                .forEach { println(\"trace:   $it\") }\n            println(\"trace:   took ${trace.durationMicros} microseconds on the server\")\n            rs.executionInfo.warnings.forEach { println(\"warning: $it\") }\n        }\n}\n\n/** Runs [statement] once per id, at most 256 requests in flight. */\nprivate fun runAll(session: CqlSession, statement: PreparedStatement, ids: IntRange) {\n    ids.chunked(256).forEach { chunk ->\n        chunk.map { session.executeAsync(statement.bind(it)).toCompletableFuture() }.forEach { it.join() }\n    }\n}\n",
+          "run": "./gradlew :nosql:demo -Pmain=sfz.model.l05.demo.TombstoneDemoKt",
+          "file": "labs/nosql/src/demo/kotlin/sfz/model/l05/demo/TombstoneDemo.kt"
+        },
+        "expect": "```text\nenqueued 2000 payouts, processed and deleted 1990\nnext batch: 10 payouts, 1990 to 1999\ntrace:   Skipped 0/0 non-slice-intersecting sstables, included 0 due to tombstones\ntrace:   Read 10 live rows and 1990 tombstone cells (see tombstone_warn_threshold)\ntrace:   took 18449 microseconds on the server\nwarning: Read 10 live rows and 1990 tombstone cells for query SELECT * FROM payments.payout_queue WHERE merchant_id = 'M-0042' LIMIT 10 ALLOW FILTERING; token 5210081981202411406 (see tombstone_warn_threshold)\n```\n\nBefore these lines the JDK prints a few warnings about `sun.misc.Unsafe` and native access from the driver's libraries; ignore them. The read returned 10 rows and stepped over 1,990 tombstones, and the server sent a warning back with the result. (The `ALLOW FILTERING` in that line is how the server prints its internal read command; the query didn't filter.) The time moves with your machine, from about 20 to 90 milliseconds here, for a partition that holds 10 live rows. With `-Pargs=101000` the demo prints `read failed: Cassandra failure during read query at consistency LOCAL_ONE (1 responses were required but only 0 replica responded, 1 failed)`, and the log says why:\n\n```text\nERROR [ReadStage-7] 2026-11-07T20:05:00,194 StorageProxy.java:2248 - Scanned over 100001 tombstones during query 'SELECT * FROM payments.payout_queue WHERE merchant_id = 'M-0042' LIMIT 10 ALLOW FILTERING' (last scanned row token was 5210081981202411406 and partion key was ((M-0042), 100000)); query aborted\n```\n\nThe TTL steps print `ttl(payment_id)` = `10`, then, 11 seconds later, `(0 rows)` and the trace line `Read 0 live rows and 1 tombstone cells`: the expired cell is a tombstone now."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: tombstones (gc_grace_seconds, zombies, TTL)",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Off the key: ALLOW FILTERING, SAI indexes and lightweight transactions",
+      "body": "Sooner or later someone needs a query the tables weren't built for. Support wants every FAILED payment from today. The CQL error from lesson 2 offers `ALLOW FILTERING`, and it's tempting, because on a laptop it works. The Try-it's trace shows what it does: \"Submitting range requests on 17 ranges\", then \"Executing seq scan across 1 sstables\", then \"Read 7 live rows\". The node walked every token range and read every row of every partition to return two. With 50 million payments on 12 nodes, each request reads 50 million rows on 12 nodes. `ALLOW FILTERING` is fine in one case: when the query also names the partition key, so the cost is one partition, which you've already kept small.\n\nThe second option is a new table, `failed_payments_by_day`, written next to the others. For anything on a hot path that's still the answer.\n\nThe third, new in Cassandra 5.0, is a storage-attached index (SAI): `CREATE INDEX ... USING 'sai'`. Each node indexes only its own data, and the index files are built and compacted along with the memtable and SSTables they describe. A query on `status` alone now reads only matching rows, but it still asks every node, because any node may hold a FAILED payment: the trace still says 17 ranges. So SAI is right for a query that runs a few times a minute, or to filter inside one partition (`account_id = ? AND status = ?`). It's wrong for the authorization path, and every write pays to keep it up to date.\n\nThe last tool fixes something the write path made impossible. AP4 says an idempotency key may be used once. Two retries of the same payment reach two coordinators at the same moment. Both `INSERT` the key, both succeed because an insert is an upsert, the later timestamp wins, and both requests believe they created the payment. `INSERT ... IF NOT EXISTS` turns the insert into a lightweight transaction (LWT): the replicas first agree, through a round of the Paxos consensus protocol, that the row is absent, and only then write. The reply has an `[applied]` column, and when it's `False` it carries the row that won. The CQL docs warn that LWTs \"incur a non-negligible performance cost\": a Paxos round adds several round trips between replicas to the write. Use them for the few writes that must not race, like claiming a key. The Transactions track's lesson on transactions in NoSQL shows how Paxos makes this safe, and what Cassandra 6's Accord adds for transactions across partitions.\n\nThis lesson treated the cluster as one box that stores partitions. The Partitioning track opens the box, in its lesson on the inside of a Cassandra cluster (the token ring, snitches, gossip, and how a coordinator runs a read or a write) and the one after it, which sets a cluster up from `cassandra.yaml` and keeps it healthy with `nodetool`.",
+      "try": {
+        "title": "Filter, index, then claim a key once",
+        "minutes": 5,
+        "steps": [
+          "In cqlsh, run the three blocks below in order. Before each traced `SELECT`, predict how many rows the node reads to return two.",
+          "Predict what the second `IF NOT EXISTS` returns before you run it.",
+          "Stop Cassandra when you're done: `docker compose -f env/cassandra.yml down -v`."
+        ],
+        "code": {
+          "lang": "sql",
+          "title": "in cqlsh",
+          "src": "-- 1. FAILED payments, any account: allowed only with ALLOW FILTERING. Watch the trace.\nTRACING ON;\nSELECT payment_id, account_id FROM payments.payments_by_account WHERE status = 'FAILED' ALLOW FILTERING;\nTRACING OFF;\n\n-- 2. a storage-attached index on status (it builds in the background: wait a few seconds)\nCREATE INDEX IF NOT EXISTS payments_by_account_status ON payments.payments_by_account (status) USING 'sai';\nTRACING ON;\nSELECT payment_id, account_id FROM payments.payments_by_account WHERE status = 'FAILED';\nTRACING OFF;\n\n-- 3. AP4: claim an idempotency key exactly once\nCREATE TABLE IF NOT EXISTS payments.idempotency_keys (idem_key text PRIMARY KEY, payment_id text);\nINSERT INTO payments.idempotency_keys (idem_key, payment_id) VALUES ('idem-7f3a', 'pay-81723') IF NOT EXISTS;\nINSERT INTO payments.idempotency_keys (idem_key, payment_id) VALUES ('idem-7f3a', 'pay-81799') IF NOT EXISTS;\n"
+        },
+        "expect": "Both `SELECT`s return pay-81720 (A-1001) and pay-81724 (A-2002). The traces, trimmed to their activity column:\n\n```text\n-- with ALLOW FILTERING\n Submitting range requests on 17 ranges with a concurrency of 2 (50.4 rows per range expected)\n Executing seq scan across 1 sstables for (min(-9223372036854775808), min(-9223372036854775808)]\n Read 7 live rows and 0 tombstone cells\n-- with the SAI index\n Index mean cardinalities are payments_by_account_status:9223372036854775807. Scanning with payments_by_account_status.\n Submitting range requests on 17 ranges with a concurrency of 17\n Executing read on payments.payments_by_account using index payments_by_account_status\n Read 2 live rows and 0 tombstone cells\n Index query accessed memtable indexes, 1 SSTable index, and 1 segment, post-filtered 2 rows in 2 partitions, and took 355698 microseconds.\n```\n\n```text\n [applied]\n-----------\n      True\n\n [applied] | idem_key  | payment_id\n-----------+-----------+------------\n     False | idem-7f3a |  pay-81723\n```\n\nThe filtering query walked every token range (17 of them on this one-node ring), scanned from `min` all the way round to `min`, and read all 7 rows of the table. The index query still visited all 17 ranges, but each read went through the index and touched only the 2 matching rows. If you run the indexed `SELECT` in the same second as `CREATE INDEX`, you get `ReadFailure ... INDEX_NOT_AVAILABLE`, as I did on my first try: the index builds in the background. The second claim of `idem-7f3a` wasn't applied, and the reply shows who holds the key. Stop Cassandra when you're done: `docker compose -f env/cassandra.yml down -v`."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: CQL data manipulation (ALLOW FILTERING, IF NOT EXISTS, USING TTL)",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Apache Cassandra 5.0 features: Storage Attached Indexes (project blog)",
+          "url": "https://cassandra.apache.org/_/blog/Apache-Cassandra-5.0-Features-Storage-Attached-Indexes.html",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of a filing drawer for each account, where every payment slip is filed in date order. Nobody ever erases a slip. To change a payment you file a newer slip for it, stamped with the time; to delete one you file a red \"void\" slip. A reader pulls the slips for a date range and keeps the latest stamp for each payment. Once in a while a clerk recopies the drawer, keeping only the latest slip per payment (compaction), but keeps the void slips for ten days, because two other offices hold copies of the drawer and haven't all seen them yet. A drawer used as an inbox fills with void slips that every reader has to flip past. The analogy breaks on the stamps: a clerk would notice two slips stamped a second apart from two different offices, while Cassandra trusts whichever clock reads later, even a clock that is wrong.",
+  "in_your_world": "In Oracle, a payment's status lives in one row that each `UPDATE` changes in place. In Cassandra each status change is a new cell with the application server's timestamp, so the clocks on your Quarkus pods matter: keep NTP healthy, or a pod running 2 seconds fast wins arguments it shouldn't. A Kafka consumer that writes payments into Cassandra gets idempotency almost free, because replaying a message writes the same key with the same values. Deletes are where teams get hurt: a table used as a work queue for a settlement batch, or \"clean up the processed rows\" jobs, fill partitions with tombstones that every read pays for. Put the queue in Kafka, bucket tables by time (sized for your Black Friday merchant, not your average one), and claim idempotency keys with `INSERT ... IF NOT EXISTS USING TTL 86400`, so a Temporal activity that retries finds the key already taken.",
+  "mistake": "The most common mistake is using a Cassandra table as a queue, or any insert-then-delete pattern on one partition: pending payouts, jobs, outbox rows. It looks harmless, because the table has the right key and deletes return instantly. People expect a delete to remove data, as it does in SQL. Instead every delete adds a tombstone that stays for at least 10 days, and every read that starts at the front of the partition steps over all of them, until reads slow down and then fail at 100,000 tombstones. The fix: keep queues in Kafka; in Cassandra, bucket partitions by time and let old buckets expire with a TTL instead of deleting rows, and read from a saved position (`payout_id > ?`) so slices start after the dead rows.",
+  "compare": {
+    "title": "One status change: Oracle edits a row, Cassandra adds a piece",
+    "a": {
+      "label": "Oracle: update in place",
+      "lang": "sql",
+      "title": "SQL*Plus",
+      "src": "UPDATE payment SET status = 'CAPTURED' WHERE payment_id = 'pay-81723';\n-- the block holding the row is read into the buffer cache, changed in place,\n-- and the old value goes to undo for readers who still need it.\n-- One row, one current version, one place on disk.\nCOMMIT;"
+    },
+    "b": {
+      "label": "Cassandra: append and merge",
+      "lang": "text",
+      "title": "sstabledump of two SSTables",
+      "src": "UPDATE payments.payments_by_account SET status = 'CAPTURED' WHERE ...;\n\n== nb-1-big-Data.db  (the original insert, unchanged)\n'2026-11-07T09:00:00.000Z', 'pay-81723' | [amount_minor=2500 ts=1794081362991451], ...,\n                                          [status=AUTHORIZED ts=1794081362991451]\n== nb-2-big-Data.db  (the update: one cell)\n'2026-11-07T09:00:00.000Z', 'pay-81723' | [status=CAPTURED ts=1794081383953194]\n\n-- a read merges both pieces; compaction later writes one merged row"
+    },
+    "note": "Oracle keeps one current version of a row in one place, and an update has to find it first. Cassandra never finds anything before a write: it adds the new cell with its timestamp, and the old one stays on disk until compaction merges the files. That's why Cassandra writes are cheap and steady under load, and why reads may touch several files. It's also why there's no \"row not found\" or \"duplicate key\" on a plain write, and why a delete has to be a marker rather than an erase."
+  },
+  "worked": {
+    "title": "Redesign the payout queue so reads never wade through tombstones",
+    "steps": [
+      {
+        "say": "Write the access patterns first. The worker asks for the oldest waiting payouts of one merchant; support looks a payout up by id. About 30,000 payouts a day for a busy merchant.",
+        "code": "P1  next waiting payouts of a merchant, oldest first   ~every second\nP2  one payout by id                                    ~a few per minute\nvolume: 30,000 payouts a day for M-0042",
+        "lang": "text"
+      },
+      {
+        "say": "The first draft is a queue: one partition per merchant, delete each row once it's paid. Count what a read meets after one day: tombstones live 10 days, so they pile up.",
+        "code": "PRIMARY KEY ((merchant_id), payout_id)       -- delete when paid\n\nafter 1 day:   ~30,000 tombstones at the front of M-0042's partition\nafter 4 days:  ~120,000 -> past tombstone_failure_threshold: P1 fails",
+        "lang": "text"
+      },
+      {
+        "say": "Stop deleting. Bucket by hour, so a partition only ever holds one hour of payouts, and record the state as a column. Let whole buckets expire after a week with a TTL, on TWCS, which drops expired files whole.",
+        "code": "CREATE TABLE payouts_by_merchant_hour (\n    merchant_id  text,\n    hour         timestamp,\n    payout_id    timeuuid,\n    status       text,\n    amount_minor bigint,\n    PRIMARY KEY ((merchant_id, hour), payout_id)\n) WITH default_time_to_live = 604800\n  AND compaction = {'class': 'TimeWindowCompactionStrategy',\n                    'compaction_window_unit': 'DAYS', 'compaction_window_size': 1};",
+        "lang": "sql"
+      },
+      {
+        "say": "The worker keeps its position: the hour bucket and the last payout it handled. Each read starts after that point, so it never reads old rows at all. Marking a payout paid is an update of one cell, not a delete.",
+        "code": "SELECT payout_id, amount_minor FROM payouts_by_merchant_hour\nWHERE merchant_id = 'M-0042' AND hour = '2026-11-07 09:00:00+0000'\n  AND payout_id > ?            -- the last payout already handled\nLIMIT 10;\n\nUPDATE payouts_by_merchant_hour SET status = 'PAID'\nWHERE merchant_id = 'M-0042' AND hour = '2026-11-07 09:00:00+0000' AND payout_id = ?;",
+        "lang": "sql"
+      },
+      {
+        "say": "P2 gets its own small table, written with the payout. It expires with the same TTL, so nothing is ever deleted by hand.",
+        "code": "CREATE TABLE payout_by_id (\n    payout_id    timeuuid PRIMARY KEY,\n    merchant_id  text,\n    hour         timestamp,\n    amount_minor bigint\n) WITH default_time_to_live = 604800;",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build one Cassandra table: sorted partitions, SSTables, tombstones and compaction",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/nosql/src/main/kotlin/sfz/model/l05/WideColumnTable.kt"
+    ],
+    "run": "./gradlew :nosql:test --tests 'sfz.model.l05.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All twelve fail with `NotImplementedError`.",
+      "Read `WideColumnTable.kt`. `insert`, `delete`, `flush` and `repairFrom` are given: writes only ever add a `Version` to the memtable, and `flush` turns the memtable into an immutable `SSTable`. Each `Version` is a whole row with one timestamp; real Cassandra keeps one per cell.",
+      "Write `filteringReason`, following rules 1 to 5 in its KDoc. The messages are Cassandra's own, from lesson 2's Try-it.",
+      "Write `mergedPartition`: for each clustering key, the newest version across the SSTables and the memtable. Then `select`: refuse, pick partitions, walk the merged rows, count live rows and tombstones, stop at the limit. Ten tests pass now, including the tombstone storm.",
+      "Write `compact`. The last test is section 3's zombie made real: purge a tombstone after `gc_grace`, repair from a replica that missed the delete, and the row comes back. Change `gcGrace` in the test to 60 and watch the first half of that test fail, then put it back."
+    ],
+    "hints": [
+      "Rule 1 is one line: `if (!q.where.keys.containsAll(key.partitionKey)) return ALLOW_FILTERING`.",
+      "For rule 3, the restricted columns are `q.where.keys + listOfNotNull(q.range?.column)`. A clustering column at index `i >= fixed` that's restricted is a gap, unless `i == fixed` and it's the range.",
+      "In `mergedPartition`, the sources are `sstables.mapNotNull { it.partitions[partition] } + listOfNotNull(memtable[partition])`. Use `newer(version, old)` to decide, never `>` on timestamps yourself: it handles the tie, where the tombstone wins.",
+      "In `select`, skip rows outside the slice with the given `inSlice` only when `filteringReason(q)` is null. A filtering query reads every row of the partition, and that cost is the point of the test.",
+      "In `compact`, `v.deadSince(now)` is null for a live row. Drop a row when `deadSince + gcGraceSeconds <= now`."
+    ],
+    "done_when": "All twelve tests in `WideColumnTableTest` pass."
+  },
+  "drill": {
+    "title": "Claim a key once, and follow a delete to the end",
+    "minutes": 5,
+    "prompt": "From memory, write the CQL table for AP4 (an idempotency key and the payment it created), the statement that claims a key exactly once and expires after 24 hours, and what the reply looks like when the key is taken. Then list, in order, what happens to a row from `DELETE` until it's gone from disk.",
+    "answer": {
+      "lang": "sql",
+      "src": "CREATE TABLE payments.idempotency_keys (\n    idem_key   text PRIMARY KEY,\n    payment_id text\n);\n\nINSERT INTO payments.idempotency_keys (idem_key, payment_id)\nVALUES ('idem-7f3a', 'pay-81723')\nIF NOT EXISTS USING TTL 86400;\n\n--  [applied] | idem_key  | payment_id      when the key is taken:\n--      False | idem-7f3a |  pay-81723      the reply carries the winner\n\n-- a DELETE, from start to end:\n-- 1. a tombstone with the delete's timestamp goes to the commit log and memtable of each replica\n-- 2. reads see it shadow every older version of the row, and count it as a tombstone\n-- 3. flushes and compactions carry it along for gc_grace_seconds (864000 s, 10 days)\n-- 4. repair spreads it to any replica that missed it, inside those 10 days\n-- 5. after that, the next compaction of its files drops the tombstone and the row together"
+    }
+  },
+  "recap": [
+    "A Cassandra table is a map of partitions. The partition key is hashed to a token that picks the replicas; inside a partition, rows are sorted by the clustering columns, so a range read is one slice. Wide-column is not columnar. A partition never splits: rows = write rate × bucket length, kept under 100,000 rows and 100 MB.",
+    "Writes never edit in place: commit log, memtable, then an immutable SSTable. `INSERT` and `UPDATE` are both upserts, every cell carries a write timestamp (client-side in the Java driver), and reads merge pieces from several SSTables, newest timestamp wins.",
+    "Compaction merges SSTables and drops superseded cells. STCS is the 5.0.9 `cassandra.yaml` default; UCS, new in 5.0, is recommended for most workloads and is the default in `cassandra_latest.yaml`.",
+    "A delete or an expired TTL is a tombstone, kept for `gc_grace_seconds` (10 days) so repair can spread it. Repair more often than that, or deleted rows come back as zombies.",
+    "Insert-then-delete on one partition causes tombstone storms: a warning past 1,000 tombstones in a read, failure past 100,000. Use Kafka for queues, time buckets with TTLs, and slices that start after the dead rows.",
+    "Off the key: `ALLOW FILTERING` scans every partition (fine only inside one partition), an SAI index still asks every node, and `IF NOT EXISTS` is a Paxos-backed lightweight transaction for the few writes that must not race."
+  ],
+  "quiz": [
+    {
+      "q": "Table `payments_by_account` has `PRIMARY KEY ((account_id), created_at, payment_id)` with `created_at DESC`. Which query reads one contiguous slice of one partition?",
+      "options": [
+        "`WHERE account_id = 'A-1001' AND created_at >= '2026-11-07' AND created_at < '2026-11-08'`",
+        "`WHERE created_at >= '2026-11-07' ALLOW FILTERING`",
+        "`WHERE account_id = 'A-1001' AND payment_id = 'pay-81723'`",
+        "`WHERE account_id = 'A-1001' ORDER BY amount_minor DESC`"
+      ],
+      "answer": 0,
+      "why": "It gives the partition key with `=` and one range on the first clustering column, so the node seeks to the window and reads until it leaves it. Without the account there's no token. `payment_id` alone skips `created_at`, so it's a gap Cassandra refuses without `ALLOW FILTERING`. And `ORDER BY` works only on clustering columns, in stored or reversed order."
+    },
+    {
+      "q": "Two services set the status of pay-81723 one second apart, the first to CAPTURED, the second to VOIDED, both with plain `UPDATE`s through the Java driver. The second service's pod clock is 3 seconds slow. What does a read return afterwards?",
+      "options": [
+        "VOIDED: Cassandra applies writes in the order they arrive",
+        "An error, because two updates touched the same cell",
+        "CAPTURED: each cell keeps the highest timestamp, and the driver stamped the second update with the slow clock",
+        "Both values, as siblings for the application to merge"
+      ],
+      "answer": 2,
+      "why": "The Java driver 4.x stamps each statement with the client's clock by default. The VOIDED write carries a timestamp 2 seconds older than CAPTURED, so last write wins keeps CAPTURED on every replica, and the void disappears without an error. Cassandra has no siblings; handing both versions to the application is what Dynamo does with vector clocks (lesson 1)."
+    },
+    {
+      "q": "Why does Cassandra write a tombstone for a delete instead of removing the row from each replica?",
+      "options": [
+        "Because removing data from an SSTable would need a full rewrite of the file",
+        "So that a replica that missed the delete can't have the row copied back to the others by repair",
+        "So that the delete can be undone within `gc_grace_seconds`",
+        "Because tombstones make reads faster than missing rows"
+      ],
+      "answer": 1,
+      "why": "If the replicas that saw the delete simply forgot the row, repair would find it on the replica that was down and spread it back. The tombstone is newer than the row, so it wins the merge and repair spreads the delete instead. Immutable SSTables are true too, but a delete could still be a removal in the next compaction; the distributed copies are the reason, as the Cassandra docs say. Tombstones can't be undone, and they make reads slower."
+    },
+    {
+      "q": "Support wants every FAILED payment of the day, a few times an hour, and the team adds `CREATE INDEX ... ON payments_by_account (status) USING 'sai'`. What does a query on `status` alone now do?",
+      "options": [
+        "Reads one partition, because the index stores the partition of every FAILED payment in one place",
+        "Asks every node, and each node reads only its matching rows through its own index",
+        "The same full scan as `ALLOW FILTERING`, because SAI only works with a partition key",
+        "It's refused: an indexed column still needs `ALLOW FILTERING`"
+      ],
+      "answer": 1,
+      "why": "SAI is a local index: each node indexes its own SSTables and memtables. A query without a partition key can't know which nodes hold FAILED payments, so it visits every token range (17 in the Try-it), but each node reads only matching rows instead of all of them. That's fine a few times an hour and wrong on a hot path, where a query table wins."
+    },
+    {
+      "q": "From lesson 2: a Cassandra table for AP3 is keyed `((merchant_id), status, created_at, payment_id)`, with no day in the partition key. The busiest merchant takes 5 payments a second. What goes wrong?",
+      "options": [
+        "Cassandra rejects inserts once a partition reaches 100,000 rows",
+        "Queries for one status become scans, because status is a clustering column",
+        "Nothing: Cassandra splits a large partition across nodes when it grows",
+        "The merchant's partition gains about 432,000 rows a day and never stops growing, far past the 100,000-row and 100 MB guidance"
+      ],
+      "answer": 3,
+      "why": "A partition never splits, so everything under one partition key stays on the same replicas and grows with the write rate: 5 a second is 432,000 rows a day. The guidance isn't enforced, so nothing stops the writes; reads, compaction and repair of that partition just keep getting slower. Status first is what makes AP3 one slice. Add a time bucket to the partition key, sized for the busiest merchant.",
+      "from": "model-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What do the partition key and the clustering columns each decide?",
+      "back": "The partition key is hashed to a token: which replicas and which partition. The clustering columns decide the sorted order of rows inside the partition."
+    },
+    {
+      "front": "What happens on a Cassandra write, in order?",
+      "back": "Append to the commit log, add to the memtable, acknowledge. Later the memtable is flushed to an immutable SSTable. Nothing is read first."
+    },
+    {
+      "front": "What's the difference between INSERT and UPDATE in Cassandra?",
+      "back": "Almost none: both are upserts that write cells with a timestamp. There's no duplicate-key error and no \"row not found\"."
+    },
+    {
+      "front": "Who sets a cell's write timestamp when you use the Java driver 4.x?",
+      "back": "The client: the default `AtomicTimestampGenerator` uses the application server's clock, unless the statement says `USING TIMESTAMP`."
+    },
+    {
+      "front": "What is `gc_grace_seconds`, and its default?",
+      "back": "How long compaction must keep a tombstone before it may drop it: 864,000 s, 10 days. Repair every node more often than that."
+    },
+    {
+      "front": "Tombstone thresholds in 5.0.9's `cassandra.yaml`?",
+      "back": "`tombstone_warn_threshold: 1000` logs a warning; `tombstone_failure_threshold: 100000` aborts the read."
+    },
+    {
+      "front": "How big should a Cassandra partition be, and how do you keep it there?",
+      "back": "Under 100,000 rows and 100 MB (the Cassandra docs). Rows = write rate × bucket length, so add a time bucket to the partition key, sized for the busiest key."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Partition",
+      "plain": "All rows with the same partition key, stored together and sorted by the clustering columns, on each of the key's replicas."
+    },
+    {
+      "term": "Clustering columns",
+      "plain": "The primary-key columns after the partition key; they set the order of rows inside a partition."
+    },
+    {
+      "term": "Memtable",
+      "plain": "A node's in-memory, sorted table of recent writes, flushed to an SSTable when full."
+    },
+    {
+      "term": "Upsert",
+      "plain": "A write that inserts the row if it's absent and overwrites the named columns if it's present. Every Cassandra INSERT and UPDATE."
+    },
+    {
+      "term": "Tombstone",
+      "plain": "A timestamped marker that a row or cell was deleted or has expired; kept for gc_grace_seconds so repair can spread it."
+    },
+    {
+      "term": "Compaction strategy",
+      "plain": "The rule for which SSTables a node merges: size-tiered, leveled, time-window, or unified (UCS, 5.0)."
+    },
+    {
+      "term": "Storage-attached index (SAI)",
+      "plain": "Cassandra 5.0's secondary index: each node indexes its own data alongside its memtables and SSTables."
+    },
+    {
+      "term": "Lightweight transaction (LWT)",
+      "plain": "A conditional write (`IF NOT EXISTS`, `IF col = ?`) that runs a Paxos round among the replicas before applying."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"Deletes in Cassandra are free, they return in a millisecond. Let's keep pending payouts in a table and delete each one when it's paid.\" Explain what a delete really writes, why it has to, and what this design does to the worker's reads after a few days.",
+    "answer": "A delete in Cassandra doesn't remove anything. It writes a tombstone, a marker with a timestamp, through the normal write path, which is why it's fast. It has to be a write because the data lives on three replicas: if the replicas that saw the delete just forgot the row, repair would find it on a replica that was down and copy it back. The tombstone is newer than the row, so it wins the merge and repair spreads it instead. Cassandra keeps tombstones for gc_grace_seconds, 10 days by default, before compaction may drop them. In a queue partition, every paid payout leaves a tombstone at the front, and the worker's \"next 10\" read starts at the front, so it steps over all of them. At 30,000 payouts a day, the read meets 30,000 tombstones after one day, logs warnings past 1,000, and fails outright past 100,000, after about four days. I'd keep the queue in Kafka, or bucket the table by hour with a TTL and have the worker read from its last position, so no read ever starts in the dead rows."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Cassandra 5.0 also ships newer storage formats that its default `cassandra.yaml` leaves off. The `cassandra_latest.yaml` in the same 5.0.9 image turns them on: trie-based memtables (`TrieMemtable`), the BTI SSTable format (`sstable: selected_format: bti`, a trie-indexed format that replaces the old partition index and summary files) and UCS as the default compaction. The default file sets `storage_compatibility_mode: CASSANDRA_4`, so a cluster upgraded from 4.x keeps writing files 4.x could read; that's why the Try-it's files are named `nb-...-big-...`. A new cluster can start from `cassandra_latest.yaml` instead.\n\nTwo tools from the Try-its are worth keeping. `sstablepartitions`, new in 5.0, lists the largest partitions in an SSTable, which is how you find the account that broke the 100 MB guideline before it hurts. `sstablemetadata` prints, among other things, an estimate of droppable tombstones per file.\n\nMaterialized views were Cassandra's attempt to maintain lesson 2's \"one table per query\" for you: you declare a view with a different primary key and the server writes it. The Cassandra docs still mark them experimental, and most teams write the extra tables from the application, often in a logged batch. A logged batch guarantees that if any statement in it is applied, all of them eventually are, which is what you want when one payment goes to three tables. It isn't isolated: a reader can see one table updated before the other.\n\nScyllaDB speaks CQL and runs the same data model on a C++ engine, so this lesson's tables and queries work there unchanged. Since its 2025.1 release it's source-available rather than open source."
+  },
+  "sources": [
+    {
+      "title": "Apache Cassandra documentation: data modeling introduction",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/data-modeling/intro.html"
+    },
+    {
+      "title": "Apache Cassandra documentation: CQL data manipulation (SELECT, ALLOW FILTERING, lightweight transactions, TTL)",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/cql/dml.html"
+    },
+    {
+      "title": "Apache Cassandra documentation: tombstones",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/tombstones.html"
+    },
+    {
+      "title": "Apache Cassandra documentation: Unified Compaction Strategy",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/managing/operating/compaction/ucs.html"
+    },
+    {
+      "title": "Apache Cassandra: what's new in 5.0 (SAI, UCS, trie memtables and SSTables, sstablepartitions)",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/new/index.html"
+    }
+  ]
+}

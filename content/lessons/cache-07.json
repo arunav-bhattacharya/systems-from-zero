@@ -1,0 +1,420 @@
+{
+  "id": "cache-07",
+  "title": "Keeping a cache honest: invalidation, leases and consistency",
+  "minutes": 40,
+  "goal": "By the end you can draw the stale-set race as a timeline, explain why a delete after the commit still lets an old row back into the cache, and close the gap with a lease or a version check in Lua, with change data capture and a TTL behind them.",
+  "warmup": {
+    "q": "A pod misses on `merchant:{m-17}`, reads the name `Fietsen Utrecht` from Oracle, and then stalls in a 40 ms GC pause before its `SET ... EX 3600`. During those 40 ms another service renames the merchant to `Velo Utrecht`, commits, and runs `DEL merchant:{m-17}`, as lesson 6 taught. What do readers get for the next hour?",
+    "options": [
+      "`Velo Utrecht`: the delete came after the commit, so the next read loads the new row",
+      "`Fietsen Utrecht`: the stalled pod's SET lands after the DEL and puts the old name back",
+      "Nothing cached: Redis refuses a SET to a key that was deleted a moment ago",
+      "`Velo Utrecht`, about 40 ms later: Redis notices the conflict and drops the key"
+    ],
+    "answer": 1,
+    "why": "The DEL ran while the key was empty, so it deleted nothing. The stalled pod's SET arrives after it and stores the name it read before the commit. No later write is coming to delete it, so every reader gets the old name until the hour-long TTL ends. Redis keeps no memory of a deleted key and knows nothing about what the database holds, so it can't notice anything. This lesson calls the race a stale set and shows two ways to make Redis refuse that SET."
+  },
+  "sections": [
+    {
+      "h": "Every cache entry is a copy of one version of a row",
+      "body": "Lesson 6 left you with a rule: commit to the database first, then `DEL` the cached key. This lesson is about the cases where that rule still leaves a wrong answer in the cache, and what it takes to close them.\n\nStart with what a cache entry is. `merchant:{m-17} = Fietsen Utrecht` is a copy of one version of one row: the row as it was when some pod read it. Every `UPDATE` makes a new version of the row in Oracle, and the copy in Redis says nothing about which version it came from. That gives this lesson's model: **a cache is honest as long as no copy older than the newest invalidation can get into it.** Each race below is a way for an old copy to get in. Each fix is a way for Redis to recognize the old copy and refuse it.\n\nThe first way in is the write path. Say writers update the cache instead of deleting from it: `UPDATE`, `COMMIT`, then `SET merchant:{m-17} <new name>`. Writer A renames the merchant to `Fietsen Utrecht` and writer B, a moment later, to `Velo Utrecht`. Oracle ends with B's name, because B committed last. But each `SET` travels from its own pod over its own connection, and nothing puts them in commit order. If A's pod stalls for 20 ms and its `SET` arrives second, Redis keeps A's name and Oracle keeps B's. No error is raised anywhere, and the two disagree until the TTL ends. Designing Data-Intensive Applications calls this pattern dual writes: one change written separately to two systems.\n\nDeleting fixes this case because a delete carries no value. Two deletes in either order leave the same empty key, and the next reader loads whatever Oracle has committed. Meta's memcache paper gives the same reason for deleting rather than updating: deletes are idempotent, so running one twice or out of order changes nothing.\n\nTwo more ways in remain, and delete-on-write closes neither. A slow reader can copy the old version into the cache after the delete: that is the next section. And a pod can die between its commit and its `DEL`, so the invalidation never happens: that is the last section. Behind all of them sits the TTL, which caps how long a wrong copy lives, whatever let it in.",
+      "try": {
+        "title": "Two updates that arrive out of order, then two deletes",
+        "minutes": 2,
+        "steps": [
+          "Start the server from the `labs` folder if it isn't running (`docker compose -f env/redis.yml up -d`) and open a prompt: `docker compose -f env/redis.yml exec redis redis-cli`.",
+          "The first two lines are writer B's `SET` (it committed last) and writer A's `SET`, which arrived later because A's pod stalled. Run them and the `GET`. Which writer's name does every reader get now?",
+          "Now replay the same two writers with deletes. Run the last three lines and predict the `GET` first."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "SET merchant:{m-17} \"Velo Utrecht\"\nSET merchant:{m-17} \"Fietsen Utrecht\"\nGET merchant:{m-17}\nDEL merchant:{m-17}\nDEL merchant:{m-17}\nGET merchant:{m-17}"
+        },
+        "expect": "The two `SET`s print `OK` and `OK`, and `GET` prints `\"Fietsen Utrecht\"`: writer A's name, although writer B committed last. Redis keeps whatever arrived last, and nothing in it knows the commit order. With deletes, the first `DEL` prints `(integer) 1`, the second `(integer) 0` (there was nothing left to delete), and `GET` prints `(nil)`: the next reader goes to Oracle and caches what was committed last, whichever delete arrived first."
+      },
+      "refs": [
+        {
+          "title": "Scaling Memcache at Facebook (NSDI 2013)",
+          "url": "https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "The stale set: a slow reader puts the old row back after the delete",
+      "body": "Delete-on-write leaves one race on the read path, and it takes three actors. Reader A, a pod serving a fraud check, misses on `merchant:{m-17}` and reads the row from Oracle: version 1, `Fietsen Utrecht`. Before A's `SET` reaches Redis, the writer commits version 2, `Velo Utrecht`, and sends `DEL merchant:{m-17}`. The key is still empty, so the delete removes nothing. Then A's `SET` arrives and stores version 1 with an hour of TTL. Reader B, any later request, gets `Fietsen Utrecht`, and so does every request after it. Nothing will delete the key again, because the write that should have deleted it is already over. Meta's memcache paper calls this a **stale set**. The stepper plays it one step at a time.\n\nTwo conditions must both hold: A's database read comes before the commit, and A's `SET` comes after the delete. Between a read and the `SET` that follows it there are usually a millisecond or two. A garbage-collection pause, a wait for a pooled connection or a retried network call stretches that gap to tens or hundreds of milliseconds, and one write landing inside it is enough.\n\nSo the race is rare per request and frequent at scale. Meta's 2022 post on cache consistency describes the same race with an invalidation that carried the new value: a fill of x = 42 started, x was updated to 43, the invalidation set 43, and the delayed fill then wrote 42. The database said 43, and the cache said 42 indefinitely. Meta's TAO serves more than a quadrillion queries a day. When Meta started measuring, about one cache write in a million was still inconsistent five minutes later, and at that volume one in a million is a steady stream of wrong answers.\n\nThe TTL caps the damage at an hour here. For a merchant's display name, an hour of the old name is a nuisance. For a merchant's suspended flag, it is an hour of approvals that should have been refused.\n\nThe lab doesn't wait for a lucky GC pause. Each cache takes a hook that runs between its database read and its fill, and two latches hold reader A in that hook until the writer has finished. A latch (`CountDownLatch`) is a gate: one thread waits on it until another thread opens it. With latches deciding the order, twenty runs give twenty stale caches.",
+      "stepper": {
+        "title": "The stale-set race, one step at a time",
+        "intro": "Three pods, one Oracle row, one Redis key. Time runs down the page; the bottom row shows what each store holds.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"Reader A misses on merchant m-17\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-a\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v1 Fietsen Utrecht</text><rect class=\"box\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">no key</text></svg>",
+            "say": "The start. Oracle holds version 1 of merchant m-17, `Fietsen Utrecht`, and Redis holds nothing for it, perhaps because its TTL just ended. Reader A, a pod running a fraud check, sends `GET merchant:{m-17}` and misses."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"Reader A reads version 1 from Oracle\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box-a\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-a\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v1 Fietsen Utrecht</text><rect class=\"box\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">no key</text></svg>",
+            "say": "Reader A queries Oracle and gets version 1. Then it stalls before its `SET`: a garbage-collection pause, a wait for a pooled connection, a slow network. In the lab, a latch holds it here."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"The writer commits version 2 while reader A is paused\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-dim\" x=\"40\" y=\"120\" width=\"210\" height=\"68\" rx=\"8\"/><text class=\"t-s t-m\" x=\"145\" y=\"159\" text-anchor=\"middle\">paused: GC, slow pool</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box-a\" x=\"260\" y=\"120\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-a\" x=\"365\" y=\"140\" text-anchor=\"middle\">UPDATE, COMMIT: v2</text><rect class=\"box-a\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v2 Velo Utrecht</text><rect class=\"box\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">no key</text></svg>",
+            "say": "The writer renames the merchant and commits. Oracle now holds version 2, `Velo Utrecht`. Reader A still holds version 1 in its own memory, and nothing tells it that it is out of date."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"The writer deletes an empty key\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-dim\" x=\"40\" y=\"120\" width=\"210\" height=\"68\" rx=\"8\"/><text class=\"t-s t-m\" x=\"145\" y=\"159\" text-anchor=\"middle\">paused: GC, slow pool</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"260\" y=\"120\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"140\" text-anchor=\"middle\">UPDATE, COMMIT: v2</text><rect class=\"box-a\" x=\"260\" y=\"158\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-a\" x=\"365\" y=\"178\" text-anchor=\"middle\">DEL: 0 keys deleted</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v2 Velo Utrecht</text><rect class=\"box-a\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">no key: the DEL found nothing</text></svg>",
+            "say": "The writer follows lesson 6's rule and sends `DEL merchant:{m-17}` after its commit. The key is empty, so Redis deletes nothing and answers 0. The writer's part looks finished."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"Reader A stores version 1 after the delete\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-dim\" x=\"40\" y=\"120\" width=\"210\" height=\"68\" rx=\"8\"/><text class=\"t-s t-m\" x=\"145\" y=\"159\" text-anchor=\"middle\">paused: GC, slow pool</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"260\" y=\"120\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"140\" text-anchor=\"middle\">UPDATE, COMMIT: v2</text><rect class=\"box\" x=\"260\" y=\"158\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"178\" text-anchor=\"middle\">DEL: 0 keys deleted</text><rect class=\"box-bad\" x=\"40\" y=\"196\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"145\" y=\"216\" text-anchor=\"middle\">SET v1 EX 3600: OK</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v2 Velo Utrecht</text><rect class=\"box-bad\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">v1 Fietsen Utrecht, TTL 1 h</text></svg>",
+            "say": "Reader A wakes up and sends `SET merchant:{m-17} \"Fietsen Utrecht\" EX 3600`. Redis keeps no record of the delete or of any version, so it stores the old name for an hour. This is the **stale set**."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"Reader B gets the old name\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-dim\" x=\"40\" y=\"120\" width=\"210\" height=\"68\" rx=\"8\"/><text class=\"t-s t-m\" x=\"145\" y=\"159\" text-anchor=\"middle\">paused: GC, slow pool</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"260\" y=\"120\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"140\" text-anchor=\"middle\">UPDATE, COMMIT: v2</text><rect class=\"box\" x=\"260\" y=\"158\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"178\" text-anchor=\"middle\">DEL: 0 keys deleted</text><rect class=\"box-bad\" x=\"40\" y=\"196\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"145\" y=\"216\" text-anchor=\"middle\">SET v1 EX 3600: OK</text><rect class=\"box-bad\" x=\"480\" y=\"234\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"585\" y=\"254\" text-anchor=\"middle\">GET: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v2 Velo Utrecht</text><rect class=\"box-bad\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">v1 Fietsen Utrecht, TTL 1 h</text></svg>",
+            "say": "Reader B, any later request, sends `GET` and gets `Fietsen Utrecht`. So does every request for the next hour. No write is coming to delete it: the one that should have deleted it finished before the stale copy arrived."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 360\" role=\"img\" aria-label=\"The race window: the read before the commit, the fill after the delete\"><text class=\"t\" x=\"145\" y=\"30\" text-anchor=\"middle\">Reader A (pod 1)</text><text class=\"t\" x=\"365\" y=\"30\" text-anchor=\"middle\">Writer (pod 2)</text><text class=\"t\" x=\"585\" y=\"30\" text-anchor=\"middle\">Reader B (pod 3)</text><text class=\"t-s t-m\" x=\"22\" y=\"64\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"22\" y=\"102\" text-anchor=\"middle\">2</text><text class=\"t-s t-m\" x=\"22\" y=\"140\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"22\" y=\"178\" text-anchor=\"middle\">4</text><text class=\"t-s t-m\" x=\"22\" y=\"216\" text-anchor=\"middle\">5</text><text class=\"t-s t-m\" x=\"22\" y=\"254\" text-anchor=\"middle\">6</text><rect class=\"box-dim\" x=\"40\" y=\"120\" width=\"210\" height=\"68\" rx=\"8\"/><text class=\"t-s t-m\" x=\"145\" y=\"159\" text-anchor=\"middle\">paused: GC, slow pool</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"145\" y=\"64\" text-anchor=\"middle\">GET: miss</text><rect class=\"box-b\" x=\"40\" y=\"82\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"145\" y=\"102\" text-anchor=\"middle\">SELECT: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"260\" y=\"120\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"140\" text-anchor=\"middle\">UPDATE, COMMIT: v2</text><rect class=\"box\" x=\"260\" y=\"158\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"365\" y=\"178\" text-anchor=\"middle\">DEL: 0 keys deleted</text><rect class=\"box-b\" x=\"40\" y=\"196\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-b\" x=\"145\" y=\"216\" text-anchor=\"middle\">SET v1 EX 3600: OK</text><rect class=\"box-bad\" x=\"480\" y=\"234\" width=\"210\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"585\" y=\"254\" text-anchor=\"middle\">GET: v1 Fietsen Utrecht</text><rect class=\"box\" x=\"40\" y=\"290\" width=\"320\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"200\" y=\"309\" text-anchor=\"middle\">Oracle, merchants row m-17</text><text class=\"t-s\" x=\"200\" y=\"329\" text-anchor=\"middle\">v2 Velo Utrecht</text><rect class=\"box-bad\" x=\"380\" y=\"290\" width=\"310\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"535\" y=\"309\" text-anchor=\"middle\">Redis, merchant:{m-17}</text><text class=\"t-s\" x=\"535\" y=\"329\" text-anchor=\"middle\">v1 Fietsen Utrecht, TTL 1 h</text></svg>",
+            "say": "The window. The race needed reader A's SELECT to come before the commit (step 2) and its SET to come after the delete (step 5). To refuse step 5, Redis must be able to tell that the late SET is older than the delete. A lease and a version are two ways to give it that knowledge."
+          }
+        ]
+      },
+      "try": {
+        "title": "Run the race four times, with four caches",
+        "minutes": 4,
+        "steps": [
+          "With the server running, run `StaleSetDemo` (Java) or `StaleSetDemoKt` (Kotlin) from the `labs` folder. It plays the stepper's timeline four times, with latches, so the order is the same on every run: plain cache-aside, a lease, a version check with a plain `DEL`, and a version check with a tombstone.",
+          "Before you read the output, predict for each race whether reader B gets `Fietsen Utrecht` (stale) or `Velo Utrecht` (fresh). Sections 3 and 4 explain the last three; for now, look at what each one does differently on the `W` lines.",
+          "Read race 1 against the stepper: which output line is frame 4, and which is frame 5?"
+        ],
+        "code": {
+          "lang": "java",
+          "title": "StaleSetDemo.java",
+          "src": "package sfz.cache.l07.demo;\n\nimport redis.clients.jedis.RedisClient;\nimport redis.clients.jedis.params.SetParams;\n\nimport java.util.List;\nimport java.util.Map;\nimport java.util.concurrent.CompletableFuture;\nimport java.util.concurrent.ConcurrentHashMap;\nimport java.util.concurrent.CountDownLatch;\nimport java.util.concurrent.TimeUnit;\n\n/** The stale-set race four times, always in the same order: reader A misses, the writer commits, A fills, B reads. */\npublic class StaleSetDemo {\n    record Row(String name, long version) {}\n\n    static final Map<String, Row> table = new ConcurrentHashMap<>();             // the \"database\"\n    static final RedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build();\n    static final String KEY = \"demo:l07:merchant:{m-17}\";\n    static final String LEASE = \"demo:l07:lease:{m-17}\";\n\n    /** What a pod does on a read, and what the writer does after its commit. */\n    interface Cache {\n        String get(String who, Runnable beforeFill);\n        void afterWrite(long newVersion);\n    }\n\n    static void say(String who, String what) {\n        System.out.printf(\"  %s  %s%n\", who, what);\n    }\n\n    // 1. lesson 6's cache-aside: GET, on a miss SELECT and SET; after a write, DEL\n    static final Cache NAIVE = new Cache() {\n        public String get(String who, Runnable beforeFill) {\n            String hit = redis.get(KEY);\n            if (hit != null) return hit;\n            Row row = table.get(\"m-17\");\n            say(who, \"GET: miss. SELECT: \" + row.name() + \" (v\" + row.version() + \")\");\n            beforeFill.run();\n            redis.set(KEY, row.name(), SetParams.setParams().ex(3_600));\n            say(who, \"SET \" + row.name() + \" EX 3600: OK\");\n            return row.name();\n        }\n        public void afterWrite(long v) {\n            say(\"W\", \"DEL: \" + redis.del(KEY) + \" keys deleted\");\n        }\n    };\n\n    // 2. a lease: only the reader whose token is still in the lease key may fill\n    static final String FILL_WITH_LEASE = \"\"\"\n            if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end\n            redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600)\n            redis.call('DEL', KEYS[2])\n            return 1\n            \"\"\";\n\n    static final Cache LEASED = new Cache() {\n        public String get(String who, Runnable beforeFill) {\n            String hit = redis.get(KEY);\n            if (hit != null) return hit;\n            String token = \"t-\" + who;                                       // readable; real code uses a UUID\n            String took = redis.set(LEASE, token, SetParams.setParams().nx().px(10_000));\n            Row row = table.get(\"m-17\");\n            say(who, \"GET: miss. SET lease \" + token + \" NX PX 10000: \" + took + \". SELECT: \" + row.name() + \" (v\" + row.version() + \")\");\n            beforeFill.run();\n            Object ok = redis.eval(FILL_WITH_LEASE, List.of(KEY, LEASE), List.of(token, row.name()));\n            say(who, \"fill with lease \" + token + \": \" + (Long.valueOf(1).equals(ok) ? \"stored\" : \"refused, the lease is gone\"));\n            return row.name();\n        }\n        public void afterWrite(long v) {\n            say(\"W\", \"DEL value and lease: \" + redis.del(KEY, LEASE) + \" keys deleted\");\n        }\n    };\n\n    // 3 and 4. a version check: the entry is a hash {ver, name}; a fill older than what the cache has seen is refused\n    static final String FILL_IF_NEWER = \"\"\"\n            local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\n            if seen and seen > tonumber(ARGV[1]) then return 0 end\n            redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2])\n            redis.call('EXPIRE', KEYS[1], 3600)\n            return 1\n            \"\"\";\n    static final String TOMBSTONE = \"\"\"\n            local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\n            if seen and seen > tonumber(ARGV[1]) then return 0 end\n            redis.call('DEL', KEYS[1])\n            redis.call('HSET', KEYS[1], 'ver', ARGV[1])\n            redis.call('PEXPIRE', KEYS[1], ARGV[2])\n            return 1\n            \"\"\";\n\n    static Cache versioned(boolean tombstone) {\n        return new Cache() {\n            public String get(String who, Runnable beforeFill) {\n                String hit = redis.hget(KEY, \"name\");                        // a tombstone has no name: a miss\n                if (hit != null) return hit;\n                Row row = table.get(\"m-17\");\n                say(who, \"HGET: miss. SELECT: \" + row.name() + \" (v\" + row.version() + \")\");\n                beforeFill.run();\n                Object ok = redis.eval(FILL_IF_NEWER, List.of(KEY), List.of(String.valueOf(row.version()), row.name()));\n                say(who, \"fill v\" + row.version() + \" if newer: \" + (Long.valueOf(1).equals(ok)\n                        ? \"stored\" : \"refused, the cache has seen v\" + redis.hget(KEY, \"ver\")));\n                return row.name();\n            }\n            public void afterWrite(long v) {\n                if (tombstone) {\n                    redis.eval(TOMBSTONE, List.of(KEY), List.of(String.valueOf(v), \"10000\"));\n                    say(\"W\", \"tombstone: ver \" + v + \", no name, for 10 s\");\n                } else {\n                    say(\"W\", \"DEL: \" + redis.del(KEY) + \" keys deleted\");\n                }\n            }\n        };\n    }\n\n    static void race(String title, Cache cache) throws Exception {\n        redis.del(KEY, LEASE);\n        table.put(\"m-17\", new Row(\"Fietsen Utrecht\", 1));\n        System.out.println(title);\n        CountDownLatch atFill = new CountDownLatch(1);\n        CountDownLatch writerDone = new CountDownLatch(1);\n\n        // reader A misses, reads v1, and stops just before its fill until the writer is done\n        CompletableFuture<String> readerA = CompletableFuture.supplyAsync(() -> cache.get(\"A\", () -> {\n            atFill.countDown();\n            await(writerDone);\n        }));\n        await(atFill);\n        table.put(\"m-17\", new Row(\"Velo Utrecht\", 2));\n        say(\"W\", \"UPDATE: Velo Utrecht (v2). COMMIT\");\n        cache.afterWrite(2);\n        writerDone.countDown();\n        readerA.get(5, TimeUnit.SECONDS);\n\n        String b = cache.get(\"B\", () -> {});\n        String db = table.get(\"m-17\").name();\n        System.out.println(\"  B  reads: \" + b + (b.equals(db) ? \"  (fresh)\"\n                : \"  (STALE: the database says \" + db + \", and the entry lives \" + redis.ttl(KEY) + \" s more)\"));\n        System.out.println();\n    }\n\n    static void await(CountDownLatch latch) {\n        try {\n            if (!latch.await(5, TimeUnit.SECONDS)) throw new IllegalStateException(\"timed out\");\n        } catch (InterruptedException e) {\n            throw new IllegalStateException(e);\n        }\n    }\n\n    public static void main(String[] args) throws Exception {\n        race(\"1. cache-aside, DEL after the commit\", NAIVE);\n        race(\"2. a lease that the DEL revokes\", LEASED);\n        race(\"3. a version check, DEL after the commit\", versioned(false));\n        race(\"4. a version check, a tombstone after the commit\", versioned(true));\n        System.out.println(\"cleaning up: \" + redis.del(KEY, LEASE) + \" keys deleted\");\n        redis.close();\n    }\n}\n",
+          "run": "./gradlew :redis:demo -Pmain=sfz.cache.l07.demo.StaleSetDemo",
+          "file": "labs/redis/src/demo/java/sfz/cache/l07/demo/StaleSetDemo.java",
+          "alt": {
+            "lang": "kotlin",
+            "title": "StaleSetDemo.kt",
+            "src": "package sfz.cache.l07.demo\n\nimport redis.clients.jedis.RedisClient\nimport redis.clients.jedis.params.SetParams\nimport java.util.concurrent.CompletableFuture\nimport java.util.concurrent.ConcurrentHashMap\nimport java.util.concurrent.CountDownLatch\nimport java.util.concurrent.TimeUnit\n\n/** The stale-set race four times, always in the same order: reader A misses, the writer commits, A fills, B reads. */\nprivate data class Row(val name: String, val version: Long)\n\nprivate val table = ConcurrentHashMap<String, Row>()                       // the \"database\"\nprivate val redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()\nprivate const val KEY = \"demo:l07:merchant:{m-17}\"\nprivate const val LEASE = \"demo:l07:lease:{m-17}\"\n\n/** What a pod does on a read, and what the writer does after its commit. */\nprivate interface Cache {\n    fun get(who: String, beforeFill: () -> Unit): String\n    fun afterWrite(newVersion: Long)\n}\n\nprivate fun say(who: String, what: String) = println(\"  $who  $what\")\n\n// 1. lesson 6's cache-aside: GET, on a miss SELECT and SET; after a write, DEL\nprivate object Naive : Cache {\n    override fun get(who: String, beforeFill: () -> Unit): String {\n        redis.get(KEY)?.let { return it }\n        val row = table.getValue(\"m-17\")\n        say(who, \"GET: miss. SELECT: ${row.name} (v${row.version})\")\n        beforeFill()\n        redis.set(KEY, row.name, SetParams.setParams().ex(3_600))\n        say(who, \"SET ${row.name} EX 3600: OK\")\n        return row.name\n    }\n\n    override fun afterWrite(newVersion: Long) = say(\"W\", \"DEL: ${redis.del(KEY)} keys deleted\")\n}\n\n// 2. a lease: only the reader whose token is still in the lease key may fill\nprivate val FILL_WITH_LEASE = \"\"\"\n    if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end\n    redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600)\n    redis.call('DEL', KEYS[2])\n    return 1\n\"\"\".trimIndent()\n\nprivate object Leased : Cache {\n    override fun get(who: String, beforeFill: () -> Unit): String {\n        redis.get(KEY)?.let { return it }\n        val token = \"t-$who\"                                                // readable; real code uses a UUID\n        val took = redis.set(LEASE, token, SetParams.setParams().nx().px(10_000))\n        val row = table.getValue(\"m-17\")\n        say(who, \"GET: miss. SET lease $token NX PX 10000: $took. SELECT: ${row.name} (v${row.version})\")\n        beforeFill()\n        val ok = redis.eval(FILL_WITH_LEASE, listOf(KEY, LEASE), listOf(token, row.name))\n        say(who, \"fill with lease $token: \" + if (ok == 1L) \"stored\" else \"refused, the lease is gone\")\n        return row.name\n    }\n\n    override fun afterWrite(newVersion: Long) = say(\"W\", \"DEL value and lease: ${redis.del(KEY, LEASE)} keys deleted\")\n}\n\n// 3 and 4. a version check: the entry is a hash {ver, name}; a fill older than what the cache has seen is refused\nprivate val FILL_IF_NEWER = \"\"\"\n    local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\n    if seen and seen > tonumber(ARGV[1]) then return 0 end\n    redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2])\n    redis.call('EXPIRE', KEYS[1], 3600)\n    return 1\n\"\"\".trimIndent()\nprivate val TOMBSTONE = \"\"\"\n    local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\n    if seen and seen > tonumber(ARGV[1]) then return 0 end\n    redis.call('DEL', KEYS[1])\n    redis.call('HSET', KEYS[1], 'ver', ARGV[1])\n    redis.call('PEXPIRE', KEYS[1], ARGV[2])\n    return 1\n\"\"\".trimIndent()\n\nprivate class Versioned(val tombstone: Boolean) : Cache {\n    override fun get(who: String, beforeFill: () -> Unit): String {\n        redis.hget(KEY, \"name\")?.let { return it }                         // a tombstone has no name: a miss\n        val row = table.getValue(\"m-17\")\n        say(who, \"HGET: miss. SELECT: ${row.name} (v${row.version})\")\n        beforeFill()\n        val ok = redis.eval(FILL_IF_NEWER, listOf(KEY), listOf(row.version.toString(), row.name))\n        say(who, \"fill v${row.version} if newer: \" +\n            if (ok == 1L) \"stored\" else \"refused, the cache has seen v${redis.hget(KEY, \"ver\")}\")\n        return row.name\n    }\n\n    override fun afterWrite(newVersion: Long) {\n        if (tombstone) {\n            redis.eval(TOMBSTONE, listOf(KEY), listOf(newVersion.toString(), \"10000\"))\n            say(\"W\", \"tombstone: ver $newVersion, no name, for 10 s\")\n        } else {\n            say(\"W\", \"DEL: ${redis.del(KEY)} keys deleted\")\n        }\n    }\n}\n\nprivate fun race(title: String, cache: Cache) {\n    redis.del(KEY, LEASE)\n    table[\"m-17\"] = Row(\"Fietsen Utrecht\", 1)\n    println(title)\n    val atFill = CountDownLatch(1)\n    val writerDone = CountDownLatch(1)\n\n    // reader A misses, reads v1, and stops just before its fill until the writer is done\n    val readerA = CompletableFuture.supplyAsync {\n        cache.get(\"A\") { atFill.countDown(); check(writerDone.await(5, TimeUnit.SECONDS)) }\n    }\n    check(atFill.await(5, TimeUnit.SECONDS))\n    table[\"m-17\"] = Row(\"Velo Utrecht\", 2)\n    say(\"W\", \"UPDATE: Velo Utrecht (v2). COMMIT\")\n    cache.afterWrite(2)\n    writerDone.countDown()\n    readerA.get(5, TimeUnit.SECONDS)\n\n    val b = cache.get(\"B\") {}\n    val db = table.getValue(\"m-17\").name\n    println(\"  B  reads: $b\" + if (b == db) \"  (fresh)\"\n        else \"  (STALE: the database says $db, and the entry lives ${redis.ttl(KEY)} s more)\")\n    println()\n}\n\nfun main() {\n    race(\"1. cache-aside, DEL after the commit\", Naive)\n    race(\"2. a lease that the DEL revokes\", Leased)\n    race(\"3. a version check, DEL after the commit\", Versioned(tombstone = false))\n    race(\"4. a version check, a tombstone after the commit\", Versioned(tombstone = true))\n    println(\"cleaning up: ${redis.del(KEY, LEASE)} keys deleted\")\n    redis.close()\n}\n",
+            "run": "./gradlew :redis:demo -Pmain=sfz.cache.l07.demo.StaleSetDemoKt",
+            "file": "labs/redis/src/demo/kotlin/sfz/cache/l07/demo/StaleSetDemo.kt"
+          }
+        },
+        "expect": "Race 1 ends with `B  reads: Fietsen Utrecht  (STALE: the database says Velo Utrecht, and the entry lives 3600 s more)`. Its `W  DEL: 0 keys deleted` line is frame 4, and `A  SET Fietsen Utrecht EX 3600: OK` is frame 5. In race 2, A's fill prints `refused, the lease is gone`, because the writer's `DEL value and lease: 1 keys deleted` removed A's token; B takes lease `t-B`, reads v2 and gets `Velo Utrecht  (fresh)`. Race 3 is stale again: after a plain DEL, `fill v1 if newer: stored`, because the cache had no version left to compare with. Race 4 is fresh: the writer left `tombstone: ver 2`, so A's fill prints `refused, the cache has seen v2`, and B fills v2. The Java and Kotlin demos print the same lines on every run, because latches decide the order. The last line is `cleaning up: 1 keys deleted`."
+      },
+      "refs": [
+        {
+          "title": "Cache made consistent (Meta engineering, 2022)",
+          "url": "https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "A lease lets the delete cancel a fill that hasn't happened yet",
+      "body": "The stale `SET` got in because Redis had nothing left of the delete by the time the fill arrived: deleting an empty key leaves no trace. So give each miss something that the delete can take away.\n\nThat is a **lease**, the fix in Meta's memcache paper (Nishtala and others, NSDI 2013). On a miss, memcached hands the reader a 64-bit token tied to that key. To fill the key, the reader must present the token, and a delete of the key invalidates it, so a fill that started before the write is refused. The paper compares it to load-link and store-conditional, a pair of CPU instructions where the store succeeds only if nobody wrote the address since the load.\n\nRedis has no lease command, but it has the parts. On a miss, the reader takes the lease with `SET lease:{m-17} <random token> NX PX 10000`: `NX` lets exactly one reader take it, and `PX 10000` makes a crashed holder's lease vanish after 10 seconds. After its commit, the writer deletes the value and the lease in one command, `DEL merchant:{m-17} lease:{m-17}`. To fill, the reader checks that the lease still holds its token and then sets the value. Those two steps can't have a gap between them: a delete landing between the check and the `SET` is the same race again.\n\nSo the fill is a Lua script. `EVAL` sends Redis a small Lua program, and Redis runs the whole script as one command on its single thread (lesson 2), so no other client's command lands between its lines. The Transactions track's lesson on serial execution covers scripts in full; this one needs four lines:\n\n```text\nif redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end   -- revoked by a write, or someone else's\nredis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])\nredis.call('DEL', KEYS[2])                                    -- done: the next miss may take a new lease\nreturn 1\n```\n\nReplay the race. Reader A takes the lease and stalls. The writer's `DEL` removes the lease along with the empty value. A's fill finds no token, returns 0 and changes nothing. Reader B misses, takes a new lease, reads version 2 and fills it.\n\nLeases also fix lesson 6's stampede, because only one reader per key holds the lease. The others wait a few milliseconds for the value instead of all querying the database. Meta hands out one token per key every 10 seconds, and on keys prone to stampedes the peak database load over a measured week fell from 17,000 queries a second to 1,300. A reader that waits too long reads the database itself, but never fills without a lease.",
+      "try": {
+        "title": "Take a lease, lose it to a write",
+        "minutes": 3,
+        "steps": [
+          "At the redis-cli prompt, run the first three lines: reader A takes the lease with token `t-A`, and reader B tries for it with `t-B`.",
+          "The fourth line is the writer's `DEL` after its commit. Then reader A presents `t-A` to the fill script. Predict the script's reply and the `GET` after it.",
+          "Run the rest: reader B misses, takes a fresh lease and fills version 2. What is left of the lease afterwards?"
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL merchant:{m-17} lease:{m-17}\nSET lease:{m-17} t-A NX PX 10000\nSET lease:{m-17} t-B NX PX 10000\nDEL merchant:{m-17} lease:{m-17}\nEVAL \"if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600) redis.call('DEL', KEYS[2]) return 1\" 2 merchant:{m-17} lease:{m-17} t-A \"Fietsen Utrecht\"\nGET merchant:{m-17}\nSET lease:{m-17} t-B NX PX 10000\nEVAL \"if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end redis.call('SET', KEYS[1], ARGV[2], 'EX', 3600) redis.call('DEL', KEYS[2]) return 1\" 2 merchant:{m-17} lease:{m-17} t-B \"Velo Utrecht\"\nGET merchant:{m-17}\nEXISTS lease:{m-17}"
+        },
+        "expect": "`DEL` prints `(integer) 0` on a fresh server. Reader A's `SET ... NX` prints `OK`: it holds the lease. Reader B's prints `(nil)`: taken, so B would wait. The writer's `DEL` prints `(integer) 1`, the lease (the value was never there). A's `EVAL` prints `(integer) 0`, refused, and `GET` prints `(nil)`: the old name never reached the cache. B's second try at the lease prints `OK`, its fill prints `(integer) 1`, `GET` prints `\"Velo Utrecht\"`, and `EXISTS lease:{m-17}` prints `(integer) 0`: the fill gave the lease back."
+      },
+      "refs": [
+        {
+          "title": "Scaling Memcache at Facebook, section 3.2.1: leases",
+          "url": "https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Scripting with Lua (Redis docs)",
+          "url": "https://redis.io/docs/latest/develop/programmability/eval-intro/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A version check refuses anything older than what the cache has seen",
+      "body": "A lease works when every fill starts with a miss. Some writes into the cache don't: a writer that updates the cache directly, or a pipeline that copies changes from the database (next section). For those, compare versions instead of tokens.\n\nThe database already orders each row's changes: a version column, an update timestamp, a position in its log. Store that version with the copy, as a Redis hash `merchant:{m-17} = {ver: 1, name: Fietsen Utrecht}`, and make every write into the cache conditional: store this only if the cache holds nothing newer.\n\n```text\nlocal seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\nif seen and seen > tonumber(ARGV[1]) then return 0 end        -- the cache has seen a newer version\nredis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2])\nredis.call('EXPIRE', KEYS[1], 3600)\nreturn 1\n```\n\nWith versions, updating the cache on write becomes safe again. In the first section's two-writer race, writer A's late `SET` carries version 2 while the cache already holds version 3, so the script refuses it. Uber's CacheFront, a Redis cache in front of its Docstore database that serves more than 40 million reads a second, does this: each row's MySQL timestamp is its version, and a Lua script writes a value only if it is newer, in one round trip.\n\nA version check has a hole of its own, and Meta's post points at it. The check needs the newer version to still be in the cache when the old fill arrives. Replay the stale set with a version check and a writer that deletes: the `DEL` removes the cache's only record of version 2, A's fill of version 1 finds nothing to compare with, and it is stored. Eviction (lesson 5) can remove the newer version just before the old fill arrives, with the same result.\n\nSo keep the version when you drop the value. The writer replaces the entry with a **tombstone**, `{ver: 2}` with no name, and gives it a TTL longer than the slowest fill can take, say 10 seconds. Readers treat a tombstone as a miss. A fill of version 1 is refused, because 1 is less than 2. A fill of version 2 replaces the tombstone. Races 3 and 4 of the demo show both halves: a version check after a plain `DEL` lets the old name in, and the same check after a tombstone refuses it.",
+      "try": {
+        "title": "A tombstone refuses an old fill, a DEL doesn't",
+        "minutes": 3,
+        "steps": [
+          "At the redis-cli prompt, clear the key and run the tombstone script: the writer has committed version 2. Read the entry with `HGETALL`.",
+          "Now two fills arrive: version 1 from a slow reader, then version 2 from a fresh one. Predict both replies before you run them.",
+          "The last three lines play Meta's hole: the entry disappears (an eviction, or a writer that only deletes), and the slow reader's version 1 arrives. Predict the `HGET`."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "DEL merchant:{m-17}\nEVAL \"local seen = tonumber(redis.call('HGET', KEYS[1], 'ver')) if seen and seen > tonumber(ARGV[1]) then return 0 end redis.call('DEL', KEYS[1]) redis.call('HSET', KEYS[1], 'ver', ARGV[1]) redis.call('PEXPIRE', KEYS[1], ARGV[2]) return 1\" 1 merchant:{m-17} 2 10000\nHGETALL merchant:{m-17}\nEVAL \"local seen = tonumber(redis.call('HGET', KEYS[1], 'ver')) if seen and seen > tonumber(ARGV[1]) then return 0 end redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2]) redis.call('EXPIRE', KEYS[1], 3600) return 1\" 1 merchant:{m-17} 1 \"Fietsen Utrecht\"\nEVAL \"local seen = tonumber(redis.call('HGET', KEYS[1], 'ver')) if seen and seen > tonumber(ARGV[1]) then return 0 end redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2]) redis.call('EXPIRE', KEYS[1], 3600) return 1\" 1 merchant:{m-17} 2 \"Velo Utrecht\"\nHGETALL merchant:{m-17}\nDEL merchant:{m-17}\nEVAL \"local seen = tonumber(redis.call('HGET', KEYS[1], 'ver')) if seen and seen > tonumber(ARGV[1]) then return 0 end redis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2]) redis.call('EXPIRE', KEYS[1], 3600) return 1\" 1 merchant:{m-17} 1 \"Fietsen Utrecht\"\nHGET merchant:{m-17} name"
+        },
+        "expect": "The first `DEL` prints `(integer) 1` if the last Try it left the key, `(integer) 0` otherwise. The tombstone script prints `(integer) 1`, and `HGETALL` shows only `1) \"ver\"` and `2) \"2\"`: a version with no name. The slow reader's fill of version 1 prints `(integer) 0`, refused. The fresh fill of version 2 prints `(integer) 1`, and `HGETALL` now shows `ver` `2` and `name` `\"Velo Utrecht\"`. Then the hole: `DEL` prints `(integer) 1`, the version-1 fill prints `(integer) 1`, stored, and `HGET` prints `\"Fietsen Utrecht\"`. With no version left in the cache, the check had nothing to refuse with."
+      },
+      "refs": [
+        {
+          "title": "How Uber serves over 40 million reads per second using an integrated cache",
+          "url": "https://www.uber.com/blog/how-uber-serves-over-40-million-reads-per-second-using-an-integrated-cache/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Invalidate from the commit log, measure it, and keep the TTL as the backstop",
+      "body": "Every fix so far assumes the writer's invalidation happens. It doesn't if the pod dies between `COMMIT` and `DEL`: an OOM kill, a deploy, a lost connection to Redis. The commit stands, the delete never runs, and the old copy lives until its TTL. A retry loop can't help a pod that is gone. This is the other half of the dual-write problem, partial failure: one change for two systems, and only one of them got it.\n\nThe fix is to take invalidation away from the application. The database already records every committed change, in commit order, in its log: the redo log in Oracle, the binlog in MySQL, the write-ahead log in PostgreSQL. A process that reads that log and turns each change into a cache invalidation can't skip a commit, because it doesn't depend on the pod that made it. That is **change data capture** (CDC), which the Stream processing track builds properly. Meta ran it long before the name caught on: a daemon called mcsqueal on every database tails the MySQL commit log, pulls out the keys to delete and sends the deletes to every cache cluster in the region. Only 4% of those deletes find a cached value to remove, which shows how cheap a spare delete is. Uber's CacheFront tails the binlog with its Flux pipeline and keeps Redis within seconds of the database, and since a binlog holds only committed transactions, uncommitted data never reaches the cache.\n\nCDC doesn't end the races of the earlier sections. Its writes arrive a little after the commit, and fills from the read path still interleave with them, which is why Uber runs every write into Redis, from either side, through the same version check.\n\nThen measure, because you can't fix an inconsistency you never see. Meta's \"Cache made consistent\" describes Polaris, a service that receives invalidations as if it were a cache and checks a few minutes later whether the caches still disagree with the database. It reports \"N nines of cache writes are consistent within M minutes\", and with the bugs it found, Meta took TAO from six nines to ten nines at the five-minute mark. Uber runs CacheFront in a shadow mode that compares cached rows with the database and reports 99.99% consistency.\n\nAnd keep the TTL. It fixes none of the races in this lesson; it only caps how long a wrong copy lives. That cap covers what you haven't found yet: a lagging invalidation pipeline, a bug in your own version check. Uber's default is five minutes for rows with no explicit invalidation. Choose yours as in lesson 6, by how long a wrong answer may live, and keep any guarantee stronger than that in the database.",
+      "refs": [
+        {
+          "title": "Cache made consistent (Meta engineering, 2022)",
+          "url": "https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/",
+          "kind": "read"
+        },
+        {
+          "title": "Scaling Memcache at Facebook, section 4.1: regional invalidations",
+          "url": "https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of price tags in a shop window, copied by clerks from the price list in the back office. When the office changes a price, a clerk takes the old tag out of the window, and the next customer who asks gets a tag copied fresh from the list. The stale set is a slow clerk who copied the old price, stopped for coffee, and pins the old tag up after the price changed and the window was cleared. A lease is a numbered ticket the clerk takes from the office before copying: a price change tears up every ticket for that item, and the window accepts a tag only with a ticket that is still valid. A version is the date printed on every tag, and the window refuses a tag older than the one it last took down. The analogy breaks on memory: a shop window would remember a tag that was taken down a minute ago, while Redis remembers nothing about a deleted key unless you leave a tombstone there on purpose.",
+  "in_your_world": "Most caches in a payment platform can live with lesson 6's rules: merchant profiles, BIN tables, FX rates and partner configuration change rarely, and an hour of an old display name is a nuisance. Use this lesson where a stale value decides something: a merchant's suspension, a card's risk tier, a fraud-model flag read on the authorization path. Fill those through a lease or a version check, and take invalidation off the request path. Most payment platforms already stream Oracle's changes somewhere (GoldenGate, a Debezium connector into Kafka, an outbox table), and a small Kafka consumer that turns each change into a versioned invalidation can't skip a commit the way a crashed Quarkus pod can. The version is easy to find: the version column that JPA's `@Version` already maintains on the row. Then measure: sample changed keys, compare Redis with Oracle a minute after each change, and alert on the mismatch rate, not only on the hit ratio.",
+  "mistake": "The most common mistake is trusting the order of your own code: \"we delete after the commit, so the cache can't stay stale\". The delete is right, and it still loses to a reader that read before the commit and fills after the delete, and to a pod that dies between the two. People make this mistake because each line of the write path is correct on its own, and tests send one request at a time. The fix is to let Redis refuse old copies: take a lease on a miss and fill only while it is valid, or store a version with every entry, write only if it is newer, and leave a tombstone when you invalidate. Then move invalidation onto the database's change log, and keep a TTL on every entry as the cap on whatever you missed.",
+  "compare": {
+    "title": "A read that fills only with a live lease, in Java and Kotlin",
+    "java": {
+      "title": "LeasedMerchantCache.java",
+      "src": "@Override\npublic String get(String id) {\n    long giveUpAt = System.nanoTime() + patience.toNanos();\n    while (true) {\n        String cached = redis.get(valueKey(id));\n        if (cached != null) return cached;                                  // a hit\n        String token = UUID.randomUUID().toString();\n        if (redis.set(leaseKey(id), token, SetParams.setParams().nx().px(lease.toMillis())) != null) {\n            MerchantTable.Row row = table.read(id);                         // the lease is ours: load\n            if (row == null) {\n                redis.delex(leaseKey(id), CompareCondition.valueEq(token));\n                return null;\n            }\n            redis.eval(FILL, List.of(valueKey(id), leaseKey(id)),\n                    List.of(token, row.getName(), String.valueOf(TTL_SECONDS)));   // refused after a write\n            return row.getName();\n        }\n        if (System.nanoTime() >= giveUpAt) break;                           // someone else loads: wait\n        sleep(10);\n    }\n    MerchantTable.Row row = table.read(id);                                 // out of patience: never fill\n    return row == null ? null : row.getName();\n}"
+    },
+    "kotlin": {
+      "title": "LeasedMerchantCache.kt",
+      "src": "override fun get(id: String): String? {\n    val giveUpAt = System.nanoTime() + patience.toNanos()\n    while (true) {\n        redis.get(valueKey(id))?.let { return it }                         // a hit\n        val token = UUID.randomUUID().toString()\n        if (redis.set(leaseKey(id), token, SetParams.setParams().nx().px(lease.toMillis())) != null) {\n            val row = table.read(id) ?: run {                              // the lease is ours: load\n                redis.delex(leaseKey(id), CompareCondition.valueEq(token))\n                return null\n            }\n            redis.eval(FILL, listOf(valueKey(id), leaseKey(id)),\n                listOf(token, row.name, TTL_SECONDS.toString()))           // refused after a write\n            return row.name\n        }\n        if (System.nanoTime() >= giveUpAt) break                           // someone else loads: wait\n        Thread.sleep(10)\n    }\n    return table.read(id)?.name                                            // out of patience: never fill\n}"
+    },
+    "note": "Both send the same Redis traffic: a GET, on a miss one `SET ... NX PX` for the lease, and one EVAL of the fill script, which refuses the value if a write deleted the lease in the meantime. Kotlin's `?: run { ...; return null }` handles a missing row inside the same expression, and `table.read(id)?.name` folds the last null check into one line. Java's `Thread.sleep` throws the checked `InterruptedException`, so the lab's Java version wraps it in a small `sleep` helper that restores the interrupt flag. Neither version takes a lock inside the JVM: the only mutual exclusion is the lease in Redis, which is why it works across pods. The lab's real method also runs the `beforeFill` hook just before the EVAL; it is left out here."
+  },
+  "worked": {
+    "title": "A version check with tombstones, in two Lua scripts",
+    "steps": [
+      {
+        "say": "Start with the record. Each entry is a hash holding the row's version and its name, and readers ask only for the name with `HGET merchant:{m-17} name`. A tombstone is the same hash with a version and no name, so it reads as a miss and nobody needs special code for it.",
+        "code": "HSET merchant:{m-17} ver 1 name \"Fietsen Utrecht\"     # a value: version 1\nHGET merchant:{m-17} name                             # \"Fietsen Utrecht\"\nHSET merchant:{m-17} ver 2                            # after DEL: a tombstone for version 2\nHGET merchant:{m-17} name                             # (nil): a miss",
+        "lang": "text"
+      },
+      {
+        "say": "The fill: write only if the cache hasn't seen a newer version. Equal versions are allowed on purpose, so a fill of version 2 can replace a tombstone of version 2. A fill on an empty key is always stored, which is the hole the tombstone exists to close.",
+        "code": "local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\nif seen and seen > tonumber(ARGV[1]) then return 0 end        -- the cache has seen a newer version\nredis.call('HSET', KEYS[1], 'ver', ARGV[1], 'name', ARGV[2])\nredis.call('EXPIRE', KEYS[1], 3600)\nreturn 1",
+        "lang": "text"
+      },
+      {
+        "say": "The invalidation: replace the entry with a tombstone of the new version, unless the cache already holds something newer. Its TTL must be longer than the slowest read-to-fill a reader can take; 10 seconds covers a request with a 5-second timeout.",
+        "code": "local seen = tonumber(redis.call('HGET', KEYS[1], 'ver'))\nif seen and seen > tonumber(ARGV[1]) then return 0 end\nredis.call('DEL', KEYS[1])\nredis.call('HSET', KEYS[1], 'ver', ARGV[1])                   -- a version and no name: a tombstone\nredis.call('PEXPIRE', KEYS[1], ARGV[2])                       -- longer than the slowest fill\nreturn 1",
+        "lang": "text"
+      },
+      {
+        "say": "Call them from the read path and from the write path. The reader passes the version it read with the row; the writer passes the version it just committed.",
+        "code": "String get(String id) {\n    String name = redis.hget(key(id), \"name\");            // a tombstone has no name: a miss\n    if (name != null) return name;\n    MerchantTable.Row row = table.read(id);\n    if (row == null) return null;\n    redis.eval(FILL_IF_NEWER, List.of(key(id)),\n            List.of(String.valueOf(row.getVersion()), row.getName()));\n    return row.getName();\n}\n\nvoid afterWrite(String id, long committedVersion) {\n    redis.eval(TOMBSTONE, List.of(key(id)), List.of(String.valueOf(committedVersion), \"10000\"));\n}",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "fun get(id: String): String? {\n    redis.hget(key(id), \"name\")?.let { return it }          // a tombstone has no name: a miss\n    val row = table.read(id) ?: return null\n    redis.eval(FILL_IF_NEWER, listOf(key(id)),\n        listOf(row.version.toString(), row.name))\n    return row.name\n}\n\nfun afterWrite(id: String, committedVersion: Long) {\n    redis.eval(TOMBSTONE, listOf(key(id)), listOf(committedVersion.toString(), \"10000\"))\n}"
+      },
+      {
+        "say": "Know the hole that is left. A fill slower than the tombstone's 10 seconds finds nothing to compare with and gets in, and so does one that arrives after an eviction removed the tombstone. A version also protects you only if it really names the data next to it: Meta's post describes a fill that read the version and the data at different moments, so the cache held old data under the new version number. Keep the entry's TTL as the cap on all of that.",
+        "code": "",
+        "lang": ""
+      }
+    ]
+  },
+  "lab": {
+    "title": "Reproduce the stale set with latches, then close it with a lease",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/redis/src/main/kotlin/sfz/cache/l07/StaleSetRace.kt",
+      "labs/redis/src/main/java/sfz/cache/l07/LeasedMerchantCache.java"
+    ],
+    "run": "./gradlew :redis:test --tests 'sfz.cache.l07.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. All 11 fail: three in `StaleSetRaceTest` and eight in `LeasedMerchantCacheTest`, against the shared Redis container. `MerchantTable` (the database, with a version per row) and `NaiveMerchantCache` (lesson 6's cache-aside) are done for you.",
+      "In `StaleSetRace.kt`, write `run` from its KDoc: two `CountDownLatch`es, reader A on its own thread with a hook that holds it before its fill, and the writer in between. Run `./gradlew :redis:test --tests 'sfz.cache.l07.StaleSetRaceTest'`. The first two tests pass: you have made the stepper's timeline happen on purpose, twenty times in a row.",
+      "In `LeasedMerchantCache.java`, write the `FILL` script, then `afterWrite` (one DEL of both keys), then `get` from its javadoc.",
+      "Run all 11 tests. `a fill whose lease was deleted by a write is refused` is the stepper's frame 5 with the fix in place. `a reader that misses while another holds the lease waits for that value...` is the stampede fix that leases give for free: two misses, one query."
+    ],
+    "hints": [
+      "`pods.cache { atFill.countDown(); writerDone.await(5, SECONDS) }` builds reader A's cache: the lambda is its `beforeFill` hook. The second cache gets `pods.cache {}`.",
+      "The script: `if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end`, then the SET with `'EX', ARGV[3]`, then DEL the lease and `return 1`.",
+      "`redis.set(leaseKey(id), token, SetParams.setParams().nx().px(lease.toMillis()))` returns null when another reader holds the lease.",
+      "From Java, a Kotlin property is a getter: `row.getName()`."
+    ],
+    "done_when": "All 11 tests in `sfz.cache.l07` pass."
+  },
+  "drill": {
+    "title": "The lease fill from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write the fill script that stores a value only while the caller's lease is still in place, and the Jedis call that runs it with a value key, a lease key, a token, a name and a TTL. Then say which command on the write path makes this script refuse a stale fill.",
+    "answer": {
+      "lang": "java",
+      "src": "static final String FILL = \"\"\"\n        if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end\n        redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])\n        redis.call('DEL', KEYS[2])\n        return 1\n        \"\"\";\n\nboolean fill(String valueKey, String leaseKey, String token, String name) {\n    Object r = redis.eval(FILL, List.of(valueKey, leaseKey), List.of(token, name, \"3600\"));\n    return Long.valueOf(1).equals(r);\n}\n// the writer, after its commit: DEL <valueKey> <leaseKey> in one command, which takes the token away",
+      "alt": {
+        "lang": "kotlin",
+        "src": "val FILL = \"\"\"\n    if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end\n    redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])\n    redis.call('DEL', KEYS[2])\n    return 1\n\"\"\".trimIndent()\n\nfun fill(valueKey: String, leaseKey: String, token: String, name: String): Boolean =\n    redis.eval(FILL, listOf(valueKey, leaseKey), listOf(token, name, \"3600\")) == 1L\n// the writer, after its commit: DEL <valueKey> <leaseKey> in one command, which takes the token away"
+      }
+    }
+  },
+  "recap": [
+    "A cache is honest as long as no copy older than the newest invalidation can get in. Every race in this lesson is a way in.",
+    "Delete on write instead of updating: two deletes in any order leave the same empty key, and two SETs from two writers don't.",
+    "The stale set: a reader that read before the commit and fills after the delete puts the old row back, for the whole TTL.",
+    "A lease (SET NX PX on a miss, one DEL of value and lease on write, a Lua fill that checks the token) refuses that fill and lets one reader per key load.",
+    "A version check refuses fills older than what the cache has seen, but only while it still holds the newer version: leave a tombstone when you invalidate.",
+    "Move invalidation onto the database's change log, measure consistency, and keep the TTL as the backstop for what you missed."
+  ],
+  "quiz": [
+    {
+      "q": "Two services rename merchant m-17 a few milliseconds apart. Each commits to Oracle and then runs `SET merchant:{m-17} <its new name>`. Oracle ends with the second rename. What can Redis end with?",
+      "options": [
+        "Always the second rename: Redis applies the SETs in commit order",
+        "Either name: the SETs travel from two pods, can arrive in either order, and the last one to arrive stays",
+        "Neither: Redis refuses a second SET to the same key within a few milliseconds",
+        "Always the first rename: the first SET holds the key until its TTL ends"
+      ],
+      "answer": 1,
+      "why": "Redis sees only the order in which commands reach it, and two pods' SETs can arrive in either order whatever the commit order was. If the first writer's SET arrives last, the cache keeps the older name with no error anywhere. Deleting instead of setting removes the problem, because two deletes in any order leave the same empty key; a version check also fixes it, by refusing the older SET."
+    },
+    {
+      "q": "A lease-based cache takes `SET lease:{k} <token> NX PX 10000` on a miss, fills through a Lua script that checks the token, and the writer runs `DEL k lease:{k}` after its commit. Reader A takes the lease and stalls. The writer commits and deletes. Reader B then misses. What happens next?",
+      "options": [
+        "B takes a new lease, reads the new row and fills it; A's late fill finds no token of its own and is refused",
+        "B waits for A's fill, and both end up with the old row",
+        "B reads the database but may not fill until A's lease expires 10 seconds later",
+        "A's fill succeeds, because A took its lease before the write"
+      ],
+      "answer": 0,
+      "why": "The writer's DEL removed A's lease together with the empty value, so the lease key is free and B's `SET NX` succeeds. B reads the committed row and fills it. When A's fill finally runs, the lease key holds B's token or nothing, never A's, so the script returns 0 and writes nothing. Waiting for A would be right only while A's lease still existed."
+    },
+    {
+      "q": "A cache stores `{ver, name}` and fills only if the incoming version isn't older than the cached one. The writer commits version 2 and then runs a plain `DEL`. A reader that read version 1 before the commit fills afterwards. What does the cache hold?",
+      "options": [
+        "Nothing: the version check refuses version 1",
+        "Version 2: the script notices the conflict and reloads the row",
+        "An error, because the key was deleted",
+        "Version 1: after the DEL there is no newer version to compare with, so the fill is stored"
+      ],
+      "answer": 3,
+      "why": "A version check compares with what the cache holds, and after the DEL it holds nothing, so any fill wins. That is the hole Meta describes, and an eviction opens it too. A tombstone closes it: the writer leaves `{ver: 2}` without a name for longer than the slowest fill, and the fill of version 1 is then refused. Redis never reloads anything by itself."
+    },
+    {
+      "q": "A pod commits a merchant suspension to Oracle and is OOM-killed before it runs its `DEL`. Which design still gets the change to the cache?",
+      "options": [
+        "Retry the DEL in a `finally` block",
+        "A shorter TTL on every entry",
+        "A consumer of the database's change log that invalidates every changed row, whichever pod committed it",
+        "Delete the key before the commit as well as after it"
+      ],
+      "answer": 2,
+      "why": "A dead pod runs no `finally` block and no second delete. The change log records every committed change whether or not the pod that made it survives, so an invalidator that reads it can't skip a commit. A shorter TTL only shortens how long the stale suspension flag lives; it is the backstop, not the fix."
+    },
+    {
+      "q": "From lesson 6: 100 requests from four pods miss the same hot key at once. With this lesson's lease cache, how many of them query the database?",
+      "options": [
+        "100: leases only stop stale fills",
+        "1: only the lease holder queries; the others wait for its value, and read the database only if it takes longer than their patience",
+        "0: the lease hands everyone the last value it saw",
+        "4: one per pod, because a lease works only inside one JVM"
+      ],
+      "answer": 1,
+      "why": "The lease lives in Redis, so `SET NX` picks exactly one holder across all four pods. The other 99 find the lease taken and poll the cache for a short while instead of querying. It is the cross-pod lock from lesson 6, with one more job: a write revokes it. Lesson 6's in-process single-flight was the one that stopped at the JVM's edge.",
+      "from": "cache-06"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is the stale-set race?",
+      "back": "A reader misses and reads the old row; a writer commits and deletes the still-empty key; the reader's SET then stores the old row, which stays until its TTL ends."
+    },
+    {
+      "front": "Why delete rather than update the cache on a write?",
+      "back": "Deletes are idempotent: two in any order leave the same empty key. Two writers' SETs can arrive out of commit order and leave the older value."
+    },
+    {
+      "front": "How does a lease stop a stale fill?",
+      "back": "A miss takes a token (`SET lease NX PX`), the fill must present it, and the writer's DEL of value and lease takes it away, so a fill that began before the write is refused."
+    },
+    {
+      "front": "What did memcache's leases do to stampedes at Meta?",
+      "back": "One token per key every 10 seconds, others wait briefly: peak database load on stampede-prone keys fell from 17,000 to 1,300 queries a second."
+    },
+    {
+      "front": "Why does a version check need a tombstone?",
+      "back": "It can refuse only fills older than a version it still holds. A DEL or an eviction erases that version, and an old fill gets in. A tombstone keeps the version without the value."
+    },
+    {
+      "front": "What does change data capture add to cache invalidation?",
+      "back": "Invalidations come from the database's commit log, so a pod dying between COMMIT and DEL can't skip one. Its writes still race with fills, so keep the version check."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Stale set",
+      "plain": "A fill that stores a row read before a write, after that write's invalidation already ran."
+    },
+    {
+      "term": "Lease",
+      "plain": "A short-lived token a reader gets on a miss and must present to fill; a write revokes it."
+    },
+    {
+      "term": "Version check",
+      "plain": "Writing into the cache only if the incoming version is not older than the cached one."
+    },
+    {
+      "term": "Tombstone",
+      "plain": "An entry that keeps a version but no value, so a later, older fill can be recognized and refused."
+    },
+    {
+      "term": "Dual write",
+      "plain": "Writing one change separately to two systems, such as Oracle and Redis, with nothing keeping them in step."
+    },
+    {
+      "term": "Change data capture",
+      "plain": "Reading a database's log of committed changes and passing each change on, for example as a cache invalidation."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"Our merchant cache deletes the key after every commit, so it can't serve stale data for more than a few milliseconds.\" Explain the two ways it still can, and what you would add.",
+    "answer": "Deleting after the commit is the right rule, and it still leaves two gaps. First, a reader can miss, read the old row, and stall in a GC pause or a slow connection; meanwhile the writer commits and deletes the key, which is still empty, so the delete does nothing. Then the reader's SET arrives and stores the old row with a full TTL, and nothing will delete it again. Second, the pod can die between its commit and its DEL, and then no delete runs at all. For the first gap I would make Redis able to refuse the late fill: either a lease, a token taken with SET NX PX on a miss that the writer's DEL removes and the fill script checks, or a version stored with each entry so that a fill older than what the cache has seen is refused, with a tombstone left on invalidation so the version survives the delete. For the second gap I would drive invalidation from the database's change log rather than from the pod, so a crash can't skip one. And I would keep a TTL on every entry and measure the mismatch rate, because those catch the cases we haven't thought of."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Meta's version bug.** \"Cache made consistent\" walks through a real inconsistency its tracing found. A rare transaction updated a row's data and its version in two tables. A fill ran in between and stored the old data with the new version number. The invalidation then failed with a transient error, and the error handler called `drop_cache(key, version)`, which drops an entry only if its version is older than the one given. The cached version was not older, so nothing was dropped, and the old data stayed. The on-call engineer found it in under 30 minutes, thanks to the tracing. The lesson: a version protects you only if it was read in the same snapshot as the data it labels.\n\n**More of memcache's tricks.** A new cache cluster warming itself from a warm one could cache a value that the warm cluster hadn't invalidated yet. Meta's fix: deletes sent to the cold cluster carry a two-second hold-off, during which `add` for that key fails and tells the client to read the database instead. The paper admits a delete delayed by more than two seconds remains a hole. For writes from a non-primary region, a \"remote marker\" key tells later readers to fetch from the primary region until replication catches up. The Replication track's lesson on replication lag explains the problem those markers work around.\n\n**Client-side caching has the same races.** Redis 6 and later can push invalidations to clients that cache keys in their own memory (lesson 6's deeper section). That moves the copy closer to the code, and the stale set can now happen inside a pod: a client that read a key just before an invalidation and stores it just after. Disconnection is the other gap: invalidations sent while a client was disconnected never reach it, which is why Jedis flushes its local cache whenever a connection drops.\n\n**\"Delayed double delete\".** Many blog posts suggest deleting the key, waiting a few hundred milliseconds, and deleting it again. It shrinks the window instead of closing it, and it needs a guess at how slow the slowest reader is. A lease or a version check closes it.\n\n**Redis 8.4's compare-and-set.** `SET key value IFEQ <expected>` writes only if the current value equals `<expected>`, and `DELEX key IFEQ <expected>` deletes only then. They help when the value itself carries the token or version. When the check must look at another key, as the lease fill does, or compare numbers, as the version check does, a Lua script is still the tool.\n\nFor the general argument, from dual writes to deriving every system from one ordered log, read Designing Data-Intensive Applications, 2nd edition, chapter 12, \"Keeping Systems in Sync\"."
+  },
+  "sources": [
+    {
+      "title": "Nishtala et al., Scaling Memcache at Facebook (NSDI 2013)",
+      "url": "https://www.usenix.org/system/files/conference/nsdi13/nsdi13-final170_update.pdf"
+    },
+    {
+      "title": "Cache made consistent (Meta engineering, 2022)",
+      "url": "https://engineering.fb.com/2022/06/08/core-infra/cache-made-consistent/"
+    },
+    {
+      "title": "How Uber serves over 40 million reads per second using an integrated cache (2024)",
+      "url": "https://www.uber.com/blog/how-uber-serves-over-40-million-reads-per-second-using-an-integrated-cache/"
+    },
+    {
+      "title": "Scripting with Lua (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/programmability/eval-intro/"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 12",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

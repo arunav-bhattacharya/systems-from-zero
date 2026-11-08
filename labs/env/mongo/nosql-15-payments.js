@@ -1,4 +1,4 @@
-// Lesson nosql-15: helpers for the sharded-cluster Try-its in env/mongo-sharded.yml.
+// Lesson shard-07: helpers for the sharded-cluster Try-its in env/mongo-sharded.yml.
 // Inside mongosh on the mongos: load("/sfz/nosql-15-payments.js")
 //   payments(n, from)   n payment documents, pay-<from> to pay-<from + n - 1>, one minute apart
 //   ledger(n, from)     n ledger entries of about 1 KB each, one second apart, in time order

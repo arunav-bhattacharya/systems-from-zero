@@ -1,129 +1,129 @@
 {
-  "id": "os",
-  "intro": "By the end of this track you can follow a JVM service from its first system call to its container's limits: read a `strace` and a thread dump against what the kernel shows in `/proc`, tell a JVM `OutOfMemoryError` from a kernel OOM kill and a `SIGTERM` from a `SIGKILL`, explain why a pod with a CPU limit stalls and why its RSS doesn't fall, write a file so that a power cut can't corrupt it, say what epoll and virtual threads do with 2,000 idle connections, and build a container by hand from namespaces and a cgroup.\n\nYou need to be able to program, and to run Docker on your laptop. Nothing about kernels is assumed. Lesson 1 sets up the picture the whole track uses, programs in user mode asking the kernel for everything through system calls, and each later lesson opens one box of that kernel: processes, threads, the scheduler, locks, virtual memory, malloc, the page cache, file systems, I/O and containers. The kernel facts are Linux 6.12 (the lab box's kernel, with EEVDF and cgroup v2), and the JVM facts are JDK 25.\n\nEvery Try-it runs in the lab box, an Ubuntu 24.04 container with JDK 25, `strace`, `gcc` and friends: `docker compose -f env/labbox.yml run --rm box` from the `labs` folder, or `box-priv` for the steps that need privileges (`unshare`, mounts, io_uring). Short C programs live in `labs/os/c/lNN/` and compile to `/tmp` inside the box; Java demos live in `labs/os/src/demo`. The labs are Kotlin models of each mechanism, in packages `sfz.os.l01` to `sfz.os.l12`, with tests that need no Docker; many check your model against real output captured in the lab box. Run `./gradlew :os:test --tests 'sfz.os.lNN.*'` from `labs/` until it passes; `./gradlew :os:solutionTest` runs the same tests against the reference answers.",
-  "cheatsheet": "## The picture\n\nPrograms run in **user mode** and can't touch hardware. The **kernel** runs in kernel mode and does everything on their behalf, asked through **system calls** (a trap: about 150 ns in the lab box). A container is ordinary processes on that one kernel, with namespaces, a cgroup, capabilities, seccomp and an overlay root around them.\n\n## Where to look\n\n| question | look at |\n|---|---|\n| what is it asking the kernel for? | `strace -f -c -p <pid>` (always `-f` for a JVM) |\n| what is a process doing right now? | `/proc/<pid>/status` (`State`, `Threads`, `VmRSS`, `NSpid`), `ps -L -o tid,stat,wchan:20,comm` |\n| which Java thread is that TID? | `jstack <pid>`: `nid=` is the TID in decimal since JDK 18 |\n| how much memory, really? | RSS (`VmRSS`, `smaps_rollup`), PSS for shared pages, `jcmd <pid> VM.native_memory summary` |\n| what limits this container? | `/sys/fs/cgroup/`: `memory.max`, `cpu.max`, `pids.max` |\n| did it hit them? | `memory.events` (`oom_kill`), `cpu.stat` (`nr_throttled`), `pids.events` (`max`) |\n| is it waiting for a resource? | `cpu.pressure`, `memory.pressure` (PSI) in the cgroup; `/proc/pressure/*` is the whole machine |\n| which files are open or deleted? | `ls -l /proc/<pid>/fd`, `lsof +L1`, `grep 'open files' /proc/<pid>/limits` |\n| what did the JVM detect? | `java -XshowSettings:system -version`, `-Xlog:os+container=debug` |\n\n## Processes, signals and threads (lessons 1 to 3)\n\n- `fork` copies the process (copy-on-write), `execve` replaces the program and keeps PID and open fds, `wait` collects the exit status. A dead child is a **zombie** until reaped; an **orphan** is adopted by PID 1.\n- Exit status of a killed process: 128 + signal. **137** = `SIGKILL` (OOM killer or grace period over), **143** = `SIGTERM` handled. `SIGKILL` and `SIGSTOP` can't be caught; the JVM runs shutdown hooks on `SIGTERM`, `SIGINT`, `SIGHUP`.\n- In a container, make the JVM PID 1 with the exec-form `ENTRYPOINT`, and add `--init` (tini) if it starts child processes.\n- A thread is a task that shares memory, files and signal handlers (`clone` flags). Platform thread = one OS thread, about 2 MB stack reserved on arm64 Linux (1 MB on x86-64).\n- Every thread counts against `pids.max`: past it, `clone` fails with `EAGAIN` and the JVM says `OutOfMemoryError: unable to create native thread`.\n- Virtual threads mount on carriers (one per CPU) and unmount when they block; since JDK 24 `synchronized` doesn't pin, class initializers and native frames still do.\n- The vDSO answers clock reads in user space (about 17 ns); `strace` never sees them. Docker's seccomp filter refuses about 44 calls, `clone3` with `ENOSYS`.\n\n## CPU and locks (lessons 4 and 5)\n\n| | `nice` | `cpu.max` |\n|---|---|---|\n| what it is | a weight: nice 0 = 1024, nice 10 = 110 | a budget: quota per period, `50000 100000` = 50 ms per 100 ms |\n| when it matters | only when tasks compete for a CPU | always, even on an idle node |\n| failure mode | a share you didn't expect | throttling: all threads stop until the next period |\n| evidence | `ps -o ni,pcpu`, `/proc/<pid>/schedstat` | `cpu.stat`: `nr_throttled` / `nr_periods` |\n\n- EEVDF (complete in Linux 6.12) runs the eligible task (owed CPU) with the earliest virtual deadline; default slice 3 ms on 8 or more CPUs.\n- The JVM's `availableProcessors()` = quota / period, rounded up; it sizes GC, JIT, `ForkJoinPool` and carriers.\n- A **futex** lock costs one compare-and-swap when nobody else wants it; the kernel is entered only to sleep (`FUTEX_WAIT`) or wake (`FUTEX_WAKE`).\n- Deadlock needs mutual exclusion, hold and wait, no preemption and circular wait. Fix by breaking one: lock ordering first, `tryLock` with random back-off second. `jstack` prints \"Found one Java-level deadlock\"; the kernel only sees threads asleep in `futex_wait_queue`.\n\n## Memory (lessons 6 to 8)\n\n| number | means |\n|---|---|\n| VSZ | every reserved address; `-Xmx4g` reserves 4 GB at start |\n| RSS | pages in RAM now; what a memory limit counts (with page cache) |\n| PSS | RSS with shared pages split among sharers; sums correctly |\n| `Committed_AS` | memory promised to all processes; can exceed RAM (overcommit) |\n\n- Pages are 4 KB (16 KB on Apple Silicon); a four-level page table maps them; the TLB caches translations, and 2 MB huge pages multiply its reach by 512.\n- **Minor fault**: first touch or a page already in RAM, about a microsecond. **Major fault**: waits for the disk (an uncached file page or swap). `-XX:+AlwaysPreTouch` takes the heap's faults at start-up.\n- `fork` copies page tables, not pages; the first write to a page copies it. `MAP_SHARED` writes reach the file; `MAP_PRIVATE` writes go to private copies.\n- `OutOfMemoryError: Java heap space` is the JVM's `-Xmx`: an exception, heap dump possible. Exit 137 with `oom_kill` in `memory.events` is the kernel's `memory.max`: `SIGKILL`, nothing runs. The OOM killer picks the biggest process (plus `oom_score_adj`), not the one that asked last.\n- `malloc` uses `brk` for small blocks and `mmap` from 128 KB; freed memory goes back to malloc, not the kernel, so RSS stays at its peak. glibc keeps up to 8 arenas per CPU; `MALLOC_ARENA_MAX=2` trades lock waits for less RSS. NMT shows HotSpot's own memory, not native libraries.\n\n## Files (lessons 9 and 10)\n\n- Every read and write goes through the **page cache**. `available`, not `free`, is what programs can still get; clean cache is dropped on demand, and in a cgroup it's charged as `file` next to `anon`.\n- `write()` returns once the bytes are in RAM (dirty). Writeback comes about 30 s later. A process crash, `kill -9` included, loses nothing; a power cut loses dirty pages. `fsync` (`force(true)`) or `fdatasync` (`force(false)`) waits for the device: 2 to 9 ms here, so batch with group commit.\n- Replace a file safely: write a temp file in the same directory, `fsync` it, `rename` it over the target, `fsync` the directory.\n- A file is an **inode** (size, owner, link count, blocks; no name). A directory maps names to inode numbers. Hard link = another name for the inode; symlink = an inode holding a path.\n- Three tables: fd table (per process) → open file description (offset, flags; one per `open()`, shared by `fork` and `dup2`) → inode. `O_APPEND` moves the offset to the end before every write.\n- `rm` of an open file frees nothing until the last close: `df` counts it, `du` doesn't. Find it with `lsof +L1`, free it with `: > /proc/<pid>/fd/<n>`.\n- `EMFILE` = this process hit `RLIMIT_NOFILE` (the JVM raises its soft limit to the hard one); `ENFILE` = the machine hit `fs.file-max`. Sockets are descriptors too.\n- ext4's journal (`data=ordered`, commit every 5 s) keeps metadata consistent through a crash. It doesn't make un-fsynced data durable.\n\n## I/O (lesson 11)\n\n| model | call | wakes you when | cost per wait |\n|---|---|---|---|\n| blocking | `read()` | data arrived | one thread per connection |\n| non-blocking | `read()` → `EAGAIN` | never: you ask again | a spinning CPU |\n| readiness | `epoll_wait` (`epoll_pwait` on arm64) | some registered sockets are readable | the ready sockets only |\n| completion | `io_uring_enter` | the I/O you submitted is done | many operations per call, files too |\n\n- `select`/`poll` check every descriptor per call (`select` stops at 1,024). Level-triggered reports a socket while readable; edge-triggered once per arrival, so drain to `EAGAIN`.\n- Java's `Selector` is epoll on Linux, kqueue on macOS. Virtual threads use it underneath: failed `read`, `epoll_ctl`, park, the `MasterPoller` thread in `epoll_wait`.\n- io_uring is blocked by Docker's default seccomp (Docker 25+), disabled on Google's production servers, and switchable with `kernel.io_uring_disabled`.\n\n## Containers (lesson 12)\n\n| | namespace | cgroup |\n|---|---|---|\n| decides | what a process can see | how much it can use |\n| kinds | pid, mnt, net, uts, ipc, user, cgroup, time | pids, memory, cpu (and io, cpuset) |\n| made with | `unshare`, `clone(CLONE_NEW*)` | `mkdir /sys/fs/cgroup/<name>`, write `cgroup.procs` |\n| when exceeded | nothing to exceed | `fork` gets `EAGAIN`, the OOM killer runs, threads are throttled |\n\n- Root in a default Docker container is user 0 to the kernel, with 14 capabilities and a seccomp filter; `--privileged` gives all capabilities and no filter.\n- The root file system is an overlay: read-only image layers plus a per-container upper layer; the first write copies a file up. `docker diff` lists the upper layer.\n- JDK 25 in a container: heap = 25% of `memory.max`, CPUs = quota / period rounded up, G1 only with at least 2 CPUs and 1,792 MB (else Serial). JDK-8346874: older JDK builds on kernel 6.12 missed the container and sized the heap from the host.\n- USE method: for each resource, check utilization, saturation and errors. In a container: `cpu.stat`, `cpu.pressure`, `memory.current`, `memory.pressure`, `memory.events`, `pids.events`.",
-  "recap": [
-    "Programs run in user mode and ask the kernel for everything through system calls. `strace -f` shows them; the vDSO and uncontended futexes stay in user space and never show up.",
-    "A process is created by `fork`, changed by `execve` and collected by `wait`. Exit 137 is `SIGKILL` and skips every shutdown hook; 143 is a handled `SIGTERM`.",
-    "Threads are kernel tasks that share memory. Each platform thread costs a stack and a slot in `pids.max`; virtual threads park on the heap and run on one carrier per CPU.",
-    "`nice` weights a CPU share only under contention; `cpu.max` is a hard budget per 100 ms period, and spending it early freezes every thread until the next period.",
-    "VSZ is what a process reserved, RSS what it has in RAM. Pages arrive on first touch (minor faults); major faults wait for the disk. Freed malloc memory and page cache both keep RSS or usage high without being leaks.",
-    "`OutOfMemoryError` is the JVM's heap limit, an exception you can see. A kernel OOM kill at `memory.max` is a `SIGKILL` of the biggest process, visible only as 137 and `oom_kill`.",
-    "`write()` reaches RAM, `fsync` reaches the disk. A journal keeps a file system's structure consistent, not your un-fsynced data. Replace files with temp file, `fsync`, `rename`, `fsync` of the directory.",
-    "A file is an inode; names point at it and descriptors reach it through open file descriptions, which `fork` shares. A deleted file lives until its last descriptor closes.",
-    "epoll lets one thread wait on thousands of sockets and is under Java's `Selector`, Netty and virtual threads. io_uring submits work and collects completions, and is often switched off for security.",
-    "A container is processes on the shared kernel: namespaces for what they see, a cgroup for what they use, capabilities and seccomp for what they may ask, an overlay for their files. The JVM sizes itself from the same cgroup files."
-  ],
-  "quiz": [
-    {
-      "q": "A service reads `System.nanoTime()` and takes an uncontended `ReentrantLock` a million times each. `strace -f -c` shows almost no `clock_gettime` and almost no `futex` calls. Why?",
-      "options": [
-        "strace drops fast calls under load",
-        "Both stay in user space: clock reads go through the vDSO, and an uncontended lock is one compare-and-swap, with `futex` called only to sleep or wake",
-        "The JIT compiler removed both calls",
-        "The kernel batches them into one system call per second"
-      ],
-      "answer": 1,
-      "why": "The vDSO maps code and data into every process so the C library can read the clock without a trap (lesson 1). A futex-based lock takes and releases its word with atomic instructions and enters the kernel only when a thread must wait (lesson 5). strace stops the program at every real system call, so it misses neither; there were none to see."
-    },
-    {
-      "q": "One pod stops with exit code 143 and its log ends with \"offsets committed\". Another stops with 137 and its log ends mid-line. What's the difference?",
-      "options": [
-        "143 is an OOM kill; 137 is a clean stop",
-        "Both got `SIGTERM`; 137 just took longer",
-        "143: the JVM caught `SIGTERM` and ran its shutdown hooks. 137: something sent `SIGKILL`, which no process can catch, so no hook ran",
-        "137 means the JVM threw `OutOfMemoryError`"
-      ],
-      "answer": 2,
-      "why": "An exit status after a signal is 128 plus the signal number: 143 is 15 (`SIGTERM`) and 137 is 9 (`SIGKILL`). `SIGTERM` can be handled, and the JVM runs shutdown hooks on it. `SIGKILL` comes from the grace period running out or the kernel's OOM killer; an uncaught `OutOfMemoryError` ends the JVM with status 1."
-    },
-    {
-      "q": "A service in a pod with `pids.max` 512 starts a platform thread per request. Under load it logs `OutOfMemoryError: unable to create native thread`, with the heap 30% used. What fixes the cause?",
-      "options": [
-        "A bigger `-Xmx`",
-        "A bigger `-Xss`",
-        "More CPU",
-        "Fewer threads: a bounded pool, or virtual threads, which don't need a kernel task each"
-      ],
-      "answer": 3,
-      "why": "Each platform thread is a kernel task, and `pids.max` counts tasks, so `clone` failed with `EAGAIN` and the JVM reported it under an `OutOfMemoryError` name (lesson 3). The heap has nothing to do with it, and bigger stacks make things worse. Virtual threads waiting on I/O park on the heap and run on a few carriers."
-    },
-    {
-      "q": "The node is idle, yet a service with `cpu.max` = `50000 100000` shows 90 ms stalls every 100 ms when four threads get busy. A teammate suggests `renice -n -5`. Will it help?",
-      "options": [
-        "No: nice is a weight that only splits a CPU between competing tasks, while `cpu.max` is a budget that throttles the whole group once 50 ms are spent, idle node or not",
-        "Yes: a lower nice value gives the service more CPU",
-        "Yes, but only on EEVDF kernels",
-        "No: nice only applies to processes, not threads"
-      ],
-      "answer": 0,
-      "why": "Weights matter only when tasks compete; on an idle node the service already gets every CPU it asks for. The stalls are throttling: four busy threads spend the 50 ms budget in about 12.5 ms and then all wait for the next period (lesson 4). `cpu.stat`'s `nr_throttled` shows it. Fewer busy threads or a bigger budget help."
-    },
-    {
-      "q": "A JVM with `-Xmx4g` and 300 platform threads shows VSZ 7.9 GB and RSS 900 MB in `ps`. Which number is the container's memory limit compared with, and why is the other so large?",
-      "options": [
-        "VSZ; RSS only counts the heap",
-        "RSS; VSZ counts every reserved address, such as the whole 4 GB heap and 2 MB of stack per thread, most of it never touched",
-        "Both are counted, so the container needs 8.2 GB",
-        "Neither: the limit is compared with `-Xmx`"
-      ],
-      "answer": 1,
-      "why": "VSZ adds up regions the process reserved; RAM is only spent on pages it touched, which RSS counts (lesson 6). The cgroup charges pages in RAM, page cache included. RSS includes more than the heap: thread stacks in use, metaspace, code cache and native memory that malloc keeps after `free` (lesson 8)."
-    },
-    {
-      "q": "A fraud service maps a 2 GB reference file and probes it at random. Right after a deploy, p99 latency is high for a minute; `ps -o min_flt,maj_flt` shows `maj_flt` climbing. A teammate points to the fresh heap's page faults. Who's right?",
-      "options": [
-        "The teammate: heap faults are major faults",
-        "Neither: page faults never cost more than a microsecond",
-        "The `maj_flt` count: probes of file pages that aren't in the page cache wait for the disk, while a fresh heap page is a minor fault filled from RAM",
-        "Both are minor faults, so it must be the JIT compiler"
-      ],
-      "answer": 2,
-      "why": "A minor fault is resolved from RAM: a zeroed page on first touch of the heap, or a file page already cached, in about a microsecond (lesson 6). A major fault waits for storage, around 0.1 ms on an SSD and more on a network disk. A cold mapped file produces major faults until its pages are cached (lessons 7 and 9)."
-    },
-    {
-      "q": "Which evidence tells you the kernel killed the JVM for memory, and not the JVM running out of heap?",
-      "options": [
-        "An `OutOfMemoryError: Java heap space` stack trace and a heap dump",
-        "Exit code 1 and a full GC in the log",
-        "`Committed_AS` above `CommitLimit` in `/proc/meminfo`",
-        "Exit code 137, `OOMKilled` in the pod status and `oom_kill` in the cgroup's `memory.events`, with no Java exception"
-      ],
-      "answer": 3,
-      "why": "The kernel acts at `memory.max` with `SIGKILL`, so nothing in the JVM runs: no exception, no heap dump, no hook, only the exit code and the counters (lesson 7). An `OutOfMemoryError` is the JVM's own `-Xmx` limit, thrown as an exception you can log and dump. With overcommit, `Committed_AS` above `CommitLimit` is normal and kills nothing."
-    },
-    {
-      "q": "A ledger writer calls `write()` and replies \"saved\". ext4 is journaled. In which case can the record be gone afterwards?",
-      "options": [
-        "The JVM is killed with `kill -9` a second later",
-        "The machine loses power a second later",
-        "Both",
-        "Neither: the journal protects it"
-      ],
-      "answer": 1,
-      "why": "After `write()` the record is a dirty page in the kernel's page cache. A dead process doesn't touch the page cache, so the kernel still writes it back (lesson 9). A power cut loses everything still dirty. ext4's journal keeps metadata consistent through a crash (lesson 10) but doesn't make un-fsynced data durable; only `fsync` before replying does."
-    },
-    {
-      "q": "Which statement about epoll and io_uring is right?",
-      "options": [
-        "epoll tells you when a socket can be read without blocking; io_uring takes the read itself and tells you when it's done, for files as well as sockets",
-        "They're the same model; io_uring is just faster",
-        "epoll works on regular files and io_uring only on sockets",
-        "Java's `Selector` uses io_uring on Linux since JDK 21"
-      ],
-      "answer": 0,
-      "why": "epoll is a readiness API: register sockets once, then `epoll_wait` returns the ready ones and you still make each read yourself. Regular files are always \"ready\", so epoll can't help with disk reads. io_uring is a completion API: submit operations into a shared ring, collect results from another. The JDK's `Selector` and virtual threads use epoll (lesson 11)."
-    },
-    {
-      "q": "A container has its own PID namespace and no `pids.max`. Which statement is true?",
-      "options": [
-        "The namespace limits it to 32,768 processes",
-        "The namespace's PID 1 stops forks it doesn't approve",
-        "Without `pids.max` the container can't start any process",
-        "A fork bomb inside it can still fill the host's task table: a namespace changes what processes see, and only a cgroup limits what they use"
-      ],
-      "answer": 3,
-      "why": "Namespaces give the container its own view: PIDs numbered from 1, its own hostname and network. They never make a call fail for using too much. `pids.max`, `memory.max` and `cpu.max` in a cgroup do: `fork` fails with `EAGAIN`, the OOM killer runs, threads are throttled (lesson 12)."
-    }
-  ]
+ "id": "os",
+ "intro": "By the end of this track you can follow a JVM service from its first system call to its container's limits: read a `strace` and a thread dump against what the kernel shows in `/proc`, tell a JVM `OutOfMemoryError` from a kernel OOM kill and a `SIGTERM` from a `SIGKILL`, explain why a pod with a CPU limit stalls and why its RSS doesn't fall, write a file so that a power cut can't corrupt it, say what epoll and virtual threads do with 2,000 idle connections, and build a container by hand from namespaces and a cgroup.\n\nYou need to be able to program, and to run Docker on your laptop. Nothing about kernels is assumed. Lesson 1 sets up the picture the whole track uses, programs in user mode asking the kernel for everything through system calls, and each later lesson opens one box of that kernel: processes, threads, the scheduler, locks, virtual memory, malloc, the page cache, file systems, I/O and containers. The kernel facts are Linux 6.12 (the lab box's kernel, with EEVDF and cgroup v2), and the JVM facts are JDK 25.\n\nEvery Try-it runs in the lab box, an Ubuntu 24.04 container with JDK 25, `strace`, `gcc` and friends: `docker compose -f env/labbox.yml run --rm box` from the `labs` folder, or `box-priv` for the steps that need privileges (`unshare`, mounts, io_uring). Short C programs live in `labs/os/c/lNN/` and compile to `/tmp` inside the box; Java demos live in `labs/os/src/demo`. The labs are Kotlin models of each mechanism, in packages `sfz.os.l01` to `sfz.os.l12`, with tests that need no Docker; many check your model against real output captured in the lab box. Run `./gradlew :os:test --tests 'sfz.os.lNN.*'` from `labs/` until it passes; `./gradlew :os:solutionTest` runs the same tests against the reference answers.",
+ "cheatsheet": "## The picture\n\nPrograms run in **user mode** and can't touch hardware. The **kernel** runs in kernel mode and does everything on their behalf, asked through **system calls** (a trap: about 150 ns in the lab box). A container is ordinary processes on that one kernel, with namespaces, a cgroup, capabilities, seccomp and an overlay root around them.\n\n## Where to look\n\n| question | look at |\n|---|---|\n| what is it asking the kernel for? | `strace -f -c -p <pid>` (always `-f` for a JVM) |\n| what is a process doing right now? | `/proc/<pid>/status` (`State`, `Threads`, `VmRSS`, `NSpid`), `ps -L -o tid,stat,wchan:20,comm` |\n| which Java thread is that TID? | `jstack <pid>`: `nid=` is the TID in decimal since JDK 18 |\n| how much memory, really? | RSS (`VmRSS`, `smaps_rollup`), PSS for shared pages, `jcmd <pid> VM.native_memory summary` |\n| what limits this container? | `/sys/fs/cgroup/`: `memory.max`, `cpu.max`, `pids.max` |\n| did it hit them? | `memory.events` (`oom_kill`), `cpu.stat` (`nr_throttled`), `pids.events` (`max`) |\n| is it waiting for a resource? | `cpu.pressure`, `memory.pressure` (PSI) in the cgroup; `/proc/pressure/*` is the whole machine |\n| which files are open or deleted? | `ls -l /proc/<pid>/fd`, `lsof +L1`, `grep 'open files' /proc/<pid>/limits` |\n| what did the JVM detect? | `java -XshowSettings:system -version`, `-Xlog:os+container=debug` |\n\n## Processes, signals and threads (lessons 1 to 3)\n\n- `fork` copies the process (copy-on-write), `execve` replaces the program and keeps PID and open fds, `wait` collects the exit status. A dead child is a **zombie** until reaped; an **orphan** is adopted by PID 1.\n- Exit status of a killed process: 128 + signal. **137** = `SIGKILL` (OOM killer or grace period over), **143** = `SIGTERM` handled. `SIGKILL` and `SIGSTOP` can't be caught; the JVM runs shutdown hooks on `SIGTERM`, `SIGINT`, `SIGHUP`.\n- In a container, make the JVM PID 1 with the exec-form `ENTRYPOINT`, and add `--init` (tini) if it starts child processes.\n- A thread is a task that shares memory, files and signal handlers (`clone` flags). Platform thread = one OS thread, about 2 MB stack reserved on arm64 Linux (1 MB on x86-64).\n- Every thread counts against `pids.max`: past it, `clone` fails with `EAGAIN` and the JVM says `OutOfMemoryError: unable to create native thread`.\n- Virtual threads mount on carriers (one per CPU) and unmount when they block; since JDK 24 `synchronized` doesn't pin, class initializers and native frames still do.\n- The vDSO answers clock reads in user space (about 17 ns); `strace` never sees them. Docker's seccomp filter refuses about 44 calls, `clone3` with `ENOSYS`.\n\n## CPU and locks (lessons 4 and 5)\n\n| | `nice` | `cpu.max` |\n|---|---|---|\n| what it is | a weight: nice 0 = 1024, nice 10 = 110 | a budget: quota per period, `50000 100000` = 50 ms per 100 ms |\n| when it matters | only when tasks compete for a CPU | always, even on an idle node |\n| failure mode | a share you didn't expect | throttling: all threads stop until the next period |\n| evidence | `ps -o ni,pcpu`, `/proc/<pid>/schedstat` | `cpu.stat`: `nr_throttled` / `nr_periods` |\n\n- EEVDF (complete in Linux 6.12) runs the eligible task (owed CPU) with the earliest virtual deadline; default slice 3 ms on 8 or more CPUs.\n- The JVM's `availableProcessors()` = quota / period, rounded up; it sizes GC, JIT, `ForkJoinPool` and carriers.\n- A **futex** lock costs one compare-and-swap when nobody else wants it; the kernel is entered only to sleep (`FUTEX_WAIT`) or wake (`FUTEX_WAKE`).\n- Deadlock needs mutual exclusion, hold and wait, no preemption and circular wait. Fix by breaking one: lock ordering first, `tryLock` with random back-off second. `jstack` prints \"Found one Java-level deadlock\"; the kernel only sees threads asleep in `futex_wait_queue`.\n\n## Memory (lessons 6 to 8)\n\n| number | means |\n|---|---|\n| VSZ | every reserved address; `-Xmx4g` reserves 4 GB at start |\n| RSS | pages in RAM now; what a memory limit counts (with page cache) |\n| PSS | RSS with shared pages split among sharers; sums correctly |\n| `Committed_AS` | memory promised to all processes; can exceed RAM (overcommit) |\n\n- Pages are 4 KB (16 KB on Apple Silicon); a four-level page table maps them; the TLB caches translations, and 2 MB huge pages multiply its reach by 512.\n- **Minor fault**: first touch or a page already in RAM, about a microsecond. **Major fault**: waits for the disk (an uncached file page or swap). `-XX:+AlwaysPreTouch` takes the heap's faults at start-up.\n- `fork` copies page tables, not pages; the first write to a page copies it. `MAP_SHARED` writes reach the file; `MAP_PRIVATE` writes go to private copies.\n- `OutOfMemoryError: Java heap space` is the JVM's `-Xmx`: an exception, heap dump possible. Exit 137 with `oom_kill` in `memory.events` is the kernel's `memory.max`: `SIGKILL`, nothing runs. The OOM killer picks the biggest process (plus `oom_score_adj`), not the one that asked last.\n- `malloc` uses `brk` for small blocks and `mmap` from 128 KB; freed memory goes back to malloc, not the kernel, so RSS stays at its peak. glibc keeps up to 8 arenas per CPU; `MALLOC_ARENA_MAX=2` trades lock waits for less RSS. NMT shows HotSpot's own memory, not native libraries.\n\n## Files (lessons 9 and 10)\n\n- Every read and write goes through the **page cache**. `available`, not `free`, is what programs can still get; clean cache is dropped on demand, and in a cgroup it's charged as `file` next to `anon`.\n- `write()` returns once the bytes are in RAM (dirty). Writeback comes about 30 s later. A process crash, `kill -9` included, loses nothing; a power cut loses dirty pages. `fsync` (`force(true)`) or `fdatasync` (`force(false)`) waits for the device: 2 to 9 ms here, so batch with group commit.\n- Replace a file safely: write a temp file in the same directory, `fsync` it, `rename` it over the target, `fsync` the directory.\n- A file is an **inode** (size, owner, link count, blocks; no name). A directory maps names to inode numbers. Hard link = another name for the inode; symlink = an inode holding a path.\n- Three tables: fd table (per process) → open file description (offset, flags; one per `open()`, shared by `fork` and `dup2`) → inode. `O_APPEND` moves the offset to the end before every write.\n- `rm` of an open file frees nothing until the last close: `df` counts it, `du` doesn't. Find it with `lsof +L1`, free it with `: > /proc/<pid>/fd/<n>`.\n- `EMFILE` = this process hit `RLIMIT_NOFILE` (the JVM raises its soft limit to the hard one); `ENFILE` = the machine hit `fs.file-max`. Sockets are descriptors too.\n- ext4's journal (`data=ordered`, commit every 5 s) keeps metadata consistent through a crash. It doesn't make un-fsynced data durable.\n\n## I/O (lesson 11)\n\n| model | call | wakes you when | cost per wait |\n|---|---|---|---|\n| blocking | `read()` | data arrived | one thread per connection |\n| non-blocking | `read()` → `EAGAIN` | never: you ask again | a spinning CPU |\n| readiness | `epoll_wait` (`epoll_pwait` on arm64) | some registered sockets are readable | the ready sockets only |\n| completion | `io_uring_enter` | the I/O you submitted is done | many operations per call, files too |\n\n- `select`/`poll` check every descriptor per call (`select` stops at 1,024). Level-triggered reports a socket while readable; edge-triggered once per arrival, so drain to `EAGAIN`.\n- Java's `Selector` is epoll on Linux, kqueue on macOS. Virtual threads use it underneath: failed `read`, `epoll_ctl`, park, the `MasterPoller` thread in `epoll_wait`.\n- io_uring is blocked by Docker's default seccomp (Docker 25+), disabled on Google's production servers, and switchable with `kernel.io_uring_disabled`.\n\n## Containers (lesson 12)\n\n| | namespace | cgroup |\n|---|---|---|\n| decides | what a process can see | how much it can use |\n| kinds | pid, mnt, net, uts, ipc, user, cgroup, time | pids, memory, cpu (and io, cpuset) |\n| made with | `unshare`, `clone(CLONE_NEW*)` | `mkdir /sys/fs/cgroup/<name>`, write `cgroup.procs` |\n| when exceeded | nothing to exceed | `fork` gets `EAGAIN`, the OOM killer runs, threads are throttled |\n\n- Root in a default Docker container is user 0 to the kernel, with 14 capabilities and a seccomp filter; `--privileged` gives all capabilities and no filter.\n- The root file system is an overlay: read-only image layers plus a per-container upper layer; the first write copies a file up. `docker diff` lists the upper layer.\n- JDK 25 in a container: heap = 25% of `memory.max`, CPUs = quota / period rounded up, G1 only with at least 2 CPUs and 1,792 MB (else Serial). JDK-8346874: older JDK builds on kernel 6.12 missed the container and sized the heap from the host.\n- USE method: for each resource, check utilization, saturation and errors. In a container: `cpu.stat`, `cpu.pressure`, `memory.current`, `memory.pressure`, `memory.events`, `pids.events`.",
+ "recap": [
+  "Programs run in user mode and ask the kernel for everything through system calls. `strace -f` shows them; the vDSO and uncontended futexes stay in user space and never show up.",
+  "A process is created by `fork`, changed by `execve` and collected by `wait`. Exit 137 is `SIGKILL` and skips every shutdown hook; 143 is a handled `SIGTERM`.",
+  "Threads are kernel tasks that share memory. Each platform thread costs a stack and a slot in `pids.max`; virtual threads park on the heap and run on one carrier per CPU.",
+  "`nice` weights a CPU share only under contention; `cpu.max` is a hard budget per 100 ms period, and spending it early freezes every thread until the next period.",
+  "VSZ is what a process reserved, RSS what it has in RAM. Pages arrive on first touch (minor faults); major faults wait for the disk. Freed malloc memory and page cache both keep RSS or usage high without being leaks.",
+  "`OutOfMemoryError` is the JVM's heap limit, an exception you can see. A kernel OOM kill at `memory.max` is a `SIGKILL` of the biggest process, visible only as 137 and `oom_kill`.",
+  "`write()` reaches RAM, `fsync` reaches the disk. A journal keeps a file system's structure consistent, not your un-fsynced data. Replace files with temp file, `fsync`, `rename`, `fsync` of the directory.",
+  "A file is an inode; names point at it and descriptors reach it through open file descriptions, which `fork` shares. A deleted file lives until its last descriptor closes.",
+  "epoll lets one thread wait on thousands of sockets and is under Java's `Selector`, Netty and virtual threads. io_uring submits work and collects completions, and is often switched off for security.",
+  "A container is processes on the shared kernel: namespaces for what they see, a cgroup for what they use, capabilities and seccomp for what they may ask, an overlay for their files. The JVM sizes itself from the same cgroup files."
+ ],
+ "quiz": [
+  {
+   "q": "A service reads `System.nanoTime()` and takes an uncontended `ReentrantLock` a million times each. `strace -f -c` shows almost no `clock_gettime` and almost no `futex` calls. Why?",
+   "options": [
+    "strace drops fast calls under load",
+    "Both stay in user space: clock reads go through the vDSO, and an uncontended lock is one compare-and-swap, with `futex` called only to sleep or wake",
+    "The JIT compiler removed both calls",
+    "The kernel batches them into one system call per second"
+   ],
+   "answer": 1,
+   "why": "The vDSO maps code and data into every process so the C library can read the clock without a trap (lesson 1). A futex-based lock takes and releases its word with atomic instructions and enters the kernel only when a thread must wait (lesson 5). strace stops the program at every real system call, so it misses neither; there were none to see."
+  },
+  {
+   "q": "One pod stops with exit code 143 and its log ends with \"offsets committed\". Another stops with 137 and its log ends mid-line. What's the difference?",
+   "options": [
+    "143 is an OOM kill; 137 is a clean stop",
+    "Both got `SIGTERM`; 137 just took longer",
+    "143: the JVM caught `SIGTERM` and ran its shutdown hooks. 137: something sent `SIGKILL`, which no process can catch, so no hook ran",
+    "137 means the JVM threw `OutOfMemoryError`"
+   ],
+   "answer": 2,
+   "why": "An exit status after a signal is 128 plus the signal number: 143 is 15 (`SIGTERM`) and 137 is 9 (`SIGKILL`). `SIGTERM` can be handled, and the JVM runs shutdown hooks on it. `SIGKILL` comes from the grace period running out or the kernel's OOM killer; an uncaught `OutOfMemoryError` ends the JVM with status 1."
+  },
+  {
+   "q": "A service in a pod with `pids.max` 512 starts a platform thread per request. Under load it logs `OutOfMemoryError: unable to create native thread`, with the heap 30% used. What fixes the cause?",
+   "options": [
+    "A bigger `-Xmx`",
+    "A bigger `-Xss`",
+    "More CPU",
+    "Fewer threads: a bounded pool, or virtual threads, which don't need a kernel task each"
+   ],
+   "answer": 3,
+   "why": "Each platform thread is a kernel task, and `pids.max` counts tasks, so `clone` failed with `EAGAIN` and the JVM reported it under an `OutOfMemoryError` name (lesson 3). The heap has nothing to do with it, and bigger stacks make things worse. Virtual threads waiting on I/O park on the heap and run on a few carriers."
+  },
+  {
+   "q": "The node is idle, yet a service with `cpu.max` = `50000 100000` shows 90 ms stalls every 100 ms when four threads get busy. A teammate suggests `renice -n -5`. Will it help?",
+   "options": [
+    "No: nice is a weight that only splits a CPU between competing tasks, while `cpu.max` is a budget that throttles the whole group once 50 ms are spent, idle node or not",
+    "Yes: a lower nice value gives the service more CPU",
+    "Yes, but only on EEVDF kernels",
+    "No: nice only applies to processes, not threads"
+   ],
+   "answer": 0,
+   "why": "Weights matter only when tasks compete; on an idle node the service already gets every CPU it asks for. The stalls are throttling: four busy threads spend the 50 ms budget in about 12.5 ms and then all wait for the next period (lesson 4). `cpu.stat`'s `nr_throttled` shows it. Fewer busy threads or a bigger budget help."
+  },
+  {
+   "q": "A JVM with `-Xmx4g` and 300 platform threads shows VSZ 7.9 GB and RSS 900 MB in `ps`. Which number is the container's memory limit compared with, and why is the other so large?",
+   "options": [
+    "VSZ; RSS only counts the heap",
+    "RSS; VSZ counts every reserved address, such as the whole 4 GB heap and 2 MB of stack per thread, most of it never touched",
+    "Both are counted, so the container needs 8.2 GB",
+    "Neither: the limit is compared with `-Xmx`"
+   ],
+   "answer": 1,
+   "why": "VSZ adds up regions the process reserved; RAM is only spent on pages it touched, which RSS counts (lesson 6). The cgroup charges pages in RAM, page cache included. RSS includes more than the heap: thread stacks in use, metaspace, code cache and native memory that malloc keeps after `free` (lesson 8)."
+  },
+  {
+   "q": "A fraud service maps a 2 GB reference file and probes it at random. Right after a deploy, p99 latency is high for a minute; `ps -o min_flt,maj_flt` shows `maj_flt` climbing. A teammate points to the fresh heap's page faults. Who's right?",
+   "options": [
+    "The teammate: heap faults are major faults",
+    "Neither: page faults never cost more than a microsecond",
+    "The `maj_flt` count: probes of file pages that aren't in the page cache wait for the disk, while a fresh heap page is a minor fault filled from RAM",
+    "Both are minor faults, so it must be the JIT compiler"
+   ],
+   "answer": 2,
+   "why": "A minor fault is resolved from RAM: a zeroed page on first touch of the heap, or a file page already cached, in about a microsecond (lesson 6). A major fault waits for storage, around 0.1 ms on an SSD and more on a network disk. A cold mapped file produces major faults until its pages are cached (lessons 7 and 9)."
+  },
+  {
+   "q": "Which evidence tells you the kernel killed the JVM for memory, and not the JVM running out of heap?",
+   "options": [
+    "An `OutOfMemoryError: Java heap space` stack trace and a heap dump",
+    "Exit code 1 and a full GC in the log",
+    "`Committed_AS` above `CommitLimit` in `/proc/meminfo`",
+    "Exit code 137, `OOMKilled` in the pod status and `oom_kill` in the cgroup's `memory.events`, with no Java exception"
+   ],
+   "answer": 3,
+   "why": "The kernel acts at `memory.max` with `SIGKILL`, so nothing in the JVM runs: no exception, no heap dump, no hook, only the exit code and the counters (lesson 7). An `OutOfMemoryError` is the JVM's own `-Xmx` limit, thrown as an exception you can log and dump. With overcommit, `Committed_AS` above `CommitLimit` is normal and kills nothing."
+  },
+  {
+   "q": "A ledger writer calls `write()` and replies \"saved\". ext4 is journaled. In which case can the record be gone afterwards?",
+   "options": [
+    "The JVM is killed with `kill -9` a second later",
+    "The machine loses power a second later",
+    "Both",
+    "Neither: the journal protects it"
+   ],
+   "answer": 1,
+   "why": "After `write()` the record is a dirty page in the kernel's page cache. A dead process doesn't touch the page cache, so the kernel still writes it back (lesson 9). A power cut loses everything still dirty. ext4's journal keeps metadata consistent through a crash (lesson 10) but doesn't make un-fsynced data durable; only `fsync` before replying does."
+  },
+  {
+   "q": "Which statement about epoll and io_uring is right?",
+   "options": [
+    "epoll tells you when a socket can be read without blocking; io_uring takes the read itself and tells you when it's done, for files as well as sockets",
+    "They're the same model; io_uring is just faster",
+    "epoll works on regular files and io_uring only on sockets",
+    "Java's `Selector` uses io_uring on Linux since JDK 21"
+   ],
+   "answer": 0,
+   "why": "epoll is a readiness API: register sockets once, then `epoll_wait` returns the ready ones and you still make each read yourself. Regular files are always \"ready\", so epoll can't help with disk reads. io_uring is a completion API: submit operations into a shared ring, collect results from another. The JDK's `Selector` and virtual threads use epoll (lesson 11)."
+  },
+  {
+   "q": "A container has its own PID namespace and no `pids.max`. Which statement is true?",
+   "options": [
+    "The namespace limits it to 32,768 processes",
+    "The namespace's PID 1 stops forks it doesn't approve",
+    "Without `pids.max` the container can't start any process",
+    "A fork bomb inside it can still fill the host's task table: a namespace changes what processes see, and only a cgroup limits what they use"
+   ],
+   "answer": 3,
+   "why": "Namespaces give the container its own view: PIDs numbered from 1, its own hostname and network. They never make a call fail for using too much. `pids.max`, `memory.max` and `cpu.max` in a cgroup do: `fork` fails with `EAGAIN`, the OOM killer runs, threads are throttled (lesson 12)."
+  }
+ ]
 }

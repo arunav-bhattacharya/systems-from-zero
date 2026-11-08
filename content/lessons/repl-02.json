@@ -1,0 +1,385 @@
+{
+  "id": "repl-02",
+  "title": "Replication logs: statements, WAL and logical rows",
+  "minutes": 40,
+  "goal": "By the end you can say what a statement log, a physical WAL and a logical row log each record, predict which statements make a statement-based follower drift (now(), random(), auto-increment under concurrency, LIMIT without ORDER BY, repeats, triggers), explain why shipping the WAL ties every node to one major version, and read PostgreSQL's WAL records and logical decoding output for the same rows.",
+  "warmup": {
+    "q": "A follower keeps up by running the leader's SQL statements again, in the same order. Which statement is certain to leave the follower's data the same as the leader's?",
+    "options": [
+      "INSERT INTO refunds (payment_id, amount_minor, reason, created_at) VALUES (41, 500, 'duplicate', now())",
+      "UPDATE accounts SET balance_minor = balance_minor + 500 WHERE account_id = 7, when a reconnecting follower may be sent it twice",
+      "UPDATE payments SET status = 'failed' WHERE payment_id = 41",
+      "DELETE FROM sessions WHERE expires_at < now() LIMIT 1000"
+    ],
+    "answer": 2,
+    "why": "Setting a fixed value on a row found by its key gives the same result on any server, even if it runs twice. `now()` reads the follower's own clock, which is later than the leader's. A relative update sent twice adds twice. `LIMIT` without `ORDER BY` deletes whichever 1,000 rows the scan meets first, which can differ between servers, and it uses `now()` too. Logs that carry row values avoid all three."
+  },
+  "sections": [
+    {
+      "h": "Ship the statement: small, readable, and different on every server",
+      "body": "Lesson 1 said the leader writes every change into a log that the followers apply. It didn't say what an entry contains. Real systems give three answers, and each fails in its own way.\n\nThe simplest answer is the statement itself. The leader runs `UPDATE payments SET status = 'settled' WHERE batch_id = 42`, writes those 58 bytes to the log, and every follower runs the same statement. One entry can change 80,000 rows, a person can read the log, and followers on other versions understand it as long as the SQL means the same thing there. MySQL replicated only this way until row-based logging arrived in 5.1.\n\nIt breaks because a statement is a small program, and each follower runs it somewhere else, later. Anything that depends on where or when it runs can come out different:\n\n- `now()` and `random()`. The follower evaluates them with its own clock and its own random generator. In this section's demo the follower runs each statement 350 ms after the leader, so every `created_at` is 350 ms later and every random reference differs.\n- Auto-increment ids under concurrency. Two sessions insert at once. The first takes id 7, the second id 8, but the second commits first. The log is in commit order, so the follower runs the second insert first and gives it id 7.\n- Statements whose result depends on row order. `DELETE FROM payments WHERE merchant = 'm2' LIMIT 100` deletes whichever 100 rows the scan meets first, and a follower built from a dump stores its rows in a different physical order.\n- Relative changes that arrive twice. `SET fee = fee + 30` is right once. If a reconnecting follower is sent the entry again (lesson 1's catch-up), it charges the fee again.\n- Triggers and functions with side effects, such as an audit trigger that stamps `now()` or a function that calls another service. They run again on every follower.\n\nThe leader can repair some of this by writing values into the log. MySQL's statement format records the source's timestamp with each statement, so its manual treats `NOW()` as safe, and it flags statements that use `RAND()`, `UUID()`, `SYSDATE()` or `USER()`, and updates with `LIMIT`, as unsafe. In `STATEMENT` format an unsafe statement only earns a warning; in `MIXED` format it is logged as rows. MySQL 8.0 also made interleaved auto-increment locking the default because row-based logging had become the default: that lock mode isn't safe for statement-based replication. The PostgreSQL manual warns about middleware that sends the same SQL to several servers, such as Pgpool-II: `random()`, `CURRENT_TIMESTAMP` and sequences \"can have different values on different servers\".\n\nThe other repair is to forbid nondeterminism. VoltDB replicates by running the same stored procedures on every replica, and requires them to be deterministic. You know this rule from Temporal: it rebuilds a workflow by replaying its history, so workflow code must decide the same way on every replay, and it reads time and randomness through `Workflow.currentTimeMillis()` and `Workflow.randomUUID()`, whose values the history records (the Encoding track's lesson on durable execution). Statement-based replication is the same idea for SQL, with nothing to enforce the rule. Without something that enforces it, don't use it.",
+      "try": {
+        "title": "One log of statements, one log of rows",
+        "minutes": 4,
+        "steps": [
+          "Run the demo from the `labs` folder. The leader runs five statements and writes both logs. Follower S runs each statement 350 ms later on its own clock; follower R applies the row events. Then the tail of each log arrives a second time, as after a reconnect.",
+          "Read the statement log and the row log side by side. Which row-log entries came from statement 4?",
+          "Predict, then run with `-Pargs='pin'`, where the leader writes its own `now()` and random values into each statement before logging it. Which difference goes away, and which one stays?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.repl.l02.demo.LogsDemoKt -q\n./gradlew :sim:demo -Pmain=sfz.repl.l02.demo.LogsDemoKt -Pargs='pin' -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/repl/l02/demo/LogsDemo.kt",
+          "run": "./gradlew :sim:demo -Pmain=sfz.repl.l02.demo.LogsDemoKt -q"
+        },
+        "expect": "```text\nstatement log:\n  1  INSERT INTO payments (merchant, amount, fee, ref, created_at) VALUES ('m1', 1250, 0, md5(random()::text), now());\n  2  INSERT INTO payments (merchant, amount, fee, ref, created_at) VALUES ('m2', 4000, 0, md5(random()::text), now());\n  3  INSERT INTO payments (merchant, amount, fee, ref, created_at) VALUES ('m1', 990, 0, md5(random()::text), now());\n  4  UPDATE payments SET fee = fee + 30 WHERE merchant = 'm1';\n  5  DELETE FROM payments WHERE merchant = 'm2' LIMIT 1;\nrow log:\n  insert id=1 merchant=m1 amount=1250 fee=0 ref=23c52a1a created_at=1000010\n  insert id=2 merchant=m2 amount=4000 fee=0 ref=a4b105b0 created_at=1000020\n  insert id=3 merchant=m1 amount=990 fee=0 ref=e0934861 created_at=1000030\n  update id=1 -> merchant=m1 amount=1250 fee=30 ref=23c52a1a created_at=1000010\n  update id=3 -> merchant=m1 amount=990 fee=30 ref=e0934861 created_at=1000030\n  delete id=2\n\nafter replaying, and after the tail of each log arrived a second time:\n                   id merchant  amount  fee ref       created_at\n  leader            1 m1          1250   30 23c52a1a  1000010\n  leader            3 m1           990   30 e0934861  1000030\n  statement copy    1 m1          1250   60 d850e0b3  1000360   <- differs\n  statement copy    3 m1           990   60 e936623d  1000380   <- differs\n  row copy          1 m1          1250   30 23c52a1a  1000010\n  row copy          3 m1           990   30 e0934861  1000030\n  statement copy equals the leader: false; row copy equals the leader: true\n```\n\nStatement 4 became two row entries, one per row it changed. The statement copy has its own references and timestamps, and paid the fee twice when statement 4 arrived again; the row copy is identical to the leader, resend and all. With `pin`, the statements carry `'23c52a1a', 1000010` instead of `random()` and `now()`, so references and timestamps match, but the fee is still 60: pinning values doesn't make a relative update safe to repeat."
+      },
+      "refs": [
+        {
+          "title": "MySQL 8.4: Determination of safe and unsafe statements in binary logging",
+          "url": "https://dev.mysql.com/doc/refman/8.4/en/replication-rbr-safe-unsafe.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Comparison of different replication solutions",
+          "url": "https://www.postgresql.org/docs/18/different-replication-solutions.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Ship the WAL: exact bytes, tied to one version",
+      "body": "PostgreSQL went the other way. It already writes every change to its write-ahead log (WAL) before it touches a data page, so that after a crash it can replay the log onto its pages (the Storage track's lesson on write-ahead logging and crash recovery). A standby is a server whose recovery never ends: it receives the primary's WAL as it is written and replays it onto an identical copy of the data files. Oracle Data Guard ships Oracle's redo log the same way.\n\nA WAL record doesn't say what the SQL was. It says which bytes changed where. In this section's Try it, one `INSERT` into `refunds` writes four records: a heap insert into the first 8 KB page (block 0) of the table's file, an insert into a leaf page of the primary-key index, a row lock on the referenced payment (the foreign-key check takes it), and the commit. `rel 1663/16386/17262` names the tablespace, the database and the table's file. There is no `now()` to evaluate and no id to choose: the primary did all of that, and the standby copies the results bit for bit, indexes included. Nothing can drift.\n\nThe price is that the log speaks the storage engine's private language. Page layouts, tuple headers and index formats may change between major versions, so a PostgreSQL 17 standby can't replay a PostgreSQL 18 primary's WAL. You can't upgrade by upgrading the standby first and failing over to it, the trick that would make an upgrade nearly free. All the nodes of a physical cluster move together, with `pg_upgrade` and a short outage, or through a logical copy (next section).\n\nThe WAL also describes everything on the server: every database, every index page, every page VACUUM cleaned. You can't ship one table, and nothing outside PostgreSQL can read it.\n\nSo physical replication is the right format for what lesson 1 asked of a follower: an exact copy, ready to take over. For anything else, it is the wrong one.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 373\" role=\"img\" aria-label=\"The same insert as a statement, as four physical WAL records naming pages and offsets, and as a logical row event with every column's value\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"350\" y=\"22\" text-anchor=\"middle\">one INSERT INTO refunds, as each kind of log records it</text><rect class=\"box-b\" x=\"14\" y=\"36\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"89.0\" y=\"71.0\" text-anchor=\"middle\">statement</text><rect class=\"box\" x=\"176\" y=\"36\" width=\"510\" height=\"60\" rx=\"8\"/><text class=\"t-s t-code\" x=\"188\" y=\"61\" text-anchor=\"start\">INSERT INTO refunds (payment_id, amount_minor, reason,</text><text class=\"t-s t-code\" x=\"188\" y=\"80\" text-anchor=\"start\">created_at) VALUES (3, 750, 'customer_request', now());</text><rect class=\"box\" x=\"14\" y=\"108\" width=\"150\" height=\"98\" rx=\"8\"/><text class=\"t\" x=\"89.0\" y=\"162.0\" text-anchor=\"middle\">physical WAL</text><rect class=\"box\" x=\"176\" y=\"108\" width=\"510\" height=\"98\" rx=\"8\"/><text class=\"t-s t-code\" x=\"188\" y=\"133\" text-anchor=\"start\">Heap  INSERT off 8       rel 1663/16386/17262 blk 0</text><text class=\"t-s t-code\" x=\"188\" y=\"152\" text-anchor=\"start\">Btree INSERT_LEAF off 8  rel 1663/16386/17274 blk 1</text><text class=\"t-s t-code\" x=\"188\" y=\"171\" text-anchor=\"start\">Heap  LOCK off 3         rel 1663/16386/17226 blk 0</text><text class=\"t-s t-code\" x=\"188\" y=\"190\" text-anchor=\"start\">Transaction COMMIT 2026-11-08 06:04:53.554268 UTC</text><rect class=\"box-a\" x=\"14\" y=\"218\" width=\"150\" height=\"117\" rx=\"8\"/><text class=\"t\" x=\"89.0\" y=\"281.5\" text-anchor=\"middle\">logical (row)</text><rect class=\"box\" x=\"176\" y=\"218\" width=\"510\" height=\"117\" rx=\"8\"/><text class=\"t-s t-code\" x=\"188\" y=\"243\" text-anchor=\"start\">BEGIN 852</text><text class=\"t-s t-code\" x=\"188\" y=\"262\" text-anchor=\"start\">table public.refunds: INSERT: refund_id:8 payment_id:3</text><text class=\"t-s t-code\" x=\"188\" y=\"281\" text-anchor=\"start\">amount_minor:750 reason:'customer_request'</text><text class=\"t-s t-code\" x=\"188\" y=\"300\" text-anchor=\"start\">created_at:'2026-11-08 06:04:53...'</text><text class=\"t-s t-code\" x=\"188\" y=\"319\" text-anchor=\"start\">COMMIT 852</text><text class=\"t-s t-m\" x=\"350\" y=\"361\" text-anchor=\"middle\">the WAL names files, pages and offsets; the row log names tables, keys and values</text></svg>",
+        "caption": "The same INSERT as each log would record it. The WAL lines are from this section's Try it; the row lines are in the format of PostgreSQL's test_decoding plugin, shortened."
+      },
+      "try": {
+        "title": "Read the WAL records of one INSERT",
+        "minutes": 5,
+        "steps": [
+          "Start the primary and its standby from the `labs` folder: `docker compose -f env/postgres-ha.yml up -d --wait` (about 20 seconds the first time). Open psql on the primary: `docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course`.",
+          "Run the SQL below. The first INSERT only warms things up; the one you will read is the second. Copy the two LSNs it prints.",
+          "In a shell, decode the WAL between them, with your LSNs: `docker compose -f env/postgres-ha.yml exec -u postgres primary bash -c 'pg_waldump -p $PGDATA/pg_wal -s 0/5003FD8 -e 0/5005D88'`. Match each `rel` number to the file nodes the last query printed."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql on the primary",
+          "src": "INSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (3, 700, 'customer_request', now());          -- warms up: see the expect\nSELECT pg_current_wal_lsn() AS before;\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (3, 750, 'customer_request', now()) RETURNING refund_id;\nSELECT pg_current_wal_lsn() AS after;\nSELECT oid AS course FROM pg_database WHERE datname = 'course';\nSELECT pg_relation_filenode('refunds') AS refunds,\n       pg_relation_filenode('refunds_pkey') AS refunds_pkey,\n       pg_relation_filenode('payments') AS payments;\n"
+        },
+        "expect": "The second refund is id 8, between `0/5003FD8` and `0/5005D88` here. Its records (your LSNs, ids and file nodes differ):\n\n```text\nrmgr: Heap2       len (rec/tot):     53/  7297, tx:          0, lsn: 0/05003FD8, prev 0/05003FB0, desc: PRUNE_ON_ACCESS , isCatalogRel: F, blkref #0: rel 1663/16386/1255 blk 47 FPW\nrmgr: Heap        len (rec/tot):    111/   111, tx:        852, lsn: 0/05005C78, prev 0/05003FD8, desc: INSERT off: 8, flags: 0x00, blkref #0: rel 1663/16386/17262 blk 0\nrmgr: Btree       len (rec/tot):     64/    64, tx:        852, lsn: 0/05005CE8, prev 0/05005C78, desc: INSERT_LEAF off: 8, blkref #0: rel 1663/16386/17274 blk 1\nrmgr: Heap        len (rec/tot):     54/    54, tx:        852, lsn: 0/05005D28, prev 0/05005CE8, desc: LOCK xmax: 852, off: 3, infobits: [LOCK_ONLY, KEYSHR_LOCK], flags: 0x00, blkref #0: rel 1663/16386/17226 blk 0\nrmgr: Transaction len (rec/tot):     34/    34, tx:        852, lsn: 0/05005D60, prev 0/05005D28, desc: COMMIT 2026-11-08 06:04:53.554268 UTC\n```\n\nHere `course` was 16386, `refunds` 17262, `refunds_pkey` 17274 and `payments` 17226. Transaction 852 is the INSERT: the heap record puts the row at item 8 of the table's first page, the B-tree record adds its key to the index, the lock record is the foreign-key check marking payment 3's row with a key-share lock, and the commit makes it count. The four add up to 263 bytes, with no SQL and no `now()` in sight: the commit time is a value the primary already chose. The first line has `tx: 0`: it is cleanup of a system catalog page by another part of the server, a reminder that the WAL carries everything that happens on it. Decode from before the first INSERT instead and you also see `FPW` records (whole 8 KB pages, logged on the first change after a checkpoint, as the Storage track's lesson explained) and a `Sequence` record: the identity column logging 32 values ahead."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: pg_waldump",
+          "url": "https://www.postgresql.org/docs/18/pgwaldump.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Log-shipping standby servers",
+          "url": "https://www.postgresql.org/docs/18/warm-standby.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Ship the rows: a logical log",
+      "body": "Between the two sits the **logical log**, also called row-based. Each entry describes one row. An insert carries every column's new value, an update carries the row's key and its new values, a delete carries the key, and a commit marker closes each transaction. The leader computes every value once, and the log records results, never the SQL that produced them.\n\nIn this section's Try it, `UPDATE refunds SET amount_minor = amount_minor + 50 WHERE payment_id = 4` comes out of PostgreSQL's logical decoding as:\n\n```text\ntable public.refunds: UPDATE: refund_id[bigint]:9 payment_id[bigint]:4 amount_minor[bigint]:350 reason[text]:'duplicate' created_at[timestamp with time zone]:'2026-11-08 06:05:14.59426+00'\n```\n\nThe `+ 50` is gone; the entry says the row now holds 350. Applying it twice still leaves 350. Lesson 1's catch-up can send a follower entries it already has, and a log of results makes that harmless. MongoDB built its oplog this way on purpose: its manual says every oplog operation is idempotent, so an update that adds to a balance is recorded with the resulting value, and an update of many documents becomes one oplog entry per document.\n\nA row entry says nothing about pages, so it isn't tied to the storage format. A follower can run a newer major version or a different storage engine, and it can take only some tables. That opens two doors. Upgrades: start a logical copy on the new version, let it catch up, then move the application in minutes. And change data capture: other systems can read the same stream, which is how Debezium feeds database changes into Kafka (the Stream processing track's lesson on dual writes and change data capture).\n\nMySQL keeps its binary log as a second log next to InnoDB's own redo log, and row-based has been its default format since 5.7. Changing `binlog_format` has been deprecated since MySQL 8.0, and the manual expects row-based to become the only format. PostgreSQL has no second log. With `wal_level = logical`, logical decoding reads the WAL and turns it into row changes through an output plugin: `pgoutput` feeds the built-in publications and subscriptions, and `test_decoding` prints text you can read.\n\nRows cost more in some places. One `UPDATE` of 80,000 rows is one statement but 80,000 row entries. The follower finds each row by its key, so in PostgreSQL a table without a primary key can't publish updates and deletes until you set a `REPLICA IDENTITY`. And PostgreSQL's logical stream carries no schema changes and, as of version 18, no sequence values (lesson 4 covers what 18 and 19 add).",
+      "try": {
+        "title": "Decode three changes into rows",
+        "minutes": 5,
+        "steps": [
+          "With the servers from the last Try it running, switch the primary to logical WAL and restart it: `docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c 'ALTER SYSTEM SET wal_level = logical'`, then `docker compose -f env/postgres-ha.yml restart primary`.",
+          "Open psql on the primary (`docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course`) and run the session below. Before the last query, predict what the UPDATE's entry will say about `amount_minor`.",
+          "Put the server back: `docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course -c 'ALTER SYSTEM RESET wal_level'` and `docker compose -f env/postgres-ha.yml restart primary`. Dropping the slot first matters: a slot nobody reads keeps WAL on the primary forever (lesson 4)."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql on the primary",
+          "src": "SHOW wal_level;\nSELECT slot_name FROM pg_create_logical_replication_slot('peek', 'test_decoding');\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (4, 300, 'duplicate', now()) RETURNING refund_id;\nUPDATE refunds SET amount_minor = amount_minor + 50 WHERE payment_id = 4;\nDELETE FROM refunds WHERE payment_id = 3 AND amount_minor = 750;   -- the last Try it's refund\nSELECT lsn, xid, data FROM pg_logical_slot_get_changes('peek', NULL, NULL);\nSELECT pg_drop_replication_slot('peek');\n"
+        },
+        "expect": "`wal_level` is `logical`. Each transaction comes out between BEGIN and COMMIT, with one line per row (the wide column header is trimmed; your ids, xids and LSNs differ):\n\n```text\n    lsn    | xid |  data\n-----------+-----+-------------------------------------------------------------\n 0/6000110 | 859 | BEGIN 859\n 0/6000178 | 859 | table public.refunds: INSERT: refund_id[bigint]:9 payment_id[bigint]:4 amount_minor[bigint]:300 reason[text]:'duplicate' created_at[timestamp with time zone]:'2026-11-08 06:05:14.59426+00'\n 0/6002228 | 859 | COMMIT 859\n 0/6004270 | 860 | BEGIN 860\n 0/6004270 | 860 | table public.refunds: UPDATE: refund_id[bigint]:9 payment_id[bigint]:4 amount_minor[bigint]:350 reason[text]:'duplicate' created_at[timestamp with time zone]:'2026-11-08 06:05:14.59426+00'\n 0/6004318 | 860 | COMMIT 860\n 0/6004318 | 861 | BEGIN 861\n 0/6004318 | 861 | table public.refunds: DELETE: refund_id[bigint]:8\n 0/60063B8 | 861 | COMMIT 861\n(9 rows)\n```\n\nThe INSERT carries every column, including the `created_at` that `now()` produced on the primary. The UPDATE carries the key and the result, 350. The DELETE carries only the key: refund 8, the last Try it's. `get_changes` consumes what it returns, so a second call prints nothing; `pg_logical_slot_peek_changes` would leave the changes in place."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Logical decoding",
+          "url": "https://www.postgresql.org/docs/18/logicaldecoding.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MySQL 8.4: Replication formats",
+          "url": "https://dev.mysql.com/doc/refman/8.4/en/replication-formats.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MongoDB manual: Replica set oplog",
+          "url": "https://www.mongodb.com/docs/manual/core/replica-set-oplog/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Triggers: a change log you build yourself",
+      "body": "Sometimes the database's own log won't do. You need one table copied into another kind of database, filtered or reshaped, from a version with no logical decoding. Then you capture changes yourself. A row-level trigger on the table writes a change row into a log table on every insert, update and delete, in the same transaction as the change. A separate process reads the log table in order, applies the changes somewhere else and deletes what it has shipped. Slony-I replicated PostgreSQL this way, table by table, to several standbys (its site now says it hasn't been updated in years and points to PostgreSQL's built-in logical replication). Bucardo used triggers to copy between several databases in both directions.\n\nIt is a logical log written by hand. It carries row values (the Try it stores each row as JSON with `to_jsonb(NEW)`), so it keeps the logical log's advantages: you pick the tables, the shape and the destination. It costs more, and the cost lands inside every user transaction, because each write becomes two plus the trigger's own work. In the Try it, 20,000 inserts took 76 ms without the trigger and 191 ms with it. Triggers also miss what nobody wrote them for: a new table, a `TRUNCATE` (row-level triggers don't fire for it), a schema change.\n\nThe idea is alive in two places. Audit tables keep the log table as the product. And the transactional outbox has the application write an event row in the same transaction as its data, for a relay to publish to Kafka; the Stream processing track picks that up.\n\n| | Statement | Physical WAL | Logical (row) | Trigger |\n|---|---|---|---|---|\n| An entry says | the SQL text | bytes at a page and offset | a row's key and values | a row's values, your format |\n| Follower ends up identical | only if every statement is deterministic | yes, bit for bit | yes | if the trigger is right |\n| Versions must match | no | yes | no | no |\n| Other systems can read it | no | no | yes | yes |\n| An UPDATE of 80,000 rows | 1 entry | 80,000+ page records | 80,000 entries | 80,000 log rows, in the transaction |",
+      "try": {
+        "title": "Capture changes with a trigger, and time what it costs",
+        "minutes": 4,
+        "steps": [
+          "With the servers running, pipe the script below into psql on the primary (save it as `capture.sql` in the `labs` folder): `docker compose -f env/postgres-ha.yml exec -T primary psql -U sfz -d course < capture.sql`.",
+          "Before you run it: in the timed part, the first 20,000 inserts fire the trigger and the second 20,000 don't. How much slower do you expect the first batch to be?",
+          "When you're done with this lesson's Try-its, `docker compose -f env/postgres-ha.yml down -v` removes both servers."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "capture.sql",
+          "src": "CREATE TABLE refunds_changes (\n    change_id  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n    op         text NOT NULL,\n    refund_id  bigint NOT NULL,\n    row_data   jsonb,\n    changed_at timestamptz NOT NULL DEFAULT clock_timestamp()\n);\n\nCREATE FUNCTION log_refund_change() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN\n    IF TG_OP = 'DELETE' THEN\n        INSERT INTO refunds_changes (op, refund_id) VALUES (TG_OP, OLD.refund_id);\n        RETURN OLD;\n    END IF;\n    INSERT INTO refunds_changes (op, refund_id, row_data) VALUES (TG_OP, NEW.refund_id, to_jsonb(NEW));\n    RETURN NEW;\nEND $$;\n\nCREATE TRIGGER refunds_capture AFTER INSERT OR UPDATE OR DELETE ON refunds\n    FOR EACH ROW EXECUTE FUNCTION log_refund_change();\n\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nVALUES (5, 420, 'fraud', now()) RETURNING refund_id \\gset\nUPDATE refunds SET amount_minor = 400 WHERE refund_id = :refund_id;\nDELETE FROM refunds WHERE refund_id = :refund_id;\nSELECT change_id, op, refund_id, row_data FROM refunds_changes ORDER BY change_id;\n\n\\timing on\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nSELECT 6, 100, 'customer_request', now() FROM generate_series(1, 20000);\nALTER TABLE refunds DISABLE TRIGGER refunds_capture;\nINSERT INTO refunds (payment_id, amount_minor, reason, created_at)\nSELECT 6, 100, 'customer_request', now() FROM generate_series(1, 20000);\n\\timing off\n\nDROP TRIGGER refunds_capture ON refunds;\nDROP FUNCTION log_refund_change();\nDROP TABLE refunds_changes;\nDELETE FROM refunds WHERE payment_id = 6;\n"
+        },
+        "expect": "The log table holds the three changes, each with the row as JSON (your ids and times differ):\n\n```text\n change_id |   op   | refund_id |                                                           row_data\n-----------+--------+-----------+------------------------------------------------------------------------------------------------------------------------------\n         1 | INSERT |        10 | {\"reason\": \"fraud\", \"refund_id\": 10, \"created_at\": \"2026-11-08T06:05:29.475533+00:00\", \"payment_id\": 5, \"amount_minor\": 420}\n         2 | UPDATE |        10 | {\"reason\": \"fraud\", \"refund_id\": 10, \"created_at\": \"2026-11-08T06:05:29.475533+00:00\", \"payment_id\": 5, \"amount_minor\": 400}\n         3 | DELETE |        10 |\n(3 rows)\n\nTiming is on.\nINSERT 0 20000\nTime: 190.586 ms\nALTER TABLE\nTime: 0.433 ms\nINSERT 0 20000\nTime: 75.503 ms\nTiming is off.\n```\n\nWith the trigger the batch took about 2.5 times as long. Running the two batches in the other order gave the same ratio (73 ms without, 187 ms with), so it isn't a warm-up effect. Your times depend on the machine; the ratio is the point, and every extra millisecond was spent inside the inserting transaction."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Trigger functions in PL/pgSQL",
+          "url": "https://www.postgresql.org/docs/18/plpgsql-trigger.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Slony-I",
+          "url": "https://www.slony.info/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Three ways to keep a second set of accounting books in step with yours. Statement: phone the other clerk the instruction (\"add this month's interest to every savings account\") and let him work it out with his own calculator and today's date. Physical: fax him a copy of each page you changed, which only works if his book has exactly your page layout. Logical: send him each changed account line with its new balance. The first is shortest and drifts, the second is exact and brittle, the third is exact and portable, which is why most systems ended up there. The analogy breaks at speed and order: real logs arrive as a stream in strict sequence, and the clerk never gets to skip a line or ask what you meant.",
+  "in_your_world": "Oracle has the same three layers. Data Guard ships redo, Oracle's physical log, so a standby must match the primary's version. GoldenGate and Debezium's Oracle connector (through LogMiner) read that redo and turn it into row changes, which is how Oracle data reaches Kafka. Temporal enforces exactly the determinism that statement-based replication only hopes for: your workflow code is replayed against its history, so you already write it with `Workflow.currentTimeMillis()` instead of `System.currentTimeMillis()`. When you build a change feed for a payments table, prefer the database's logical stream (Debezium on PostgreSQL or MySQL) or an outbox table over a homemade trigger, and give every consumer an upsert by key, so that a replayed change is harmless, just as it is in the oplog.",
+  "mistake": "Turning on PostgreSQL logical replication for a table without a primary key. The publication is created without an error and inserts replicate fine. The first UPDATE or DELETE on that table then fails on the primary, inside the application's transaction, with \"cannot update table ... because it does not have a replica identity and publishes updates\". It happens because a row entry must identify the row on the follower, and a table without a key gives it nothing to go on. The fix is a primary key (best), a unique index named with `ALTER TABLE ... REPLICA IDENTITY USING INDEX`, or `REPLICA IDENTITY FULL`, which logs the whole old row with every update and delete and makes the follower search for it: more WAL, and slow applies on big tables. Check every published table for a key before you create the publication.",
+  "compare": {
+    "title": "One UPDATE, two logs",
+    "a": {
+      "label": "Statement-based",
+      "lang": "sql",
+      "title": "what the follower receives",
+      "src": "UPDATE refunds\nSET amount_minor = amount_minor + 50\nWHERE payment_id = 4;\n\n-- one entry, whatever the number of rows\n-- the follower evaluates it against its own data\n-- sent twice: amount_minor goes up by 100"
+    },
+    "b": {
+      "label": "Row-based (PostgreSQL logical decoding)",
+      "lang": "text",
+      "title": "what test_decoding printed (one line, wrapped)",
+      "src": "BEGIN 860\ntable public.refunds: UPDATE: refund_id[bigint]:9\n  payment_id[bigint]:4 amount_minor[bigint]:350\n  reason[text]:'duplicate'\n  created_at[timestamp with time zone]:'2026-11-08 06:05:14.59426+00'\nCOMMIT 860\n\n-- one entry per changed row, with the results\n-- sent twice: amount_minor is still 350"
+    },
+    "note": "The statement is shorter and describes the intent, and the follower has to recompute it, so its answer depends on the follower's data, clock and luck. The row entry is longer and describes only the outcome, so any follower that applies it ends up with the same row, any number of times. Most systems log rows, and keep statements, if at all, for cases where the leader can prove the statement is deterministic."
+  },
+  "worked": {
+    "title": "Read a PostgreSQL change stream from Kotlin, safely",
+    "steps": [
+      {
+        "say": "Create a logical slot once. The slot remembers how far its reader has confirmed, and the primary keeps WAL from that point on.",
+        "lang": "sql",
+        "code": "-- needs wal_level = logical\nSELECT pg_create_logical_replication_slot('refunds_cdc', 'test_decoding');"
+      },
+      {
+        "say": "Poll with peek, which reads changes without consuming them, so a crash between reading and applying loses nothing. Logical decoding only emits committed transactions, in commit order.",
+        "lang": "kotlin",
+        "code": "data class Change(val lsn: String, val xid: String, val data: String)\n\nfun peek(conn: java.sql.Connection, max: Int = 1_000): List<Change> =\n    conn.prepareStatement(\n        \"SELECT lsn::text, xid::text, data FROM pg_logical_slot_peek_changes('refunds_cdc', NULL, ?)\"\n    ).use { ps ->\n        ps.setInt(1, max)\n        ps.executeQuery().use { rs ->\n            buildList { while (rs.next()) add(Change(rs.getString(1), rs.getString(2), rs.getString(3))) }\n        }\n    }"
+      },
+      {
+        "say": "Apply each change by key, so a change seen twice is harmless: an upsert for inserts and updates, a delete for deletes. Parsing test_decoding's text is fine for a demo; production code uses pgoutput through a replication connection, or Debezium.",
+        "lang": "sql",
+        "code": "-- in the target database, for each INSERT or UPDATE line\nINSERT INTO refunds_copy (refund_id, payment_id, amount_minor, reason, created_at)\nVALUES (:refund_id, :payment_id, :amount_minor, :reason, :created_at)\nON CONFLICT (refund_id) DO UPDATE\nSET payment_id = EXCLUDED.payment_id, amount_minor = EXCLUDED.amount_minor,\n    reason = EXCLUDED.reason, created_at = EXCLUDED.created_at;\n-- for each DELETE line\nDELETE FROM refunds_copy WHERE refund_id = :refund_id;"
+      },
+      {
+        "say": "Only after the target has committed, tell the slot how far you got. The primary may then recycle the WAL before that point. If you crash before this step, the next peek returns the same changes, and the upserts absorb them.",
+        "lang": "sql",
+        "code": "SELECT pg_replication_slot_advance('refunds_cdc', :last_applied_lsn::pg_lsn);"
+      },
+      {
+        "say": "When the reader is retired, drop the slot. A slot nobody advances keeps every WAL file from its position until the primary's disk is full (lesson 4's mistake).",
+        "lang": "sql",
+        "code": "SELECT pg_drop_replication_slot('refunds_cdc');"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Statement replay against row replay",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/repl/l02/ReplicationLog.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.repl.l02.*'",
+    "steps": [
+      "Run the tests from the `labs` folder; no Docker. All 21 fail, because the leader builds its row log with exercise 1. Read `ReplicationLog.kt`: `Server.execute` runs statements with the server's own clock, random generator, id counter and heap order, and `Leader.run` writes both logs.",
+      "Exercise 1, `rowEvents(before, after)`: one event per changed row, in id order. Run `RowEventsTest`, then `StatementReplayTest`: it now passes, and each test is one way a statement replica drifts (its own `now()`, its own `random()`, a fee charged twice, a `LIMIT` that picks other rows, swapped ids).",
+      "Exercise 2, `Server.applyRow`: apply an event so that applying it twice changes nothing, and move `nextId` past every replicated id, so that a promoted follower doesn't hand out an id it holds (lesson 1's GitHub bug). `RowReplayTest` replays every drift case with rows.",
+      "Exercise 3, `pin`: replace `now()` and `random()` with the leader's values before logging, as MySQL does for `NOW()`. `PinTest` shows what that fixes and what it can't. Then `ReplayPropertyTest` runs 100 random workloads per property."
+    ],
+    "hints": [
+      "`rowEvents`: walk `(before.keys + after.keys).sorted()` and compare `before[id]` with `after[id]`: only after is an insert, only before is a delete, both and different is an update.",
+      "`applyRow`: a `when (event)` that puts `event.row` for inserts and updates and removes the id for deletes; then `if (event !is RowEvent.Deleted) nextId = maxOf(nextId, event.id + 1)`.",
+      "`pin`: only `Statement.Insert` has values to pin. Use `statement.copy(ref = ..., createdAt = ...)`, calling `on.randomRef()` and `on.now()` only for the parts that are `Ref.Random` and `Ts.Now`.",
+      "A property test failure prints the seed, the workload size and the lag. Paste them into a plain test and print `leader.rows` and `follower.rows` side by side."
+    ],
+    "done_when": "All 21 tests in `RowEventsTest`, `StatementReplayTest`, `RowReplayTest`, `PinTest` and `ReplayPropertyTest` pass."
+  },
+  "drill": {
+    "title": "Decode a change into row events",
+    "minutes": 4,
+    "prompt": "From memory, write `rowEvents(before, after)`: given the table before and after one statement (maps from id to row), return an Inserted, Updated or Deleted event for every changed row, in id order. Then say in one sentence why a follower applying these events twice ends up with the same table.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun rowEvents(before: Map<Long, Row>, after: Map<Long, Row>): List<RowEvent> =\n    (before.keys + after.keys).sorted().mapNotNull { id ->\n        val old = before[id]\n        val new = after[id]\n        when {\n            old == null && new != null -> RowEvent.Inserted(new)\n            old != null && new == null -> RowEvent.Deleted(id)\n            old != null && new != null && old != new -> RowEvent.Updated(new)\n            else -> null\n        }\n    }\n\n// Twice is harmless: each event says what the row IS (or that it is gone), never what to add to it."
+    }
+  },
+  "recap": [
+    "A replication log can carry statements, physical page changes (the WAL) or logical row changes. Each is a different answer to \"what does a follower need to reproduce this write?\"",
+    "Statement logs are small and readable, and they drift: now(), random(), auto-increment under concurrency, LIMIT without ORDER BY, repeated relative updates and triggers all come out differently on a follower. MySQL pins NOW() and flags the rest as unsafe.",
+    "WAL shipping copies the primary's bytes exactly, indexes included, and ties every node to the same major version and the whole server. It is the right format for a failover copy.",
+    "A logical log carries each row's key and resulting values, so applying it twice is harmless and followers can run other versions or other systems. MySQL's row binlog, PostgreSQL's logical decoding and MongoDB's idempotent oplog work this way.",
+    "Trigger-based capture is a logical log you write yourself: flexible, but it doubles the work inside every transaction and misses what the triggers don't cover."
+  ],
+  "quiz": [
+    {
+      "q": "You need to upgrade a PostgreSQL 17 primary with one physical standby to PostgreSQL 18 with only a minute of downtime. Which plan works?",
+      "options": [
+        "Upgrade the standby to 18 first, let it catch up from the 17 primary, then fail over to it",
+        "Build a new 18 server, copy the data with logical replication from the 17 primary, let it catch up, then move the application",
+        "Turn on synchronous_commit so the standby is exactly up to date, then upgrade both at once",
+        "Change wal_level to logical on the standby so it can replay WAL from another version"
+      ],
+      "answer": 1,
+      "why": "Physical WAL describes pages in 17's on-disk format, and an 18 server can't replay it, so the standby can't be upgraded first. A logical copy carries rows, which an 18 server can apply, so it can catch up while 17 keeps serving and take over in a short switch. Synchronous commit and wal_level don't change what format the WAL is in."
+    },
+    {
+      "q": "A follower receives `UPDATE accounts SET balance_minor = balance_minor - 1250 WHERE account_id = 7` twice after a reconnect. Which kind of log would have made that harmless?",
+      "options": [
+        "A row log that carries the account's resulting balance",
+        "A statement log with the leader's timestamp pinned into it",
+        "Any log, as long as the follower applies entries in order",
+        "None: repeated entries always corrupt a follower"
+      ],
+      "answer": 0,
+      "why": "A row entry says \"account 7's balance is now 48,750\"; applying that twice gives the same balance. Pinning values fixes now() and random(), not repetition of a relative change. Order alone doesn't help when the same entry arrives twice. This is why MongoDB records increments in the oplog as their resulting values."
+    },
+    {
+      "q": "Two transactions insert into a MySQL table with an AUTO_INCREMENT key at the same moment, with statement-based logging and interleaved auto-increment locking. Transaction A gets id 500 and B gets id 501, but B commits first. What can a replica end up with?",
+      "options": [
+        "The same ids, because the binary log records the ids",
+        "A duplicate-key error that stops replication",
+        "Both rows with id 500",
+        "A's row with id 501 and B's row with id 500"
+      ],
+      "answer": 3,
+      "why": "The statement log is in commit order and doesn't carry the ids, so the replica runs B's insert first and gives it 500, then A's and gives it 501: the ids are swapped. MySQL 8.0 made interleaved locking the default only together with row-based logging, which carries each row's id and avoids this."
+    },
+    {
+      "q": "A team builds change capture with triggers that write every change to a log table. Inserts into the busiest table now take twice as long. Where does the extra time go?",
+      "options": [
+        "Into the reader process that ships the log rows, which runs on the same CPU",
+        "Into replication of the log table to the standby, which slows the commit",
+        "Into each user transaction: every insert also inserts a log row and runs the trigger, before the commit",
+        "Into VACUUM, which has to clean up the log table"
+      ],
+      "answer": 2,
+      "why": "A row-level trigger runs inside the transaction that fired it, so the application waits for the second insert and the trigger function on every write, and holds its locks meanwhile. The shipping process runs separately. The extra WAL does reach the standby, but with asynchronous replication that doesn't add to commit time."
+    },
+    {
+      "q": "Lesson 1's follower catches up by asking for \"every entry after position 4,812\", and the leader may resend entries the follower already applied. Which property of a log makes that safe without any extra bookkeeping?",
+      "options": [
+        "Entries are compressed",
+        "Applying an entry twice leaves the same state as applying it once",
+        "Entries carry the leader's timestamp",
+        "The log is stored on the leader's disk"
+      ],
+      "answer": 1,
+      "why": "If entries are idempotent, a resend does no harm, and the follower can simply skip what it has or apply it again. A follower that tracks its position exactly can also skip duplicates, which is what lesson 1's lab does, but idempotent entries make the overlap safe even when the position is uncertain. Timestamps don't prevent a double fee.",
+      "from": "repl-01"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Name four things that make a statement give a different result on a follower.",
+      "back": "now() and random() (the follower's own clock and generator), auto-increment ids taken out of commit order, LIMIT without ORDER BY (scan order), and triggers or functions with side effects. Also relative updates sent twice."
+    },
+    {
+      "front": "What does a PostgreSQL WAL record name?",
+      "back": "A file (tablespace/database/relation), a block and an offset, and the bytes to change there, plus a transaction id. No SQL."
+    },
+    {
+      "front": "Why can't a PostgreSQL 17 standby follow an 18 primary?",
+      "back": "Physical WAL is in the storage engine's on-disk format, which can change between major versions. Cross-version copies need logical replication."
+    },
+    {
+      "front": "What does a logical (row) log entry contain for an insert, an update and a delete?",
+      "back": "Insert: every column's new value. Update: the row's key and its new values. Delete: the key (or the whole old row). A commit marker ends each transaction."
+    },
+    {
+      "front": "Why are MongoDB oplog entries safe to apply twice?",
+      "back": "They record results, not operations: an increment is stored as the resulting value, and a multi-document update becomes one entry per document."
+    },
+    {
+      "front": "What does PostgreSQL need before it can publish UPDATEs and DELETEs of a table?",
+      "back": "A replica identity: a primary key by default, or a named unique index, or REPLICA IDENTITY FULL (the whole old row)."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Statement-based replication",
+      "plain": "The leader logs the SQL text, and followers run it again."
+    },
+    {
+      "term": "Nondeterministic",
+      "plain": "Gives a different result depending on when or where it runs, like now() or random()."
+    },
+    {
+      "term": "WAL shipping",
+      "plain": "Sending the database's own write-ahead log, which names changed pages and bytes, to followers that replay it."
+    },
+    {
+      "term": "Logical (row-based) log",
+      "plain": "A log of row changes: each entry has a row's key and its resulting values."
+    },
+    {
+      "term": "Logical decoding",
+      "plain": "PostgreSQL's feature that reads the WAL and turns it into row changes through an output plugin."
+    },
+    {
+      "term": "Idempotent",
+      "plain": "Applying it twice gives the same result as applying it once."
+    },
+    {
+      "term": "Change data capture (CDC)",
+      "plain": "Reading a database's committed row changes as a stream for other systems."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague asks why PostgreSQL needs both physical and logical replication, when \"replication is just copying the changes\". Explain what each one copies and when you'd use it.",
+    "answer": "Both copy the changes, but they describe them in different languages. Physical replication ships PostgreSQL's write-ahead log, which says which bytes on which page of which file changed. A standby replays that onto an identical copy of the files, so it ends up exact, indexes and all, and it's ready to take over at a failover. The catch is that the log is in PostgreSQL's private on-disk format: the standby must be the same major version, it gets every database on the server, and nothing else can read it. Logical replication decodes the same log into row changes: this row was inserted with these values, this key now has these values, this key was deleted. Rows don't depend on the page format, so the receiver can be a newer version, take only some tables, or not be PostgreSQL at all. That's what you use for upgrades with little downtime and for feeding other systems like Kafka. It costs more for big updates, one entry per row, needs a key on every table, and doesn't carry schema changes. So: physical for the copy you fail over to, logical for everything that needs to move data somewhere different."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "MySQL's row events have a knob for how much of the row they carry: `binlog_row_image` is `FULL` by default (every column, before and after), and `MINIMAL` logs only the key and the changed columns. Smaller binary logs, at the cost of consumers such as Debezium seeing less of each row.\n\nPostgreSQL 19, at release candidate as this is written, adds logical replication of sequence values, which closes one of the gaps this lesson listed; check the final release notes before you rely on it. Schema changes still aren't replicated logically: tools apply DDL on both sides themselves.\n\nState machine replication is the general idea behind making statements safe: if every replica starts in the same state and applies the same deterministic commands in the same order, they stay identical. VoltDB uses it for whole stored procedures. Raft and Paxos (the Consistency and consensus track) agree on the order of the commands; determinism is the application's side of the bargain. Temporal's replay is the same contract applied to one workflow.\n\nMongoDB's oplog lives in the capped collection `local.oplog.rs`. Since MongoDB 5.0 you can't write to it by hand on a replica set. Its size, 5% of free disk by default, bounded between 990 MB and 50 GB, sets the oplog window from lesson 1: how long a secondary can be away and still catch up from its position.\n\nDesigning Data-Intensive Applications, 2nd edition, chapter 6 describes the same three log formats, and points out that a logical log is also the natural input for change data capture, which this course picks up in the Stream processing track."
+  },
+  "sources": [
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 6",
+      "url": "https://dataintensive.net/"
+    },
+    {
+      "title": "PostgreSQL 18: Comparison of different replication solutions",
+      "url": "https://www.postgresql.org/docs/18/different-replication-solutions.html"
+    },
+    {
+      "title": "PostgreSQL 18: Logical decoding",
+      "url": "https://www.postgresql.org/docs/18/logicaldecoding.html"
+    },
+    {
+      "title": "MySQL 8.4 Reference Manual: Replication formats",
+      "url": "https://dev.mysql.com/doc/refman/8.4/en/replication-formats.html"
+    },
+    {
+      "title": "MongoDB manual: Replica set oplog",
+      "url": "https://www.mongodb.com/docs/manual/core/replica-set-oplog/"
+    }
+  ]
+}

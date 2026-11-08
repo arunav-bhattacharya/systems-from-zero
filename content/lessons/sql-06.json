@@ -1,420 +1,437 @@
 {
-  "id": "sql-06",
-  "title": "Recursive CTEs: trees and graphs in SQL",
-  "minutes": 40,
-  "goal": "By the end you can walk a tree of any depth down or up with WITH RECURSIVE, carry depth and path down the walk, follow a graph with cycles without looping forever, and generate rows such as a calendar from nothing.",
-  "warmup": {
-    "q": "In PostgreSQL, what makes a `WITH RECURSIVE` query stop?",
-    "options": [
-      "A built-in limit of 100 levels",
-      "A round of the recursive part that produces no new rows",
-      "The first time a row repeats",
-      "A LIMIT clause, which every recursive query must have"
-    ],
-    "answer": 1,
-    "why": "PostgreSQL runs the recursive part round after round, each time from the rows the previous round produced, and stops when a round produces none. There is no depth limit (SQL Server has one, 100 by default), and with UNION ALL repeated rows are kept, so data with a cycle never produces an empty round and the query runs until something cancels it."
-  },
-  "sections": [
-    {
-      "h": "A self join climbs one level, and a tree needs a loop",
-      "body": "Marketing pays a bonus for a referrer's whole downline: the customers they referred, the customers those referred, and so on down. Who is in Asha's downline?\n\n`customers.referred_by` holds the id of the customer who referred each customer, and lesson 3 joined the table to itself through it. Those pointers form a **tree**. Each customer has at most one parent (their referrer) and any number of children (the people they referred). A customer with no parent is a **root**. The seed has five roots, 1, 2, 7, 9 and 11, so it is a forest of five trees, two of them a single customer. Asha (1) referred Chloe (3) and Elena (5), Chloe referred Farid (6), and Elena referred Jonas (10). The **depth** of a customer is the number of steps down from their root: Farid's is 2.\n\nOne level is easy: `WHERE referred_by = 1` returns Chloe and Elena. The second level needs a self join: customers joined to customers on `g.referred_by = c.customer_id`, starting from Asha's children. Every further level needs one more join: reaching Mateo, at the bottom of Ben's chain 2 to 4 to 8 to 13, takes two. Worse, the query must know the depth in advance. The day Mateo refers someone, Ben's chain grows to four levels and the two-join query misses the new customer, without an error.\n\nIn Kotlin you would not write one statement per level. You would write a loop:\n\n```kotlin\nvar frontier = listOf(1L)                     // start from Asha\nval downline = mutableListOf<Long>()\nwhile (frontier.isNotEmpty()) {\n    frontier = customers\n        .filter { it.referredBy in frontier }     // one level down: what one self join does\n        .map { it.id }\n    downline += frontier\n}\n```\n\nEach turn of the loop does the work of one self join: it finds the children of the customers that the previous turn found. The loop stops when a turn finds nobody. Nothing in it depends on how deep the tree is. That loop, written in SQL, is a recursive CTE, and it is the picture for the rest of this lesson: **start somewhere, step one level from the rows you found last, and stop when a step finds nothing.**",
-      "try": {
-        "title": "Climb one level per join",
-        "minutes": 3,
-        "steps": [
-          "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-          "Run the first two queries: Asha's children, then her grandchildren with one self join.",
-          "Run the third. It follows Ben's chain with two joins after the first level. How many joins would a fourth level need?"
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SELECT customer_id, full_name FROM customers WHERE referred_by = 1;\n\nSELECT g.customer_id, g.full_name\nFROM customers c\nJOIN customers g ON g.referred_by = c.customer_id\nWHERE c.referred_by = 1;\n\nSELECT c.customer_id AS level1, g.customer_id AS level2, gg.customer_id AS level3\nFROM customers c\nLEFT JOIN customers g  ON g.referred_by = c.customer_id\nLEFT JOIN customers gg ON gg.referred_by = g.customer_id\nWHERE c.referred_by = 2;"
-        },
-        "expect": "The first query returns Chloe Martin (3) and Elena Petrova (5). The second returns Farid Haddad (6) and Jonas Weber (10). The third:\n\n```postgresql\n level1 | level2 | level3\n--------+--------+--------\n      4 |      8 |     13\n(1 row)\n```\n\nEach level costs one more join, and a customer at level 4 would need a third. The query encodes the depth of today's data."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Joins between tables (self joins)",
-          "url": "https://www.postgresql.org/docs/18/tutorial-join.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "WITH RECURSIVE runs the loop for you",
-      "body": "Here is the loop as a query:\n\n```sql\nWITH RECURSIVE downline AS (\n    SELECT customer_id, full_name, 0 AS depth          -- anchor: where the loop starts\n    FROM customers\n    WHERE customer_id = 1\n  UNION ALL\n    SELECT c.customer_id, c.full_name, d.depth + 1     -- recursive term: one level down\n    FROM customers c\n    JOIN downline d ON c.referred_by = d.customer_id\n)\nSELECT * FROM downline;\n```\n\nIt has two parts, joined by `UNION ALL`. The first, the **anchor**, is an ordinary query that produces the starting rows: here, Asha. The second, the **recursive term**, mentions the CTE's own name, `downline`. That self-reference is what the word `RECURSIVE` allows, and it plays the role of `frontier` in the Kotlin loop.\n\nPostgreSQL evaluates it with a **working table** that holds the rows of the latest round:\n\n1. Run the anchor. Put its rows in the result and in the working table.\n2. Run the recursive term, reading `downline` as the working table only. Add the new rows to the result, and make them the new working table.\n3. Repeat step 2 until a round produces no rows.\n\nFor Asha, the anchor gives {1}. Round 1 joins customers to {1} and finds {3, 5}. Round 2 joins to {3, 5} and finds {6, 10}. Round 3 joins to {6, 10}, finds nobody, and the loop ends with five rows. The stepper runs the same loop over the whole forest. Despite the name, nothing calls itself: the PostgreSQL docs say outright that these queries are evaluated iteratively, and the three steps above are a while loop.\n\nTwo consequences follow from the algorithm. First, the recursive term only ever sees the latest round, never the whole result so far, so it cannot aggregate: `count(*)` in the recursive term fails with `aggregate functions are not allowed in a recursive query's recursive term`. Count in the main query, after the loop. Second, the loop has no built-in limit. It stops when a round comes back empty, and only then. SQL Server stops a recursive CTE after 100 levels by default; PostgreSQL has no such limit, so data that never runs out of new rows gives a query that never ends. The fourth section deals with that.\n\nEach round is an ordinary join, planned and run like any other. On the large data set, the forest of 50,000 customers comes out in 8 rounds and about 40 ms, and EXPLAIN shows the loop directly: the `WorkTable Scan` node reads the working table, and its `loops=8` is the number of rounds.",
-      "stepper": {
-        "title": "The working table, round by round",
-        "intro": "Click Next to watch a recursive CTE walk the referral forest from its roots.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">WITH RECURSIVE tree AS (anchor UNION ALL recursive term)</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-dim\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-m\" x=\"570\" y=\"81\" text-anchor=\"middle\">not started</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s t-m\" x=\"20\" y=\"318\" text-anchor=\"start\">13 customers, 5 roots. Nothing has run yet.</text></svg>",
-            "say": "The seed's referral forest. An edge goes from a referrer down to the customer they referred. Five customers have `referred_by` NULL: they are the roots. The query will list every customer with a depth."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">anchor: SELECT ... FROM customers WHERE referred_by IS NULL</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box-a\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box-a\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box-a\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box-a\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box-a\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-a\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-code\" x=\"570\" y=\"81\" text-anchor=\"middle\">{1, 2, 7, 9, 11}</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s t-a\" x=\"484\" y=\"158\" text-anchor=\"start\">depth 0: 1 2 7 9 11</text><text class=\"t-s t-m\" x=\"570\" y=\"272\" text-anchor=\"middle\">5 rows</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">The anchor runs once: 5 roots enter the result and the working table.</text></svg>",
-            "say": "PostgreSQL runs the **anchor**, `WHERE referred_by IS NULL`, exactly once. Its 5 rows go into the result, and also into the **working table**, which holds the rows of the latest round."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">round 1: customers JOIN working table ON referred_by = customer_id</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln-a\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln-a\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln-a\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln-a\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box-ok\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box-a\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box-a\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box-ok\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box-a\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box-ok\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box-a\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box-ok\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box-ok\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-a\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-code\" x=\"570\" y=\"81\" text-anchor=\"middle\">{3, 4, 5, 12}</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"158\" text-anchor=\"start\">depth 0: 1 2 7 9 11</text><text class=\"t-s t-a\" x=\"484\" y=\"182\" text-anchor=\"start\">depth 1: 3 4 5 12</text><text class=\"t-s t-m\" x=\"570\" y=\"272\" text-anchor=\"middle\">9 rows</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">Round 1 joins only the working table: 4 new rows replace it.</text></svg>",
-            "say": "Round 1 runs the **recursive term**. Wherever it says `tree`, PostgreSQL reads only the working table, {1, 2, 7, 9, 11}, and joins it to customers on `referred_by`. It finds 3, 4, 5 and 12. They are added to the result and become the new working table."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">round 2: customers JOIN working table ON referred_by = customer_id</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln-a\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln-a\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln-a\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box-ok\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box-ok\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box-ok\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box-a\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box-a\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box-ok\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box-ok\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box-a\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box-ok\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box-ok\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box-ok\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box-ok\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-a\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-code\" x=\"570\" y=\"81\" text-anchor=\"middle\">{6, 8, 10}</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"158\" text-anchor=\"start\">depth 0: 1 2 7 9 11</text><text class=\"t-s\" x=\"484\" y=\"182\" text-anchor=\"start\">depth 1: 3 4 5 12</text><text class=\"t-s t-a\" x=\"484\" y=\"206\" text-anchor=\"start\">depth 2: 6 8 10</text><text class=\"t-s t-m\" x=\"570\" y=\"272\" text-anchor=\"middle\">12 rows</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">Round 2 starts from {3, 4, 5, 12}: 3 new rows.</text></svg>",
-            "say": "Round 2 joins customers to {3, 4, 5, 12} and finds 6, 8 and 10. Rows from earlier rounds are not read again: each round only extends the latest frontier."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">round 3: customers JOIN working table ON referred_by = customer_id</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln-a\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box-ok\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box-ok\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box-ok\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box-ok\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box-ok\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box-ok\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box-ok\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box-ok\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box-a\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box-ok\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box-ok\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box-ok\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box-ok\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-a\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-code\" x=\"570\" y=\"81\" text-anchor=\"middle\">{13}</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"158\" text-anchor=\"start\">depth 0: 1 2 7 9 11</text><text class=\"t-s\" x=\"484\" y=\"182\" text-anchor=\"start\">depth 1: 3 4 5 12</text><text class=\"t-s\" x=\"484\" y=\"206\" text-anchor=\"start\">depth 2: 6 8 10</text><text class=\"t-s t-a\" x=\"484\" y=\"230\" text-anchor=\"start\">depth 3: 13</text><text class=\"t-s t-m\" x=\"570\" y=\"272\" text-anchor=\"middle\">13 rows</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">Round 3 starts from {6, 8, 10}: only 13 is found.</text></svg>",
-            "say": "Round 3 joins customers to {6, 8, 10}. Only Mateo (13), referred by Hugo (8), comes back. Ben's chain is the deepest tree in the forest."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A recursive CTE walks the referral forest one level per round until the working table is empty\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">round 4: customers JOIN {13} ON referred_by = customer_id</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">depth 0</text><text class=\"t-s t-m\" x=\"20\" y=\"144\" text-anchor=\"start\">depth 1</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">depth 2</text><text class=\"t-s t-m\" x=\"20\" y=\"264\" text-anchor=\"start\">depth 3</text><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"120\" y2=\"124\"/><line class=\"ln\" x1=\"150\" y1=\"96\" x2=\"180\" y2=\"124\"/><line class=\"ln\" x1=\"120\" y1=\"156\" x2=\"120\" y2=\"184\"/><line class=\"ln\" x1=\"180\" y1=\"156\" x2=\"180\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"96\" x2=\"250\" y2=\"124\"/><line class=\"ln\" x1=\"250\" y1=\"156\" x2=\"250\" y2=\"184\"/><line class=\"ln\" x1=\"250\" y1=\"216\" x2=\"250\" y2=\"244\"/><line class=\"ln\" x1=\"320\" y1=\"96\" x2=\"320\" y2=\"124\"/><circle class=\"box-ok\" cx=\"150\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"150\" y=\"84.5\" text-anchor=\"middle\">1</text><circle class=\"box-ok\" cx=\"120\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"144.5\" text-anchor=\"middle\">3</text><circle class=\"box-ok\" cx=\"180\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"144.5\" text-anchor=\"middle\">5</text><circle class=\"box-ok\" cx=\"120\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"120\" y=\"204.5\" text-anchor=\"middle\">6</text><circle class=\"box-ok\" cx=\"180\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"180\" y=\"204.5\" text-anchor=\"middle\">10</text><circle class=\"box-ok\" cx=\"250\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"84.5\" text-anchor=\"middle\">2</text><circle class=\"box-ok\" cx=\"250\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"144.5\" text-anchor=\"middle\">4</text><circle class=\"box-ok\" cx=\"250\" cy=\"200\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"204.5\" text-anchor=\"middle\">8</text><circle class=\"box-ok\" cx=\"250\" cy=\"260\" r=\"16\"/><text class=\"t-s\" x=\"250\" y=\"264.5\" text-anchor=\"middle\">13</text><circle class=\"box-ok\" cx=\"320\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"84.5\" text-anchor=\"middle\">7</text><circle class=\"box-ok\" cx=\"320\" cy=\"140\" r=\"16\"/><text class=\"t-s\" x=\"320\" y=\"144.5\" text-anchor=\"middle\">12</text><circle class=\"box-ok\" cx=\"380\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"380\" y=\"84.5\" text-anchor=\"middle\">9</text><circle class=\"box-ok\" cx=\"430\" cy=\"80\" r=\"16\"/><text class=\"t-s\" x=\"430\" y=\"84.5\" text-anchor=\"middle\">11</text><text class=\"t-s t-m\" x=\"570\" y=\"46\" text-anchor=\"middle\">working table</text><rect class=\"box-bad\" x=\"470\" y=\"54\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"570\" y=\"81\" text-anchor=\"middle\">empty: stop</text><text class=\"t-s t-m\" x=\"570\" y=\"126\" text-anchor=\"middle\">result</text><rect class=\"box\" x=\"470\" y=\"134\" width=\"200\" height=\"150\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"158\" text-anchor=\"start\">depth 0: 1 2 7 9 11</text><text class=\"t-s\" x=\"484\" y=\"182\" text-anchor=\"start\">depth 1: 3 4 5 12</text><text class=\"t-s\" x=\"484\" y=\"206\" text-anchor=\"start\">depth 2: 6 8 10</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">depth 3: 13</text><text class=\"t-s t-ok\" x=\"570\" y=\"272\" text-anchor=\"middle\">13 rows</text><text class=\"t-s t-a\" x=\"20\" y=\"318\" text-anchor=\"start\">Round 4 starts from {13}: nobody has referred_by = 13. Done.</text></svg>",
-            "say": "Round 4 joins customers to {13}. Nobody was referred by Mateo, so the round produces no rows, the working table is empty, and the loop stops. The result holds all 13 customers. The stop condition was never written down: it is the data running out."
-          }
-        ]
-      },
-      "try": {
-        "title": "Count the rounds",
-        "minutes": 5,
-        "steps": [
-          "Run the downline query. Look at the order of the rows: it is the order of the rounds.",
-          "Optional, with the large data set loaded (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute): run the second statement, which walks all 50,000 customers. Find the `WorkTable Scan` and its `loops`."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "WITH RECURSIVE downline AS (\n    SELECT customer_id, full_name, 0 AS depth, ARRAY[customer_id] AS path\n    FROM customers\n    WHERE customer_id = 1\n  UNION ALL\n    SELECT c.customer_id, c.full_name, d.depth + 1, d.path || c.customer_id\n    FROM customers c\n    JOIN downline d ON c.referred_by = d.customer_id\n)\nSELECT * FROM downline;\n\nSET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nWITH RECURSIVE tree AS (\n    SELECT customer_id, 0 AS depth FROM customers WHERE referred_by IS NULL\n  UNION ALL\n    SELECT c.customer_id, t.depth + 1 FROM customers c JOIN tree t ON c.referred_by = t.customer_id\n)\nSELECT depth, count(*) AS customers FROM tree GROUP BY depth ORDER BY depth;\nSET search_path = public;"
-        },
-        "expect": "The downline comes out round by round:\n\n```postgresql\n customer_id |   full_name   | depth |   path\n-------------+---------------+-------+----------\n           1 | Asha Rao      |     0 | {1}\n           3 | Chloe Martin  |     1 | {1,3}\n           5 | Elena Petrova |     1 | {1,5}\n           6 | Farid Haddad  |     2 | {1,3,6}\n          10 | Jonas Weber   |     2 | {1,5,10}\n(5 rows)\n```\n\nOn the large data set (plan trimmed):\n\n```postgresql\n   CTE tree\n     ->  Recursive Union (actual time=4.643..26.168 rows=50000.00 loops=1)\n           ->  Seq Scan on customers (actual time=4.643..8.147 rows=35077.00 loops=1)\n                 Filter: (referred_by IS NULL)\n           ->  Hash Join (actual time=0.749..1.727 rows=1865.38 loops=8)\n                 Hash Cond: (t.customer_id = c.referred_by)\n                 ->  WorkTable Scan on tree t (actual time=0.000..0.220 rows=6250.00 loops=8)\n                 ->  Hash (actual time=5.923..5.924 rows=14923.00 loops=1)\n```\n\nThe anchor found 35,077 roots. The recursive term ran 8 times: 7 rounds found customers at depths 1 to 7, and the eighth found nobody. The hash table of customers was built once (`loops=1`) and reused by every round. `rows` in EXPLAIN is an average per loop."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: WITH queries, recursive queries",
-          "url": "https://www.postgresql.org/docs/18/queries-with.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Carry the path down, and sort by it",
-      "body": "The rows of a recursive CTE come out round by round, 1, then 3 and 5, then 6 and 10, and like any query result they have no order you can rely on unless you ask for one. Round by round is called **breadth-first** order. To print a tree indented, you want each customer directly under their parent: 1, 3, 6, 5, 10. That is **depth-first** order, and you need something to sort by.\n\nA column computed in the recursive term is carried down the tree; `d.depth + 1` already does this for the depth. Do the same with the **path**, the list of ids from the root down to the row:\n\n```sql\nSELECT customer_id, 0 AS depth, ARRAY[customer_id] AS path ...      -- anchor\nSELECT c.customer_id, d.depth + 1, d.path || c.customer_id ...      -- recursive term\n```\n\n`ARRAY[1]` builds a one-element array and `||` appends to it, so Farid's path is `{1,3,6}`. PostgreSQL compares arrays element by element, the way strings compare character by character, so `ORDER BY path` sorts `{1,3}` and `{1,3,6}` before `{1,5}`: depth-first. The path answers other questions too. `path[1]` is the root of the row's tree (arrays count from 1), and `cardinality(path) - 1` is its depth.\n\nPostgreSQL 14 added a standard clause that builds the sort key for you. Write `SEARCH DEPTH FIRST BY customer_id SET ord` right after the CTE's closing parenthesis, and every row gets an extra column `ord`. `ORDER BY ord` in the main query then sorts depth-first, and `SEARCH BREADTH FIRST BY customer_id SET ord` sorts by round. The hand-made path works on every version and you can read it; SEARCH is shorter.\n\nThe same machinery walks up the tree. Flip the join: start from Mateo and join each row to its referrer, `c.customer_id = u.referred_by`. The loop visits 13, 8, 4 and 2 and stops at Ben, whose `referred_by` is NULL. A join on NULL matches nothing (lesson 1), so that round is empty. Walking up is cheap, because each round finds at most one row: one parent per customer.",
-      "try": {
-        "title": "Sort a forest and climb a chain",
-        "minutes": 4,
-        "steps": [
-          "Run the first query, which uses SEARCH DEPTH FIRST. Check that every customer appears right after their referrer.",
-          "Change `DEPTH` to `BREADTH` and run it again. Predict the first five rows.",
-          "Run the last query, which walks up from Mateo. Which row ends the loop, and why?"
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "\\pset null '∅'\nWITH RECURSIVE tree AS (\n    SELECT customer_id, 0 AS depth FROM customers WHERE referred_by IS NULL\n  UNION ALL\n    SELECT c.customer_id, t.depth + 1\n    FROM customers c JOIN tree t ON c.referred_by = t.customer_id\n) SEARCH DEPTH FIRST BY customer_id SET ord\nSELECT customer_id, depth, ord FROM tree ORDER BY ord;\n\nWITH RECURSIVE up AS (\n    SELECT customer_id, full_name, referred_by, 0 AS hops\n    FROM customers WHERE customer_id = 13\n  UNION ALL\n    SELECT c.customer_id, c.full_name, c.referred_by, u.hops + 1\n    FROM customers c JOIN up u ON c.customer_id = u.referred_by\n)\nSELECT * FROM up;"
-        },
-        "expect": "Depth-first, each tree in turn (trimmed after Ben's tree):\n\n```postgresql\n customer_id | depth |        ord\n-------------+-------+--------------------\n           1 |     0 | {(1)}\n           3 |     1 | {(1),(3)}\n           6 |     2 | {(1),(3),(6)}\n           5 |     1 | {(1),(5)}\n          10 |     2 | {(1),(5),(10)}\n           2 |     0 | {(2)}\n           4 |     1 | {(2),(4)}\n           8 |     2 | {(2),(4),(8)}\n          13 |     3 | {(2),(4),(8),(13)}\n```\n\n`ord` is the same idea as the path array, built by PostgreSQL. With BREADTH, `ord` becomes `(depth, id)` pairs and the first five rows are the roots 1, 2, 7, 9 and 11. The walk up returns 13 (Mateo, 0 hops), 8, 4 and then Ben Carter with `referred_by` ∅ and 3 hops. The next round looks for `customer_id = NULL`, which matches nothing, so it is empty and the loop stops."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Search order (SEARCH DEPTH FIRST / BREADTH FIRST)",
-          "url": "https://www.postgresql.org/docs/18/queries-with.html",
-          "kind": "docs"
-        },
-        {
-          "title": "PostgreSQL 18: Array functions and operators",
-          "url": "https://www.postgresql.org/docs/18/functions-array.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Graphs have cycles, so stop the loop yourself",
-      "body": "A referral chain cannot loop in real life, but the schema allows it: nothing stops an UPDATE that records Asha as referred by Farid, who sits below her. Then the chain goes 1, 3, 6, 1, 3, 6, and the downline query from the second section never ends. Round 3 finds Asha again, round 4 finds Chloe and Elena again, and the working table is never empty. The Try it below creates this cycle inside a transaction and lets `statement_timeout` cancel the query.\n\nA tree is a special kind of **graph**. A graph is any set of nodes connected by edges, and in general the edges can form a **cycle**: a path that comes back to where it started. Money is a graph. Every journal in the ledger moves money from one account to another, and money comes back: Farid's account 106 paid Volt Electronics (account 304), and Volt refunded account 106. Any query that follows money has to expect cycles.\n\nThere are three ways to make the loop stop.\n\n`UNION` instead of `UNION ALL` drops every new row that equals a row already in the result. If each row holds only the node id, that is a visited set, like the `HashSet` in a breadth-first search, and the loop ends once every reachable node has been seen. Add a depth or a path column and two visits to the same node are no longer equal rows, so UNION drops nothing and the loop runs on.\n\nYou can carry the path and refuse to step onto a node that is already on it: `WHERE c.customer_id <> ALL (d.path)` in the recursive term.\n\nOr let PostgreSQL 14 and later do that bookkeeping. `CYCLE customer_id SET is_cycle USING path`, after the closing parenthesis, adds two columns: `path`, the nodes visited so far, and `is_cycle`, a boolean. A row whose node is already on its path is emitted once with `is_cycle` true and is not followed further. Filter it out with `WHERE NOT is_cycle` in the main query.\n\nThe path methods stop a cycle along one path. They do not remember nodes that another path reached, so the same account can appear several times, once per route, and in a dense graph the number of routes grows quickly. If you need each node once with its shortest distance, group after the loop: `GROUP BY account_id` with `min(hops)`. The lab's money walk needs exactly that.",
-      "try": {
-        "title": "Make a cycle, then survive it",
-        "minutes": 5,
-        "steps": [
-          "Run the first transaction. It records Farid as Asha's referrer, sets a 3-second timeout, and runs the plain downline query. Wait for the error, then ROLLBACK (a failed transaction accepts nothing else).",
-          "Run the second transaction: the same cycle, then the query with a CYCLE clause, then a version that uses UNION on the id alone.",
-          "Find the row with `is_cycle = t`. Which customer does it repeat?"
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "BEGIN;\nUPDATE customers SET referred_by = 6 WHERE customer_id = 1;   -- Asha \"referred by\" Farid\nSET LOCAL statement_timeout = '3s';\nWITH RECURSIVE downline AS (\n    SELECT customer_id, 0 AS depth FROM customers WHERE customer_id = 1\n  UNION ALL\n    SELECT c.customer_id, d.depth + 1\n    FROM customers c JOIN downline d ON c.referred_by = d.customer_id\n)\nSELECT count(*) FROM downline;\nROLLBACK;\n\nBEGIN;\nUPDATE customers SET referred_by = 6 WHERE customer_id = 1;\nWITH RECURSIVE downline AS (\n    SELECT customer_id, 0 AS depth FROM customers WHERE customer_id = 1\n  UNION ALL\n    SELECT c.customer_id, d.depth + 1\n    FROM customers c JOIN downline d ON c.referred_by = d.customer_id\n) CYCLE customer_id SET is_cycle USING path\nSELECT customer_id, depth, is_cycle, path FROM downline;\n\nWITH RECURSIVE downline AS (\n    SELECT customer_id FROM customers WHERE customer_id = 1\n  UNION\n    SELECT c.customer_id FROM customers c JOIN downline d ON c.referred_by = d.customer_id\n)\nSELECT customer_id FROM downline;\nROLLBACK;"
-        },
-        "expect": "After three seconds the first query fails with `ERROR:  canceling statement due to statement timeout`. The CYCLE version stops on its own:\n\n```postgresql\n customer_id | depth | is_cycle |       path\n-------------+-------+----------+-------------------\n           1 |     0 | f        | {(1)}\n           3 |     1 | f        | {(1),(3)}\n           5 |     1 | f        | {(1),(5)}\n           6 |     2 | f        | {(1),(3),(6)}\n          10 |     2 | f        | {(1),(5),(10)}\n           1 |     3 | t        | {(1),(3),(6),(1)}\n(6 rows)\n```\n\nAsha comes back at depth 3 with `is_cycle` true and is not followed again. The UNION version returns 1, 3, 5, 6 and 10: the round that found Asha again added nothing new, so the next working table was empty. Both ROLLBACKs restore Asha's real `referred_by`, NULL."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Cycle detection (the CYCLE clause)",
-          "url": "https://www.postgresql.org/docs/18/queries-with.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Recursion can make rows: a calendar from nothing",
-      "body": "The March report needs one row for every day, including days without payments. Lesson 4 explained why GROUP BY cannot do that alone: a group exists only if some row has its key, and a quiet day has no rows. The days have to exist first, as rows, and then the payments can be attached to them with a LEFT JOIN.\n\nA recursive CTE can make those rows from nothing. The anchor produces the first day. The recursive term adds one day to the previous round's day, and its WHERE clause is the stop condition:\n\n```sql\nWITH RECURSIVE days AS (\n    SELECT date '2026-03-01' AS day          -- round 0: one row\n  UNION ALL\n    SELECT day + 1                           -- each round: the next day\n    FROM days\n    WHERE day < date '2026-03-31'            -- the round after 31 March adds nothing\n)\nSELECT day FROM days;                        -- 31 rows\n```\n\nThis is the same loop as the referral walk, with a different reason to stop. There, the data ran out. Here, the WHERE clause turns false: in the round that starts from 31 March, the only row fails `day < '2026-03-31'`, the round is empty, and the loop ends. Forget the WHERE clause and the loop runs until something cancels it, because `day + 1` always has a next day.\n\nPostgreSQL also has a built-in function for this, `generate_series(start, stop, step)`, which returns one row per step and is the usual choice in PostgreSQL code. The recursive form also works, with small syntax changes, in Oracle, SQL Server and MySQL, and it shows that generating rows is just a loop whose working table holds one row.\n\nAttaching the payments uses three earlier lessons at once. Lesson 1's half-open range makes each day `created_at >= day AND created_at < day + 1`, where a date compared with a timestamptz means midnight in the session's time zone, UTC here. Lesson 3 says the conditions on payments belong in ON, so a day with only failed payments keeps its row. And lesson 4 says to count `p.payment_id` rather than `*`, and to wrap the sum in `coalesce(..., 0)`, because the sum over no rows is NULL. The lab's third exercise is this report for the whole of March.",
-      "try": {
-        "title": "A calendar from nothing",
-        "minutes": 3,
-        "steps": [
-          "Run the query for the first week of June. Predict how many rows have a payment before you run it.",
-          "Replace the `days` CTE with `SELECT g::date AS day FROM generate_series(timestamp '2026-06-01', timestamp '2026-06-07', interval '1 day') AS g` and check that nothing changes."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "WITH RECURSIVE days AS (\n    SELECT date '2026-06-01' AS day\n  UNION ALL\n    SELECT day + 1 FROM days WHERE day < date '2026-06-07'\n)\nSELECT d.day, count(p.payment_id) AS payments, coalesce(sum(p.amount_minor), 0) AS volume\nFROM days d\nLEFT JOIN payments p\n       ON p.status = 'succeeded'\n      AND p.created_at >= d.day\n      AND p.created_at <  d.day + 1\nGROUP BY d.day\nORDER BY d.day;"
-        },
-        "expect": "Seven rows, one with a payment:\n\n```postgresql\n    day     | payments | volume\n------------+----------+--------\n 2026-06-01 |        0 |      0\n 2026-06-02 |        0 |      0\n 2026-06-03 |        0 |      0\n 2026-06-04 |        1 |   5875\n 2026-06-05 |        0 |      0\n 2026-06-06 |        0 |      0\n 2026-06-07 |        0 |      0\n(7 rows)\n```\n\nAsha's 58.75 grocery payment on 4 June is the only succeeded payment that week. The generate_series version returns the same seven rows."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Set returning functions (generate_series)",
-          "url": "https://www.postgresql.org/docs/18/functions-srf.html",
-          "kind": "docs"
-        }
-      ]
-    }
+ "id": "sql-06",
+ "title": "Window functions: ranking, LAG and running totals",
+ "minutes": 40,
+ "goal": "By the end you can compute a value for each row from a set of related rows without losing any rows, rank with ROW_NUMBER, RANK and DENSE_RANK and say what each does with ties, compare a row with the one before it using LAG, build a running total, and filter on a window's result one query level up.",
+ "warmup": {
+  "q": "The seed has 30 succeeded payments at 6 merchants. How many rows does `SELECT payment_id, sum(amount_minor) OVER (PARTITION BY merchant_id) FROM payments WHERE status = 'succeeded'` return?",
+  "options": [
+   "6, one per merchant",
+   "30, one per payment",
+   "1, the grand total",
+   "None: it fails because payment_id is not in a GROUP BY"
   ],
-  "analogy": "A recursive CTE is a phone tree. The organizer calls the first people on the list (the anchor). Each of them calls the people below them on the sheet (the recursive term), and only the people called in the last round make calls in the next one (the working table). It ends when a round of calls reaches nobody new to call. If someone's sheet lists a person higher up the tree, the calls go round forever; checking \"have I already been called on this chain?\" before dialing is the CYCLE clause. The analogy breaks at speed and order: PostgreSQL makes a whole round of calls as one join, and it reports results in no particular order unless you sort by a path.",
-  "in_your_world": "Payments data is full of trees and graphs: referral programmes, merchant hierarchies (a franchise, its regions, its stores), account ownership, and the chain of refunds and chargebacks that point at an original payment. A Temporal workflow that settles a franchise often starts with \"all stores below this node\", and a recursive CTE answers that in one statement instead of one query per level from Kotlin. Fraud and AML teams follow money: \"which accounts did these funds pass through within three hops\" is a graph walk where cycles are normal, so it needs a CYCLE clause or a visited set. In Oracle code you will usually see the same walk as CONNECT BY. And a recursive date series is the quick way to give a dashboard a row for every day, so a quiet Sunday shows as 0 instead of disappearing.",
-  "mistake": "The most common mistake is a recursive query with no protection against cycles, written against data that has none today. It works for months, then a support agent fixes a record by hand, two rows point at each other, and the query loops until `statement_timeout` kills it, or until it fills the disk with temporary rows if there is no timeout. People skip the protection because a tree \"cannot\" have cycles, and because UNION ALL is what every example shows. Add a CYCLE clause (PostgreSQL 14 and later) or a path check to every recursive walk over data that people or other systems can edit, and set a `statement_timeout` for the role that runs it. If the data really must be a tree, enforce that on write as well.",
-  "compare": {
-    "title": "Walking a hierarchy: Oracle CONNECT BY and PostgreSQL WITH RECURSIVE",
-    "a": {
-      "label": "Oracle",
-      "lang": "sql",
-      "title": "Oracle CONNECT BY",
-      "src": "-- Oracle's own hierarchical syntax\nSELECT customer_id,\n       LEVEL - 1                             AS depth,\n       SYS_CONNECT_BY_PATH(customer_id, '/') AS path\nFROM customers\nSTART WITH customer_id = 1\nCONNECT BY NOCYCLE PRIOR customer_id = referred_by\nORDER SIBLINGS BY customer_id;\n-- without NOCYCLE a loop raises\n-- ORA-01436: CONNECT BY loop in user data"
-    },
-    "b": {
-      "label": "PostgreSQL 18",
-      "lang": "sql",
-      "title": "PostgreSQL 18",
-      "src": "WITH RECURSIVE downline AS (\n    SELECT customer_id, 0 AS depth, ARRAY[customer_id] AS path\n    FROM customers WHERE customer_id = 1\n  UNION ALL\n    SELECT c.customer_id, d.depth + 1, d.path || c.customer_id\n    FROM customers c\n    JOIN downline d ON c.referred_by = d.customer_id\n) CYCLE customer_id SET is_cycle USING cycle_path\nSELECT customer_id, depth, path\nFROM downline\nWHERE NOT is_cycle\nORDER BY path;\n-- without CYCLE a loop runs until statement_timeout"
-    },
-    "note": "Both list Asha's downline depth first. `START WITH` is the anchor, `CONNECT BY PRIOR customer_id = referred_by` is the recursive join (`PRIOR` marks the parent row's column), `LEVEL` is the depth counted from 1, and `SYS_CONNECT_BY_PATH` builds the path as text. PostgreSQL never had CONNECT BY, so Oracle hierarchical queries must be rewritten when they move. Oracle has also supported the standard recursive WITH since 11g Release 2, with differences: no RECURSIVE keyword, a required column list after the CTE name, UNION ALL only, and its own `SEARCH` and `CYCLE ... SET mark TO 'Y' DEFAULT 'N'` clauses. The biggest behavioural difference is the cycle. Oracle detects it and raises an error unless you ask for NOCYCLE or CYCLE. PostgreSQL does not detect it at all unless you write CYCLE or a path check, and keeps running."
-  },
-  "worked": {
-    "title": "Every referrer's downline size, in one statement",
-    "steps": [
-      {
-        "say": "Marketing wants, for every customer, how many people sit anywhere below them, and how many they referred directly. Walking down from one customer answers for one. To answer for all, start the walk from every customer at once, and carry the starting point down as a column. The anchor makes each customer its own `ancestor_id` at depth 0.",
-        "code": "-- 1. anchor: every customer starts a walk of its own\nWITH RECURSIVE below AS (\n    SELECT customer_id AS ancestor_id, customer_id, 0 AS depth\n    FROM customers",
-        "lang": "sql"
-      },
-      {
-        "say": "The recursive term steps down one level and copies `ancestor_id` unchanged, the way the path was carried in the third section. Each result row now says \"this customer is below that ancestor, at this depth\". There is one row per (ancestor, descendant) pair, plus the 13 depth-0 rows: 26 rows in all.",
-        "code": "-- 2. recursive term: one level down, same ancestor\n  UNION ALL\n    SELECT b.ancestor_id, c.customer_id, b.depth + 1\n    FROM customers c\n    JOIN below b ON c.referred_by = b.customer_id\n)",
-        "lang": "sql"
-      },
-      {
-        "say": "The recursive term cannot aggregate, so count in the main query, after the loop. FILTER (lesson 4) splits one group into the whole downline and the direct referrals, and HAVING drops customers who referred nobody.",
-        "code": "-- 3. aggregate after the loop\nSELECT b.ancestor_id, cu.full_name,\n       count(*) FILTER (WHERE b.depth > 0) AS downline,\n       count(*) FILTER (WHERE b.depth = 1) AS direct,\n       max(b.depth)                        AS levels\nFROM below b\nJOIN customers cu ON cu.customer_id = b.ancestor_id\nGROUP BY b.ancestor_id, cu.full_name\nHAVING count(*) FILTER (WHERE b.depth > 0) > 0\nORDER BY downline DESC, b.ancestor_id;",
-        "lang": "sql"
-      },
-      {
-        "say": "Check it against the forest. Asha has 4 below her (3, 5, 6, 10), two of them direct. Ben has 3 in a chain three levels deep. Daniel, in the middle of Ben's chain, has 2. Seven customers referred someone, which matches the seed's facts: everyone except 6, 9, 10, 11, 12 and 13.",
-        "code": "--  ancestor_id |   full_name   | downline | direct | levels\n-- -------------+---------------+----------+--------+--------\n--            1 | Asha Rao      |        4 |      2 |      2\n--            2 | Ben Carter    |        3 |      1 |      3\n--            4 | Daniel Kim    |        2 |      1 |      2\n--            3 | Chloe Martin  |        1 |      1 |      1\n--            5 | Elena Petrova |        1 |      1 |      1\n--            7 | Grace Lee     |        1 |      1 |      1\n--            8 | Hugo Silva    |        1 |      1 |      1",
-        "lang": "sql"
-      }
+  "answer": 1,
+  "why": "OVER turns sum into a window function. PostgreSQL computes it for each row, over the rows that share that row's merchant_id, and keeps every row, so 30 rows come back and each shows its merchant's total. The GROUP BY rule from lesson 4 does not apply, because nothing is folded: each output row is still one payment with one payment_id."
+ },
+ "sections": [
+  {
+   "h": "GROUP BY folds rows away, and a window keeps them",
+   "body": "Finance wants every March payment on one screen, next to its merchant's March total and the payment's share of that total. The rows must stay, and each row needs a number computed from other rows.\n\nLesson 4's tool for \"a number from many rows\" is GROUP BY, and it folds each group into one row. `GROUP BY merchant_id` turns the eight succeeded March payments into four rows, one per merchant. Add `payment_id` to the SELECT list and PostgreSQL refuses: `column \"payments.payment_id\" must appear in the GROUP BY clause or be used in an aggregate function`. The error is fair. After grouping, a row stands for a whole merchant, so there is no single payment_id to print.\n\nYou could compute the totals in a derived table and join them back to the payments, as lesson 5 did for merchant averages. It works, but you write the grouping twice, once to fold and once to join back. It also gets clumsy for the next questions in this lesson: what place is this payment, and what was the payment before it on the same card?\n\nA **window function** answers them without folding anything. Write `OVER` after an aggregate:\n\n```sql\nSELECT payment_id, merchant_id, amount_minor,\n       sum(amount_minor) OVER (PARTITION BY merchant_id) AS merchant_total\nFROM payments\nWHERE status = 'succeeded'\n  AND created_at >= '2026-03-01' AND created_at < '2026-04-01';\n```\n\nFor each row, PostgreSQL takes a set of related rows, called the row's **window**, computes the function over that set, and puts the result in a new column of the current row. `PARTITION BY merchant_id` says which rows are related: the rows with the same merchant_id. Each such set is a **partition**. Payment 17's window is merchant 4's partition, payments 17, 18 and 19, so its merchant_total is 56997. Payments 18 and 19 have the same window and get the same total. Eight rows go in and eight rows come out.\n\nIn Kotlin, GROUP BY is `groupBy` and then a fold. A window is `groupBy` used as a lookup while you map over the original list:\n\n```kotlin\nval byMerchant = march.groupBy { it.merchantId }          // the partitions\nval rows = march.map { p ->                                // every row stays\n    Row(p.paymentId, p.amountMinor, byMerchant.getValue(p.merchantId).sumOf { it.amountMinor })\n}\n```\n\nThat is the picture for the whole lesson: **for every row, a window of related rows; the function reads the window; the row stays.** `OVER ()` with nothing inside makes the whole result one partition, so `sum(amount_minor) OVER ()` puts the month's total, 211132, on every row. The stepper runs the query, and its last frame shows the one change that turns a total into a running total.",
+   "stepper": {
+    "title": "A window for every row, and every row stays",
+    "intro": "Click Next to run `sum(amount_minor) OVER (PARTITION BY merchant_id)` on the eight succeeded March payments.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"40\" y=\"102\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"118.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"118.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"118.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"130\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"146.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"146.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"146.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"40\" y=\"158\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"174.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"174.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"174.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"186\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"202.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"202.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"202.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"214\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"230.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"230.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"230.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"242\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"258.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"258.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"258.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"270\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"286.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"286.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"286.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-m\" x=\"20\" y=\"350\" text-anchor=\"start\">Eight succeeded March payments. Nothing has run yet.</text></svg>",
+      "say": "The eight succeeded March payments. Lesson 4's stepper folded these same rows into four, one per merchant. This query asks for every payment with its merchant's total next to it."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"ln-d\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">PARTITION BY sorts the rows into partitions. Nothing is folded.</text></svg>",
+      "say": "`PARTITION BY merchant_id` sorts the rows so that each merchant's payments sit together. Each block is a **partition**. Unlike GROUP BY, nothing is folded: the eight rows are all still there."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"box-b\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"ln-d\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box-a\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box-a\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-a\" x=\"480\" y=\"92\" text-anchor=\"start\">current row: 14</text><text class=\"t-s\" x=\"480\" y=\"116\" text-anchor=\"start\">window: 14</text><text class=\"t-s t-a\" x=\"480\" y=\"140\" text-anchor=\"start\">sum = 5310</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">Row 14: its window is merchant 1's partition, one row.</text></svg>",
+      "say": "PostgreSQL walks the rows. For the current row, payment 14, the **window** is its partition: merchant 1 has only this one row. `sum` over the window is 5310, and it goes into a new column of row 14."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"box-b\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box-a\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box-a\" x=\"340\" y=\"112\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"128.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-a\" x=\"480\" y=\"92\" text-anchor=\"start\">current row: 17</text><text class=\"t-s\" x=\"480\" y=\"116\" text-anchor=\"start\">window: 17, 18, 19</text><text class=\"t-s t-a\" x=\"480\" y=\"140\" text-anchor=\"start\">sum = 56997</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">Row 17: its window is all of merchant 4's partition.</text></svg>",
+      "say": "Payment 17 belongs to merchant 4. Its window is the whole partition, payments 17, 18 and 19, so its total is 3 × 18999 = 56997."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"box-b\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"112\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"128.5\" text-anchor=\"middle\">56997</text><rect class=\"box-a\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box-a\" x=\"340\" y=\"140\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"156.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-a\" x=\"480\" y=\"92\" text-anchor=\"start\">current row: 18</text><text class=\"t-s\" x=\"480\" y=\"116\" text-anchor=\"start\">window: 17, 18, 19</text><text class=\"t-s t-a\" x=\"480\" y=\"140\" text-anchor=\"start\">sum = 56997</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">Row 18: the same window, so the same total. Row 17 keeps its value.</text></svg>",
+      "say": "Payment 18 has the same window, so it gets the same total. Row 17 did not go anywhere: a window function adds a column, it never removes a row."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"ln-d\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"box-b\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box-a\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box-a\" x=\"340\" y=\"206\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"222.5\" text-anchor=\"middle\">147500</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"112\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"128.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"140\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"156.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"168\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"184.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><text class=\"t-s t-a\" x=\"480\" y=\"92\" text-anchor=\"start\">current row: 13</text><text class=\"t-s\" x=\"480\" y=\"116\" text-anchor=\"start\">window: 13, 16, 22</text><text class=\"t-s t-a\" x=\"480\" y=\"140\" text-anchor=\"start\">sum = 147500</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">Row 13 starts merchant 5's partition: a new window.</text></svg>",
+      "say": "Payment 19 got 56997 too. Payment 13 is the first row of merchant 5's partition, so the window changes to payments 13, 16 and 22, and the total is 147500."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">merchant_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"ln-d\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"340\" y=\"206\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"222.5\" text-anchor=\"middle\">147500</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box\" x=\"340\" y=\"234\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"250.5\" text-anchor=\"middle\">147500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"112\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"128.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"140\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"156.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"168\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"184.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"340\" y=\"300\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><rect class=\"box\" x=\"340\" y=\"262\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"278.5\" text-anchor=\"middle\">147500</text><text class=\"t-s\" x=\"480\" y=\"92\" text-anchor=\"start\">8 rows in</text><text class=\"t-s t-ok\" x=\"480\" y=\"116\" text-anchor=\"start\">8 rows out</text><text class=\"t-s t-m\" x=\"480\" y=\"140\" text-anchor=\"start\">GROUP BY gave 4</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">Every row has its merchant's total, and every row is still there.</text></svg>",
+      "say": "Every row now carries its merchant's total: 8 rows in, 8 rows out. To get a share, divide `amount_minor` by that column; to rank, use a ranking function over the same window."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"sum over PARTITION BY merchant_id: each row gets its partition's total and every row stays\"><text class=\"t-s t-code\" x=\"20\" y=\"24\" text-anchor=\"start\">SELECT payment_id, merchant_id, amount_minor,</text><text class=\"t-s t-code t-a\" x=\"70\" y=\"40\" text-anchor=\"start\">sum(amount_minor) OVER (PARTITION BY merchant_id ORDER BY created_at)</text><text class=\"t-s t-m\" x=\"70\" y=\"62\" text-anchor=\"middle\">payment</text><text class=\"t-s t-m\" x=\"130\" y=\"62\" text-anchor=\"middle\">merchant</text><text class=\"t-s t-m\" x=\"194\" y=\"62\" text-anchor=\"middle\">amount</text><text class=\"t-s t-m\" x=\"395\" y=\"62\" text-anchor=\"middle\">running_total</text><rect class=\"ln-d\" x=\"32\" y=\"70\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"90.0\" text-anchor=\"start\">merchant 1</text><rect class=\"ln-d\" x=\"32\" y=\"108\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"156.0\" text-anchor=\"start\">merchant 4</text><rect class=\"box-b\" x=\"32\" y=\"202\" width=\"206\" height=\"60\" rx=\"8\"/><rect class=\"ln-d\" x=\"32\" y=\"202\" width=\"206\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"250.0\" text-anchor=\"start\">merchant 5</text><rect class=\"ln-d\" x=\"32\" y=\"296\" width=\"206\" height=\"32\" rx=\"8\"/><text class=\"t-s t-m\" x=\"248\" y=\"316.0\" text-anchor=\"start\">merchant 7</text><rect class=\"box\" x=\"40\" y=\"206\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"222.5\" text-anchor=\"middle\">13</text><text class=\"t-s t-code\" x=\"130\" y=\"222.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"340\" y=\"206\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"222.5\" text-anchor=\"middle\">64000</text><rect class=\"box\" x=\"40\" y=\"74\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"90.5\" text-anchor=\"middle\">14</text><text class=\"t-s t-code\" x=\"130\" y=\"90.5\" text-anchor=\"middle\">m1</text><text class=\"t-s t-code\" x=\"194\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box\" x=\"340\" y=\"74\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"90.5\" text-anchor=\"middle\">5310</text><rect class=\"box-a\" x=\"40\" y=\"234\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"250.5\" text-anchor=\"middle\">16</text><text class=\"t-s t-code\" x=\"130\" y=\"250.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"250.5\" text-anchor=\"middle\">31500</text><rect class=\"box-a\" x=\"340\" y=\"234\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"250.5\" text-anchor=\"middle\">95500</text><rect class=\"box\" x=\"40\" y=\"112\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"128.5\" text-anchor=\"middle\">17</text><text class=\"t-s t-code\" x=\"130\" y=\"128.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"112\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"128.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"40\" y=\"140\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"156.5\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"130\" y=\"156.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"156.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"140\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"156.5\" text-anchor=\"middle\">37998</text><rect class=\"box\" x=\"40\" y=\"168\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"184.5\" text-anchor=\"middle\">19</text><text class=\"t-s t-code\" x=\"130\" y=\"184.5\" text-anchor=\"middle\">m4</text><text class=\"t-s t-code\" x=\"194\" y=\"184.5\" text-anchor=\"middle\">18999</text><rect class=\"box\" x=\"340\" y=\"168\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"184.5\" text-anchor=\"middle\">56997</text><rect class=\"box\" x=\"40\" y=\"300\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"316.5\" text-anchor=\"middle\">21</text><text class=\"t-s t-code\" x=\"130\" y=\"316.5\" text-anchor=\"middle\">m7</text><text class=\"t-s t-code\" x=\"194\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"340\" y=\"300\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"395\" y=\"316.5\" text-anchor=\"middle\">1325</text><rect class=\"box\" x=\"40\" y=\"262\" width=\"190\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"70\" y=\"278.5\" text-anchor=\"middle\">22</text><text class=\"t-s t-code\" x=\"130\" y=\"278.5\" text-anchor=\"middle\">m5</text><text class=\"t-s t-code\" x=\"194\" y=\"278.5\" text-anchor=\"middle\">52000</text><rect class=\"box\" x=\"340\" y=\"262\" width=\"110\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"395\" y=\"278.5\" text-anchor=\"middle\">147500</text><text class=\"t-s t-a\" x=\"480\" y=\"92\" text-anchor=\"start\">current row: 16</text><text class=\"t-s\" x=\"480\" y=\"116\" text-anchor=\"start\">window: 13, 16</text><text class=\"t-s t-a\" x=\"480\" y=\"140\" text-anchor=\"start\">sum = 95500</text><text class=\"t-s t-a\" x=\"20\" y=\"350\" text-anchor=\"start\">With ORDER BY, row 16's window ends at row 16: a running total.</text></svg>",
+      "say": "Add `ORDER BY created_at` inside OVER and each row's window stops at the current row. Row 16's window is now 13 and 16 only, so it shows 95500, and payment 22 shows 147500. That is a running total, the subject of the fourth section."
+     }
     ]
-  },
-  "lab": {
-    "title": "A forest of any depth, a money graph with cycles, and a calendar",
-    "minutes": 15,
-    "needs": [
-      "Docker"
-    ],
-    "files": [
-      "labs/sql/src/main/resources/sfz/sql/l06/referral_tree.sql",
-      "labs/sql/src/main/resources/sfz/sql/l06/money_reach.sql",
-      "labs/sql/src/main/resources/sfz/sql/l06/daily_volume_march.sql"
-    ],
-    "run": "./gradlew :sql:test --tests 'sfz.sql.l06.*'",
+   },
+   "try": {
+    "title": "Totals next to the rows",
+    "minutes": 4,
     "steps": [
-      "With Docker running, run the tests from the `labs` folder. All six fail. The tests cancel any statement after 10 seconds, so a loop that never ends fails its test instead of hanging.",
-      "`referral_tree.sql` stops after one self join. Rewrite it with WITH RECURSIVE so it returns every customer with `root_id`, `depth` and `path`, in path order.",
-      "`money_reach.sql` walks the money graph from account 106 with a depth cap that hides the cycles. Remove the cap, make the recursion stop on its own, and return each reachable account once with its fewest hops.",
-      "`daily_volume_march.sql` misses quiet days. Generate the 31 days, then LEFT JOIN the succeeded payments to them.",
-      "Run the tests until all six pass. Each exercise has a second test that adds rows first (a deeper chain, a new transfer, payments on the edges of a day)."
+     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+     "Run the first query. Check that 8 rows come back and that the three Volt Electronics payments (merchant 4) share one total.",
+     "Run the second query, which uses `OVER ()`. Predict the number on every row before you run it.",
+     "Rewrite the second query as `SELECT merchant_id, sum(amount_minor) ... GROUP BY merchant_id` (drop `payment_id`). How many rows now?"
     ],
-    "hints": [
-      "Carry `root_id` down unchanged in the recursive term, as the worked example carries `ancestor_id`: the anchor sets it to the root's own id.",
-      "Add `CYCLE account_id SET is_cycle USING path` after the `reach` CTE's closing parenthesis. Then filter `NOT is_cycle` and `account_id <> 106`, and `GROUP BY account_id` with `min(hops)`.",
-      "Count `p.payment_id`, not `*`, and put `p.status = 'succeeded'` in the ON clause. A day is `p.created_at >= d.day AND p.created_at < d.day + 1`."
-    ],
-    "done_when": "All six tests in `RecursiveCteTest` pass."
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, merchant_id, amount_minor,\n       sum(amount_minor) OVER (PARTITION BY merchant_id) AS merchant_total,\n       round(100.0 * amount_minor / sum(amount_minor) OVER (PARTITION BY merchant_id), 1) AS pct\nFROM payments\nWHERE status = 'succeeded'\n  AND created_at >= '2026-03-01' AND created_at < '2026-04-01'\nORDER BY merchant_id, payment_id;\n\nSELECT payment_id, merchant_id, amount_minor,\n       sum(amount_minor) OVER () AS month_total\nFROM payments\nWHERE status = 'succeeded'\n  AND created_at >= '2026-03-01' AND created_at < '2026-04-01'\nORDER BY merchant_id, payment_id;"
+    },
+    "expect": "The first query keeps all eight rows:\n\n```postgresql\n payment_id | merchant_id | amount_minor | merchant_total |  pct\n------------+-------------+--------------+----------------+-------\n         14 |           1 |         5310 |           5310 | 100.0\n         17 |           4 |        18999 |          56997 |  33.3\n         18 |           4 |        18999 |          56997 |  33.3\n         19 |           4 |        18999 |          56997 |  33.3\n         13 |           5 |        64000 |         147500 |  43.4\n         16 |           5 |        31500 |         147500 |  21.4\n         22 |           5 |        52000 |         147500 |  35.3\n         21 |           7 |         1325 |           1325 | 100.0\n(8 rows)\n```\n\nThe second shows 211132 on all eight rows: one partition holding the whole month. The GROUP BY version returns 4 rows (5310, 56997, 147500 and 1325), with no payment left to look at."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Window functions (tutorial)",
+     "url": "https://www.postgresql.org/docs/18/tutorial-window.html",
+     "kind": "docs"
+    }
+   ]
   },
-  "drill": {
-    "title": "A cycle-safe tree walk from memory",
+  {
+   "h": "ORDER BY inside OVER numbers the rows, and ties need a rule",
+   "body": "Risk asks for each succeeded payment's place by amount over the half-year. A place depends on how many rows sort ahead of this one. You could `ORDER BY amount_minor DESC` and count rows in Kotlin, but then the numbers exist only in the JVM, and SQL cannot filter or join on them.\n\nPut the ORDER BY inside OVER instead. It sorts the rows of each window, and a ranking function reports where the current row falls in that order:\n\n```sql\nSELECT payment_id, amount_minor,\n       row_number() OVER (ORDER BY amount_minor DESC) AS row_number,\n       rank()       OVER (ORDER BY amount_minor DESC) AS rank,\n       dense_rank() OVER (ORDER BY amount_minor DESC) AS dense_rank\nFROM payments\nWHERE status = 'succeeded';\n```\n\nThere is no PARTITION BY, so all 30 payments share one window. The first ten places are easy: 129900 is 1st, 99000 is 2nd. Then payments 17, 18 and 19 all have 18999, and the three functions disagree:\n\n| payment | amount_minor | row_number | rank | dense_rank |\n|---|---|---|---|---|\n| 28 | 23450 | 10 | 10 | 10 |\n| 17, 18, 19 | 18999 | 11, 12, 13 in some order | 11, 11, 11 | 11, 11, 11 |\n| 7 | 6120 | 14 | 14 | 12 |\n\nRows that sort as equal on the window's ORDER BY are **peers**. `row_number()` ignores peers and counts 1, 2, 3, so it must break the tie, and it breaks it in whatever order the rows reached the sort. In the run shown in the Try it, payment 19 got 11. Nothing promises it will next time. `rank()` gives peers the same number and then skips, the way a race is scored: three runners share 11th, and the next one is 14th. `dense_rank()` gives peers the same number without skipping, so it counts distinct amounts: 6120 is the 12th distinct amount.\n\nPick by the question. Exactly one row per position (a page of results, the newest row per key) is row_number, and then end its ORDER BY with a unique column, `ORDER BY amount_minor DESC, payment_id`, so the numbers stop moving. Places where ties share is rank. The n-th largest distinct value is dense_rank.\n\nAdd PARTITION BY and the numbering starts again in every partition. With `rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC)`, the 5.50 ride is first at Metro Transit (merchant 3), and its three 2.75 rides share second place. In Kotlin, row_number over one partition is `sortedByDescending { it.amountMinor }.mapIndexed { i, p -> i + 1 to p }`.",
+   "try": {
+    "title": "Three ways to number a tie",
+    "minutes": 4,
+    "steps": [
+     "Run the first query and find payments 17, 18 and 19. Compare the three columns, then look at the row after them.",
+     "Run it again a few times. On a table this small row_number usually comes out the same, but nothing guarantees it: another plan, or an UPDATE that moves a row on disk, can change it.",
+     "Run the second query: places inside merchants 3 and 4. Where does the tie fall in each?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, amount_minor,\n       row_number() OVER (ORDER BY amount_minor DESC) AS row_number,\n       rank()       OVER (ORDER BY amount_minor DESC) AS rank,\n       dense_rank() OVER (ORDER BY amount_minor DESC) AS dense_rank\nFROM payments\nWHERE status = 'succeeded'\nORDER BY amount_minor DESC, payment_id\nLIMIT 14;\n\nSELECT merchant_id, payment_id, amount_minor,\n       rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) AS place\nFROM payments\nWHERE status = 'succeeded' AND merchant_id IN (3, 4)\nORDER BY merchant_id, place, payment_id;"
+    },
+    "expect": "The first query (trimmed to the rows around the tie; your row_number for 17, 18 and 19 may be in another order):\n\n```postgresql\n payment_id | amount_minor | row_number | rank | dense_rank\n------------+--------------+------------+------+------------\n         28 |        23450 |         10 |   10 |         10\n         17 |        18999 |         12 |   11 |         11\n         18 |        18999 |         13 |   11 |         11\n         19 |        18999 |         11 |   11 |         11\n          7 |         6120 |         14 |   14 |         12\n```\n\nInside merchants:\n\n```postgresql\n merchant_id | payment_id | amount_minor | place\n-------------+------------+--------------+-------\n           3 |         32 |          550 |     1\n           3 |          4 |          275 |     2\n           3 |          9 |          275 |     2\n           3 |         26 |          275 |     2\n           4 |          3 |       129900 |     1\n           4 |         31 |        75000 |     2\n           4 |          8 |        54999 |     3\n           4 |         28 |        23450 |     4\n           4 |         17 |        18999 |     5\n           4 |         18 |        18999 |     5\n           4 |         19 |        18999 |     5\n(11 rows)\n```\n\nThe numbering restarts at 1 for merchant 4. Metro Transit's tie is right below first place; Volt's is at the bottom."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Window functions (row_number, rank, dense_rank)",
+     "url": "https://www.postgresql.org/docs/18/functions-window.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "LAG reads the row before, inside the same partition",
+   "body": "Farid has complained to support. He paid Volt Electronics 189.99 and was charged twice, two minutes apart: payments 17 and 18. Before refunding him, support wants every case like it: a succeeded payment with the same card, merchant and amount as one made at most five minutes before it.\n\nThe question compares each payment with the one before it. Lesson 3's self join can do that: join payments to itself on card, merchant and amount, where the second was created up to five minutes after the first. But a self join pairs every row with every matching row. Three identical charges in five minutes give three pairs (1 and 2, 1 and 3, 2 and 3), and you want two: each charge with the one just before it.\n\n`lag(x)` returns the value of x from the row before the current row, in the window's order. `lead(x)` returns it from the row after. Both return NULL when there is no such row, and `lag(x, 2)` looks two rows back.\n\n```sql\nSELECT payment_id, created_at,\n       lag(payment_id) OVER w AS prev_id,\n       created_at - lag(created_at) OVER w AS since_prev\nFROM payments\nWHERE status = 'succeeded'\nWINDOW w AS (PARTITION BY card_id, merchant_id, amount_minor ORDER BY created_at);\n```\n\nThe WINDOW clause at the end names a window definition once, so several calls can share it with `OVER w`. The partition is the whole definition of \"the same charge\": one card, one merchant, one amount. Inside it the rows are in time order, so each row's previous row is the same charge made just before. Payment 18's prev_id is 17, and its since_prev is `00:02:10`. Every other payment is alone in its partition, or first in it, and gets NULL.\n\nThe partition is where this query goes wrong. Drop card_id and the window means \"same merchant, same amount\". Payment 19 is Chloe's own 189.99 purchase at Volt, three days later, and it now has 18 as its previous row. The five-minute check saves you at Volt. It would not save you at Metro Transit, where every ride costs 2.75 and two different riders tap in a minute apart all day long. Say what \"the same\" means in words first, then put exactly those columns in PARTITION BY.\n\nKotlin has the same move: `zipWithNext()` on each group's sorted list pairs every element with the next one. To keep only the pairs at most five minutes apart, you need to filter on a window's result, and the last section shows why that takes one more query level.",
+   "try": {
+    "title": "Find the double charge",
+    "minutes": 4,
+    "steps": [
+     "Run the first query. It looks at merchant 4 only, to keep the output short. Find the one row with a prev_id.",
+     "Run the second query, whose window forgot card_id. Which row now has a previous charge, and why is it not a duplicate?",
+     "In the first query, change `lag` to `lead` in both places. Which row now has a value, and what does it point to?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, card_id, amount_minor, created_at,\n       lag(payment_id) OVER w AS prev_id,\n       created_at - lag(created_at) OVER w AS since_prev\nFROM payments\nWHERE status = 'succeeded' AND merchant_id = 4\nWINDOW w AS (PARTITION BY card_id, merchant_id, amount_minor ORDER BY created_at)\nORDER BY created_at;\n\nSELECT payment_id, card_id, amount_minor, created_at,\n       lag(payment_id) OVER w AS prev_id,\n       created_at - lag(created_at) OVER w AS since_prev\nFROM payments\nWHERE status = 'succeeded' AND merchant_id = 4\nWINDOW w AS (PARTITION BY merchant_id, amount_minor ORDER BY created_at)\nORDER BY created_at;"
+    },
+    "expect": "With the card in the partition, only payment 18 has a previous charge:\n\n```postgresql\n payment_id | card_id | amount_minor |       created_at       | prev_id | since_prev\n------------+---------+--------------+------------------------+---------+------------\n          3 |       6 |       129900 | 2026-01-09 17:45:00+00 |         |\n          8 |       3 |        54999 | 2026-02-07 15:20:00+00 |         |\n         17 |       8 |        18999 | 2026-03-12 16:40:00+00 |         |\n         18 |       8 |        18999 | 2026-03-12 16:42:10+00 |      17 | 00:02:10\n         19 |       4 |        18999 | 2026-03-15 21:00:00+00 |         |\n         28 |       7 |        23450 | 2026-04-27 17:30:00+00 |         |\n         31 |      13 |        75000 | 2026-05-16 15:55:00+00 |         |\n(7 rows)\n```\n\nWithout card_id, payment 19 (card 4) gets prev_id 18 and since_prev `3 days 04:17:50`: a different customer's purchase. With `lead`, payment 17 points forward to 18, its since_prev turns into `-00:02:10` because the other row is later, and every other row is empty."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Window functions (lag, lead)",
+     "url": "https://www.postgresql.org/docs/18/functions-window.html",
+     "kind": "docs"
+    },
+    {
+     "title": "PostgreSQL 18: SELECT, the WINDOW clause",
+     "url": "https://www.postgresql.org/docs/18/sql-select.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "A running total is a sum whose window ends at the current row",
+   "body": "Farid's statement should show his balance after every entry, so he can see the duplicate charge and the refund that undid it. Lesson 2 kept `accounts.balance_minor` as a cached sum of the ledger: 29281 for his account 106. That is only the last line of the statement. Every earlier line needs the sum of the entries up to that line.\n\nA correlated subquery (lesson 5) can compute each line: for every entry, add up the account's entries created up to and including it. It is correct, and it starts adding from the first entry again for every line. An account with 1,000 entries costs about 500,000 additions to print 1,000 numbers.\n\nAdd ORDER BY to a sum's window, and the window changes shape:\n\n```sql\nSELECT entry_id, entry_type, amount_minor, created_at,\n       sum(amount_minor) OVER (ORDER BY created_at, entry_id) AS balance_minor\nFROM ledger_entries\nWHERE account_id = 106;\n```\n\nWithout ORDER BY, a row's window is its whole partition, and every row shows the same total. With ORDER BY, the window runs from the first row of the partition up to the current row. PostgreSQL sorts the rows once and walks down them, carrying the sum from one row to the next: one addition per row. In Kotlin it is `runningFold`:\n\n```kotlin\nentries.sortedWith(compareBy({ it.createdAt }, { it.entryId }))\n    .runningFold(0L) { balance, e -> balance + e.amountMinor }\n    .drop(1)                                   // runningFold starts with the initial 0\n```\n\nFarid's statement reads 50000 after his deposit, 31001 after payment 17, 12002 after the duplicate, 31001 again after the refund, and 29281 after his last purchase. The last line equals the cached balance, which makes a cheap check that the cache and the ledger agree. For a statement of every account at once, add `PARTITION BY account_id`, and the running sum starts again at each account.\n\nThe same works for the other aggregates: `count(*)` with ORDER BY is a running count, `avg` a running average, `max` the largest so far.\n\nThe set of rows a window function actually adds up is called its **frame**, and frames are the subject of lesson 7. One rule from it now: end the window's ORDER BY with a unique column, as `entry_id` here. Several entries can share a created_at, and with `ORDER BY created_at` alone PostgreSQL adds tied rows to the sum in one step, so they all show the same balance. Lesson 7 shows exactly that happening to the clearing account.",
+   "try": {
+    "title": "Farid's statement",
+    "minutes": 3,
+    "steps": [
+     "Run the first query. Find the duplicate charge and the refund in the running balance.",
+     "Compare the last balance with the second query, the cached balance.",
+     "Run the third query, the same sum without ORDER BY inside OVER. What does every row show, and why?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT entry_id, entry_type, payment_id, amount_minor, created_at,\n       sum(amount_minor) OVER (ORDER BY created_at, entry_id) AS balance_minor\nFROM ledger_entries\nWHERE account_id = 106\nORDER BY created_at, entry_id;\n\nSELECT balance_minor FROM accounts WHERE account_id = 106;\n\nSELECT entry_id, amount_minor,\n       sum(amount_minor) OVER () AS balance_minor\nFROM ledger_entries\nWHERE account_id = 106\nORDER BY created_at, entry_id;"
+    },
+    "expect": "```postgresql\n entry_id | entry_type | payment_id | amount_minor |       created_at       | balance_minor\n----------+------------+------------+--------------+------------------------+---------------\n       15 | deposit    |            |        50000 | 2026-01-10 09:00:00+00 |         50000\n       57 | payment    |         17 |       -18999 | 2026-03-12 16:40:00+00 |         31001\n       59 | payment    |         18 |       -18999 | 2026-03-12 16:42:10+00 |         12002\n       62 | refund     |         18 |        18999 | 2026-03-13 10:00:00+00 |         31001\n       97 | payment    |         33 |        -1720 | 2026-05-28 12:40:00+00 |         29281\n(5 rows)\n```\n\nThe cached balance is 29281, the same as the last line. Without ORDER BY, every row shows 29281: the window is the whole partition, so each row gets the account's total."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: Window function calls",
+     "url": "https://www.postgresql.org/docs/18/sql-expressions.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Windows run after WHERE and GROUP BY, so filter them one level up",
+   "body": "To finish the duplicate detector you need to keep only the rows whose since_prev is at most five minutes. The obvious place for that is WHERE, and PostgreSQL refuses any window function there:\n\n```postgresql\ncourse=# SELECT payment_id, merchant_id, amount_minor\ncourse-# FROM payments\ncourse-# WHERE status = 'succeeded'\ncourse-#   AND rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) = 1;\nERROR:  window functions are not allowed in WHERE\n```\n\nLesson 1's logical order explains why: FROM, then WHERE, then GROUP BY and HAVING, then the select list, then DISTINCT, ORDER BY and LIMIT. Window functions are computed in the select-list step, after WHERE, GROUP BY and HAVING have finished. While WHERE runs, no rank exists yet.\n\nSo compute the window in a subquery or a CTE (lesson 5), and filter in the query around it:\n\n```sql\nSELECT merchant_id, payment_id, amount_minor\nFROM (SELECT payment_id, merchant_id, amount_minor,\n             rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place = 1;\n```\n\nThe two WHEREs do different jobs. The inner one runs before the window and decides which rows the window sees: failed payments never get a place, and in the duplicate detector a failed attempt between 17 and 18 can never become \"the previous charge\". The outer one runs after the window and filters on its result. Oracle AI Database 26ai added a QUALIFY clause that does the outer filter without the extra level. PostgreSQL 18 has no QUALIFY, so you write the subquery.\n\nThe same order lets a window sit on top of a GROUP BY. By the time windows run, each group is one row, and its aggregates are ordinary values:\n\n```sql\nSELECT date_trunc('month', created_at)::date AS month,\n       sum(amount_minor) AS volume,\n       sum(sum(amount_minor)) OVER (ORDER BY date_trunc('month', created_at)) AS year_to_date\nFROM payments\nWHERE status = 'succeeded'\nGROUP BY date_trunc('month', created_at);\n```\n\n`sum(sum(...))` looks odd until you read it inside out. The inner sum is the GROUP BY aggregate, one value per month. The outer sum is a window over those six month rows. The last row shows 720455, the half-year total from lesson 4.\n\nA window costs a sort. PostgreSQL has to bring each partition's rows together, in window order, before it can walk them, and nothing is folded away, so every row goes through that sort. On the large data set, ranking each merchant's payments sorts all 1,000,478 rows and writes 33 MB of the sort to disk. A GROUP BY over the same column keeps 2,500 running totals in a hash table instead, and is several times faster.",
+   "try": {
+    "title": "Filter a window one level up",
     "minutes": 5,
-    "prompt": "Without looking, write a recursive CTE that lists everyone below Ben (customer 2) with their depth and their path of ids, protected against cycles with a path check (no CYCLE clause), sorted depth first. Then name the round in which it stops on the seed data, and why.",
-    "answer": {
-      "lang": "sql",
-      "src": "WITH RECURSIVE downline AS (\n    SELECT customer_id, 0 AS depth, ARRAY[customer_id] AS path   -- anchor: Ben\n    FROM customers\n    WHERE customer_id = 2\n  UNION ALL\n    SELECT c.customer_id, d.depth + 1, d.path || c.customer_id    -- one level down\n    FROM customers c\n    JOIN downline d ON c.referred_by = d.customer_id\n    WHERE c.customer_id <> ALL (d.path)                           -- never revisit a node on this path\n)\nSELECT customer_id, depth, path\nFROM downline\nWHERE depth > 0\nORDER BY path;\n-- 4 {2,4}, 8 {2,4,8}, 13 {2,4,8,13}.\n-- Round 4 starts from {13}, finds nobody with referred_by = 13, and is empty: the loop stops."
+    "steps": [
+     "Run the first query and read the error.",
+     "Run the second: each merchant's largest payment. Two merchants are missing. Why?",
+     "Run the third: monthly volume with a running total over the grouped rows.",
+     "Optional, with the large data set loaded (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute; skip this if an earlier lesson loaded it): run the two EXPLAINs. Compare the Sort in the window plan with the HashAggregate in the GROUP BY plan."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\n  AND rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) = 1;\n\nSELECT merchant_id, payment_id, amount_minor\nFROM (SELECT payment_id, merchant_id, amount_minor,\n             rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) AS place\n      FROM payments\n      WHERE status = 'succeeded') AS ranked\nWHERE place = 1\nORDER BY merchant_id;\n\nSELECT date_trunc('month', created_at)::date AS month,\n       sum(amount_minor) AS volume,\n       sum(sum(amount_minor)) OVER (ORDER BY date_trunc('month', created_at)) AS year_to_date\nFROM payments\nWHERE status = 'succeeded'\nGROUP BY date_trunc('month', created_at)\nORDER BY month;\n\nSET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT payment_id, merchant_id, amount_minor,\n       rank() OVER (PARTITION BY merchant_id ORDER BY amount_minor DESC) AS place\nFROM payments;\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT merchant_id, count(*), sum(amount_minor)\nFROM payments\nGROUP BY merchant_id;\nRESET search_path;"
+    },
+    "expect": "`ERROR:  window functions are not allowed in WHERE`. The subquery version returns six rows, one per merchant with payments: 7 (6120), 25 (2275), 32 (550), 3 (129900), 23 (99000) and 33 (1720). Merchants 6 and 8 have no payments, so they have no rows to rank. The running total:\n\n```postgresql\n   month    | volume | year_to_date\n------------+--------+--------------\n 2026-01-01 | 184315 |       184315\n 2026-02-01 |  65344 |       249659\n 2026-03-01 | 211132 |       460791\n 2026-04-01 | 128880 |       589671\n 2026-05-01 |  83909 |       673580\n 2026-06-01 |  46875 |       720455\n(6 rows)\n```\n\nOn the large data set (plans trimmed; times vary with the machine and with what else Docker is running):\n\n```postgresql\n WindowAgg (actual time=1123.027..1893.087 rows=1000478.00 loops=1)\n   Window: w1 AS (PARTITION BY merchant_id ORDER BY amount_minor ROWS UNBOUNDED PRECEDING)\n   ->  Sort (actual time=1122.966..1275.763 rows=1000478.00 loops=1)\n         Sort Key: merchant_id, amount_minor DESC\n         Sort Method: external merge  Disk: 33312kB\n         ->  Seq Scan on payments (actual time=5.559..218.332 rows=1000478.00 loops=1)\n Execution Time: 1966.789 ms\n\n Finalize GroupAggregate (actual time=574.582..591.029 rows=2500.00 loops=1)\n   ->  Gather Merge (actual time=574.554..585.527 rows=7500.00 loops=1)\n         Workers Launched: 2\n         ->  Sort (actual time=551.911..553.292 rows=2500.00 loops=3)\n               ->  Partial HashAggregate (actual time=548.976..550.568 rows=2500.00 loops=3)\n                     ->  Parallel Seq Scan on payments (actual time=0.535..184.838 rows=333492.67 loops=3)\n Execution Time: 591.278 ms\n```\n\nThe window plan sorts every row and returns every row: about 2 seconds here. `external merge  Disk` means the sort did not fit in `work_mem` (4 MB by default) and spilled to temporary files. The GROUP BY plan folds the rows into a hash table in three parallel processes and returns 2,500 rows, in about 0.2 to 0.6 seconds across my runs. EXPLAIN prints the frame as `ROWS UNBOUNDED PRECEDING` because rank does not depend on the frame, so PostgreSQL uses the cheapest one."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: SELECT, the order of processing",
+     "url": "https://www.postgresql.org/docs/18/sql-select.html",
+     "kind": "docs"
+    },
+    {
+     "title": "Oracle AI Database: new SQL features, including QUALIFY",
+     "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/nfcoa/appdev_sql.html",
+     "kind": "docs"
     }
+   ]
+  }
+ ],
+ "analogy": "A window function is a teacher marking exam papers with the whole class's pile beside her. For each paper she looks through the papers of the same class (the partition), writes something on this paper that needs the others, such as its position in the class or the score of the paper just above it, and puts it back. Every paper comes back, with one more number on it. GROUP BY is the head teacher who wants one line per class, the class average, and never sees a single paper again. The analogy breaks on cost: the teacher looks up what she needs paper by paper, while PostgreSQL first sorts the whole pile into class and score order, and that sort is most of the work.",
+ "in_your_world": "A lot of Kotlin post-processing is a window function in disguise. A settlement report that loads every payment into a `Map<Long, List<Payment>>` to compute each payment's share of its merchant's day is a PARTITION BY. A Kafka consumer that drops an authorization when it looks like the previous one for the card catches most retries, and a nightly LAG query over the same table finds the ones it let through. Customer statements with a balance on every line are running totals, and comparing the last line with `balance_minor` is a cheap invariant check for the ledger. In Oracle the same functions are called analytic functions, with the same OVER syntax; Oracle AI Database 26ai also has QUALIFY, so Oracle code you port may filter on a window result in one level where PostgreSQL needs a subquery.",
+ "mistake": "Using row_number() where rows can tie, and trusting the result. A top-10 job or a keep-the-newest-row dedupe written with `row_number() OVER (ORDER BY amount_minor DESC)` or `ORDER BY created_at DESC` passes every test, because the test data has no ties. In production two rows tie, and which one gets number 1 depends on the plan and on where the rows sit on disk, so the job keeps a different row on different days and nobody can reproduce yesterday's report. Decide what a tie means. If tied rows should share a place, use rank or dense_rank. If you need exactly one row, end the window's ORDER BY with a unique column, usually the primary key, so the order is total.",
+ "compare": {
+  "title": "Filtering on a window's result: Oracle QUALIFY and a PostgreSQL subquery",
+  "a": {
+   "label": "Oracle AI Database 26ai",
+   "lang": "sql",
+   "title": "Oracle 26ai, QUALIFY",
+   "src": "-- the same duplicate detector; QUALIFY filters after\n-- the analytic (window) functions are computed\nSELECT payment_id, card_id, created_at\nFROM payments\nWHERE status = 'succeeded'\nQUALIFY created_at - LAG(created_at) OVER (\n            PARTITION BY card_id, merchant_id, amount_minor\n            ORDER BY created_at) <= INTERVAL '5' MINUTE;"
   },
-  "recap": [
-    "A self join climbs one level per join, so it needs the depth in advance. A recursive CTE is the loop that does not.",
-    "WITH RECURSIVE: the anchor runs once, then the recursive term runs against the previous round's rows (the working table) until a round produces nothing.",
-    "Carry columns down the walk: depth + 1, a path array with `||`, a root id. Sort by the path, or use SEARCH DEPTH FIRST, to print trees in order.",
-    "PostgreSQL has no depth limit and does not detect cycles. Stop cycles with the CYCLE clause, a path check, or UNION on a node-only row.",
-    "Aggregate after the loop, never inside the recursive term. A recursive CTE can also generate rows, such as a calendar to LEFT JOIN facts onto."
-  ],
-  "quiz": [
-    {
-      "q": "Mateo (13) refers a new customer, Nia (14). Which part of the recursive downline query for Ben (2) must change to include her?",
-      "options": [
-        "Nothing: one more round finds her",
-        "The anchor, to start from 13",
-        "A fourth self join in the recursive term",
-        "The depth limit in the query"
-      ],
-      "answer": 0,
-      "why": "The recursive term finds the children of whatever the last round found, so the round that starts from {13} now finds Nia, and the round after that is empty. That is the point of the loop: the query does not encode the depth. A fixed chain of self joins would need a fourth join."
-    },
-    {
-      "q": "A recursive CTE has columns (account_id, hops) and uses UNION instead of UNION ALL. The account graph has a cycle. What happens?",
-      "options": [
-        "It stops: UNION removes repeated accounts",
-        "It raises a cycle error",
-        "It runs until a timeout: hops differs on every visit, so no row is a duplicate",
-        "It returns only the first round"
-      ],
-      "answer": 2,
-      "why": "UNION drops a new row only when the whole row equals an earlier one. Each lap around the cycle adds 1 to hops, so the rows are never equal and every round has new rows. UNION works as a visited set only when the row is just the node id. Use CYCLE or a path check, then min(hops) after the loop."
-    },
-    {
-      "q": "You walk up from a customer to the root of their referral tree. Which join belongs in the recursive term `FROM customers c JOIN up u ON ...`?",
-      "options": [
-        "`c.referred_by = u.customer_id`",
-        "`c.customer_id = u.referred_by`",
-        "`c.referred_by = u.referred_by`",
-        "`c.customer_id = u.customer_id`"
-      ],
-      "answer": 1,
-      "why": "Going up, the next row is the current row's referrer: the customer whose id equals the current row's referred_by. `c.referred_by = u.customer_id` walks down instead, to the children. The walk stops at the root, whose referred_by is NULL and matches nothing."
-    },
-    {
-      "q": "You want each root's total downline size. Where does `count(*)` go?",
-      "options": [
-        "In the recursive term, to count each round",
-        "In the anchor",
-        "In the main query after the CTE, grouped by a root id carried down the walk",
-        "Nowhere: recursive CTEs cannot be counted"
-      ],
-      "answer": 2,
-      "why": "The recursive term sees only one round, and PostgreSQL rejects aggregates there. Carry the root id down unchanged, then `GROUP BY root_id` in the main query, where all the rows exist."
-    },
-    {
-      "q": "Lesson 5 said PostgreSQL inlines a CTE that is referenced once and has no side effects. Is a recursive CTE referenced once inlined too?",
-      "options": [
-        "Yes, like any CTE referenced once",
-        "Only if it uses UNION ALL",
-        "Only with NOT MATERIALIZED",
-        "No: a recursive CTE is always computed on its own, round by round"
-      ],
-      "answer": 3,
-      "why": "Inlining applies only to non-recursive CTEs. A recursive CTE has to run its loop to produce rows, so the plan shows a `CTE` node with a Recursive Union and a WorkTable Scan, and the main query reads its result through a CTE Scan. A filter in the main query therefore does not cut the walk short; put it in the anchor or the recursive term.",
-      "from": "sql-05"
-    }
-  ],
-  "flashcards": [
-    {
-      "front": "What are the two parts of a recursive CTE?",
-      "back": "The anchor (runs once, starting rows) and the recursive term (refers to the CTE's own name), joined by UNION or UNION ALL."
-    },
-    {
-      "front": "What does the recursive term read when it mentions the CTE's name?",
-      "back": "Only the working table: the rows produced by the previous round, not the whole result."
-    },
-    {
-      "front": "When does a recursive CTE stop in PostgreSQL?",
-      "back": "When a round produces no rows. There is no depth limit."
-    },
-    {
-      "front": "How do you get depth-first order from a recursive CTE?",
-      "back": "Carry a path array (`path || id`) and ORDER BY path, or add `SEARCH DEPTH FIRST BY id SET ord` and ORDER BY ord."
-    },
-    {
-      "front": "What does `CYCLE id SET is_cycle USING path` do?",
-      "back": "Tracks the ids on each path, marks a row that revisits one with is_cycle = true, and does not follow it further."
-    },
-    {
-      "front": "When does UNION (not ALL) stop a cycle?",
-      "back": "Only when the rows contain just the node id, so a revisit is an exact duplicate. A depth or path column defeats it."
-    },
-    {
-      "front": "Can the recursive term use count(*)?",
-      "back": "No. Aggregate in the main query after the loop."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Tree and root",
-      "plain": "Rows linked by a parent pointer, each with at most one parent. A root has no parent."
-    },
-    {
-      "term": "Graph and cycle",
-      "plain": "Nodes joined by edges in any pattern. A cycle is a path of edges that returns to its start."
-    },
-    {
-      "term": "Anchor",
-      "plain": "The non-recursive first part of a recursive CTE. It runs once and produces the starting rows."
-    },
-    {
-      "term": "Recursive term",
-      "plain": "The part after UNION ALL that refers to the CTE itself and produces the next round of rows."
-    },
-    {
-      "term": "Working table",
-      "plain": "The rows produced by the latest round, which the next round of the recursive term reads."
-    },
-    {
-      "term": "Depth-first and breadth-first",
-      "plain": "Depth-first lists each node right after its parent; breadth-first lists all of one level before the next."
-    },
-    {
-      "term": "CYCLE clause",
-      "plain": "PostgreSQL 14+ syntax that tracks each path and stops following a row that revisits a node."
-    },
-    {
-      "term": "Path",
-      "plain": "The list of node ids from the start of the walk to the current row, carried down as an array."
-    }
-  ],
-  "explain_back": {
-    "prompt": "After a data import, the nightly job that computes each franchise's store hierarchy with a recursive CTE stopped finishing. Explain what most likely happened, why PostgreSQL did not stop on its own, and how you would make the query safe.",
-    "answer": "A recursive CTE stops only when a round produces no rows. The import most likely created a cycle, for example a region whose parent is one of its own stores, so every round keeps finding rows and the working table is never empty. PostgreSQL has no depth limit and does not look for cycles, and UNION ALL keeps every repeated row, so the job runs until a timeout or a full disk. To make it safe, add `CYCLE store_id SET is_cycle USING path` after the CTE (or carry a path array and skip ids already on it), filter `NOT is_cycle` in the main query, and give the job's role a `statement_timeout`. Then find the bad rows: the rows with `is_cycle` true name them. If the hierarchy must be a tree, also reject cycles when rows are written."
+  "b": {
+   "label": "PostgreSQL 18",
+   "lang": "sql",
+   "title": "PostgreSQL 18, a subquery",
+   "src": "-- no QUALIFY: compute the window one level down\nSELECT payment_id, card_id, created_at\nFROM (SELECT payment_id, card_id, created_at,\n             created_at - lag(created_at) OVER (\n                 PARTITION BY card_id, merchant_id, amount_minor\n                 ORDER BY created_at) AS since_prev\n      FROM payments\n      WHERE status = 'succeeded') AS s\nWHERE since_prev <= interval '5 minutes';"
   },
-  "deeper": {
-    "minutes": 8,
-    "body": "A recursive CTE recomputes the tree on every query. That is fine for a referral forest of 50,000 customers (about 40 ms), but if a hierarchy is read far more often than it changes, you can store it in a form that needs no recursion to read. Three classic designs:\n\n- An **adjacency list** is what `customers.referred_by` is: one parent pointer per row. Writes are trivial, and reads need recursion.\n- A **closure table** stores every (ancestor, descendant, depth) pair as a row. The worked example computed exactly that table, 26 rows for this forest. Reading a whole downline becomes `WHERE ancestor_id = 2`, an index lookup, but inserting a customer means inserting one row per ancestor, and moving a subtree touches many rows.\n- A **materialized path** stores the path in each row, like `{2,4,8,13}`, so \"everyone below 4\" is a prefix test. PostgreSQL ships the `ltree` extension for labelled paths of this kind, with GiST indexes for the prefix queries.\n\nThe CYCLE clause and the path array both keep a separate path per route, so they stop cycles but not repeated work. In the money graph, the walk from account 106 produced 12 rows for 6 accounts, because several routes reach the same account. In a dense graph the number of simple paths grows exponentially with the depth, and a walk that is safe from cycles can still take forever. Cap the depth as well (`WHERE r.hops < 6`) when you only care about nearby nodes, or use UNION with node-only rows to get a true visited set, and compute distances separately.\n\nFinally, a recursive CTE stores every round in its result before the main query reads it, so a walk that finds millions of rows spills its working storage to disk like any other large intermediate result. On the large data set, the forest walk kept its 50,000 rows in about 2.4 MB of memory (`Storage: Memory  Maximum Storage: 2419kB` on the Recursive Union)."
-  },
-  "sources": [
-    {
-      "title": "PostgreSQL 18 documentation: WITH queries (recursive queries, SEARCH, CYCLE)",
-      "url": "https://www.postgresql.org/docs/18/queries-with.html"
-    },
-    {
-      "title": "PostgreSQL 18 documentation: SELECT (WITH clause)",
-      "url": "https://www.postgresql.org/docs/18/sql-select.html"
-    },
-    {
-      "title": "PostgreSQL 18 documentation: Set returning functions",
-      "url": "https://www.postgresql.org/docs/18/functions-srf.html"
-    },
-    {
-      "title": "Oracle AI Database SQL Language Reference: Hierarchical queries",
-      "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/Hierarchical-Queries.html"
-    },
-    {
-      "title": "PostgreSQL 18 documentation: ltree",
-      "url": "https://www.postgresql.org/docs/18/ltree.html"
-    }
+  "note": "Both return payment 18. Oracle's documentation describes QUALIFY as relating to analytic functions the way HAVING relates to GROUP BY: a filter that runs after they are computed. It arrived in Oracle AI Database 26ai, so Oracle 19c code, like PostgreSQL 18 code, nests the query and filters outside. Everything inside OVER is the same in both: PARTITION BY, ORDER BY, LAG, RANK, DENSE_RANK and ROW_NUMBER. Old Oracle code often numbers rows with ROWNUM; that numbers the result before ORDER BY is applied, which is why `ROW_NUMBER() OVER (ORDER BY ...)` replaced it in most Oracle code. Time arithmetic is spelled differently: Oracle writes `INTERVAL '5' MINUTE`, PostgreSQL `interval '5 minutes'`."
+ },
+ "worked": {
+  "title": "Lesson 5's question again: payments above their merchant's average, in one pass",
+  "steps": [
+   {
+    "say": "Lesson 5 asked which succeeded payments are larger than their own merchant's average, and answered it twice: with a correlated subquery that recomputed the average for every payment, and with a join to a grouped derived table. A window puts each merchant's average on every one of its rows directly.",
+    "code": "-- 1. every payment, with its merchant's average beside it\nSELECT payment_id, merchant_id, amount_minor,\n       avg(amount_minor) OVER (PARTITION BY merchant_id) AS merchant_avg\nFROM payments\nWHERE status = 'succeeded'",
+    "lang": "sql"
+   },
+   {
+    "say": "The comparison needs the window's result, so it goes one level up. Compare with the exact average and round only for display, as lesson 5 did.",
+    "code": "-- 2. filter on the window's result in the outer query\nSELECT payment_id, merchant_id, amount_minor, round(merchant_avg) AS merchant_avg\nFROM (SELECT payment_id, merchant_id, amount_minor,\n             avg(amount_minor) OVER (PARTITION BY merchant_id) AS merchant_avg\n      FROM payments\n      WHERE status = 'succeeded') AS s\nWHERE amount_minor > merchant_avg\nORDER BY payment_id;",
+    "lang": "sql"
+   },
+   {
+    "say": "While the rows are there, the same partition answers two more questions: the payment's place within its merchant, and its share of the merchant's volume. A named window, `WINDOW m`, holds the partition once; `OVER (m ORDER BY ...)` adds an order to it for rank.",
+    "code": "-- 3. one partition definition, three window functions\nSELECT payment_id, merchant_id, amount_minor, round(merchant_avg) AS merchant_avg, place, pct\nFROM (SELECT payment_id, merchant_id, amount_minor,\n             avg(amount_minor) OVER m AS merchant_avg,\n             rank() OVER (m ORDER BY amount_minor DESC) AS place,\n             round(100.0 * amount_minor / sum(amount_minor) OVER m, 1) AS pct\n      FROM payments\n      WHERE status = 'succeeded'\n      WINDOW m AS (PARTITION BY merchant_id)) AS s\nWHERE amount_minor > merchant_avg\nORDER BY payment_id;",
+    "lang": "sql"
+   },
+   {
+    "say": "Check it against lesson 5: the same 12 payments with the same rounded averages (for example 48621 at Volt and 344 at Metro Transit). Payment 29 is above Northwind's average and only 4th by size there, because Northwind's payments are close together.",
+    "code": "--  payment_id | merchant_id | amount_minor | merchant_avg | place | pct\n-- ------------+-------------+--------------+--------------+-------+------\n--           3 |           4 |       129900 |        48621 |     1 | 38.2\n--           7 |           1 |         6120 |         4705 |     1 | 18.6\n--           8 |           4 |        54999 |        48621 |     3 | 16.2\n--          13 |           5 |        64000 |        55917 |     2 | 19.1\n--          14 |           1 |         5310 |         4705 |     3 | 16.1\n--          23 |           5 |        99000 |        55917 |     1 | 29.5\n--          25 |           2 |         2275 |         1935 |     1 | 39.2\n--          29 |           1 |         4999 |         4705 |     4 | 15.2\n--          31 |           4 |        75000 |        48621 |     2 | 22.0\n--          32 |           3 |          550 |          344 |     1 | 40.0\n--          33 |           7 |         1720 |         1498 |     1 | 38.3\n--          34 |           1 |         5875 |         4705 |     2 | 17.8\n-- (12 rows)",
+    "lang": "sql"
+   }
   ]
+ },
+ "lab": {
+  "title": "A leaderboard with ties, a double-charge detector and a running total per merchant",
+  "minutes": 15,
+  "needs": [
+   "Docker"
+  ],
+  "files": [
+   "labs/sql/src/main/resources/sfz/sql/l06/payment_places.sql",
+   "labs/sql/src/main/resources/sfz/sql/l06/duplicate_charges.sql",
+   "labs/sql/src/main/resources/sfz/sql/l06/merchant_running_volume.sql"
+  ],
+  "run": "./gradlew :sql:test --tests 'sfz.sql.l06.*'",
+  "steps": [
+   "With Docker running, run the tests from the `labs` folder. All six fail.",
+   "`payment_places.sql` numbers the rows one by one and stops at 12, so the three-way tie at 18999 is split and cut. Let tied payments share a place, and filter on the place one level up.",
+   "`duplicate_charges.sql` compares each payment with the previous one in a window that holds the wrong rows, and never checks the time. Fix the partition, then keep only repeats within 5 minutes.",
+   "`merchant_running_volume.sql` groups by merchant and month correctly. Turn its last column into a running total that starts again for every merchant.",
+   "Run the tests until all six pass. Each exercise has a second test that adds rows first: a new tie for 2nd place, a failed retry between two charges, a merchant's first sale."
+  ],
+  "hints": [
+   "Shared places with skipped numbers are `rank()`. Wrap the ranking query in a subquery and put `WHERE place <= 12` outside it.",
+   "The same charge is `PARTITION BY card_id, merchant_id, amount_minor`. Keep `status = 'succeeded'` in the inner WHERE so a failed attempt is never the previous row, and filter `created_at - previous_at <= interval '5 minutes'` outside.",
+   "`sum(sum(amount_minor)) OVER (PARTITION BY merchant_id ORDER BY date_trunc('month', created_at))`: the inner sum belongs to the GROUP BY, the outer one to the window."
+  ],
+  "done_when": "All six tests in `WindowFunctionsTest` pass."
+ },
+ "drill": {
+  "title": "A statement with a low-balance warning, from memory",
+  "minutes": 5,
+  "prompt": "Without looking, write a query that lists Asha's ledger entries (account 101) in time order with the running balance and the previous entry's amount, and keeps only the entries after which the balance was below 70,000. Then say in one sentence why the filter cannot sit in the same query level as the window functions.",
+  "answer": {
+   "lang": "sql",
+   "src": "SELECT entry_id, created_at, amount_minor, prev_amount, balance_minor\nFROM (SELECT entry_id, created_at, amount_minor,\n             lag(amount_minor) OVER w AS prev_amount,      -- the entry before, in the same order\n             sum(amount_minor) OVER w AS balance_minor     -- ORDER BY in the window: a running total\n      FROM ledger_entries\n      WHERE account_id = 101\n      WINDOW w AS (ORDER BY created_at, entry_id)) AS s   -- entry_id makes the order unique\nWHERE balance_minor < 70000                                -- after the window, so one level up\nORDER BY created_at, entry_id;\n-- 73 | 2026-04-01 00:00 | -99000 | 50000 | 35320   (the hotel payment)\n-- 101 | 2026-06-04 18:05 |  -5875 | -99000 | 29445\n-- Window functions are computed in the select list, after WHERE has already run."
+  }
+ },
+ "recap": [
+  "A window function computes a value for each row from a set of related rows, its window, and keeps every row. GROUP BY folds the rows away.",
+  "PARTITION BY says which rows are related. `OVER ()` makes the whole result one partition.",
+  "ORDER BY inside OVER puts the window in order. row_number counts, rank shares a place and skips, dense_rank shares without skipping. End the ORDER BY with a unique column when you need stable numbers.",
+  "lag and lead read the row before or after in the same partition, so the partition is your definition of \"the same thing\".",
+  "With ORDER BY, sum becomes a running total. Windows run after WHERE and GROUP BY: filter on them in an outer query, and window over grouped rows with `sum(sum(x)) OVER (...)`."
+ ],
+ "quiz": [
+  {
+   "q": "On the seed, what does `SELECT payment_id, count(*) OVER () AS n FROM payments WHERE status = 'failed'` return?",
+   "options": [
+    "5 rows, each with n = 5",
+    "1 row with n = 5",
+    "5 rows with n = 1, 2, 3, 4 and 5",
+    "An error: count(*) needs a GROUP BY"
+   ],
+   "answer": 0,
+   "why": "`OVER ()` puts all five failed payments in one window with no order, so every row counts all five, and no row is folded away. Numbers 1 to 5 need an ORDER BY inside OVER (a running count) or row_number. One row is what the plain aggregate without OVER would return."
+  },
+  {
+   "q": "Two merchants tie for the highest monthly volume. Which function, filtered with `= 2`, returns the merchant whose volume is the second-highest distinct value?",
+   "options": [
+    "rank()",
+    "dense_rank()",
+    "row_number()",
+    "ntile(2)"
+   ],
+   "answer": 1,
+   "why": "dense_rank gives the tied pair 1 and the next volume 2. rank gives the pair 1 and skips to 3, so no row has rank 2. row_number gives one of the tied merchants number 2, in no fixed order, which is the wrong merchant."
+  },
+  {
+   "q": "A Kafka consumer writes every card authorization to `auths(card_id, merchant_id, amount_minor, created_at)`. A retry is the same card authorizing the same amount at the same merchant within 30 seconds of the previous one. Which window does the LAG need?",
+   "options": [
+    "PARTITION BY card_id ORDER BY created_at",
+    "PARTITION BY merchant_id, amount_minor ORDER BY created_at",
+    "ORDER BY created_at, with no partition",
+    "PARTITION BY card_id, merchant_id, amount_minor ORDER BY created_at"
+   ],
+   "answer": 3,
+   "why": "The partition must hold exactly the rows that count as \"the same\": one card, one merchant, one amount. With card_id alone, a coffee followed by a train ticket looks like a retry. Without card_id, two customers buying the same ticket a few seconds apart look like one customer retrying. With no partition, lag compares unrelated authorizations."
+  },
+  {
+   "q": "You want only the ledger entries after which the running balance is negative. Which query works in PostgreSQL 18?",
+   "options": [
+    "`... WHERE sum(amount_minor) OVER (ORDER BY created_at, entry_id) < 0`",
+    "`... HAVING sum(amount_minor) OVER (ORDER BY created_at, entry_id) < 0`",
+    "A subquery computes the running balance as a column, and the outer query filters on that column",
+    "`... GROUP BY entry_id HAVING sum(amount_minor) < 0`"
+   ],
+   "answer": 2,
+   "why": "Window functions are computed after WHERE, GROUP BY and HAVING, so PostgreSQL rejects them in WHERE and in HAVING. Computing the window in a subquery and filtering outside is the way. GROUP BY entry_id makes each entry its own group, so the sum is just the entry's own amount, not a running balance."
+  },
+  {
+   "q": "Lesson 4 said a grouped query may select only grouping columns and aggregates. Why may `SELECT payment_id, sum(amount_minor) OVER (PARTITION BY merchant_id) FROM payments` select payment_id without grouping by it?",
+   "options": [
+    "OVER switches the rule off for the whole query",
+    "Nothing is folded: each output row is still one payment row, so payment_id has one value per row",
+    "PostgreSQL picks any payment_id from the partition",
+    "PARTITION BY adds payment_id to the grouping keys"
+   ],
+   "answer": 1,
+   "why": "The GROUP BY rule exists because a folded row stands for many input rows, and a column that differs between them has no single value. A window function folds nothing; it adds a column to each row. If the same query also had a GROUP BY, the rule would apply again: windows run after grouping and can only use grouped values.",
+   "from": "sql-04"
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "What does a window function return for each row?",
+   "back": "A value computed over that row's window, a set of related rows. Every input row stays in the result."
+  },
+  {
+   "front": "What does `OVER ()` mean?",
+   "back": "One window that holds every row of the result, so every row sees the same set."
+  },
+  {
+   "front": "rank, dense_rank and row_number on amounts 50, 40, 40, 30?",
+   "back": "rank 1, 2, 2, 4. dense_rank 1, 2, 2, 3. row_number 1, 2, 3, 4, with the two 40s in no fixed order."
+  },
+  {
+   "front": "What does `lag(x)` return on the first row of a partition?",
+   "back": "NULL, or the default given as its third argument: `lag(x, 1, 0)`."
+  },
+  {
+   "front": "What turns `sum(x) OVER (PARTITION BY a)` into a running total?",
+   "back": "ORDER BY inside OVER: each row's window then ends at the current row. End that ORDER BY with a unique column."
+  },
+  {
+   "front": "Why can't a window function go in WHERE?",
+   "back": "Windows are computed in the select-list step, after WHERE, GROUP BY and HAVING. Filter on them in an outer query."
+  },
+  {
+   "front": "What is `sum(sum(x)) OVER (ORDER BY m)` in a GROUP BY query?",
+   "back": "A window over the grouped rows: the inner sum is the group's aggregate, the outer sum a running total of those values."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Window function",
+   "plain": "A function computed for each row over a set of related rows, written with OVER. No rows are folded."
+  },
+  {
+   "term": "Window",
+   "plain": "The set of rows a window function reads for the current row."
+  },
+  {
+   "term": "Partition",
+   "plain": "The rows that share the PARTITION BY values. A row's window never reaches outside its partition."
+  },
+  {
+   "term": "Peers",
+   "plain": "Rows that sort as equal on the window's ORDER BY, such as three payments of 18999."
+  },
+  {
+   "term": "ROW_NUMBER, RANK, DENSE_RANK",
+   "plain": "Positions in window order: a plain count, a shared place that skips after ties, a shared place that does not skip."
+  },
+  {
+   "term": "LAG and LEAD",
+   "plain": "Read a value from the row before or after the current row in the same partition."
+  },
+  {
+   "term": "Running total",
+   "plain": "A sum over the rows from the start of the partition up to the current row."
+  },
+  {
+   "term": "WINDOW clause",
+   "plain": "Names a window definition once so several functions can share it with OVER name."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate writes `SELECT ... FROM customers_spend WHERE rank() OVER (PARTITION BY country_code ORDER BY spend_minor DESC) = 1` for a top-spender-per-country report. Explain why PostgreSQL rejects it, how to fix it, and which ranking function to use when two customers tie for first.",
+  "answer": "PostgreSQL evaluates WHERE before it computes the select list, and window functions belong to the select list, so while WHERE runs there is no rank to compare with. The query fails with \"window functions are not allowed in WHERE\". The fix is to compute the rank in a subquery or CTE, as a column named place for example, and put `WHERE place = 1` in the outer query. Any filter that should decide which customers are ranked at all, such as only active customers, stays in the inner WHERE. If two customers tie for first and both deserve to be listed, use rank or dense_rank, which give both of them 1. If the report must show exactly one customer per country, use row_number and end the ORDER BY with a unique column such as customer_id, so the same customer wins every time."
+ },
+ "deeper": {
+  "minutes": 8,
+  "body": "A few more window functions are worth knowing by name. `ntile(4)` splits each partition into four nearly equal buckets in window order: quartiles of payment size. `percent_rank()` and `cume_dist()` give a row's relative position as a fraction, which is how \"this payment is larger than 93% of the merchant's payments\" is computed. `first_value`, `last_value` and `nth_value` read one row's value from the window, and lesson 7 shows why `last_value` surprises almost everyone.\n\nAn aggregate FILTER (lesson 4) works inside a window too: `count(*) FILTER (WHERE status = 'failed') OVER (PARTITION BY card_id)` puts each card's number of failed payments on every one of its payments.\n\nPostgreSQL 15 and later can stop a window early. When an outer query filters `WHERE place <= 3` on a row_number, rank, dense_rank or count, the planner pushes that condition into the WindowAgg node as a **Run Condition**: once a partition passes 3, it stops computing the function for that partition's remaining rows. It still reads and sorts every row, so the big cost of the sort stays. Lesson 8 compares that with a LATERAL query that reads only 3 rows per merchant through an index.\n\nThe sort itself can sometimes be skipped. If an index (lesson 1's B-tree) stores the rows already ordered by the PARTITION BY and ORDER BY columns, PostgreSQL can read the index in order and feed the WindowAgg directly. That is not always faster: reading a whole table through an index visits the table pages in index order, one row at a time, and lesson 8 measures a case where that is slower than sorting.\n\nFinally, `work_mem` decides whether the sort fits in memory. The plan in the last Try it said `external merge  Disk: 33312kB`: the sort wrote 33 MB to temporary files. `SET work_mem = '128MB'` for one session makes it an in-memory quicksort. Raise it per query or per role, not globally, because every sort and hash in every connection may use that much."
+ },
+ "sources": [
+  {
+   "title": "PostgreSQL 18 documentation: Window functions (tutorial)",
+   "url": "https://www.postgresql.org/docs/18/tutorial-window.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: Window functions (reference)",
+   "url": "https://www.postgresql.org/docs/18/functions-window.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: Window function calls",
+   "url": "https://www.postgresql.org/docs/18/sql-expressions.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: SELECT",
+   "url": "https://www.postgresql.org/docs/18/sql-select.html"
+  },
+  {
+   "title": "Oracle AI Database new features: SQL (QUALIFY)",
+   "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/nfcoa/appdev_sql.html"
+  }
+ ]
 }

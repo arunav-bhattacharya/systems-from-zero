@@ -1,0 +1,395 @@
+{
+  "id": "repl-08",
+  "title": "Concurrent writes: last write wins, version vectors and CRDTs",
+  "minutes": 40,
+  "goal": "By the end you can say when two writes are concurrent (neither happened before the other), explain from Jepsen's Riak numbers why last write wins loses acknowledged writes, detect concurrency with version vectors, and merge without loss using CRDT counters and sets.",
+  "warmup": {
+    "q": "The link between two regions has been down since 08:30. At 09:00 the EU region changes merchant M-0042's payout account; at 10:00 the US region changes the same field. Both clocks are perfectly synchronized. When the link comes back, which statement is right?",
+    "options": [
+      "US's write came an hour later, so it should replace EU's",
+      "The writes are concurrent: neither region knew of the other's change, so keeping only the 10:00 one silently loses EU's",
+      "They only conflict if they were made within the same second",
+      "With perfect clocks, last write wins is always correct"
+    ],
+    "answer": 1,
+    "why": "Whether one write may replace another depends on whether its writer had seen the other, not on the clock. US changed the field without knowing EU's change, so the US write doesn't include it. Last write wins would keep 10:00 and drop EU's change without anyone deciding to. Perfect clocks only make \"last\" well defined; they don't make it the right answer."
+  },
+  "sections": [
+    {
+      "h": "Concurrent means neither write knew about the other",
+      "body": "Lesson 7 ended with two clients writing the same balance at nearly the same moment, and the replicas keeping only the write with the later timestamp. Lesson 5 had the same problem between regions. Before choosing a rule for such writes, you need a precise test for when two writes are \"at the same time\", and the clock turns out to be the wrong tool.\n\nTake three events for one payment. At 10:00:00.000 an EU service authorizes payment pay-81723. At 10:00:00.002 a US service, which has already received the authorization, captures it. At 10:00:00.001 an AP service, which has heard of neither, voids the same payment. By the clock, all three happened within 2 ms. By what each writer knew, they differ completely. The capture's writer had seen the authorization, so the capture builds on it, and replacing the authorization with the capture loses nothing. The void's writer had seen neither. The void doesn't include the capture, and the capture doesn't include the void.\n\nLeslie Lamport named this relation in 1978: **happens-before**. Write A happens before write B if B's writer knew about A when it wrote, because the same process did A first, because a message carried A to B's writer, or through a chain of such steps. Two writes are concurrent when neither happens before the other. Concurrency is about knowledge, not time. Two laptops that each edit a merchant record offline, an hour apart, made concurrent writes. Two writes 2 ms apart are ordered if a message got through in between.\n\nThe relation says exactly when a store may throw a version away. If A happens before B, B's writer saw A, so B can replace A; that's the normal case, and most writes are like it. If A and B are concurrent, each holds something the other lacks, and any rule that keeps only one of them loses a write. Those are the conflicts of lesson 5, and the rest of this lesson is about finding and merging them.\n\nHow does a store know what a writer had seen? The simplest way, which lesson 5's lab used, is to carry it: every write lists the ids of all the writes its writer knew about, and A is before B when A's id is in B's list. It works, and the lists grow with every write. In that lab's steady-traffic run, one write carried 597 ids. Section 3 compresses the list to one counter per replica. The Faults, time and truth track builds the general tools for ordering events without a shared clock, Lamport's clocks among them.\n\n**Every version carries what its writer had seen. One write may replace another only if it saw it. Two writes that didn't see each other are concurrent, and something has to merge them, or one is lost.**",
+      "try": {
+        "title": "Order four pairs of writes without looking at the clock",
+        "minutes": 3,
+        "steps": [
+          "Read `HappensBeforeDemo.kt`: five writes, each with its wall-clock time and the set of writes its writer had seen.",
+          "For each of the four pairs it prints, predict: happens before, happens after, or concurrent? Then run it from the `labs` folder. No Docker needed."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :nosql:demo -Pmain=sfz.repl.l08.demo.HappensBeforeDemoKt -q",
+          "run": "./gradlew :nosql:demo -Pmain=sfz.repl.l08.demo.HappensBeforeDemoKt -q",
+          "file": "labs/nosql/src/demo/kotlin/sfz/repl/l08/demo/HappensBeforeDemo.kt"
+        },
+        "expect": "```text\neu:1 (authorize pay-81723, 10:00:00.000) vs us:1 (capture pay-81723, 10:00:00.002)\n    clock gap +2 ms: happens before: us:1 saw it, so us:1 may replace it\nus:1 (capture pay-81723, 10:00:00.002) vs ap:1 (void pay-81723, 10:00:00.001)\n    clock gap -1 ms: CONCURRENT: neither saw the other; keep one and the other is lost\neu:1 (authorize pay-81723, 10:00:00.000) vs ap:1 (void pay-81723, 10:00:00.001)\n    clock gap +1 ms: CONCURRENT: neither saw the other; keep one and the other is lost\nlaptop:1 (M-0042 payout account, 09:00:00.000) vs eu:2 (M-0042 payout account, 10:00:00.000)\n    clock gap +60 min: CONCURRENT: neither saw the other; keep one and the other is lost\n```\n\nThe pair 2 ms apart is ordered, because a message carried the authorization to the capturing service first. The pair an hour apart is concurrent, because the laptop was offline and the back office never heard of its edit. The clock gap predicts neither. Add `\"laptop:1\"` to the office write's `seen` set and run it again: the last pair becomes `happens before`, with the same hour on the clock."
+      },
+      "refs": [
+        {
+          "title": "Lamport, Time, Clocks, and the Ordering of Events in a Distributed System (1978, PDF)",
+          "url": "https://lamport.azurewebsites.net/pubs/time-clocks.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Last write wins loses acknowledged writes, and Jepsen counted them",
+      "body": "The cheapest rule for concurrent writes is last write wins (LWW): every write carries a timestamp, and every replica keeps the highest. It always converges, because every replica applies the same comparison, and it's everywhere. Cassandra resolves every cell this way (the Data models track's lesson on Cassandra), DynamoDB global tables in MREC mode resolve every item this way (lesson 5), and so does pgactive. Its cost follows from section 1: for two concurrent writes, \"last\" just means whichever clock read higher, and the other write disappears without an error.\n\nHow much does that lose? In 2013 Kyle Kingsbury's Jepsen tests measured it on Riak, a Dynamo-style store, with a workload built to find out. Clients added numbers to a set stored under one key, by read-modify-write, and the test counted which acknowledged additions were still there at the end. With last write wins on and no network fault at all, 1,434 of 2,000 acknowledged writes were lost: 71.7%. With a network partition, 1,815 of 1,985 were lost, 91.4%, and strict quorums didn't help (91.7%). The same test with Riak keeping concurrent versions as siblings, merged as a set, lost none of 2,000. The clocks were fine in the first run; concurrent read-modify-writes were enough.\n\nLesson 7 quoted Dynamo's own number: 99.94% of cart requests saw a single version. Both numbers are right. Production carts rarely have two writers on one key at once, while every Jepsen client hammered the same key. How much LWW loses depends on contention, and whether it can lose at all depends on the rule. Lesson 5's lab drew the curve: 1% of acknowledged holds lost with writes 5 s apart, 38.5% at 50 ms.\n\nClocks make it worse. With a skewed clock, LWW can drop a write that isn't even concurrent: a later decision stamped by a slow clock loses to an earlier one stamped by a fast clock. NTP keeps servers within milliseconds of each other on a good day, and much further apart after a VM pause or a bad time source. If the Java driver stamps writes on the application server, a pod whose clock runs 5 seconds fast wins every argument for 5 seconds. The Try-it does exactly that in Cassandra: a void issued after a capture loses to the capture.\n\nLWW is safe in one case: a key that is written once and never updated, such as an insert keyed by a fresh UUID. Anywhere else, decide whether losing one of two writes is acceptable before you choose it.",
+      "try": {
+        "title": "Lose a void to a fast clock",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start Cassandra: `docker compose -f env/cassandra.yml up -d --wait` (one to two minutes). If `payments` doesn't exist yet, load it: `docker compose -f env/cassandra.yml exec cassandra cqlsh -f /sfz/nosql-02-payments.cql`.",
+          "In `docker compose -f env/cassandra.yml exec cassandra cqlsh`, run the statements below. Predict the status before the `SELECT`. Then stop Cassandra: `docker compose -f env/cassandra.yml down -v`."
+        ],
+        "code": {
+          "lang": "sql",
+          "title": "in cqlsh",
+          "src": "-- one table, two app servers: server 2's clock is 5 seconds fast\nCREATE TABLE IF NOT EXISTS payments.payment_status (payment_id text PRIMARY KEY, status text);\n\n-- real time 10:00:00. Server 2 captures the payment and stamps it with its clock: 10:00:05\nUPDATE payments.payment_status USING TIMESTAMP 1794045605000000\nSET status = 'CAPTURED' WHERE payment_id = 'pay-81723';\n\n-- real time 10:00:02. Server 1, whose clock is right, voids it: the later decision\nUPDATE payments.payment_status USING TIMESTAMP 1794045602000000\nSET status = 'VOIDED' WHERE payment_id = 'pay-81723';\n\nSELECT payment_id, status, WRITETIME(status) FROM payments.payment_status WHERE payment_id = 'pay-81723';\n"
+        },
+        "expect": "```text\n payment_id | status   | writetime(status)\n------------+----------+-------------------\n  pay-81723 | CAPTURED |  1794045605000000\n```\n\nThe void, issued two seconds after the capture, lost to the capture's skewed timestamp. Both statements succeeded, no error appeared, and every replica would agree on CAPTURED. `USING TIMESTAMP` plays the part of each server's clock here; in production the Java driver supplies it."
+      },
+      "refs": [
+        {
+          "title": "Jepsen: Riak (Kingsbury, 2013): last write wins versus siblings, with counts",
+          "url": "https://aphyr.com/posts/285-jepsen-riak",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Version vectors notice what last write wins hides",
+      "body": "Carrying every writer's full list of seen ids works, but the list grows forever. It compresses. If each replica numbers the writes it coordinates in order, and a writer that has seen `eu`'s 7th write has also seen the six before it, then the list only needs the highest number seen from each replica. That's a **version vector**: `[(eu, 7), (us, 3)]` means \"has seen eu's first 7 writes and us's first 3\". The Dynamo paper calls the same structure a vector clock, and the lab's file keeps that name. Strictly, a version vector tracks the versions of one piece of data, and a vector clock orders events in general.\n\nWhen node Sx coordinates a write, it takes the vector of the version the client read and adds 1 to its own entry. To compare two versions, compare entry by entry, treating a missing node as 0. If every entry of A is at most B's, A is an ancestor: B saw it, so A can go. If each has an entry bigger than the other's, the versions are concurrent.\n\nThe Dynamo paper walks through this with a shopping cart. D1 and D2 are written through Sx, so D2 is `[(Sx, 2)]`. Two clients both read D2 and write at the same time, one through Sy and one through Sz: D3 is `[(Sx, 2), (Sy, 1)]`, D4 is `[(Sx, 2), (Sz, 1)]`, and neither is an ancestor of the other. Dynamo keeps both as siblings and returns both on the next read. The client merges the carts and writes D5 through Sx with the merged vector as context: `[(Sx, 3), (Sy, 1), (Sz, 1)]`, which descends from both and replaces them.\n\nThe stepper runs one partition three ways: last write wins, version vectors, and the CRDT of the next section. Version vectors detect conflicts; they don't resolve them. Your code gets siblings and has to merge them, and the obvious merge has a flaw the stepper shows: a set union brings deleted items back. Vectors also grow with every node that coordinates a write, which is why Dynamo truncated them at about 10 entries, at the risk of losing track of ancestry, which the paper says never showed up in production. Section 4 removes the merge code.",
+      "stepper": {
+        "title": "Two replicas diverge: last write wins, version vectors, and a CRDT",
+        "intro": "One blocked-card set, two regions, one network partition. Step through three ways to put it back together.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Two replicas hold the same blocked-card set, version [(eu, 2)]\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code\" x=\"170\" y=\"70\" text-anchor=\"middle\">[(eu, 2)]</text><rect class=\"box\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"111\" text-anchor=\"start\">card-4417   tag eu:1</text><rect class=\"box\" x=\"20\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"145\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code\" x=\"510\" y=\"70\" text-anchor=\"middle\">[(eu, 2)]</text><rect class=\"box\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"111\" text-anchor=\"start\">card-4417   tag eu:1</text><rect class=\"box\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"232\" text-anchor=\"start\">M-0042's blocked cards, replicated to two regions. Both copies are equal:</text><text class=\"t-s\" x=\"34\" y=\"254\" text-anchor=\"start\">the same cards, the same vector clock. Each add carried a unique tag.</text></svg>",
+            "say": "M-0042's blocked-card list lives in two regions. Both replicas hold the same two cards and the same version, whose vector clock is `[(eu, 2)]`: the EU replica coordinated both writes. Each add also carried a unique tag, `eu:1` and `eu:2`, which only the last frames need."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"During a partition EU removes card-4417 and US blocks card-5310\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code t-a\" x=\"170\" y=\"70\" text-anchor=\"middle\">[(eu, 3)]</text><rect class=\"box-dim\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"34\" y=\"111\" text-anchor=\"start\">card-4417   removed</text><rect class=\"box\" x=\"20\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"145\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box-a\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code t-a\" x=\"510\" y=\"70\" text-anchor=\"middle\">[(eu, 2), (us, 1)]</text><rect class=\"box\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"111\" text-anchor=\"start\">card-4417   tag eu:1</text><rect class=\"box\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box-a\" x=\"360\" y=\"160\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"374\" y=\"179\" text-anchor=\"start\">card-5310   tag us:1</text><line class=\"ln-bad\" x1=\"340\" y1=\"24\" x2=\"340\" y2=\"196\"/><rect class=\"box\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"232\" text-anchor=\"start\">The link between regions is down. EU unblocks card-4417 and stamps (eu, 3).</text><text class=\"t-s\" x=\"34\" y=\"254\" text-anchor=\"start\">US blocks card-5310 and stamps (us, 1). Both writes succeed: each side chose availability.</text></svg>",
+            "say": "The link between the regions goes down, and both keep taking writes: the multi-leader setup from lesson 5. EU unblocks card-4417 and its clock becomes `[(eu, 3)]`. US blocks a new card, 5310, and its clock becomes `[(eu, 2), (us, 1)]`. Neither knows about the other's write."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Last write wins keeps the EU version whole and silently loses the US block of card-5310\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code t-a\" x=\"170\" y=\"70\" text-anchor=\"middle\">10:00:05  [(eu, 3)]</text><rect class=\"box\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"111\" text-anchor=\"start\">card-9921</text><rect class=\"box-bad\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code t-bad\" x=\"510\" y=\"70\" text-anchor=\"middle\">10:00:03  [(eu, 2), (us, 1)]</text><rect class=\"box-bad\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-bad\" x=\"374\" y=\"111\" text-anchor=\"start\">card-4417</text><rect class=\"box-bad\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-bad\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921</text><rect class=\"box-bad\" x=\"360\" y=\"160\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-bad\" x=\"374\" y=\"179\" text-anchor=\"start\">card-5310</text><rect class=\"box\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"232\" text-anchor=\"start\">The link is back. Last write wins compares wall-clock timestamps: EU's 10:00:05</text><text class=\"t-s\" x=\"34\" y=\"254\" text-anchor=\"start\">beats US's 10:00:03, so the whole US version is dropped. card-5310 is unblocked.</text></svg>",
+            "say": "The link comes back. With last write wins, the replicas compare wall-clock timestamps and keep the later value whole. EU wrote at 10:00:05 by its clock, US at 10:00:03 by its own, so US's version disappears, and with it the block on card-5310. No error, no log line. If EU's clock was a few seconds fast, the \"later\" write wasn't even later."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Vector clocks compare [(eu, 3)] and [(eu, 2), (us, 1)] and find them concurrent\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code t-a\" x=\"170\" y=\"70\" text-anchor=\"middle\">[(eu, 3)]</text><rect class=\"box-a\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"34\" y=\"111\" text-anchor=\"start\">eu 3 &gt; 2</text><rect class=\"box-a\" x=\"20\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"34\" y=\"145\" text-anchor=\"start\">us 0 &lt; 1</text><rect class=\"box-a\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code t-a\" x=\"510\" y=\"70\" text-anchor=\"middle\">[(eu, 2), (us, 1)]</text><rect class=\"box-a\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"374\" y=\"111\" text-anchor=\"start\">eu 2 &lt; 3</text><rect class=\"box-a\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"374\" y=\"145\" text-anchor=\"start\">us 1 &gt; 0</text><rect class=\"box\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"232\" text-anchor=\"start\">Compare entry by entry: EU is ahead on eu, US is ahead on us. Neither clock is</text><text class=\"t-s\" x=\"34\" y=\"254\" text-anchor=\"start\">&lt;= the other, so neither write saw the other: CONCURRENT. Keep both as siblings.</text></svg>",
+            "say": "Version vectors don't trust wall clocks. Compare the two entry by entry: EU's counter for `eu` is bigger, US's counter for `us` is bigger. Neither clock is less than or equal to the other in every entry, so neither write saw the other. They're concurrent, and Dynamo keeps both as siblings for the application to merge, as in its D1 to D5 example."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A naive merge takes the union of the two sets and brings card-4417 back\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code\" x=\"170\" y=\"70\" text-anchor=\"middle\">[(eu, 3)]</text><rect class=\"box\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"111\" text-anchor=\"start\">card-9921</text><rect class=\"box\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code\" x=\"510\" y=\"70\" text-anchor=\"middle\">[(eu, 2), (us, 1)]</text><rect class=\"box\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"111\" text-anchor=\"start\">card-4417</text><rect class=\"box\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921</text><rect class=\"box\" x=\"360\" y=\"160\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"179\" text-anchor=\"start\">card-5310</text><rect class=\"box-bad\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"228\" text-anchor=\"start\">the application merges the siblings with a set union:</text><text class=\"t-s t-code t-bad\" x=\"34\" y=\"252\" text-anchor=\"start\">card-4417</text><text class=\"t-s t-code\" x=\"244\" y=\"252\" text-anchor=\"start\">card-9921</text><text class=\"t-s t-code\" x=\"454\" y=\"252\" text-anchor=\"start\">card-5310</text><text class=\"t-s\" x=\"34\" y=\"278\" text-anchor=\"start\">EU's removal of card-4417 is undone: the union can't tell \"removed\" from \"never seen\".</text></svg>",
+            "say": "The application has to merge the siblings. The obvious merge, a set union, keeps card-5310, but it also brings card-4417 back, because a missing element can mean \"removed\" or \"never added\" and the union can't tell which. That's the Dynamo paper's own warning about the shopping cart: an added item is never lost, but a deleted item can resurface."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"An OR-Set merge unions tags and removed tags and keeps both intents\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code\" x=\"170\" y=\"70\" text-anchor=\"middle\">removed: {eu:1}</text><rect class=\"box\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"111\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code\" x=\"510\" y=\"70\" text-anchor=\"middle\">removed: {}</text><rect class=\"box\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"111\" text-anchor=\"start\">card-4417   tag eu:1</text><rect class=\"box\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921   tag eu:2</text><rect class=\"box\" x=\"360\" y=\"160\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code\" x=\"374\" y=\"179\" text-anchor=\"start\">card-5310   tag us:1</text><rect class=\"box-ok\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"228\" text-anchor=\"start\">OR-Set merge: an element stays if it has a tag nobody removed</text><text class=\"t-s t-code t-ok\" x=\"34\" y=\"252\" text-anchor=\"start\">card-9921</text><text class=\"t-s t-code t-ok\" x=\"244\" y=\"252\" text-anchor=\"start\">card-5310</text><text class=\"t-s t-code\" x=\"454\" y=\"252\" text-anchor=\"start\">card-4417 gone</text><text class=\"t-s\" x=\"34\" y=\"278\" text-anchor=\"start\">Union of the tags, union of the removed tags. card-4417's only tag, eu:1, was removed.</text><text class=\"t-s\" x=\"34\" y=\"298\" text-anchor=\"start\">card-5310's tag us:1 was not. Both regions' decisions survive.</text></svg>",
+            "say": "An OR-Set keeps more information. Every add carried a unique tag, and a remove records the tags it saw: EU's removal of card-4417 removed tag `eu:1`. Merging is two unions, of the tags and of the removed tags, and an element stays if it has a tag nobody removed. card-4417 stays removed, card-5310 stays blocked. A remove only beats the adds it saw, so a concurrent re-add would win."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Merging in either order, or twice, gives the same set\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-ok\" x=\"20\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"170\" y=\"50\" text-anchor=\"middle\">EU replica</text><text class=\"t-s t-code\" x=\"170\" y=\"70\" text-anchor=\"middle\">merge(EU, US)</text><rect class=\"box-ok\" x=\"20\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"34\" y=\"111\" text-anchor=\"start\">card-5310</text><rect class=\"box-ok\" x=\"20\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"34\" y=\"145\" text-anchor=\"start\">card-9921</text><rect class=\"box-ok\" x=\"360\" y=\"30\" width=\"300\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"50\" text-anchor=\"middle\">US replica</text><text class=\"t-s t-code\" x=\"510\" y=\"70\" text-anchor=\"middle\">merge(US, EU)</text><rect class=\"box-ok\" x=\"360\" y=\"92\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"374\" y=\"111\" text-anchor=\"start\">card-5310</text><rect class=\"box-ok\" x=\"360\" y=\"126\" width=\"300\" height=\"28\" rx=\"8\"/><text class=\"t-s t-code t-ok\" x=\"374\" y=\"145\" text-anchor=\"start\">card-9921</text><rect class=\"box\" x=\"20\" y=\"206\" width=\"640\" height=\"100\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"232\" text-anchor=\"start\">Unions don't care about order or repeats, so both replicas converge on the same</text><text class=\"t-s\" x=\"34\" y=\"254\" text-anchor=\"start\">set without asking each other anything. That's a CRDT. The lab builds it.</text></svg>",
+            "say": "Union doesn't care about order, grouping or repeats, so EU merging US's state and US merging EU's give the same set, and merging again changes nothing. The replicas converge without asking each other anything or trusting a clock. A data type with a merge like that is a CRDT, and the lab builds three of them."
+          }
+        ]
+      },
+      "try": {
+        "title": "Replay Dynamo's D1 to D5",
+        "minutes": 3,
+        "steps": [
+          "Run the version vector demo from the `labs` folder. Before it prints, write D3's and D4's vectors yourself, and D5's after the client merges.",
+          "Then compare `[(Sx, 2), (Sy, 1)]` with `[(Sx, 3)]` in your head. The demo doesn't print it; check your answer against the drill."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :nosql:demo -Pmain=sfz.repl.l08.demo.VectorClockDemoKt -q",
+          "run": "./gradlew :nosql:demo -Pmain=sfz.repl.l08.demo.VectorClockDemoKt -q",
+          "file": "labs/nosql/src/demo/kotlin/sfz/repl/l08/demo/VectorClockDemo.kt"
+        },
+        "expect": "```text\nD1 written by Sx            [(Sx, 1)]\nD2 written by Sx            [(Sx, 2)]   D1 vs D2: BEFORE: the second one saw it, drop it\nD3 written by Sy (read D2)  [(Sx, 2), (Sy, 1)]\nD4 written by Sz (read D2)  [(Sx, 2), (Sz, 1)]\nD3 vs D4: CONCURRENT: neither saw the other, keep both\na client reads both, merges the carts, sends context [(Sx, 2), (Sy, 1), (Sz, 1)]\nD5 written by Sx            [(Sx, 3), (Sy, 1), (Sz, 1)]\nD3 vs D5: BEFORE: the second one saw it, drop it\nD4 vs D5: BEFORE: the second one saw it, drop it\n```\n\nD3 and D4 each have an entry the other lacks, so they are siblings. D5's vector is at least as big as both in every entry, so it replaces them. The context the client sent back is what told the store that D5 had seen both siblings; without it, the store would have no way to know which versions the new write replaces."
+      },
+      "refs": [
+        {
+          "title": "Dynamo: Amazon's Highly Available Key-value Store, section 4.4 (SOSP 2007, PDF)",
+          "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "CRDTs merge in any order without losing a write",
+      "body": "Merging siblings by hand is where conflict handling usually breaks. What if the data type knew how to merge itself, so that any two copies combine into the same result in any order, and no write is lost? That's a CRDT, a conflict-free replicated data type, and the idea is easiest to see with a counter.\n\nCount M-0042's pending payouts in three regions during a partition. Version 1 gives each replica one running total, and merging two copies adds their totals. That double-counts: once EU has merged US's total, the next sync between them adds US's payouts a second time, and copies that reach EU by two paths count twice too. Version 2 is the G-Counter (grow-only counter): every replica owns one slot and only increments its own. The value is the sum of the slots, and two copies merge by taking the maximum of each slot. A slot only grows, so the bigger number is always the newer one, and taking it twice changes nothing. To count down as well, keep two G-Counters, one for increments and one for decrements, and subtract: a PN-Counter.\n\nThe maximum works because it has three properties: the order of merges doesn't matter (commutative), the grouping doesn't matter (associative), and repeating a merge changes nothing (idempotent). Any merge with those three properties lets replicas exchange state whenever they can, through any path, as often as they like, and still converge. No clock is involved, and nobody waits for anyone.\n\nSets are harder, because removals are where unions fail. The OR-Set (observed-remove set) tags every add with a unique tag, such as `us:1`. A remove records the tags of that element it has seen, and only those. An element is in the set if it has a tag nobody removed. Merging is two unions, of tags and of removed tags. A remove beats the adds it saw, and a concurrent add, which it couldn't see, survives. In the Try-it, one region unblocks card-4417 while another blocks it again, and after the merge it's blocked.\n\nCRDTs have limits that matter in payments. Their metadata grows: slots per replica, a tag per add, removed tags kept forever unless the replicas coordinate to clean them up. And they only fit operations that commute. \"Balance never goes below zero\" doesn't: two regions can each approve a 600 payment from a balance of 1,000, and both counters merge happily to -200. An invariant like that needs replicas that agree before they write, which the Transactions track and the Consistency and consensus track cover. CRDTs suit counts, sets, flags and collaborative documents. Riak added them as built-in data types in version 2.0, which is how its siblings-as-a-set run in Jepsen's test lost nothing, and lesson 6's text editors use them for documents.\n\nOne question this track has left alone: which values a read may return in the first place, and what \"strongly consistent\" really promises. Consistency models, linearizability and the CAP theorem are the Consistency and consensus track's first lessons.",
+      "try": {
+        "title": "Three regions diverge, then merge in every order",
+        "minutes": 4,
+        "steps": [
+          "Read `CrdtDemo.kt`. Three regions edit a PN-Counter of pending payouts and an OR-Set of blocked cards while they're cut off from each other.",
+          "Predict the merged count and the merged set before you run it. Then run it from the `labs` folder. No Docker needed."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "CrdtDemo.kt",
+          "src": "package sfz.repl.l08.demo\n\n/** A PN-Counter: per-replica slots of increments and of decrements. Merge takes each slot's maximum. */\nprivate data class PN(val p: Map<String, Long> = emptyMap(), val n: Map<String, Long> = emptyMap()) {\n    fun add(r: String, by: Long) = if (by >= 0) copy(p = p + (r to (p[r] ?: 0) + by)) else copy(n = n + (r to (n[r] ?: 0) - by))\n    val value get() = p.values.sum() - n.values.sum()\n    fun merge(o: PN) = PN(maxed(p, o.p), maxed(n, o.n))\n    private fun maxed(a: Map<String, Long>, b: Map<String, Long>) = (a.keys + b.keys).associateWith { maxOf(a[it] ?: 0, b[it] ?: 0) }\n}\n\n/** An OR-Set: element -> tags of its adds, plus the tags removed. Merge is two unions. */\nprivate data class OR(val adds: Map<String, Set<String>> = emptyMap(), val removed: Set<String> = emptySet()) {\n    fun add(e: String, tag: String) = copy(adds = adds + (e to (adds[e].orEmpty() + tag)))\n    fun remove(e: String) = copy(removed = removed + adds[e].orEmpty())\n    val elements get() = adds.filterValues { tags -> tags.any { it !in removed } }.keys.sorted()\n    fun merge(o: OR) = OR((adds.keys + o.adds.keys).associateWith { adds[it].orEmpty() + o.adds[it].orEmpty() }, removed + o.removed)\n}\n\n/** Every order in which three copies can be merged, by name. */\nprivate fun <T> orders(copies: Map<String, T>, merge: (T, T) -> T): List<Pair<String, T>> {\n    val n = copies.keys.toList()\n    val perms = listOf(listOf(0, 1, 2), listOf(0, 2, 1), listOf(1, 0, 2), listOf(1, 2, 0), listOf(2, 0, 1), listOf(2, 1, 0))\n    return perms.map { p -> p.joinToString(\" + \") { n[it] } to p.map { copies.getValue(n[it]) }.reduce(merge) }\n}\n\n/**\n * Three regions are cut off from each other. Each keeps taking writes: the merchant's pending-payout\n * counter and its blocked-card set. Then the partition heals and the copies merge, in every order.\n */\nfun main() {\n    // the state every region had before the partition\n    val counter0 = PN().add(\"eu\", 5)\n    val blocked0 = OR().add(\"card-4417\", \"eu:1\").add(\"card-9921\", \"eu:2\")\n\n    // during the partition, each region edits its own copy\n    val counters = mapOf(\n        \"eu\" to counter0.add(\"eu\", 3).add(\"eu\", -2), // 3 payouts queued, 2 paid\n        \"us\" to counter0.add(\"us\", 4),               // 4 queued\n        \"ap\" to counter0.add(\"ap\", -1),              // 1 paid\n    )\n    val sets = mapOf(\n        \"eu\" to blocked0.remove(\"card-4417\"),                           // eu unblocks card-4417\n        \"us\" to blocked0.add(\"card-4417\", \"us:1\").add(\"card-5310\", \"us:2\"), // us reports it again, and blocks another\n        \"ap\" to blocked0.remove(\"card-9921\"),                           // ap unblocks card-9921\n    )\n    counters.forEach { (r, c) -> println(\"$r sees pending payouts = ${c.value}\") }\n    sets.forEach { (r, s) -> println(\"$r sees blocked cards = ${s.elements}\") }\n\n    println(\"after the partition heals:\")\n    for ((order, c) in orders(counters, PN::merge)) println(\"  merge $order -> pending payouts = ${c.value}\")\n    for ((order, s) in orders(sets, OR::merge)) println(\"  merge $order -> blocked cards = ${s.elements}\")\n}\n",
+          "run": "./gradlew :nosql:demo -Pmain=sfz.repl.l08.demo.CrdtDemoKt",
+          "file": "labs/nosql/src/demo/kotlin/sfz/repl/l08/demo/CrdtDemo.kt"
+        },
+        "expect": "```text\neu sees pending payouts = 6\nus sees pending payouts = 9\nap sees pending payouts = 4\neu sees blocked cards = [card-9921]\nus sees blocked cards = [card-4417, card-5310, card-9921]\nap sees blocked cards = [card-4417]\nafter the partition heals:\n  merge eu + us + ap -> pending payouts = 9\n  merge eu + ap + us -> pending payouts = 9\n  merge us + eu + ap -> pending payouts = 9\n  merge us + ap + eu -> pending payouts = 9\n  merge ap + eu + us -> pending payouts = 9\n  merge ap + us + eu -> pending payouts = 9\n  merge eu + us + ap -> blocked cards = [card-4417, card-5310]\n  (the other five orders print the same set)\n```\n\n5 + 3 - 2 + 4 - 1 = 9: every increment and decrement counted once, in every order. card-9921 is gone, because ap's remove had seen its only tag. card-4417 is back in the set: eu removed tag `eu:1`, but us had blocked it again with a new tag, `us:1`, that eu never saw, so the concurrent add wins. Change one region's edits in the demo and check that all six orders still agree."
+      },
+      "refs": [
+        {
+          "title": "crdt.tech: papers, implementations and a glossary of CRDTs",
+          "url": "https://crdt.tech/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of two branch offices that keep the same list of blocked cards and post each other their changes. When the post is slow, each office keeps working from its own list, and for a while they disagree. When they reconcile, comparing the time on each office's wall clock is last write wins: a fast clock wins every argument, and one office's change vanishes. Each office keeping a count of the changes it has made, and noting the other's count it last heard, is a version vector: it shows that both changed the list while apart. Keeping a ticket for every entry and every crossing-out lets them merge without arguing at all, which is a CRDT. The analogy breaks on scale: real replicas reconcile thousands of times a second with nobody reading the changes, so the merge rule has to be decided before the conflict happens.",
+  "in_your_world": "Every Cassandra update your Quarkus pods send is stamped with the pod's clock, so a pod with a drifting clock silently wins or loses concurrent writes; alert on NTP offset the way you alert on heap. When a team proposes writing in two regions, sort the data by what a lost concurrent write would mean. Counters for dashboards, sets of blocked cards and feature flags can be CRDTs and accept writes everywhere. Balances, idempotency keys and payment status can't be merged at all: two concurrent decisions about one payment need one place to decide, a single leader or a lightweight transaction, which the Transactions track covers. A Kafka topic keyed by payment id, consumed in order, is another way to give each payment one order of writes.",
+  "mistake": "The most common mistake is trusting timestamps to order writes: \"the later write is the newer decision, so last write wins does the right thing\". People believe it because on one machine it's true. Across replicas it fails twice. For concurrent writes, \"later\" is just whichever clock read higher, so one of two acknowledged writes disappears with no error; Jepsen measured 71.7% of acknowledged writes lost on a healthy Riak cluster under contention. And clocks drift, so even a write that saw the other can lose to it. The fix: decide per table whether losing one of two concurrent writes is acceptable. Where it is, LWW is fine. Where every write must survive, use siblings with a merge or a CRDT. Where only one of two writes may happen at all, check before writing, with a single leader or a lightweight transaction.",
+  "compare": {
+    "title": "Two concurrent updates: last write wins and vector clocks",
+    "a": {
+      "label": "Last write wins (Cassandra)",
+      "lang": "text",
+      "src": "capture   status = CAPTURED   ts 10:00:05 (server 2, clock +5 s)\nvoid      status = VOIDED     ts 10:00:02 (server 1, clock right)\n\nevery replica keeps the higher timestamp:\n  status = CAPTURED\n  the void is gone; no error, no sibling, no trace"
+    },
+    "b": {
+      "label": "Vector clocks (Dynamo)",
+      "lang": "text",
+      "src": "both servers read version [(s1, 1)]\ncapture   [(s1, 1), (s2, 1)]\nvoid      [(s1, 2)]\n\ncompare: s1 is bigger in one, s2 in the other -> CONCURRENT\nthe next read returns BOTH as siblings:\n  CAPTURED [(s1, 1), (s2, 1)]  and  VOIDED [(s1, 2)]\nthe application decides, and writes back with [(s1, 2), (s2, 1)]"
+    },
+    "note": "Last write wins always produces one answer, so applications never see a conflict, and that's exactly the problem: it decides by clock readings, and one of two concurrent writes disappears. Vector clocks never pick by time. They tell you that two writes didn't see each other, and hand both to your code, which then needs a merge rule that is right for the data. For payment status neither is good enough: the void and the capture shouldn't both be accepted, which needs a check before writing (a lightweight transaction or a single leader), not a merge after."
+  },
+  "worked": {
+    "title": "Choose a conflict rule for four pieces of payment data",
+    "steps": [
+      {
+        "say": "List the data and what losing one of two concurrent writes would cost. Be concrete about who notices.",
+        "code": "data                 two concurrent writes                  losing one means\nmerchant display name  two edits in the back office          a stale name, fixed by the next edit\nM-0042 payout count    two regions count payouts             a dashboard off by one, forever\nblocked cards          eu unblocks, us blocks another card   a fraudster's card works again\npayment status         a capture and a void                  money moves that shouldn't",
+        "lang": "text"
+      },
+      {
+        "say": "The display name can lose a write: last write wins is fine, and it's what Cassandra does anyway.",
+        "code": "merchant display name: LWW per cell (Cassandra's default), no extra code",
+        "lang": "text"
+      },
+      {
+        "say": "The payout count must keep every increment from every region. Make it a PN-Counter: one slot per region for ups, one for downs, merge by maximum per slot.",
+        "code": "payout count: PN-Counter, slots {eu, us, ap}\n  merge = max per slot, value = sum(p) - sum(n)\n  any order, any number of merges: same total",
+        "lang": "text"
+      },
+      {
+        "say": "Blocked cards must keep both regions' decisions, and a removal must not come back. An OR-Set does that, and a concurrent block beats an unblock, which is the safe side for fraud.",
+        "code": "blocked cards: OR-Set\n  add(card) with a fresh tag, remove(card) = the tags seen\n  merge = union of tags, union of removed tags",
+        "lang": "text"
+      },
+      {
+        "say": "Payment status can't be merged: a capture and a void must not both be accepted. Detecting the conflict afterwards is too late, so check before writing, with one leader per payment or a lightweight transaction.",
+        "code": "UPDATE payments.payment_status SET status = 'VOIDED'\nWHERE payment_id = 'pay-81723'\nIF status = 'AUTHORIZED';   -- Paxos: exactly one of capture and void wins, and the loser is told",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build vector clocks, a last-write-wins register and three CRDTs",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/nosql/src/main/kotlin/sfz/repl/l08/VectorClock.kt",
+      "labs/nosql/src/main/kotlin/sfz/repl/l08/Crdts.kt"
+    ],
+    "run": "./gradlew :nosql:test --tests 'sfz.repl.l08.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All ten fail.",
+      "In `VectorClock.kt`, write `compare` and `merge`, then `DynamoKey.put`. `prune`, `receive` and `context` are given. Four tests pass, including Dynamo's D1 to D5 example, replica by replica.",
+      "In `Crdts.kt`, write `LwwRegister.merge`. Its test passes and shows the skewed-clock loss from the Try-it; the next test shows vector clocks calling the same two writes concurrent.",
+      "Write `GCounter.merge`, then the OR-Set's `remove`, `elements` and `merge`. The last test makes 40 random edits on three replicas, syncs some of them in random directions, and checks that all six merge orders agree, fifty times.",
+      "Experiment: change `GCounter.merge` to add the slots instead of taking the maximum, and see which tests fail and why. Put it back."
+    ],
+    "hints": [
+      "In `compare`, loop over `counters.keys + other.counters.keys` and set two flags: `smaller` if `this[node] < other[node]`, `bigger` if `>`. Both: CONCURRENT. Only smaller: BEFORE. Only bigger: AFTER. Neither: EQUAL.",
+      "`merge` is `(counters.keys + other.counters.keys).associateWith { maxOf(this[it], other[it]) }`, wrapped in a `VectorClock`.",
+      "`put` is three lines: `Version(value, context.increment(node))`, then `versions = prune(versions + written)`, then return it.",
+      "LWW: compare `timestamp` first; on a tie compare `node`, so every replica picks the same winner whatever order it merges in.",
+      "OR-Set `remove` adds `adds[element].orEmpty()` to `removed`. `elements` keeps the keys of `adds` whose tags aren't all in `removed`. `merge` unions the tag sets per element and unions `removed`."
+    ],
+    "done_when": "All ten tests in `VectorClockTest` and `CrdtTest` pass."
+  },
+  "drill": {
+    "title": "Compare vectors and merge counters by hand",
+    "minutes": 5,
+    "prompt": "Without running anything, answer: (a) how `[(Sx, 2), (Sy, 1)]` relates to `[(Sx, 2), (Sz, 1)]`, to `[(Sx, 3), (Sy, 1)]` and to `[(Sx, 3)]`; (b) the vector of a write coordinated by Sz whose client read both of the first two; (c) the merge of the G-Counters `{eu: 4, us: 2}` and `{eu: 3, us: 5, ap: 1}`, and its value; (d) in one sentence, when two writes are concurrent.",
+    "answer": {
+      "lang": "text",
+      "src": "(a) [(Sx,2),(Sy,1)] vs [(Sx,2),(Sz,1)]   CONCURRENT  (bigger on Sy, smaller on Sz)\n    [(Sx,2),(Sy,1)] vs [(Sx,3),(Sy,1)]   BEFORE      (every entry <=, one smaller)\n    [(Sx,2),(Sy,1)] vs [(Sx,3)]          CONCURRENT  (smaller on Sx, bigger on Sy)\n(b) context = merge = [(Sx,2),(Sy,1),(Sz,1)]; Sz increments its own entry:\n    [(Sx,2),(Sy,1),(Sz,2)]\n(c) max per slot: {eu: 4, us: 5, ap: 1}, value 10   (adding the slots would give 15: wrong)\n(d) When neither writer had seen the other's write when it wrote,\n    however far apart their clocks say they were."
+    }
+  },
+  "recap": [
+    "Write A happens before write B if B's writer knew about A; two writes are concurrent when neither happened before the other. It's about knowledge, not time: an hour apart can be concurrent, 2 ms apart can be ordered.",
+    "Last write wins converges by keeping the highest timestamp, and silently drops the other concurrent write. Jepsen measured 71.7% of acknowledged writes lost on a healthy Riak cluster under contention (91.4% with a partition) and 0% with siblings merged as a set. Skewed clocks can make even a later write lose.",
+    "Version vectors (Dynamo's \"vector clocks\") keep one counter per replica. Compare entry by entry: all at most the other's means ancestor, each bigger somewhere means concurrent, and the store keeps both as siblings for the application to merge.",
+    "CRDTs merge by operations that are commutative, associative and idempotent: G-Counter (max per slot), PN-Counter (two G-Counters), OR-Set (unique tags, remove what you saw). They don't fit invariants like \"balance never below zero\"; those need agreement before the write.",
+    "Which values a read may return at all (consistency models, linearizability, CAP) is the subject of the Consistency and consensus track."
+  ],
+  "quiz": [
+    {
+      "q": "A capture of pay-81723 is written by a US service at 10:00:00.002, after it received the authorization written in the EU at 10:00:00.000. An AP service that had heard of neither writes a void at 10:00:00.001. Which pairs are concurrent?",
+      "options": [
+        "None: all three are 2 ms apart, so they're effectively simultaneous",
+        "Authorization and capture only, because they're on different continents",
+        "The void with the authorization, and the void with the capture; the capture happened after the authorization",
+        "All three pairs, because the clocks of three regions can't be compared"
+      ],
+      "answer": 2,
+      "why": "The capture's writer had seen the authorization, so the authorization happens before the capture, whatever the clocks say. The void's writer had seen neither, so the void is concurrent with both. Being close in time, or far apart, or on different continents doesn't decide it; what each writer knew does."
+    },
+    {
+      "q": "Dynamo's paper reports 99.94% of shopping-cart requests seeing a single version, while Jepsen's Riak test lost 71.7% of acknowledged writes under last write wins. How can both be true?",
+      "options": [
+        "Dynamo used better clocks than Riak",
+        "Dynamo's carts rarely had two writers on one key at once, while every Jepsen client wrote the same key; how much a rule loses depends on contention, and whether it can lose depends on the rule",
+        "Jepsen's test injected network partitions, and Dynamo never saw one",
+        "One of the measurements must be wrong"
+      ],
+      "answer": 1,
+      "why": "Loss under last write wins needs two concurrent writes to the same key. Real carts mostly have one writer at a time, so divergence was rare; Jepsen built a workload where every write raced others on one key. Jepsen's 71.7% came from a run with no partition at all and fine clocks, so neither partitions nor clocks explain the gap. Dynamo's carts also didn't use last write wins: they kept siblings and merged them."
+    },
+    {
+      "q": "Which of these is a safe place to use last write wins?",
+      "options": [
+        "A payment's status, which a capture and a void may both update",
+        "An account balance that two regions update by read-modify-write",
+        "A set of blocked cards that several regions add to and remove from",
+        "An audit event inserted once under a fresh UUID and never updated"
+      ],
+      "answer": 3,
+      "why": "Last write wins only loses data when two writes to the same key are concurrent. A row written once under a unique key never has a second write to lose. The status, the balance and the card set all take concurrent updates, and each lost write is a real decision: a void, a payment, a block."
+    },
+    {
+      "q": "Two copies of a G-Counter are `{eu: 5, us: 2}` and `{eu: 3, us: 4}`. Why does the merge take `{eu: 5, us: 4}` rather than adding to `{eu: 8, us: 6}`?",
+      "options": [
+        "Because adding would overflow the counter",
+        "Because the maximum is faster to compute",
+        "Because each slot only grows, so the bigger value already includes the smaller, and adding would count the same increments twice",
+        "Because CRDTs never store more than one value per slot"
+      ],
+      "answer": 2,
+      "why": "eu's slot is only ever incremented by eu, so 5 is a later state of the same slot than 3, and contains those 3 increments. Taking the maximum gives the same result in any order and when repeated, which lets copies sync any number of times. Adding counts shared history twice: merge the same copy again and the total keeps climbing."
+    },
+    {
+      "q": "From lesson 7: Cassandra with N = 3, every write and read at `QUORUM`. Is that linearizable?",
+      "options": [
+        "Yes: R + W > N means every read sees every write",
+        "No: R + W > N makes acknowledged writes and reads overlap, but timeouts, concurrent writes resolved by timestamp and reads during a write still break the one-copy illusion",
+        "Yes, as long as hinted handoff is on",
+        "No, because QUORUM reads only ask one replica"
+      ],
+      "answer": 1,
+      "why": "Lesson 7 showed the overlap guarantee and its gaps: a timed-out write may still land, two concurrent writes are settled by timestamps (last write wins), and a quorum read during a write can see it while a later one doesn't, unless read repair blocks. Abadi: \"simply using a quorum protocol is not sufficient\" for linearizability. Cassandra's lightweight transactions add the missing agreement step.",
+      "from": "repl-07"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "When does write A happen before write B?",
+      "back": "When B's writer knew about A: the same process did A first, a message carried A to B's writer, or a chain of those."
+    },
+    {
+      "front": "When are two writes concurrent?",
+      "back": "When neither happened before the other: neither writer had seen the other's write. The clock gap doesn't matter."
+    },
+    {
+      "front": "What did Jepsen measure for Riak with last write wins?",
+      "back": "1,434 of 2,000 acknowledged writes lost (71.7%) with no fault; 91.4% with a partition; 0 lost with siblings merged as a set."
+    },
+    {
+      "front": "How do you compare two version vectors?",
+      "back": "Entry by entry, missing = 0. All <= with one smaller: ancestor. Each bigger somewhere: concurrent, keep both as siblings."
+    },
+    {
+      "front": "Version vector versus vector clock?",
+      "back": "A version vector tracks versions of one piece of data across replicas; a vector clock orders events in general. Dynamo's \"vector clocks\" are version vectors."
+    },
+    {
+      "front": "What makes a CRDT merge safe?",
+      "back": "It's commutative, associative and idempotent, so copies converge whatever order and however often they merge. Example: G-Counter takes the max per slot."
+    },
+    {
+      "front": "When is last write wins safe?",
+      "back": "When each key is written once and never updated, such as inserts keyed by a fresh UUID. Otherwise it drops one of two concurrent writes."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Happens-before",
+      "plain": "A happens before B when B's writer knew about A, directly or through a chain of messages."
+    },
+    {
+      "term": "Concurrent writes",
+      "plain": "Two writes where neither writer had seen the other's write, however close or far apart in time."
+    },
+    {
+      "term": "Last write wins (LWW)",
+      "plain": "Conflict rule that keeps the value with the highest timestamp and drops the rest."
+    },
+    {
+      "term": "Version vector",
+      "plain": "One counter per replica on each version; comparing two shows whether one saw the other or they're concurrent."
+    },
+    {
+      "term": "Sibling",
+      "plain": "One of several concurrent versions a store keeps and returns together for the application to merge."
+    },
+    {
+      "term": "CRDT",
+      "plain": "Conflict-free replicated data type: a value whose merge gives the same result in any order, so replicas converge without coordination."
+    },
+    {
+      "term": "OR-Set",
+      "plain": "Observed-remove set: adds carry unique tags, a remove deletes only the tags it saw, so a concurrent add survives."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague says: \"We use last write wins with NTP-synced clocks, so we always keep the newest decision and never lose anything that matters.\" Explain what last write wins actually keeps, how much it can lose, and what you'd use instead for different kinds of data.",
+    "answer": "Last write wins keeps whichever version has the highest timestamp, and it's only the newest decision when one writer had seen the other. For concurrent writes, where neither writer knew about the other, there is no newest decision; the clock just picks one, and the other write disappears with no error even though its client was told it succeeded. How much that loses depends on contention: Jepsen's Riak test, with healthy clocks and no network fault, lost 71.7% of acknowledged writes because many clients updated one key. NTP doesn't fix it, and when clocks drift it gets worse, because a write that had seen the other can still lose to it. So it depends on the data. A display name can lose a write, so last write wins is fine. Counts and sets of blocked cards should keep every write, so we'd use CRDTs, a PN-Counter or an OR-Set, or version vectors with siblings and a merge. Payment status can't be merged at all, because a capture and a void must not both happen, so it needs a check before writing, with a single leader or a lightweight transaction."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Lamport's 1978 paper defines happens-before and builds a single counter per process, now called a Lamport clock, that gives every event a number consistent with it: if A happens before B, A's number is smaller. The converse fails: a smaller number doesn't mean A happened before B, which is why a Lamport clock can order events but can't detect concurrency. Vector clocks and version vectors fix that by keeping one counter per process. The Faults, time and truth track's lesson on logical clocks builds both, along with the ID schemes that ride on them.\n\nRiak replaced plain version vectors with dotted version vectors to stop sibling explosion: when many clients write through one node without sending context, plain vectors can't tell which sibling each write replaces, and siblings pile up. The \"dot\" records the single event that created each value. Riak also encodes the vector as an opaque \"causal context\" string that clients read and send back, which is the D1 to D5 dance in production form.\n\nCRDTs come in two styles. State-based CRDTs, the ones in this lesson's lab, ship the whole state and merge it. Operation-based CRDTs ship each operation and need a delivery layer that delivers every operation exactly once, in causal order; lesson 6's text CRDT is one. Shapiro, Preguica, Baquero and Zawirski's 2011 report, \"A comprehensive study of Convergent and Commutative Replicated Data Types\", defines both and catalogues counters, registers, sets, graphs and sequences; crdt.tech links it and much more. Designing Data-Intensive Applications, 2nd edition, chapter 6, covers detecting concurrent writes, version vectors and CRDTs alongside the replication styles of this track."
+  },
+  "sources": [
+    {
+      "title": "Kingsbury, Jepsen: Riak (2013): last write wins, siblings and CRDT sets under test",
+      "url": "https://aphyr.com/posts/285-jepsen-riak"
+    },
+    {
+      "title": "DeCandia et al., Dynamo: Amazon's Highly Available Key-value Store, SOSP 2007 (section 4.4, vector clocks; section 6, divergent versions)",
+      "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    },
+    {
+      "title": "Lamport, Time, Clocks, and the Ordering of Events in a Distributed System, 1978",
+      "url": "https://lamport.azurewebsites.net/pubs/time-clocks.pdf"
+    },
+    {
+      "title": "crdt.tech: resources on conflict-free replicated data types (Kleppmann, Bieniusa, Shapiro)",
+      "url": "https://crdt.tech/"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 6",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

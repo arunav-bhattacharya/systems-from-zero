@@ -1,0 +1,421 @@
+{
+  "id": "dist-01",
+  "title": "Partial failure: networks that lose, delay and duplicate",
+  "minutes": 40,
+  "goal": "By the end you can list what silence after a request might mean and why the caller can't tell which, say what TCP does and doesn't promise, explain why a packet network has no upper bound on delay, and make retries safe with an idempotency key, measured on a simulated network.",
+  "warmup": {
+    "q": "Your service sends `POST /authorize` to a card issuer with a 2-second timeout, and the timeout fires. What do you now know about the payment?",
+    "options": [
+      "The issuer never received it, so showing the customer an error is safe",
+      "The issuer is down, so the payment failed",
+      "Nothing about whether the card was charged: it may have been, may be later, or may never be",
+      "The issuer declined it and the decline was lost"
+    ],
+    "answer": 2,
+    "why": "A timeout tells you how long you waited and nothing else. The request may be lost or stuck in a queue, the issuer may have crashed or be paused, or the card was charged and the reply was lost or is still coming. In some of those worlds the card is already charged, and in some it will be charged after you gave up. An error screen invites the customer to pay again. The safe move is to keep the payment pending and resolve it with the same idempotency key."
+  },
+  "sections": [
+    {
+      "h": "One computer fails whole; many computers fail in part",
+      "body": "On one machine, failure is mostly all or nothing. A memory error that ECC can't correct makes the kernel panic. A null dereference in native code kills the process. A disk that can't read a block makes the system call return `EIO`. Hardware and operating systems are built to stop rather than carry on with a wrong answer, so a program either gets its result or finds out it didn't. When your Kotlin code calls a local function, the function returns, or throws, or the whole process is gone and nobody is left to be confused.\n\nPut the same work on two machines and that guarantee goes away. A payment service sends an authorization to a card issuer's API across a network. Now three parts fail on their own: your process, the network between, and the issuer's process. Any one can break while the other two keep running. That is **partial failure**, and every lesson in this track is about living with it.\n\nThe trouble is what your process can know. It knows only the messages that have reached it. Send `POST /authorize` for 12.50 and wait. Either a reply arrives or nothing does. If nothing does, the request is in one of three places, each in one of two states:\n\n- on the way there: lost, or stuck in a queue and still coming;\n- at the issuer: crashed before it charged the card, or paused (a long garbage collection, a frozen VM) and about to charge it;\n- on the way back: the card was charged and the reply was lost, or the reply is just slow.\n\nFrom your side all six look identical: a socket with no bytes in it. Waiting longer doesn't settle it. A queued request can arrive after you gave up, and a paused issuer can wake and charge the card a minute later. In the stepper below, the shop's view never changes; only the issuer's side does.\n\nSo a remote call has three outcomes, not two: yes, no and unknown. Code that turns unknown into no, for example a timeout shown to the customer as a failed payment, asks the customer to try again, and in the worlds where the card was charged that charges it twice. The rest of this lesson measures how often each world turns up and what makes an unknown safe to retry. Lesson 2 asks how long to wait before you call it unknown, and lesson 5 deals with a silent node that is still acting.",
+      "stepper": {
+        "title": "Six ways to hear nothing",
+        "intro": "One payment, a 2-second timeout. The times come from the lab's `SilenceDemo` (1 ms per packet, 50 ms per charge, 5 s for the slow cases).",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The shop sends pay-1 to the issuer and starts a 2-second timer\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timer: 2,000 ms</text><rect class=\"box\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">charges cards</text><text class=\"t-s t-m\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">50 ms per charge</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"218\" y2=\"66\"/><line class=\"ln-d\" x1=\"352\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"220\" y=\"53\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"285\" y=\"70\" text-anchor=\"middle\">pay-1</text><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Six worlds follow. The shop's side is the same in every one.</text></svg>",
+            "say": "The shop sends `pay-1`, a 12.50 authorization, and starts a 2,000 ms timer. The request has three places to be: on the way there, at the issuer, or on the way back as a reply. Each of the next six frames breaks one of them."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The request is lost on the way\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">never saw pay-1</text><text class=\"t-s\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\"></text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"253\" y2=\"66\"/><line class=\"ln-d\" x1=\"387\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"255\" y=\"53\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"70\" text-anchor=\"middle\">pay-1: lost</text><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-ok\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: not charged, and never will be.</text></svg>",
+            "say": "**The request is lost.** A full switch queue dropped it, or a link went down. The issuer never hears of it. Retrying is safe here, but the shop can't know that this is the world it is in."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The request waits in a queue and arrives late\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">nothing yet</text><text class=\"t-s\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\"></text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"268\" y2=\"66\"/><line class=\"ln-d\" x1=\"402\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"270\" y=\"53\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"335\" y=\"70\" text-anchor=\"middle\">pay-1: queued</text><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-b\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: arrives at 5,000 ms, charged at 5,050 ms.</text></svg>",
+            "say": "**The request waits in a queue.** It is still on its way when the timer fires. It reaches the issuer at 5,000 ms and the card is charged at 5,050 ms, three seconds after the shop gave up."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The issuer crashed\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box-bad\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s t-bad\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">crashed</text><text class=\"t-s t-m\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">process is gone</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-ok\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: not charged. Nobody is left to charge it.</text></svg>",
+            "say": "**The issuer crashed** before it charged the card. Its kernel may even have acknowledged the TCP segment: that tells the shop nothing about the application, which is gone."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The issuer is paused\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box-b\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s t-b\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">paused: a 5 s GC</text><text class=\"t-s t-m\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">pay-1 in its buffer</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-b\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: wakes at 5,000 ms and charges at 5,050 ms.</text></svg>",
+            "say": "**The issuer is paused**: a long garbage collection, or its VM was descheduled. `pay-1` sits in the socket buffer. At 5,000 ms the process carries on as if nothing happened and charges the card."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The reply is lost\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">charged at 51 ms</text><text class=\"t-s t-m\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">code A00001</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"387\" y2=\"104\"/><line class=\"ln-d\" x1=\"253\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"255\" y=\"91\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"108\" text-anchor=\"middle\">A00001: lost</text><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-bad\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: charged at 51 ms. The shop will never hear.</text></svg>",
+            "say": "**The reply is lost.** The card was charged at 51 ms, and the proof never arrives. If the shop now tells the customer the payment failed, the customer pays again."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"The reply waits in a queue\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">sent pay-1 at 0 ms</text><text class=\"t-s t-m\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">timed out at 2,000 ms</text><rect class=\"box\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">charged at 51 ms</text><text class=\"t-s t-m\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">code A00001</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"352\" y2=\"104\"/><line class=\"ln-d\" x1=\"218\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"220\" y=\"91\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"285\" y=\"108\" text-anchor=\"middle\">A00001: queued</text><rect class=\"box-dim\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows at 2,000 ms: no reply. Unknown.</text><rect class=\"box-b\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">Truth: charged at 51 ms; the reply lands at 5,051 ms.</text></svg>",
+            "say": "**The reply is slow.** The card was charged at 51 ms and the reply lands at 5,051 ms, after the shop decided. Six worlds: in two the card was never charged, in two it already was, in two it will be. The shop saw the same thing in all six."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 270\" role=\"img\" aria-label=\"A retry with the same idempotency key resolves the unknown\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"115.0\" y=\"72.0\" text-anchor=\"middle\">shop</text><text class=\"t-s\" x=\"115.0\" y=\"90.0\" text-anchor=\"middle\">retry pay-1, same key</text><text class=\"t-s t-ok\" x=\"115.0\" y=\"108.0\" text-anchor=\"middle\">hears A00001</text><rect class=\"box-ok\" x=\"430\" y=\"30\" width=\"190\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"72.0\" text-anchor=\"middle\">issuer</text><text class=\"t-s\" x=\"525.0\" y=\"90.0\" text-anchor=\"middle\">key pay-1: seen</text><text class=\"t-s t-ok\" x=\"525.0\" y=\"108.0\" text-anchor=\"middle\">same code, no charge</text><text class=\"t-s t-m\" x=\"320\" y=\"45\" text-anchor=\"middle\">request: shop to issuer</text><text class=\"t-s t-m\" x=\"320\" y=\"136\" text-anchor=\"middle\">reply: issuer to shop</text><line class=\"ln-d\" x1=\"214\" y1=\"66\" x2=\"233\" y2=\"66\"/><line class=\"ln-d\" x1=\"367\" y1=\"66\" x2=\"424\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"235\" y=\"53\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"300\" y=\"70\" text-anchor=\"middle\">pay-1 again</text><line class=\"ln-d\" x1=\"426\" y1=\"104\" x2=\"407\" y2=\"104\"/><line class=\"ln-d\" x1=\"273\" y1=\"104\" x2=\"216\" y2=\"104\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"275\" y=\"91\" width=\"130\" height=\"26\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"108\" text-anchor=\"middle\">A00001</text><rect class=\"box-a\" x=\"20\" y=\"160\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"185\" text-anchor=\"middle\">What the shop knows after the retry: approved, code A00001.</text><rect class=\"box-ok\" x=\"20\" y=\"214\" width=\"600\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"320\" y=\"239\" text-anchor=\"middle\">One charge in every world, and now the shop knows the outcome.</text></svg>",
+            "say": "**The way out.** The shop treats the timeout as *unknown* and retries with the same idempotency key. In the worlds where the card was charged, the issuer finds the key and returns the stored code without charging again. Where it wasn't, the retry charges it once. Either way the shop ends with one charge and an answer."
+          }
+        ]
+      },
+      "try": {
+        "title": "Six worlds, one view",
+        "minutes": 4,
+        "steps": [
+          "Before you run it, write down for each of the six worlds whether the card ends up charged, and whether a reply ever reaches the shop.",
+          "Run the demo from the `labs` folder. It plays one payment through each world with a 2-second timeout and no retry, in virtual time.",
+          "Run it again with `-Pargs='3'` (three attempts, same key). Which worlds now end approved, and which stay unknown? Why does the paused issuer charge only once?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.SilenceDemoKt\n./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.SilenceDemoKt -Pargs='3'",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l01/demo/SilenceDemo.kt",
+          "run": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.SilenceDemoKt"
+        },
+        "expect": "```text\nOne payment, pay-1, timeout 2,000 ms, 1 attempt(s) with the same key\n\nworld                              the client decides         the issuer charged     reply after the decision\nthe request is lost                unknown at 2000 ms         never                  no\nthe request waits 5 s in a queue   unknown at 2000 ms         once at 5050 ms        yes (1)\nthe issuer has crashed             unknown at 2000 ms         never                  no\nthe issuer is paused for 5 s       unknown at 2000 ms         once at 5050 ms        yes (1)\nthe reply is lost                  unknown at 2000 ms         once at 51 ms          no\nthe reply waits 5 s in a queue     unknown at 2000 ms         once at 51 ms          yes (1)\n```\n\nThe second column is identical in every row; the third has three different answers. With three attempts (6 s of waiting) the two queued worlds and the paused issuer end `approved at 5051 ms`, while the lost request, the crash and the lost reply are still `unknown at 6000 ms`. The paused issuer received all three attempts at 5,000 ms and charged once, because the lab's issuer checks the key: the first copy starts the charge and the other two find it in progress."
+      },
+      "refs": [
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition, chapter 9 (faults and partial failures)",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Network faults are routine, and many are partial",
+      "body": "At any real scale these worlds turn up every day. The best public evidence is a survey by Peter Bailis and Kyle Kingsbury, *The Network Is Reliable* (2014), which collected field studies and post-mortems. In Microsoft's datacenters, a 2011 study counted about 5.2 device failures and 40.8 link failures a day, with a median of about 59,000 packets lost per failure. Redundant links and switches helped less than you'd hope: during failures they raised the median traffic delivered by only 43%. Google's Chubby lock service had 61 outages in 700 days, and 4 of the 9 that lasted longer than 30 seconds came from network maintenance.\n\nMany faults are partial. One Broadcom network card dropped every inbound packet while it kept sending. Its node kept sending heartbeats, so its standby never took over, and the service was down for five hours. In November 2020 a switch at Cloudflare failed halfway: its control-plane protocols stayed up while it forwarded only some traffic. The etcd cluster behind Cloudflare's control plane couldn't keep a stable leader and went read-only, and the knock-on effects degraded its API and dashboard for 6 hours 33 minutes. Cloudflare's post-mortem called it a Byzantine failure; it was an omission fault, messages that didn't arrive, which ordinary consensus protocols are designed to survive (lesson 7 sorts out the kinds of fault).\n\nWhat do partitions do to software that passed its tests? Alquraan and colleagues (OSDI 2018) studied 136 failures caused by network partitions in 25 widely used systems, among them MongoDB, Elasticsearch, Redis, Kafka, ZooKeeper, RabbitMQ, HDFS and Cassandra. 80% were catastrophic, with data loss the most common result (26.6%). 90% were silent: the client got no error at all. 21% left damage that stayed after the network healed. Leader election was the mechanism at fault in 39.7%.\n\nTwo of their numbers should change how you test. 88% of the failures needed only one node to be isolated, and 62% happened every time, so a cheap, targeted test would have found them. And 28.7% needed a **partial partition**: A can reach B, and B can reach C, but A can't reach C. A test that splits a cluster cleanly in two never produces that.\n\nA word on names. A **network partition** means some nodes can't reach some others for a while. It has nothing to do with partitioning data across shards (the Partitioning track). Partitions also come one way at a time: a link that carries requests and loses replies, like that network card. The Try cuts one direction only and counts what the client believes against what the issuer did.",
+      "try": {
+        "title": "Cut one direction",
+        "minutes": 4,
+        "steps": [
+          "1,000 payments, one every 10 ms. Predict: if 30% of the replies are lost and the requests all arrive, how many of the unknown payments were charged? And if 30% of the requests are lost instead?",
+          "Run the demo with `oneway`. The audit compares the client's outcomes with the issuer's own list of charges.",
+          "Look at the `unknown` column in the first two rows, then at `unknown, charged`. Rerun with `-Pargs='oneway 0.05'` to see the same split at a loss rate closer to a bad day in production."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.AuditDemoKt -Pargs='oneway'",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l01/demo/AuditDemo.kt",
+          "run": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.AuditDemoKt -Pargs='oneway'"
+        },
+        "expect": "```text\nscenario                                 approved  unknown   unknown, charged  double-charged  extra charges\nrequests lost (0.3), replies fine             723      277                  0               0              0\nrequests fine, replies lost (0.3)             697      303                303               0              0\nboth directions lost (0.15 each)              749      251                122               0              0\n```\n\n(Header line trimmed.) The client sees about 300 unknowns in both of the first two rows. In the first, none of them was charged; in the second, every one was. With loss in both directions about half of the unknowns were charged, and nothing the client can measure tells it which half."
+      },
+      "refs": [
+        {
+          "title": "Bailis and Kingsbury: The Network Is Reliable",
+          "url": "https://aphyr.com/posts/288-the-network-is-reliable",
+          "kind": "read"
+        },
+        {
+          "title": "Alquraan et al.: An Analysis of Network-Partitioning Failures in Cloud Systems (OSDI 2018)",
+          "url": "https://www.usenix.org/system/files/osdi18-alquraan.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Cloudflare: A Byzantine failure in the real world",
+          "url": "https://blog.cloudflare.com/a-byzantine-failure-in-the-real-world/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "TCP fixes packets, not requests",
+      "body": "The Computer networking track showed how TCP turns lost, duplicated and reordered packets into a clean byte stream (its lessons on UDP and on TCP performance). Every byte has a sequence number, the receiver acknowledges what arrived, the sender resends what wasn't acknowledged after a retransmission timeout, and the receiver drops duplicate segments and puts the rest in order. So why doesn't TCP make the six worlds go away?\n\nBecause TCP's promises live inside the two kernels and end with one connection. Three gaps matter.\n\nFirst, a TCP ACK means the bytes reached the issuer's kernel and sit in its socket receive buffer. It says nothing about the issuer's application. The process can crash a microsecond later with your request unread, or charge the card and crash before it writes the reply. Only an answer from the application, `charged, code A00042`, tells you the work happened.\n\nSecond, TCP can't tell you what happened when it gives up. If ACKs stop coming, Linux keeps retransmitting with exponential backoff, 15 times by default (`net.ipv4.tcp_retries2`), which takes at least 924.6 seconds, before it reports an error. Your HTTP client's timeout fires long before that. Either way you learn that the connection is dead, not which of your bytes the application acted on.\n\nThird, TCP's duplicate detection works only within one connection. When your client times out and retries, it opens a new connection or takes another one from the pool and sends the request again. To TCP that's a new byte stream with new sequence numbers. To the issuer it's a second request. A load balancer that retries for you does the same, and so does a queue that redelivers a message.\n\nSo the application needs the same three pieces TCP has, one level up: a unique id for each operation (an **idempotency key**), an answer that only the application sends, and a receiver that remembers the ids it has handled. The issuer stores the key with the charge; a retry with the same key gets the stored answer back and no second charge. The networking track's production lesson introduced idempotency keys for safe retries. Here you can count what they save: in the Try, retries cut the unknowns from 344 to 45 and charged 175 cards twice, and the same retries with the key checked charged none twice.\n\nTwo details make the key work. Create it once per payment, before the first attempt, and reuse it in every retry: a new key per attempt is no key. And the server must record the key in the same transaction as the effect. If it charges the card, crashes, and never wrote the key, the next retry charges again. The Derived data track's lesson on the end-to-end argument follows this from the client all the way to storage.",
+      "try": {
+        "title": "Retries with and without the key",
+        "minutes": 4,
+        "steps": [
+          "20% of packets are lost in each direction. Predict how many cards get charged twice when the client tries up to 3 times and the issuer doesn't check the key.",
+          "Run the demo with `retries`. Rows 2 and 3 are the same run except for the key check; rows 4 and 5 lose nothing but duplicate 20% of packets, as a retrying proxy would.",
+          "Find the cost of retries in the `unknown, charged` column of row 2: why can those 37 payments still not be resolved by the client?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.AuditDemoKt -Pargs='retries'",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l01/demo/AuditDemo.kt",
+          "run": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.AuditDemoKt -Pargs='retries'"
+        },
+        "expect": "```text\nscenario                                 approved  unknown   unknown, charged  double-charged  extra charges\nloss 0.2, 1 attempt, no key check             656      344                162               0              0\nloss 0.2, 3 attempts, no key check            955       45                 37             175            195\nloss 0.2, 3 attempts, key checked             956       44                 37               0              0\nduplicates 0.2, no key check                 1000        0                  0             190            190\nduplicates 0.2, key checked                  1000        0                  0               0              0\n```\n\nThree attempts turn most unknowns into answers, and without the key they charge 175 cards twice (195 extra charges, since some were charged three times). With the key the same faults cost nothing. The 37 payments that stay unknown but charged lost every reply; only a later retry or a status query with the same key can settle them."
+      },
+      "refs": [
+        {
+          "title": "Linux kernel docs: IP sysctl (tcp_retries2)",
+          "url": "https://docs.kernel.org/networking/ip-sysctl.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Delay has no ceiling, because packet networks queue",
+      "body": "If every packet arrived within d milliseconds and the issuer always answered within r, a timeout of 2d + r would be exact: silence after that would mean failure, never slowness. Real networks give you no d. A packet that usually takes half a millisecond inside a datacenter can take seconds.\n\nFollow one packet and count the queues it can wait in:\n\n- A switch port. When several senders send to one destination at once, the switch pushes one packet at a time onto that port and queues the rest; when the queue is full it drops the next one (the figure). A query that fans out to 100 servers and gets 100 answers back at the same instant does exactly this.\n- The receiving kernel. If every core is busy or the application's threads are all taken, arriving data waits in the socket's receive buffer, and new connections wait in the accept queue (the networking track's TCP connections lesson).\n- The hypervisor. In a VM, your virtual CPU can be taken away while another tenant's VM runs, and packets for you wait until you get a core back. On a busy host that can be tens of milliseconds.\n- TCP itself. Congestion control holds data back at the sender when it thinks the path is full, and a lost segment is resent only after a retransmission timeout, at least 200 ms on Linux. TCP turns loss into delay.\n\nEvery one of these queues grows fastest when its resource is nearly full, which is when you are busiest. At the extreme, a switch failure at GitHub in 2012 blocked traffic for 90 seconds.\n\nWhy build networks like this? The phone network didn't. A call reserved a fixed slice of every link on its path for the whole call, a **circuit**, so nothing queued and the delay was fixed. The price is that the slice sits idle whenever nobody talks. Data traffic is bursty: a page load, then nothing, then a 50 MB file. **Packet switching** lets every sender share every link and absorbs bursts in queues, so links run close to full, and the price is delay that varies without a fixed limit. Bounded delay can be bought (InfiniBand's link-level flow control, priority classes, admission control), but public clouds and the internet don't sell it to you.\n\nSo no timeout separates slow from dead. In the Try, 2% of packets in each direction wait up to 3 seconds and nothing is lost. A 100 ms timeout leaves 35 of 1,000 payments unknown, all of them charged; a 5-second timeout leaves none unknown, and makes the shop wait 5 seconds on every call to an issuer that really is dead. Lesson 2 picks the number from measurements and lets it adapt.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 240\" role=\"img\" aria-label=\"Three servers answer at once through one switch port. The answers wait in the port's output queue, and once it is full the next packet is dropped.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"24\" width=\"130\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"85.0\" y=\"44.0\" text-anchor=\"middle\">server 1</text><text class=\"t-s t-m\" x=\"85.0\" y=\"62.0\" text-anchor=\"middle\">1 answer</text><line class=\"ln\" x1=\"152\" y1=\"48\" x2=\"206\" y2=\"120\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"92\" width=\"130\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"85.0\" y=\"112.0\" text-anchor=\"middle\">server 2</text><text class=\"t-s t-m\" x=\"85.0\" y=\"130.0\" text-anchor=\"middle\">1 answer</text><line class=\"ln\" x1=\"152\" y1=\"116\" x2=\"206\" y2=\"120\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"160\" width=\"130\" height=\"48\" rx=\"8\"/><text class=\"t\" x=\"85.0\" y=\"180.0\" text-anchor=\"middle\">server 3</text><text class=\"t-s t-m\" x=\"85.0\" y=\"198.0\" text-anchor=\"middle\">1 answer</text><line class=\"ln\" x1=\"152\" y1=\"184\" x2=\"206\" y2=\"120\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"210\" y=\"76\" width=\"130\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"275.0\" y=\"107.0\" text-anchor=\"middle\">switch</text><text class=\"t-s t-m\" x=\"275.0\" y=\"125.0\" text-anchor=\"middle\">one port to</text><text class=\"t-s t-m\" x=\"275.0\" y=\"143.0\" text-anchor=\"middle\">the aggregator</text><line class=\"ln\" x1=\"342\" y1=\"120\" x2=\"368\" y2=\"120\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"372\" y=\"96\" width=\"160\" height=\"48\" rx=\"8\"/><rect class=\"box-b\" x=\"380\" y=\"106\" width=\"30\" height=\"28\" rx=\"8\"/><rect class=\"box-b\" x=\"417\" y=\"106\" width=\"30\" height=\"28\" rx=\"8\"/><rect class=\"box-b\" x=\"454\" y=\"106\" width=\"30\" height=\"28\" rx=\"8\"/><rect class=\"box-b\" x=\"491\" y=\"106\" width=\"30\" height=\"28\" rx=\"8\"/><text class=\"t-s t-m\" x=\"452\" y=\"86\" text-anchor=\"middle\">output queue (full)</text><text class=\"t-s t-m\" x=\"452\" y=\"168\" text-anchor=\"middle\">one packet leaves at a time</text><rect class=\"box-bad\" x=\"382\" y=\"186\" width=\"140\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"452\" y=\"206\" text-anchor=\"middle\">a 5th: dropped</text><line class=\"ln\" x1=\"534\" y1=\"120\" x2=\"552\" y2=\"120\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"556\" y=\"92\" width=\"104\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"608.0\" y=\"116.0\" text-anchor=\"middle\">aggregator</text><text class=\"t-s t-m\" x=\"608.0\" y=\"134.0\" text-anchor=\"middle\">waits</text></svg>",
+        "caption": "Three answers reach one switch port at the same moment. The port sends one packet at a time, the rest wait in its output queue, and once the queue is full the next packet is dropped."
+      },
+      "try": {
+        "title": "Delay with a long tail",
+        "minutes": 4,
+        "steps": [
+          "Each packet takes 1 to 5 ms, but 2% of packets wait behind other traffic for up to 3 seconds. Predict the p99 round trip, then which timeout leaves no payment unknown.",
+          "Run the demo. It first measures 10,000 round trips with no timeout at all, then runs 1,000 payments with timeouts from 100 ms to 5 s.",
+          "Rerun with `-Pargs='0.05 10000'` (5% of packets, up to 10 s). Is there still a timeout that is both safe and short?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.DelayDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l01/demo/DelayDemo.kt",
+          "run": "./gradlew -q :sim:demo -Pmain=sfz.dist.l01.demo.DelayDemoKt"
+        },
+        "expect": "```text\n10,000 payments, nothing lost, 2% of packets queued for up to 3000 ms\nround trip including 50 ms of work: p50 56 ms, p90 59 ms, p99 2329 ms, p99.9 2944 ms, max 3053 ms\n\ntimeout     approved   unknown   unknown, charged  late replies\n100 ms           965        35                 35            35\n200 ms           966        34                 34            34\n500 ms           973        27                 27            27\n1000 ms          977        23                 23            23\n2000 ms          987        13                 13            13\n5000 ms         1000         0                  0             0\n```\n\nThe median round trip is 56 ms and the p90 is 59, but the p99 is 2.3 seconds: about 4% of round trips hit a queue in one direction or the other. Every unknown payment was charged, and every one of them got a late reply, because nothing was lost. Only a timeout longer than the longest queue (the model caps it at 3 s) leaves nothing unknown. With `-Pargs='0.05 10000'` the p99 is 9.2 s, the max 17.8 s (two long waits in a row), and even a 5-second timeout leaves 57 of 1,000 payments unknown: on a real network, with no cap at all, there is no timeout that is both short and safe.\n"
+      },
+      "refs": [
+        {
+          "title": "Bailis and Kingsbury: The Network Is Reliable (the GitHub and Microsoft cases)",
+          "url": "https://aphyr.com/posts/288-the-network-is-reliable",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "You post an order and a cheque to a supplier and hear nothing for two weeks. The letter may be lost, or sitting in a sorting office, or on the desk of a clerk who is on holiday; or the goods shipped and the confirmation went astray. Post a second order and you may get two crates. So you write an order number on every letter and ask the supplier to ignore any number it has already filled, and a repeat letter costs nothing. The analogy breaks on scale: the post loses one of your letters a year, while a payment service sends thousands of requests a second through queues that change every microsecond, so the rare worlds happen every few minutes, and nobody reads each case by hand.",
+  "in_your_world": "Every remote call your services make has the third outcome. When a Quarkus REST client call to the issuer times out, leave the payment pending, not failed, and let a background job settle it by retrying with the same idempotency key or asking the issuer for that key's status. Temporal retries an activity until it succeeds unless you limit it (its default retry policy has no maximum number of attempts), so an activity that calls an issuer must send a key that stays the same across attempts: the workflow id plus the activity's purpose, or the run id and activity id Temporal gives you. A Kafka producer that retries after a timeout can write a record twice unless idempotence is on, which the Messaging track's second producer lesson covers. And when a JDBC commit to Oracle fails with a connection error, you don't know whether it committed. Oracle's Transaction Guard records a logical transaction id for exactly this case, so after a recoverable error you can ask the database for that transaction's outcome instead of guessing.",
+  "mistake": "The common mistake is treating a timeout as a failure. The code catches `SocketTimeoutException` or `HttpTimeoutException`, marks the payment `FAILED` and shows the customer an error. The customer pays again, and if the first request was charged and only its reply was lost, the card is now charged twice. People write it this way because local calls train us to think in two outcomes, and because tests rarely lose a reply. The fix: give every remote call three outcomes (approved, declined, unknown), keep the payment pending on unknown, and resolve it with a retry or status query that reuses the payment's idempotency key, which the issuer stores in the same transaction as the charge. Never create a new key for a retry.",
+  "compare": {
+    "title": "Two outcomes against three",
+    "a": {
+      "label": "Timeout means failed",
+      "lang": "kotlin",
+      "title": "PaymentService.kt",
+      "src": "fun pay(order: Order): Status =\n    try {\n        val code = issuer.authorize(order.amount)          // a new request every time\n        Status.Approved(code)\n    } catch (e: HttpTimeoutException) {\n        Status.Failed                                      // the customer is told to try again\n    }"
+    },
+    "b": {
+      "label": "Timeout means unknown",
+      "lang": "kotlin",
+      "title": "PaymentService.kt",
+      "src": "fun pay(order: Order): Status {\n    val key = order.paymentKey                             // made once, when the order was created\n    repeat(3) {\n        try {\n            return Status.Approved(issuer.authorize(key, order.amount))\n        } catch (e: HttpTimeoutException) {\n            // unknown: the same key makes the next attempt safe\n        }\n    }\n    return Status.Pending                                  // a job resolves it later with the same key\n}"
+    },
+    "note": "The left version is shorter and wrong in two worlds out of six: when the reply was lost or slow, the card was charged and the customer is told it wasn't. The right version never reports failure on a timeout. It retries with the key the order already carries, and if every attempt times out it parks the payment as pending for a job that retries or asks the issuer for the key's status. It is only correct if the issuer stores the key with the charge; a key the server ignores turns these retries into double charges."
+  },
+  "worked": {
+    "title": "A client and an issuer that survive the six worlds",
+    "steps": [
+      {
+        "say": "Simplest version: send and wait for the reply. On a lost request this waits until TCP gives up, which on Linux is more than 15 minutes, holding a thread and a pooled connection the whole time.",
+        "code": "val reply = http.send(request, BodyHandlers.ofString())   // no timeout: can block for 15+ minutes",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Bound the wait. Now the call returns, but the catch block has to decide what a timeout means, and it doesn't mean declined.",
+        "code": "val request = HttpRequest.newBuilder(issuerUri)\n    .timeout(Duration.ofSeconds(2))                       // until the response headers arrive\n    .POST(BodyPublishers.ofString(body))\n    .build()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Make the key part of the payment, not of the attempt. It is created when the order is, stored with it, and sent as a header on every attempt.",
+        "code": "val key = order.paymentKey                                 // e.g. a UUID saved with the order\nval request = HttpRequest.newBuilder(issuerUri)\n    .header(\"Idempotency-Key\", key)\n    .timeout(Duration.ofSeconds(2))\n    .POST(BodyPublishers.ofString(body))\n    .build()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "On the issuer, insert the key and the charge in one transaction. A unique constraint on the key turns a second copy into a conflict instead of a second charge.",
+        "code": "INSERT INTO charges (idempotency_key, card, amount, code)\nVALUES (:key, :card, 1250, :code)\nON CONFLICT (idempotency_key) DO NOTHING;   -- 0 rows: this key was charged already\n-- then, in the same transaction:\nSELECT code FROM charges WHERE idempotency_key = :key;",
+        "lang": "sql"
+      },
+      {
+        "say": "Return what's stored, not what was just computed. The first attempt and every retry get the same code, so the client can't tell (and doesn't need to know) which attempt did the work.",
+        "code": "fun authorize(key: String, card: String, amount: Long): String =\n    tx {\n        insertIfAbsent(key, card, amount, newCode())          // the step above\n        codeFor(key)                                          // the one stored code for this key\n    }",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A network that loses, delays and duplicates, and the client that copes",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/dist/l01/Payments.kt",
+      "labs/sim/src/main/kotlin/sfz/dist/l01/Network.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.dist.l01.*'",
+    "steps": [
+      "Read `Network.kt` (given): `send` draws loss, delay, queueing and duplication for each packet from one seeded `Random`, so a seed replays a run exactly. Nothing sleeps; a simulated minute takes milliseconds. Then run the tests from the `labs` folder: all 13 fail.",
+      "Exercise 3 first, because it is the referee: write `audit` in `Payments.kt`. It compares the client's `outcomes` with the issuer's `charges`. The 2 tests in `AuditTest` pass.",
+      "Exercise 1: write `PaymentServer.onRequest`. Without `dedupe`, charge every copy; with it, return the stored code for a known key, ignore a key whose charge is in progress, and store the code under the key before replying. No new test passes yet: every scenario needs a client.",
+      "Exercise 2: write `PaymentClient.authorize` and `onReply`. Send attempt 1, schedule a timeout with `sim.after(timeoutMs)`, and when it fires either retry with the same key or record `Outcome.Unknown`. A reply for a key already decided counts as late. Run all 13, including the jqwik properties, which try hundreds of seeds and fault rates.",
+      "Read the test `a dead issuer and a paused issuer look the same to the client`: two worlds, identical outcomes, opposite truths. Then change `dedupe = true` to `false` in `an idempotency key makes the same retries safe` and watch it fail with the double charges you counted in the Try."
+    ],
+    "hints": [
+      "`audit`: `charges.groupingBy { it.key }.eachCount()` gives charges per key. Extra charges are `count - 1` summed over keys.",
+      "Keep one `Pending(amount, attempts)` per key. In the timeout callback, `if (key in outcomes) return@after` handles the reply that came in time.",
+      "Don't put the retry logic in `onReply`. Only the timeout decides to retry; a reply only decides `Approved` or counts a late reply.",
+      "In `onRequest`, add the key to `working` before calling `charge`, and move it to `codes` inside the `charge` callback. A copy that arrives while the charge runs must not start a second one."
+    ],
+    "done_when": "All 13 tests in `sfz.dist.l01` pass."
+  },
+  "drill": {
+    "title": "The idempotent issuer from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write the issuer's `onRequest` with deduplication: a known key gets its stored code, a key in progress gets nothing, a new key is charged once. Then add one comment: what goes wrong if the real issuer writes the key to its database in a separate transaction after the charge?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "private val codes = mutableMapOf<String, String>()     // key -> code, once charged\nprivate val working = mutableSetOf<String>()            // keys being charged now\n\nfun onRequest(from: String, request: AuthRequest) {\n    val known = codes[request.key]\n    when {\n        known != null -> reply(from, request.key, known)          // a retry or a copy: same answer\n        request.key in working -> Unit                            // the first copy's reply is coming\n        else -> {\n            working += request.key\n            charge(request) { code ->\n                codes[request.key] = code                         // remember, then answer\n                working -= request.key\n                reply(from, request.key, code)\n            }\n        }\n    }\n}\n// A separate transaction leaves a gap: charge committed, crash, key never written.\n// The next retry finds no key and charges the card again. Key and charge commit together."
+    }
+  },
+  "recap": [
+    "A distributed system fails in part: your process, the network and the remote process each break on their own, and your process knows only the messages it received.",
+    "Silence after a request has six causes (lost, queued, crashed, paused, reply lost, reply slow) that look identical. A remote call has three outcomes: yes, no and unknown.",
+    "Network faults are routine and often partial or one-way. Alquraan et al. found 80% of partition failures catastrophic, 90% silent, 88% triggered by isolating one node and 28.7% needing a partial partition.",
+    "TCP's guarantees end at the kernel and at one connection: an ACK isn't an application answer, and a retry over a new connection is a new request.",
+    "Packet networks queue in switches, kernels, hypervisors and TCP itself, so delay has no upper bound and no timeout separates slow from dead.",
+    "Retries are safe only with an idempotency key made once per operation and stored in the same transaction as its effect."
+  ],
+  "quiz": [
+    {
+      "q": "From the networking track's production lesson: the client's connect to the issuer fails with `connection refused`. Is it safe to retry `POST /authorize` without an idempotency key?",
+      "options": [
+        "Yes: the TCP handshake failed, so no request bytes reached the issuer's application",
+        "No: the issuer may have charged the card before refusing",
+        "No: a refused connection means the request is queued and will arrive later",
+        "Only after a full TCP retransmission timeout"
+      ],
+      "answer": 0,
+      "why": "A refused connect means the issuer's kernel answered the SYN with a reset because nothing was listening. The request was never sent, so it can't have been processed or queued, and a retry is safe. Compare a read timeout after the request went out: that is the unknown case, where only an idempotent request or a key makes a retry safe.",
+      "from": "net-12"
+    },
+    {
+      "q": "The client sends a 600-byte request. TCP reports every byte acknowledged, then the connection resets before any response arrives. What do you know?",
+      "options": [
+        "The issuer processed the request and the response was lost",
+        "The issuer's kernel received the bytes; whether the application read or acted on them is unknown",
+        "The request was rejected, because a reset means an error",
+        "Nothing reached the issuer, because the reset cancels the delivery"
+      ],
+      "answer": 1,
+      "why": "A TCP ACK comes from the remote kernel when the bytes land in the socket buffer. The application may have crashed before reading them, or charged the card and crashed before replying. The tempting first option claims too much: only an application-level answer says the work happened."
+    },
+    {
+      "q": "Your chaos tests isolate one node at a time and also split the cluster cleanly into two halves. Which class of failure from Alquraan et al. can these tests never produce?",
+      "options": [
+        "Failures that need more than one isolated node",
+        "Failures caused by a leader election",
+        "Failures that need a partial partition, where A reaches B and B reaches C but A can't reach C",
+        "Silent failures, where the client sees no error"
+      ],
+      "answer": 2,
+      "why": "In both of your test shapes every pair of nodes is either connected or cut, consistently. A partial partition leaves some paths up and others down, so nodes disagree about who is reachable: 28.7% of the studied failures needed one. Single-node isolation does catch most bugs (88% need only that), and leader election and silent failures can both appear under clean splits."
+    },
+    {
+      "q": "You raise the issuer client's timeout from 1 second to 10 seconds. What changes?",
+      "options": [
+        "Unknown outcomes disappear, because every reply now has time to arrive",
+        "Fewer unknowns from slow replies; lost requests and lost replies are still unknown; every call to a dead issuer now holds a thread for 10 seconds",
+        "Nothing, because TCP retransmits for longer than 10 seconds anyway",
+        "Double charges disappear, because the client retries less often"
+      ],
+      "answer": 1,
+      "why": "A longer timeout turns some slow replies into answers. It can't recover a lost packet, so those worlds stay unknown, and it makes the client wait longer every time the issuer really is down. Double charges come from retrying without a key, which the timeout doesn't change."
+    },
+    {
+      "q": "A team adds idempotency keys. The issuer charges the card in one transaction and then inserts the key and the code into an `idempotency` table in a second transaction. What can still happen?",
+      "options": [
+        "Nothing: the key is stored, so retries are safe",
+        "The client gets two different codes for one charge",
+        "If the issuer crashes between the two commits, the next retry finds no key and charges the card again",
+        "The unique constraint on the key blocks the first charge"
+      ],
+      "answer": 2,
+      "why": "The key protects only what was committed with it. A crash after the charge commits and before the key commits leaves a charge with no record of its key, and the retry looks like a new payment. Write the key and the charge in one transaction, so either both exist or neither does."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is partial failure?",
+      "back": "Some parts of a system break while others keep working, and the working parts may not know what broke or whether an operation completed."
+    },
+    {
+      "front": "The six reasons a request gets no reply?",
+      "back": "Request lost; request queued; remote crashed; remote paused; processed but the reply was lost; processed but the reply is slow."
+    },
+    {
+      "front": "What does a TCP ACK prove?",
+      "back": "That the remote kernel received the bytes. Not that the application read them or acted on them."
+    },
+    {
+      "front": "Why can a retry duplicate work even over TCP?",
+      "back": "TCP drops duplicates only within one connection. A retry usually goes over a new connection, so it is a new byte stream and a new request."
+    },
+    {
+      "front": "What makes a retry safe?",
+      "back": "An idempotency key created once per operation, reused on every attempt, and stored by the server in the same transaction as the effect."
+    },
+    {
+      "front": "Why do packet networks have no upper bound on delay?",
+      "back": "They share links and absorb bursts in queues (switch ports, kernels, hypervisors, TCP's own send queue), and a queue can grow without a fixed limit."
+    },
+    {
+      "front": "What is a partial partition?",
+      "back": "A can reach B and B can reach C, but A can't reach C. Alquraan et al. found 28.7% of partition failures needed one."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Partial failure",
+      "plain": "Some components fail while the rest keep running, often without any of them knowing exactly what happened."
+    },
+    {
+      "term": "Network partition",
+      "plain": "Some nodes can't reach some others for a while. Unrelated to partitioning data into shards."
+    },
+    {
+      "term": "Partial partition",
+      "plain": "A cut where some paths work and others don't, so nodes disagree about who is reachable."
+    },
+    {
+      "term": "Idempotency key",
+      "plain": "A unique id per operation that the server stores with its effect, so a repeated request returns the stored result instead of acting twice."
+    },
+    {
+      "term": "Circuit switching",
+      "plain": "Reserving a fixed slice of every link for one conversation: bounded delay, idle capacity."
+    },
+    {
+      "term": "Packet switching",
+      "plain": "Every sender shares every link and bursts wait in queues: high utilization, delay with no fixed limit."
+    },
+    {
+      "term": "Queueing delay",
+      "plain": "Time a packet spends waiting behind others in a switch, kernel, hypervisor or TCP buffer."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"We use TCP, so requests can't be lost or duplicated. We don't need idempotency keys.\" Explain what TCP does guarantee, where that guarantee ends, and what happens to a payment when it ends.",
+    "answer": "TCP guarantees that within one connection the bytes arrive in order, once, or that the connection fails. It does that inside the two kernels with sequence numbers, ACKs and retransmission. The guarantee ends in two places. First, at the application: an ACK means the issuer's kernel has our bytes, not that the issuer charged the card. It can crash after reading the request, or after charging and before replying. Second, at the connection: when our client times out, it retries over a new connection, and TCP has no idea it's the same request, so the issuer sees two. Between those two gaps there are worlds where the card was charged and we never heard, and a retry then charges it again. So we need the same trick TCP uses, one level up: a key per payment that every attempt carries, stored by the issuer in the same transaction as the charge, so a repeat returns the first result. And when we still have no answer, the payment is pending, not failed."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Testing for partial partitions.** Alquraan and colleagues built NEAT, a partition-injection framework, and used it to find and report 32 new failures in 7 systems, including Ceph, ActiveMQ and Infinispan. Their follow-up (Alfatafta et al., OSDI 2020) focused on partial partitions alone and proposed Nifty, a layer that reroutes traffic through nodes that can still reach both sides, to make any system tolerate them. The cheapest version for your own services is a test that blocks one direction between two specific containers, with `iptables` or Toxiproxy, while a third container can still reach both.\n\n**Bounded delay, where you can buy it.** InfiniBand uses credit-based flow control on every link, so a switch never sends a packet the next hop has no room for, and nothing is dropped for lack of buffer. Datacenter Ethernet can do something similar per priority class (priority flow control). On the internet, the L4S architecture (RFCs 9330 to 9332) marks packets before queues fill so that senders slow down early, which keeps queueing delay low without reserving capacity. None of these gives a hard upper bound across a public cloud, which is why the next lesson measures rather than assumes.\n\n**The book's framing.** *Designing Data-Intensive Applications*, 2nd edition, chapter 9, makes the same argument about unreliable networks and the limits of TCP, with more field data. This lesson's numbers come from the primary sources it cites and from the lab."
+  },
+  "sources": [
+    {
+      "title": "Bailis and Kingsbury: The Network Is Reliable (ACM Queue, 2014; blog version)",
+      "url": "https://aphyr.com/posts/288-the-network-is-reliable"
+    },
+    {
+      "title": "Alquraan et al.: An Analysis of Network-Partitioning Failures in Cloud Systems (OSDI 2018)",
+      "url": "https://www.usenix.org/system/files/osdi18-alquraan.pdf"
+    },
+    {
+      "title": "Cloudflare: A Byzantine failure in the real world (November 2020)",
+      "url": "https://blog.cloudflare.com/a-byzantine-failure-in-the-real-world/"
+    },
+    {
+      "title": "Linux kernel documentation: IP sysctl",
+      "url": "https://docs.kernel.org/networking/ip-sysctl.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 9",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

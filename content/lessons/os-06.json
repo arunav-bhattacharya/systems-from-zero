@@ -1,417 +1,417 @@
 {
-  "id": "os-06",
-  "title": "Virtual memory: page tables, the TLB and page faults",
-  "minutes": 40,
-  "goal": "By the end you can translate a virtual address through a four-level page table by hand, explain what the TLB caches and when it runs out, and read page faults, VSZ and RSS to tell reserved memory from memory a process really uses.",
-  "warmup": {
-    "q": "A C program calls `mmap` to get 1 GB of memory and touches none of it. About how much does its RSS, the memory it has in RAM, grow?",
-    "options": [
-      "1 GB",
-      "About 512 MB: the kernel fills half up front",
-      "About nothing",
-      "The call fails unless 1 GB of RAM is free"
-    ],
-    "answer": 2,
-    "why": "`mmap` only records a region of valid addresses. The kernel finds RAM for a page the first time the program touches it. In the lab box RSS stayed at 1 MB after reserving 1 GB, and grew to 1,025 MB only after one byte of every page was written."
-  },
-  "sections": [
-    {
-      "h": "Every process gets private addresses, and a page table maps them to RAM",
-      "body": "Run `cat /proc/self/maps` in the lab box and `cat` lists the memory it can address: its own code at `aaaac13d0000`, a heap, the C library, and a stack up near `fffff8183000`. Those addresses are **virtual**. Every process has its own set, two processes can keep different data at the same address, and on every load and store the hardware translates the address to a place in physical RAM.\n\nWhy not let programs use physical addresses? Try the simplest version: each program gets a slice of the Docker VM's 8 GB, and its addresses are real RAM addresses. Two programs built to use the same addresses can't both run. A bad pointer in one overwrites another program's memory, or the kernel's. And a program can't grow its heap if a neighbour sits right after it.\n\nThe next try gives each process a base and a limit: the hardware adds the base to every address and refuses any address past the limit. Every program can now start at 0 and can't reach outside its slice. But the slice must be one contiguous run of RAM. A JVM that may grow its heap to 4 GB, with 40 threads that each need a stack, has to grab one huge chunk up front, and free memory breaks into gaps too small to use.\n\nThe design every modern CPU uses cuts both sides into fixed-size pieces. Physical RAM is split into frames, virtual addresses into **pages** of the same size: 4 KB in the lab box, 16 KB on an Apple Silicon Mac. A per-process **page table** says which frame holds each virtual page, if any. Any page can live in any frame, so a 1 GB heap needs no contiguous gigabyte, and a process can't touch another's memory because the other's frames aren't in its table.\n\nAn address splits in two. With 4 KB pages the low 12 bits are the offset inside the page (2^12 = 4,096), and the rest is the virtual page number. `0xffff42401234` is byte `0x234` of virtual page `0xffff42401`.\n\nThe table can't be a plain array indexed by page number. The lab box's kernel gives each process 48-bit addresses, 256 TB: that's 2^36 pages, and at 8 bytes an entry the array would need 512 GB per process. So the table is a tree. The 36 bits of page number split into four 9-bit indices. Each index picks one of 512 entries in one table, and 512 entries of 8 bytes fill exactly one 4 KB page. The root's entry points to a level 1 table, whose entry points to level 2, then level 3, whose entry holds the frame number. Tables exist only under addresses the process uses, so a small program needs only a few dozen KB of page tables. The figure walks one address.",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"The address 0xffff42401234 split into four 9-bit table indices and a 12-bit offset, walking root, level 1, level 2 and level 3 tables to a 4 KB frame\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">virtual address 0xffff42401234, split into fields</text><text class=\"t-s t-m\" x=\"80.0\" y=\"44\" text-anchor=\"middle\">bits 47-39</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"80.0\" y=\"79.0\" text-anchor=\"middle\">511</text><line class=\"ln-d\" x1=\"80.0\" y1=\"96\" x2=\"80.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"220.0\" y=\"44\" text-anchor=\"middle\">bits 38-30</text><rect class=\"box-a\" x=\"160\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"220.0\" y=\"79.0\" text-anchor=\"middle\">509</text><line class=\"ln-d\" x1=\"220.0\" y1=\"96\" x2=\"220.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"44\" text-anchor=\"middle\">bits 29-21</text><rect class=\"box-a\" x=\"300\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"360.0\" y=\"79.0\" text-anchor=\"middle\">18</text><line class=\"ln-d\" x1=\"360.0\" y1=\"96\" x2=\"360.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"500.0\" y=\"44\" text-anchor=\"middle\">bits 20-12</text><rect class=\"box-a\" x=\"440\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"500.0\" y=\"79.0\" text-anchor=\"middle\">1</text><line class=\"ln-d\" x1=\"500.0\" y1=\"96\" x2=\"500.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"640.0\" y=\"44\" text-anchor=\"middle\">bits 11-0</text><rect class=\"box-b\" x=\"580\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"640.0\" y=\"79.0\" text-anchor=\"middle\">0x234</text><line class=\"ln-d\" x1=\"640.0\" y1=\"96\" x2=\"640.0\" y2=\"146\"/><rect class=\"box\" x=\"20\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"175.0\" text-anchor=\"middle\">root table</text><text class=\"t-s t-m\" x=\"80.0\" y=\"195.0\" text-anchor=\"middle\">entry 511</text><line class=\"ln-a\" x1=\"140\" y1=\"180\" x2=\"158\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"160\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"175.0\" text-anchor=\"middle\">level 1</text><text class=\"t-s t-m\" x=\"220.0\" y=\"195.0\" text-anchor=\"middle\">entry 509</text><line class=\"ln-a\" x1=\"280\" y1=\"180\" x2=\"298\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"300\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"175.0\" text-anchor=\"middle\">level 2</text><text class=\"t-s t-m\" x=\"360.0\" y=\"195.0\" text-anchor=\"middle\">entry 18</text><line class=\"ln-a\" x1=\"420\" y1=\"180\" x2=\"438\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"440\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"175.0\" text-anchor=\"middle\">level 3</text><text class=\"t-s t-m\" x=\"500.0\" y=\"195.0\" text-anchor=\"middle\">entry 1</text><line class=\"ln-a\" x1=\"560\" y1=\"180\" x2=\"578\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"580\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"175.0\" text-anchor=\"middle\">4 KB frame</text><text class=\"t-s t-m\" x=\"640.0\" y=\"195.0\" text-anchor=\"middle\">byte 0x234</text><text class=\"t-s t-m\" x=\"20\" y=\"250\" text-anchor=\"start\">Each table: 512 entries of 8 bytes, one 4 KB page. Tables exist only where something is mapped.</text><text class=\"t-s t-m\" x=\"20\" y=\"274\" text-anchor=\"start\">The level 3 entry holds the frame number; the 12-bit offset picks the byte inside that frame.</text></svg>",
-        "caption": "The hardware's walk for one address: four reads, one per table, each using 9 bits of the address as the index. The lab's `PageTable` does the same walk."
-      },
-      "try": {
-        "title": "Page size and a process's regions",
-        "minutes": 3,
-        "steps": [
-          "On your Mac, run `getconf PAGESIZE`.",
-          "From the `labs` folder, start the lab box (`docker compose -f env/labbox.yml run --rm box`) and run the block below. `/proc/self/maps` is the region list of the process reading it, here `cat` itself.",
-          "Find the code, the heap, the C library and the stack. Then work out how many 4 KB pages the `[heap]` line spans."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "getconf PAGESIZE\ncat /proc/self/maps"
-        },
-        "expect": "On the Mac, `16384`. In the box (addresses change on every run, because the kernel randomises where things go):\n\n```text\n4096\naaaac13d0000-aaaac13d7000 r-xp 00000000 00:60 1051971                    /usr/bin/cat\naaaac13ef000-aaaac13f0000 r--p 0000f000 00:60 1051971                    /usr/bin/cat\naaaac13f0000-aaaac13f1000 rw-p 00010000 00:60 1051971                    /usr/bin/cat\naaaae7e64000-aaaae7e85000 rw-p 00000000 00:00 0                          [heap]\n...\nffff99230000-ffff993ca000 r-xp 00000000 00:60 1055536                    /usr/lib/aarch64-linux-gnu/libc.so.6\n...\nffff9942e000-ffff99430000 r-xp 00000000 00:00 0                          [vdso]\n...\nfffff8162000-fffff8183000 rw-p 00000000 00:00 0                          [stack]\n```\n\nEach line is one region: start and end address, permissions (`r-xp` is readable and executable code, `rw-p` is writable private data), then the file it comes from, if any. The heap here is `0x21000` bytes, 33 pages. The vDSO from lesson 1 is a region too."
-      },
-      "refs": [
-        {
-          "title": "OSTEP chapter 18: Paging: Introduction",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf",
-          "kind": "read"
-        },
-        {
-          "title": "OSTEP chapter 20: Paging: Smaller Tables",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf",
-          "kind": "read"
-        },
-        {
-          "title": "Memory Layout on AArch64 Linux",
-          "url": "https://docs.kernel.org/arch/arm64/memory.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "The TLB caches translations, and its reach decides what is cheap to touch",
-      "body": "Translating through four tables means four extra memory reads, each one waiting for the one before, ahead of every load or store the program asked for. A read that misses the CPU caches costs over 100 ns in the lab box (the 1 GB row in the Try-it below). Paying that four extra times per access would make every program several times slower.\n\nSo the CPU keeps a small cache of recent translations, the **TLB** (translation lookaside buffer): virtual page number in, frame number out, fast enough that a hit adds almost nothing. A miss costs a walk, and the walk's reads may themselves come from the CPU caches. Most accesses hit because programs reuse pages. A loop over one 4 KB page translates it once and hits 4,095 times.\n\nThe TLB is small. CPUs have a first-level TLB of a few dozen to a couple of hundred entries and a second level of a few thousand. What counts is its **reach**: entries times page size. Two thousand entries of 4 KB pages cover 8 MB. A program that jumps around a bigger working set, say a 64 MB hash index probed at random, misses the TLB on most accesses and pays a walk each time.\n\nThe fix is bigger pages. An entry at level 2 of the tree can map a whole 2 MB block directly, a **huge page**. One TLB entry then covers 512 times as much memory, and the walk is one level shorter. `tlb.c` visits one cache line in every page of a buffer, in random order, first with 4 KB pages and then with 2 MB pages. Both runs touch exactly the same cache lines, so the data caches behave the same and only the number of translations differs:\n\n```text\nbuffer    pages(4 KB)   4 KB pages   2 MB pages\n    1 MB         256       0.9 ns       0.9 ns\n   16 MB        4096      35.9 ns       7.6 ns\n```\n\nAt 1 MB, 256 translations fit in the TLB either way. At 16 MB, 4,096 translations don't fit, and 8 do: the same work costs almost five times as much with small pages. From 256 MB up both runs are slow, because the data no longer fits in the CPU caches either.\n\nLinux offers huge pages two ways. Transparent huge pages (THP) let the kernel use 2 MB pages for large regions on its own; the lab box's kernel has THP set to `always`. Reserved huge pages (hugetlbfs) are set aside by an administrator, and the JVM uses them with `-XX:+UseLargePages`.",
-      "try": {
-        "title": "Measure what a TLB miss costs",
-        "minutes": 3,
-        "steps": [
-          "`os/c/l06/tlb.c` builds a random chain through one cache line in each page of a buffer, then follows it 20 million times. It runs every buffer size twice: with 4 KB pages (`MADV_NOHUGEPAGE`) and with 2 MB pages (`MADV_HUGEPAGE`).",
-          "Predict where the 4 KB column jumps, then run it."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "gcc -O2 -o /tmp/tlb os/c/l06/tlb.c\n/tmp/tlb"
-        },
-        "expect": "Timings vary with your Mac and with what else the Docker VM is doing:\n\n```text\nbuffer    pages(4 KB)   4 KB pages   2 MB pages\n    1 MB         256       0.9 ns       0.9 ns\n   16 MB        4096      35.9 ns       7.6 ns\n   64 MB       16384      49.5 ns      18.0 ns\n  256 MB       65536     123.1 ns      78.2 ns\n 1024 MB      262144     193.4 ns     139.5 ns\n```\n\nThe 4 KB column jumps between 1 MB and 16 MB, where 4,096 translations stop fitting in the TLB; the 2 MB column needs only 8 entries for 16 MB. At 256 MB and 1 GB both columns are slow because the data itself misses the CPU caches, and the gap that remains is the cost of the walks."
-      },
-      "refs": [
-        {
-          "title": "OSTEP chapter 19: Paging: Faster Translations (TLBs)",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf",
-          "kind": "read"
-        },
-        {
-          "title": "Transparent Hugepage Support (Linux kernel documentation)",
-          "url": "https://docs.kernel.org/admin-guide/mm/transhuge.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "A page fault is the kernel filling in the table on first touch",
-      "body": "`mmap` of 1 GB returns in microseconds, and the process's **RSS** (resident set size: its memory actually in RAM) doesn't move. The kernel didn't find 262,144 free frames and fill in a quarter of a million table entries. It wrote down one **region**: this range of addresses is valid, readable and writable, and backed by nothing yet. Regions are what `/proc/<pid>/maps` lists. The table entries stay empty.\n\nThe first time the program writes to a page, the TLB misses, the walk finds an empty entry, and the CPU can't finish the instruction. It raises a **page fault**: an exception that jumps into the kernel. The kernel's fault handler looks the address up in the process's regions. If the address is inside a writable region, the kernel takes a free frame, fills it with zeros, writes its number into the table and returns. The CPU runs the faulting instruction again, and this time it works. The program notices nothing, except the time it took.\n\nThis is **demand paging**: `mmap` promises the memory, and the kernel delivers it one page at a time on first touch. In the lab box each fault costs about 0.5 to 1.6 µs, and touching 1 GB of 4 KB pages takes 262,144 of them. With 2 MB pages the same gigabyte takes 512. The stepper walks through one fault.\n\nA fault the kernel can resolve from RAM, such as a fresh zeroed page or a file page already in memory, is a **minor fault**. A fault that has to wait for the disk is a **major fault**: a file page that isn't cached, or a page that was swapped out. That costs a disk read, around 0.1 ms on an SSD and more on a network disk. `/usr/bin/time -v` and `ps -o min_flt,maj_flt` report both. Minor faults are mostly a start-up and growth cost. Major faults during request handling are a latency problem.\n\nIf the address is in no region, there is nothing to fill in. The kernel sends the thread `SIGSEGV`, a segmentation fault. The JVM uses that on purpose: compiled Java code reads through a reference without checking for null first, and when the read faults near address 0, the JVM's signal handler turns the `SIGSEGV` into a `NullPointerException`.",
-      "stepper": {
-        "title": "A first touch, a page fault, and a segfault",
-        "intro": "Above the dashed line is what the hardware does on every memory access; below is what the kernel does when the hardware gives up. Addresses come from `touch.c` in the lab box.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"mmap of 1 GB records a region and nothing else\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">mmap(1 GB)</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">empty</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">no entries yet</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box-a\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p: new</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text></svg>",
-            "say": "`mmap` asks for 1 GB at `0xffff48400000`. The kernel adds one **region** to the process's list (one line in `/proc/<pid>/maps`): this range is valid and writable. It finds no RAM and fills in no page-table entries, which is why `mmap` returns at once and RSS stays at 1 MB."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The first store to the region misses the TLB and the hardware walks the table\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store 0xffff48400000</text><rect class=\"box-b\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-a\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">walking...</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text><line class=\"ln-a\" x1=\"220\" y1=\"72\" x2=\"258\" y2=\"72\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"460\" y1=\"72\" x2=\"498\" y2=\"72\" marker-end=\"url(#arr)\"/></svg>",
-            "say": "The program writes its first byte. The TLB has no translation for page `0xffff48400`, so the hardware walks the page table, root to level 3, as in the figure above."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The walk finds an empty entry and the CPU raises a page fault\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-bad\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: stopped</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-bad\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">empty entry</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box-a\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">page fault!</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text><line class=\"ln-bad\" x1=\"560\" y1=\"110\" x2=\"400\" y2=\"168\" marker-end=\"url(#arr)\"/></svg>",
-            "say": "There is no entry to find; even the level 2 and level 3 tables for this range don't exist yet. The CPU can't finish the store. It raises a **page fault**: an exception that jumps into the kernel's fault handler, much like lesson 1's system call trap, except the program never asked for it."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The kernel finds the address in a writable region, maps a zeroed page and returns\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: waiting</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-a\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">entry: new frame</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box-a\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB + 4 KB</text><rect class=\"box-a\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">zero a page, map it</text><rect class=\"box-ok\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">inside: 1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    TLB hits: 0</text><line class=\"ln-a\" x1=\"460\" y1=\"208\" x2=\"498\" y2=\"208\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"260\" y1=\"208\" x2=\"222\" y2=\"208\" marker-end=\"url(#arr)\"/></svg>",
-            "say": "The handler looks the address up in the regions. It's inside the 1 GB mapping, which is writable, so this is a valid first touch. The kernel takes a free frame, fills it with zeros (no process may see another's old data), creates the missing tables and writes the frame number into the entry. RSS grows by 4 KB. Nothing was read from disk: a **minor fault**, about 0.5 to 1.6 µs in the lab box."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The store runs again, the walk succeeds and the TLB keeps the translation\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-ok\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: done</text><rect class=\"box-a\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">hit for this page</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">entry: frame</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB + 4 KB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    TLB hits: 4,095 more</text><line class=\"ln-a\" x1=\"220\" y1=\"72\" x2=\"258\" y2=\"72\" marker-end=\"url(#arr)\"/></svg>",
-            "say": "The kernel returns to the faulting instruction and the CPU runs the store again. This time the walk finds the frame, the store completes, and the TLB keeps the translation. The next 4,095 bytes of this page are TLB hits. The next page faults again: touching all of the 1 GB takes 262,144 faults with 4 KB pages, 512 with 2 MB pages."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"A load from address 0 is in no region: the kernel sends SIGSEGV\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-bad\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">load 0x0</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">empty entry</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS unchanged</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">SIGSEGV</text><rect class=\"box-bad\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">no region at 0x0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    segfaults: 1</text><line class=\"ln-bad\" x1=\"560\" y1=\"110\" x2=\"400\" y2=\"168\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"460\" y1=\"208\" x2=\"498\" y2=\"208\" marker-end=\"url(#arr)\"/></svg>",
-            "say": "A bug loads through a null pointer. The walk fails and the kernel looks for a region, as before, but no region covers address 0, so there's nothing to fill in. The kernel sends the thread `SIGSEGV`, a segmentation fault. The JVM does this on purpose: compiled code reads through a reference without checking for null, and if the read faults near address 0, the JVM's signal handler turns the `SIGSEGV` into a `NullPointerException`."
-          }
-        ]
-      },
-      "try": {
-        "title": "Count the faults for 1 GB",
-        "minutes": 4,
-        "steps": [
-          "`os/c/l06/touch.c` reserves 1 GB with `mmap`, then writes one byte in every 4 KB page and counts its own page faults. `none` touches nothing; `huge` asks for 2 MB pages.",
-          "Predict the fault count and RSS for each of the three runs. The last line runs it under `/usr/bin/time -v`, which counts faults from outside."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "gcc -O2 -o /tmp/touch os/c/l06/touch.c\n/tmp/touch 1024 none\n/tmp/touch 1024 4k\n/tmp/touch 1024 huge\n/usr/bin/time -v /tmp/touch 1024 4k 2>&1 | grep -E \"Major|Minor|Maximum resident\""
-        },
-        "expect": "Addresses and timings differ between runs:\n\n```text\nreserved 1024 MB at 0xffff5fe00000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (none): 3 page faults in 0 ms, RSS 1 MB, page tables 44 KB\nreserved 1024 MB at 0xffff62c00000, page size 4096 bytes, RSS 1 MB, page tables 40 KB\ntouched (4k): 262147 page faults in 129 ms (0.49 us each), RSS 1025 MB, page tables 2092 KB\nreserved 1024 MB at 0xffff65200000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (huge): 515 page faults in 79 ms, RSS 1025 MB, page tables 2096 KB\n\tMaximum resident set size (kbytes): 1049880\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 262216\n```\n\nReserving costs nothing. Touching 1 GB costs one fault per 4 KB page, 262,144 plus 3 from `printf`, and the 512 new last-level tables add 2 MB of page tables. With 2 MB pages it's 512 faults (plus 3). The page tables don't shrink: Linux keeps a spare table for each huge page so it can split it back into 4 KB pages later. Major faults: 0, nothing came from disk."
-      },
-      "refs": [
-        {
-          "title": "OSTEP chapter 21: Beyond Physical Memory: Mechanisms",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf",
-          "kind": "read"
-        },
-        {
-          "title": "getrusage(2): ru_minflt and ru_majflt",
-          "url": "https://man7.org/linux/man-pages/man2/getrusage.2.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "The JVM reserves gigabytes and touches megabytes",
-      "body": "A JVM started with `-Xmx4g` reserves 4 GB of addresses for its heap at start-up, the same way `touch.c` reserved its gigabyte. `ps` shows two numbers, in KB:\n\n```text\n  PID    VSZ   RSS COMMAND\n   40 7304252 181196 java\n```\n\n**VSZ** (virtual size) is the total size of all the process's regions: 7.3 GB here, the 4 GB heap plus other reserved regions such as thread stacks (2 MB each, from lesson 3), the code cache and class metadata. **RSS** is what is in RAM: 181 MB. VSZ is what the process could touch; RSS is what it has touched and still holds. A container's memory limit counts pages in RAM, never reserved addresses, so watch RSS. Lesson 8 of this track takes apart what fills the rest of it.\n\nThe heap fills in by demand paging like everything else. The JVM faults in each heap page the first time it puts objects there, so a fresh JVM pays its faults during its first minutes of traffic, spread across requests. `-XX:+AlwaysPreTouch` makes it touch every heap page at start-up instead. With `-Xms1g -Xmx1g`, maximum RSS goes from 179 MB to 1,115 MB, because the whole heap is in RAM before `main` runs. Minor faults go from about 5,100 to anywhere between 7,900 and 56,000 in my runs. That's well under the 262,144 that 4 KB pages would need, because this kernel gives parts of the heap 2 MB pages (the `-Xmx4g` run had 137 MB of `AnonHugePages`), and how much it got changed from run to run. Start-up stayed around 0.04 s: the JVM pre-touches the heap in 4 MB chunks on its GC threads in parallel, and the run used 0.08 to 0.10 s of system time inside 0.04 s of wall time.\n\nTurn it on for long-running services that need steady latency: the faults happen once, before the first request. It also proves the memory is there. In a container limited to 300 MB, `-Xms400m` started and ran fine, because it touched little of its heap. With `-XX:+AlwaysPreTouch` added, the kernel killed it at start-up: exit code 137, lesson 2's 128 plus `SIGKILL`, and `oom_kill 1` in the container's `memory.events`. Better there, where you notice at once, than hours later when traffic finally grows the heap into the limit. The price is that RSS is the whole heap from the first second.\n\nLast, page size isn't universal. The lab box's arm64 kernel uses 4 KB pages and macOS on Apple Silicon uses 16 KB. Code that rounds to pages, or reasons about how many pages a buffer spans, should ask the system (`getconf PAGESIZE`) instead of assuming 4096.",
-      "try": {
-        "title": "VSZ, RSS and AlwaysPreTouch in a JVM",
-        "minutes": 4,
-        "steps": [
-          "`Idle` allocates 64 MB of arrays and waits. Start it with `-Xmx4g` and compare VSZ with RSS.",
-          "Then start it twice with a 1 GB heap, without and with `-XX:+AlwaysPreTouch`, and predict how maximum RSS and the fault count change."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l06/demo/Idle.java\njava -Xmx4g -cp /tmp/out sfz.os.l06.demo.Idle 20 & pid=$!\nsleep 3\nps -o pid,vsz,rss,comm -p $pid\ngrep -E \"^(Rss|AnonHugePages)\" /proc/$pid/smaps_rollup\nkill $pid\nfor flag in -XX:-AlwaysPreTouch -XX:+AlwaysPreTouch; do\n  echo \"== $flag\"\n  /usr/bin/time -v java -Xms1g -Xmx1g $flag -cp /tmp/out sfz.os.l06.demo.Idle 0 2>&1 | grep -E \"Elapsed|Minor|Maximum resident\"\ndone",
-          "file": "labs/os/src/demo/java/sfz/os/l06/demo/Idle.java"
-        },
-        "expect": "```text\npid 40 holds 64 MB of arrays\n  PID    VSZ   RSS COMMAND\n   40 7304252 181196 java\nRss:              181196 kB\nAnonHugePages:    137216 kB\n== -XX:-AlwaysPreTouch\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tMaximum resident set size (kbytes): 178836\n\tMinor (reclaiming a frame) page faults: 5113\n== -XX:+AlwaysPreTouch\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tMaximum resident set size (kbytes): 1115084\n\tMinor (reclaiming a frame) page faults: 41066\n```\n\n7.3 GB reserved, 181 MB resident, 137 MB of it in 2 MB pages. With pre-touch the JVM holds the whole 1 GB heap before `main` runs. The fault count moves between runs (from about 7,900 to 56,000 in mine) depending on how much of the heap gets 2 MB pages."
-      },
-      "refs": [
-        {
-          "title": "The java command (JDK 25): AlwaysPreTouch, UseLargePages",
-          "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html",
-          "kind": "docs"
-        },
-        {
-          "title": "proc_pid_status(5): VmSize, VmRSS, VmPTE",
-          "url": "https://man7.org/linux/man-pages/man5/proc_pid_status.5.html",
-          "kind": "docs"
-        }
-      ]
-    }
+ "id": "os-06",
+ "title": "Virtual memory: page tables, the TLB and page faults",
+ "minutes": 40,
+ "goal": "By the end you can translate a virtual address through a four-level page table by hand, explain what the TLB caches and when it runs out, and read page faults, VSZ and RSS to tell reserved memory from memory a process really uses.",
+ "warmup": {
+  "q": "A C program calls `mmap` to get 1 GB of memory and touches none of it. About how much does its RSS, the memory it has in RAM, grow?",
+  "options": [
+   "1 GB",
+   "About 512 MB: the kernel fills half up front",
+   "About nothing",
+   "The call fails unless 1 GB of RAM is free"
   ],
-  "analogy": "A page table is a hotel's room list, one per guest group. Every group's booking says \"rooms 1 to 40\", and the front desk's list says which real room each of those numbers means for that group, so two groups' room 12 are different rooms and nobody can walk into another group's. The TLB is the sticky note on the desk with the last few lookups, so a busy guest doesn't wait for the full list every time. Demand paging is a hotel that confirms 40 rooms but makes each one up only when the guest first opens its door. The analogy breaks on the cost of asking. A guest at the desk waits seconds; a TLB miss costs a few dozen nanoseconds, and a program makes billions of accesses, so in a computer that small cost decides whether a hash index is fast.",
-  "in_your_world": "A Quarkus service in a pod with a 2 GB memory limit, started with `-Xmx1536m`, might show VSZ around 5 GB and RSS around 400 MB right after deploy, and RSS creeps up for the first hour as the heap's pages get touched. Alerts set on VSZ are noise; the pod's limit and the OOM killer count RSS. If you'd rather find out at deploy time that the heap doesn't fit, start with `-Xms` equal to `-Xmx` and `-XX:+AlwaysPreTouch`: RSS jumps to the full heap at once, and a pod that can't hold it dies before it takes traffic. The TLB shows up in in-memory structures: an exchange-rate cache or a fraud model of a few hundred MB, read at random on every authorization, misses the TLB on most lookups with 4 KB pages. Huge pages (THP, or `-XX:+UseLargePages`) can make those lookups noticeably faster, and it's the same reason Oracle hosts are usually set up with reserved huge pages for the database's shared memory.",
-  "mistake": "Reading VSZ as memory use. A JVM with `-Xmx4g` shows 7.3 GB of VSZ while it holds 181 MB of RAM, so dashboards that plot VSZ or alerts set on it fire for no reason, and people cut the heap of a perfectly healthy service. VSZ counts every reserved address: the whole heap from the start, 2 MB of stack per thread, the code cache, class metadata and more. RAM is only ever spent on pages that were touched. The fix is to watch RSS (or the container's memory charge), and to remember that RSS for a JVM grows toward `-Xmx` over time as the heap is used, unless `AlwaysPreTouch` makes it jump there at once.",
-  "compare": {
-    "title": "Touching 1 GB with 4 KB pages and with 2 MB pages",
-    "a": {
-      "label": "4 KB pages (MADV_NOHUGEPAGE)",
-      "lang": "text",
-      "title": "touch.c 1024 4k",
-      "src": "reserved 1024 MB at 0xffff62c00000, page size 4096 bytes, RSS 1 MB, page tables 40 KB\ntouched (4k): 262147 page faults in 129 ms (0.49 us each), RSS 1025 MB, page tables 2092 KB"
-    },
-    "b": {
-      "label": "2 MB pages (MADV_HUGEPAGE)",
-      "lang": "text",
-      "title": "touch.c 1024 huge",
-      "src": "reserved 1024 MB at 0xffff65200000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (huge): 515 page faults in 79 ms, RSS 1025 MB, page tables 2096 KB"
-    },
-    "note": "Same gigabyte of RAM either way. Huge pages need 512 faults instead of 262,144, but the time doesn't drop by the same factor, because most of it goes to zeroing 1 GB of memory, which both runs must do. The big win comes later, in the TLB: 16 MB of this buffer needs 4,096 translations with small pages and 8 with huge ones. `getconf PAGESIZE` still says 4096 in both runs, because huge pages are an extra size the kernel uses for some regions, not a new base page size."
-  },
-  "worked": {
-    "title": "Read a JVM's memory from outside the JVM",
+  "answer": 2,
+  "why": "`mmap` only records a region of valid addresses. The kernel finds RAM for a page the first time the program touches it. In the lab box RSS stayed at 1 MB after reserving 1 GB, and grew to 1,025 MB only after one byte of every page was written."
+ },
+ "sections": [
+  {
+   "h": "Every process gets private addresses, and a page table maps them to RAM",
+   "body": "Run `cat /proc/self/maps` in the lab box and `cat` lists the memory it can address: its own code at `aaaac13d0000`, a heap, the C library, and a stack up near `fffff8183000`. Those addresses are **virtual**. Every process has its own set, two processes can keep different data at the same address, and on every load and store the hardware translates the address to a place in physical RAM.\n\nWhy not let programs use physical addresses? Try the simplest version: each program gets a slice of the Docker VM's 8 GB, and its addresses are real RAM addresses. Two programs built to use the same addresses can't both run. A bad pointer in one overwrites another program's memory, or the kernel's. And a program can't grow its heap if a neighbour sits right after it.\n\nThe next try gives each process a base and a limit: the hardware adds the base to every address and refuses any address past the limit. Every program can now start at 0 and can't reach outside its slice. But the slice must be one contiguous run of RAM. A JVM that may grow its heap to 4 GB, with 40 threads that each need a stack, has to grab one huge chunk up front, and free memory breaks into gaps too small to use.\n\nThe design every modern CPU uses cuts both sides into fixed-size pieces. Physical RAM is split into frames, virtual addresses into **pages** of the same size: 4 KB in the lab box, 16 KB on an Apple Silicon Mac. A per-process **page table** says which frame holds each virtual page, if any. Any page can live in any frame, so a 1 GB heap needs no contiguous gigabyte, and a process can't touch another's memory because the other's frames aren't in its table.\n\nAn address splits in two. With 4 KB pages the low 12 bits are the offset inside the page (2^12 = 4,096), and the rest is the virtual page number. `0xffff42401234` is byte `0x234` of virtual page `0xffff42401`.\n\nThe table can't be a plain array indexed by page number. The lab box's kernel gives each process 48-bit addresses, 256 TB: that's 2^36 pages, and at 8 bytes an entry the array would need 512 GB per process. So the table is a tree. The 36 bits of page number split into four 9-bit indices. Each index picks one of 512 entries in one table, and 512 entries of 8 bytes fill exactly one 4 KB page. The root's entry points to a level 1 table, whose entry points to level 2, then level 3, whose entry holds the frame number. Tables exist only under addresses the process uses, so a small program needs only a few dozen KB of page tables. The figure walks one address.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 720 290\" role=\"img\" aria-label=\"The address 0xffff42401234 split into four 9-bit table indices and a 12-bit offset, walking root, level 1, level 2 and level 3 tables to a 4 KB frame\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">virtual address 0xffff42401234, split into fields</text><text class=\"t-s t-m\" x=\"80.0\" y=\"44\" text-anchor=\"middle\">bits 47-39</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"80.0\" y=\"79.0\" text-anchor=\"middle\">511</text><line class=\"ln-d\" x1=\"80.0\" y1=\"96\" x2=\"80.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"220.0\" y=\"44\" text-anchor=\"middle\">bits 38-30</text><rect class=\"box-a\" x=\"160\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"220.0\" y=\"79.0\" text-anchor=\"middle\">509</text><line class=\"ln-d\" x1=\"220.0\" y1=\"96\" x2=\"220.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"360.0\" y=\"44\" text-anchor=\"middle\">bits 29-21</text><rect class=\"box-a\" x=\"300\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"360.0\" y=\"79.0\" text-anchor=\"middle\">18</text><line class=\"ln-d\" x1=\"360.0\" y1=\"96\" x2=\"360.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"500.0\" y=\"44\" text-anchor=\"middle\">bits 20-12</text><rect class=\"box-a\" x=\"440\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"500.0\" y=\"79.0\" text-anchor=\"middle\">1</text><line class=\"ln-d\" x1=\"500.0\" y1=\"96\" x2=\"500.0\" y2=\"146\"/><text class=\"t-s t-m\" x=\"640.0\" y=\"44\" text-anchor=\"middle\">bits 11-0</text><rect class=\"box-b\" x=\"580\" y=\"52\" width=\"120\" height=\"44\" rx=\"8\"/><text class=\"t t-code\" x=\"640.0\" y=\"79.0\" text-anchor=\"middle\">0x234</text><line class=\"ln-d\" x1=\"640.0\" y1=\"96\" x2=\"640.0\" y2=\"146\"/><rect class=\"box\" x=\"20\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"175.0\" text-anchor=\"middle\">root table</text><text class=\"t-s t-m\" x=\"80.0\" y=\"195.0\" text-anchor=\"middle\">entry 511</text><line class=\"ln-a\" x1=\"140\" y1=\"180\" x2=\"158\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"160\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"175.0\" text-anchor=\"middle\">level 1</text><text class=\"t-s t-m\" x=\"220.0\" y=\"195.0\" text-anchor=\"middle\">entry 509</text><line class=\"ln-a\" x1=\"280\" y1=\"180\" x2=\"298\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"300\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"175.0\" text-anchor=\"middle\">level 2</text><text class=\"t-s t-m\" x=\"360.0\" y=\"195.0\" text-anchor=\"middle\">entry 18</text><line class=\"ln-a\" x1=\"420\" y1=\"180\" x2=\"438\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"440\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"175.0\" text-anchor=\"middle\">level 3</text><text class=\"t-s t-m\" x=\"500.0\" y=\"195.0\" text-anchor=\"middle\">entry 1</text><line class=\"ln-a\" x1=\"560\" y1=\"180\" x2=\"578\" y2=\"180\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"580\" y=\"148\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"175.0\" text-anchor=\"middle\">4 KB frame</text><text class=\"t-s t-m\" x=\"640.0\" y=\"195.0\" text-anchor=\"middle\">byte 0x234</text><text class=\"t-s t-m\" x=\"20\" y=\"250\" text-anchor=\"start\">Each table: 512 entries of 8 bytes, one 4 KB page. Tables exist only where something is mapped.</text><text class=\"t-s t-m\" x=\"20\" y=\"274\" text-anchor=\"start\">The level 3 entry holds the frame number; the 12-bit offset picks the byte inside that frame.</text></svg>",
+    "caption": "The hardware's walk for one address: four reads, one per table, each using 9 bits of the address as the index. The lab's `PageTable` does the same walk."
+   },
+   "try": {
+    "title": "Page size and a process's regions",
+    "minutes": 3,
     "steps": [
-      {
-        "say": "Start with the two totals. VSZ is reserved address space, RSS is RAM. A big gap is normal for a JVM.",
-        "code": "ps -o pid,vsz,rss,min_flt,maj_flt,comm -p $pid\n#   PID    VSZ   RSS  MINFL  MAJFL COMMAND\n#    40 7304252 179640 5913      0 java",
-        "lang": "bash"
-      },
-      {
-        "say": "Split RSS into anonymous memory (heap, stacks, malloc) and file pages (the JDK's code and libraries, mapped from files). Add the page tables' own cost while you're there.",
-        "code": "grep -E '^(VmSize|VmRSS|RssAnon|RssFile|VmPTE)' /proc/$pid/status\n# VmSize:\t 7304252 kB\n# VmRSS:\t  179640 kB\n# RssAnon:\t  157792 kB\n# RssFile:\t   21848 kB\n# VmPTE:\t     692 kB",
-        "lang": "bash"
-      },
-      {
-        "say": "Check how much of it sits in huge pages. With THP set to `always`, a JVM heap often gets 2 MB pages without asking.",
-        "code": "cat /sys/kernel/mm/transparent_hugepage/enabled\n# [always] madvise never\ngrep AnonHugePages /proc/$pid/smaps_rollup\n# AnonHugePages:    137216 kB",
-        "lang": "bash"
-      },
-      {
-        "say": "Read the faults. `MINFL` (5,913 at start-up) is first touches: expected while the heap grows, gone once it has. `MAJFL` above 0 and climbing under steady traffic means pages are coming from disk: a memory-mapped file that isn't cached, or swap. That's the number to alert on.",
-        "code": "watch -n 5 ps -o min_flt,maj_flt,rss -p $pid",
-        "lang": "bash"
-      }
+     "On your Mac, run `getconf PAGESIZE`.",
+     "From the `labs` folder, start the lab box (`docker compose -f env/labbox.yml run --rm box`) and run the block below. `/proc/self/maps` is the region list of the process reading it, here `cat` itself.",
+     "Find the code, the heap, the C library and the stack. Then work out how many 4 KB pages the `[heap]` line spans."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "getconf PAGESIZE\ncat /proc/self/maps"
+    },
+    "expect": "On the Mac, `16384`. In the box (addresses change on every run, because the kernel randomises where things go):\n\n```text\n4096\naaaac13d0000-aaaac13d7000 r-xp 00000000 00:60 1051971                    /usr/bin/cat\naaaac13ef000-aaaac13f0000 r--p 0000f000 00:60 1051971                    /usr/bin/cat\naaaac13f0000-aaaac13f1000 rw-p 00010000 00:60 1051971                    /usr/bin/cat\naaaae7e64000-aaaae7e85000 rw-p 00000000 00:00 0                          [heap]\n...\nffff99230000-ffff993ca000 r-xp 00000000 00:60 1055536                    /usr/lib/aarch64-linux-gnu/libc.so.6\n...\nffff9942e000-ffff99430000 r-xp 00000000 00:00 0                          [vdso]\n...\nfffff8162000-fffff8183000 rw-p 00000000 00:00 0                          [stack]\n```\n\nEach line is one region: start and end address, permissions (`r-xp` is readable and executable code, `rw-p` is writable private data), then the file it comes from, if any. The heap here is `0x21000` bytes, 33 pages. The vDSO from lesson 1 is a region too."
+   },
+   "refs": [
+    {
+     "title": "OSTEP chapter 18: Paging: Introduction",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf",
+     "kind": "read"
+    },
+    {
+     "title": "OSTEP chapter 20: Paging: Smaller Tables",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf",
+     "kind": "read"
+    },
+    {
+     "title": "Memory Layout on AArch64 Linux",
+     "url": "https://docs.kernel.org/arch/arm64/memory.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "The TLB caches translations, and its reach decides what is cheap to touch",
+   "body": "Translating through four tables means four extra memory reads, each one waiting for the one before, ahead of every load or store the program asked for. A read that misses the CPU caches costs over 100 ns in the lab box (the 1 GB row in the Try-it below). Paying that four extra times per access would make every program several times slower.\n\nSo the CPU keeps a small cache of recent translations, the **TLB** (translation lookaside buffer): virtual page number in, frame number out, fast enough that a hit adds almost nothing. A miss costs a walk, and the walk's reads may themselves come from the CPU caches. Most accesses hit because programs reuse pages. A loop over one 4 KB page translates it once and hits 4,095 times.\n\nThe TLB is small. CPUs have a first-level TLB of a few dozen to a couple of hundred entries and a second level of a few thousand. What counts is its **reach**: entries times page size. Two thousand entries of 4 KB pages cover 8 MB. A program that jumps around a bigger working set, say a 64 MB hash index probed at random, misses the TLB on most accesses and pays a walk each time.\n\nThe fix is bigger pages. An entry at level 2 of the tree can map a whole 2 MB block directly, a **huge page**. One TLB entry then covers 512 times as much memory, and the walk is one level shorter. `tlb.c` visits one cache line in every page of a buffer, in random order, first with 4 KB pages and then with 2 MB pages. Both runs touch exactly the same cache lines, so the data caches behave the same and only the number of translations differs:\n\n```text\nbuffer    pages(4 KB)   4 KB pages   2 MB pages\n    1 MB         256       0.9 ns       0.9 ns\n   16 MB        4096      35.9 ns       7.6 ns\n```\n\nAt 1 MB, 256 translations fit in the TLB either way. At 16 MB, 4,096 translations don't fit, and 8 do: the same work costs almost five times as much with small pages. From 256 MB up both runs are slow, because the data no longer fits in the CPU caches either.\n\nLinux offers huge pages two ways. Transparent huge pages (THP) let the kernel use 2 MB pages for large regions on its own; the lab box's kernel has THP set to `always`. Reserved huge pages (hugetlbfs) are set aside by an administrator, and the JVM uses them with `-XX:+UseLargePages`.",
+   "try": {
+    "title": "Measure what a TLB miss costs",
+    "minutes": 3,
+    "steps": [
+     "`os/c/l06/tlb.c` builds a random chain through one cache line in each page of a buffer, then follows it 20 million times. It runs every buffer size twice: with 4 KB pages (`MADV_NOHUGEPAGE`) and with 2 MB pages (`MADV_HUGEPAGE`).",
+     "Predict where the 4 KB column jumps, then run it."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "gcc -O2 -o /tmp/tlb os/c/l06/tlb.c\n/tmp/tlb"
+    },
+    "expect": "Timings vary with your Mac and with what else the Docker VM is doing:\n\n```text\nbuffer    pages(4 KB)   4 KB pages   2 MB pages\n    1 MB         256       0.9 ns       0.9 ns\n   16 MB        4096      35.9 ns       7.6 ns\n   64 MB       16384      49.5 ns      18.0 ns\n  256 MB       65536     123.1 ns      78.2 ns\n 1024 MB      262144     193.4 ns     139.5 ns\n```\n\nThe 4 KB column jumps between 1 MB and 16 MB, where 4,096 translations stop fitting in the TLB; the 2 MB column needs only 8 entries for 16 MB. At 256 MB and 1 GB both columns are slow because the data itself misses the CPU caches, and the gap that remains is the cost of the walks."
+   },
+   "refs": [
+    {
+     "title": "OSTEP chapter 19: Paging: Faster Translations (TLBs)",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf",
+     "kind": "read"
+    },
+    {
+     "title": "Transparent Hugepage Support (Linux kernel documentation)",
+     "url": "https://docs.kernel.org/admin-guide/mm/transhuge.html",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "A page fault is the kernel filling in the table on first touch",
+   "body": "`mmap` of 1 GB returns in microseconds, and the process's **RSS** (resident set size: its memory actually in RAM) doesn't move. The kernel didn't find 262,144 free frames and fill in a quarter of a million table entries. It wrote down one **region**: this range of addresses is valid, readable and writable, and backed by nothing yet. Regions are what `/proc/<pid>/maps` lists. The table entries stay empty.\n\nThe first time the program writes to a page, the TLB misses, the walk finds an empty entry, and the CPU can't finish the instruction. It raises a **page fault**: an exception that jumps into the kernel. The kernel's fault handler looks the address up in the process's regions. If the address is inside a writable region, the kernel takes a free frame, fills it with zeros, writes its number into the table and returns. The CPU runs the faulting instruction again, and this time it works. The program notices nothing, except the time it took.\n\nThis is **demand paging**: `mmap` promises the memory, and the kernel delivers it one page at a time on first touch. In the lab box each fault costs about 0.5 to 1.6 µs, and touching 1 GB of 4 KB pages takes 262,144 of them. With 2 MB pages the same gigabyte takes 512. The stepper walks through one fault.\n\nA fault the kernel can resolve from RAM, such as a fresh zeroed page or a file page already in memory, is a **minor fault**. A fault that has to wait for the disk is a **major fault**: a file page that isn't cached, or a page that was swapped out. That costs a disk read, around 0.1 ms on an SSD and more on a network disk. `/usr/bin/time -v` and `ps -o min_flt,maj_flt` report both. Minor faults are mostly a start-up and growth cost. Major faults during request handling are a latency problem.\n\nIf the address is in no region, there is nothing to fill in. The kernel sends the thread `SIGSEGV`, a segmentation fault. The JVM uses that on purpose: compiled Java code reads through a reference without checking for null first, and when the read faults near address 0, the JVM's signal handler turns the `SIGSEGV` into a `NullPointerException`.",
+   "stepper": {
+    "title": "A first touch, a page fault, and a segfault",
+    "intro": "Above the dashed line is what the hardware does on every memory access; below is what the kernel does when the hardware gives up. Addresses come from `touch.c` in the lab box.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"mmap of 1 GB records a region and nothing else\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">mmap(1 GB)</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">empty</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">no entries yet</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box-a\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p: new</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text></svg>",
+      "say": "`mmap` asks for 1 GB at `0xffff48400000`. The kernel adds one **region** to the process's list (one line in `/proc/<pid>/maps`): this range is valid and writable. It finds no RAM and fills in no page-table entries, which is why `mmap` returns at once and RSS stays at 1 MB."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The first store to the region misses the TLB and the hardware walks the table\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store 0xffff48400000</text><rect class=\"box-b\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-a\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">walking...</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text><line class=\"ln-a\" x1=\"220\" y1=\"72\" x2=\"258\" y2=\"72\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"460\" y1=\"72\" x2=\"498\" y2=\"72\" marker-end=\"url(#arr)\"/></svg>",
+      "say": "The program writes its first byte. The TLB has no translation for page `0xffff48400`, so the hardware walks the page table, root to level 3, as in the figure above."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The walk finds an empty entry and the CPU raises a page fault\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-bad\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: stopped</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-bad\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">empty entry</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB</text><rect class=\"box-a\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">page fault!</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 0    TLB hits: 0</text><line class=\"ln-bad\" x1=\"560\" y1=\"110\" x2=\"400\" y2=\"168\" marker-end=\"url(#arr)\"/></svg>",
+      "say": "There is no entry to find; even the level 2 and level 3 tables for this range don't exist yet. The CPU can't finish the store. It raises a **page fault**: an exception that jumps into the kernel's fault handler, much like lesson 1's system call trap, except the program never asked for it."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The kernel finds the address in a writable region, maps a zeroed page and returns\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: waiting</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box-a\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">entry: new frame</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box-a\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB + 4 KB</text><rect class=\"box-a\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">zero a page, map it</text><rect class=\"box-ok\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">inside: 1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    TLB hits: 0</text><line class=\"ln-a\" x1=\"460\" y1=\"208\" x2=\"498\" y2=\"208\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"260\" y1=\"208\" x2=\"222\" y2=\"208\" marker-end=\"url(#arr)\"/></svg>",
+      "say": "The handler looks the address up in the regions. It's inside the 1 GB mapping, which is writable, so this is a valid first touch. The kernel takes a free frame, fills it with zeros (no process may see another's old data), creates the missing tables and writes the frame number into the entry. RSS grows by 4 KB. Nothing was read from disk: a **minor fault**, about 0.5 to 1.6 µs in the lab box."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"The store runs again, the walk succeeds and the TLB keeps the translation\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-ok\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">store: done</text><rect class=\"box-a\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">hit for this page</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">entry: frame</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS 1 MB + 4 KB</text><rect class=\"box\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">idle</text><rect class=\"box\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">1 GB, rw-p</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    TLB hits: 4,095 more</text><line class=\"ln-a\" x1=\"220\" y1=\"72\" x2=\"258\" y2=\"72\" marker-end=\"url(#arr)\"/></svg>",
+      "say": "The kernel returns to the faulting instruction and the CPU runs the store again. This time the walk finds the frame, the store completes, and the TLB keeps the translation. The next 4,095 bytes of this page are TLB hits. The next page faults again: touching all of the 1 GB takes 262,144 faults with 4 KB pages, 512 with 2 MB pages."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 300\" role=\"img\" aria-label=\"A load from address 0 is in no region: the kernel sends SIGSEGV\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">hardware</text><rect class=\"box-bad\" x=\"20\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"67.0\" text-anchor=\"middle\">CPU</text><text class=\"t-s t-code\" x=\"120.0\" y=\"87.0\" text-anchor=\"middle\">load 0x0</text><rect class=\"box\" x=\"260\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"67.0\" text-anchor=\"middle\">TLB</text><text class=\"t-s t-m\" x=\"360.0\" y=\"87.0\" text-anchor=\"middle\">miss</text><rect class=\"box\" x=\"500\" y=\"34\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"67.0\" text-anchor=\"middle\">page table</text><text class=\"t-s t-m\" x=\"600.0\" y=\"87.0\" text-anchor=\"middle\">empty entry</text><line class=\"ln-d\" x1=\"20\" y1=\"140\" x2=\"700\" y2=\"140\"/><text class=\"t-s t-m\" x=\"20\" y=\"160\" text-anchor=\"start\">kernel and RAM</text><rect class=\"box\" x=\"20\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"203.0\" text-anchor=\"middle\">RAM</text><text class=\"t-s t-m\" x=\"120.0\" y=\"223.0\" text-anchor=\"middle\">RSS unchanged</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"203.0\" text-anchor=\"middle\">fault handler</text><text class=\"t-s t-m\" x=\"360.0\" y=\"223.0\" text-anchor=\"middle\">SIGSEGV</text><rect class=\"box-bad\" x=\"500\" y=\"170\" width=\"200\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"600.0\" y=\"203.0\" text-anchor=\"middle\">regions (maps)</text><text class=\"t-s t-m\" x=\"600.0\" y=\"223.0\" text-anchor=\"middle\">no region at 0x0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">minor faults: 1    segfaults: 1</text><line class=\"ln-bad\" x1=\"560\" y1=\"110\" x2=\"400\" y2=\"168\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"460\" y1=\"208\" x2=\"498\" y2=\"208\" marker-end=\"url(#arr)\"/></svg>",
+      "say": "A bug loads through a null pointer. The walk fails and the kernel looks for a region, as before, but no region covers address 0, so there's nothing to fill in. The kernel sends the thread `SIGSEGV`, a segmentation fault. The JVM does this on purpose: compiled code reads through a reference without checking for null, and if the read faults near address 0, the JVM's signal handler turns the `SIGSEGV` into a `NullPointerException`."
+     }
     ]
-  },
-  "lab": {
-    "title": "Build a page-table walker with a TLB",
-    "minutes": 15,
-    "files": [
-      "labs/os/src/main/kotlin/sfz/os/l06/Paging.kt",
-      "labs/os/src/test/resources/sfz/os/l06/touch-1g.txt"
-    ],
-    "run": "./gradlew :os:test --tests 'sfz.os.l06.*'",
-    "steps": [
-      "Open `touch-1g.txt`: real output of this lesson's `touch.c` in the lab box. The tests replay that run on your model and compare the fault count and the page-table size.",
-      "Read `Paging.kt`. The constants, `Region`, `Outcome` and the `Mmu` counters are written for you.",
-      "Run the tests from the `labs` folder. All nine fail.",
-      "Write `Paging.split`: shift and mask, four times for the indices and once for the offset.",
-      "Write `PageTable.lookup` and `map`. `map` creates a `Table` wherever an entry is empty, and counts it in `tables`.",
-      "Write the `Tlb`: an LRU cache of `capacity` translations.",
-      "Write `Mmu.access`: TLB, then walk, then fault or segfault. Then look at the cliff test: a 64-entry TLB serves a loop over 64 pages perfectly and a loop over 65 pages not at all."
-    ],
-    "hints": [
-      "Index for level `l` (0 is the root): `((va ushr (12 + 9 * (3 - l))) and 511).toInt()`. Offset: `(va and 4095).toInt()`.",
-      "`object : LinkedHashMap<Long, Long>(16, 0.75f, true) { override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Long>) = size > capacity }` is a complete LRU cache: `true` orders entries by access, and the override evicts the oldest.",
-      "In `access`, count a fault or a segfault as a TLB miss too, and add `Paging.LEVELS` to `walkReads` on every miss.",
-      "The model's 516 tables are 2,064 KB. The real run grew by 2,052 KB, because the process already had a root and a level 1 table before `mmap`."
-    ],
-    "done_when": "All nine tests in `PagingTest` pass."
-  },
-  "drill": {
-    "title": "Split an address by hand",
+   },
+   "try": {
+    "title": "Count the faults for 1 GB",
     "minutes": 4,
-    "prompt": "Split `0x0000_7f3a_1234_5678` into its four 9-bit table indices and its 12-bit offset, as Kotlin you could run. Then say how many page faults touching 256 MB costs with 4 KB pages and with 2 MB pages.",
-    "answer": {
-      "lang": "kotlin",
-      "src": "val va = 0x0000_7f3a_1234_5678L\nval indices = (0 until 4).map { level -> ((va ushr (39 - 9 * level)) and 511).toInt() }\nval offset = (va and 4095).toInt()\nprintln(indices)              // [254, 232, 145, 325]\nprintln(offset.toString(16))  // 678\n\n// 256 MB / 4 KB = 65,536 faults; 256 MB / 2 MB = 128 faults"
+    "steps": [
+     "`os/c/l06/touch.c` reserves 1 GB with `mmap`, then writes one byte in every 4 KB page and counts its own page faults. `none` touches nothing; `huge` asks for 2 MB pages.",
+     "Predict the fault count and RSS for each of the three runs. The last line runs it under `/usr/bin/time -v`, which counts faults from outside."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "gcc -O2 -o /tmp/touch os/c/l06/touch.c\n/tmp/touch 1024 none\n/tmp/touch 1024 4k\n/tmp/touch 1024 huge\n/usr/bin/time -v /tmp/touch 1024 4k 2>&1 | grep -E \"Major|Minor|Maximum resident\""
+    },
+    "expect": "Addresses and timings differ between runs:\n\n```text\nreserved 1024 MB at 0xffff5fe00000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (none): 3 page faults in 0 ms, RSS 1 MB, page tables 44 KB\nreserved 1024 MB at 0xffff62c00000, page size 4096 bytes, RSS 1 MB, page tables 40 KB\ntouched (4k): 262147 page faults in 129 ms (0.49 us each), RSS 1025 MB, page tables 2092 KB\nreserved 1024 MB at 0xffff65200000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (huge): 515 page faults in 79 ms, RSS 1025 MB, page tables 2096 KB\n\tMaximum resident set size (kbytes): 1049880\n\tMajor (requiring I/O) page faults: 0\n\tMinor (reclaiming a frame) page faults: 262216\n```\n\nReserving costs nothing. Touching 1 GB costs one fault per 4 KB page, 262,144 plus 3 from `printf`, and the 512 new last-level tables add 2 MB of page tables. With 2 MB pages it's 512 faults (plus 3). The page tables don't shrink: Linux keeps a spare table for each huge page so it can split it back into 4 KB pages later. Major faults: 0, nothing came from disk."
+   },
+   "refs": [
+    {
+     "title": "OSTEP chapter 21: Beyond Physical Memory: Mechanisms",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-beyondphys.pdf",
+     "kind": "read"
+    },
+    {
+     "title": "getrusage(2): ru_minflt and ru_majflt",
+     "url": "https://man7.org/linux/man-pages/man2/getrusage.2.html",
+     "kind": "docs"
     }
+   ]
   },
-  "recap": [
-    "Every process has its own virtual addresses. A per-process page table maps each 4 KB virtual page (16 KB on Apple Silicon) to a physical frame; the low 12 bits of an address are the offset.",
-    "The table is a tree: four levels of 512-entry tables, 9 bits of the address each, so a 256 TB address space needs tables only where something is mapped.",
-    "The TLB caches recent translations. Its reach is entries times page size; past it, every access pays a four-read walk. 2 MB huge pages multiply the reach by 512.",
-    "`mmap` only records a region. The first touch of each page is a page fault that the kernel fills with a zeroed frame: a minor fault. A major fault waits for disk; an address in no region gets `SIGSEGV`.",
-    "VSZ is reserved addresses, RSS is pages in RAM. A JVM reserves its whole `-Xmx` up front and faults the heap in as it uses it, unless `-XX:+AlwaysPreTouch` touches it all at start-up."
-  ],
-  "quiz": [
+  {
+   "h": "The JVM reserves gigabytes and touches megabytes",
+   "body": "A JVM started with `-Xmx4g` reserves 4 GB of addresses for its heap at start-up, the same way `touch.c` reserved its gigabyte. `ps` shows two numbers, in KB:\n\n```text\n  PID    VSZ   RSS COMMAND\n   40 7304252 181196 java\n```\n\n**VSZ** (virtual size) is the total size of all the process's regions: 7.3 GB here, the 4 GB heap plus other reserved regions such as thread stacks (2 MB each, from lesson 3), the code cache and class metadata. **RSS** is what is in RAM: 181 MB. VSZ is what the process could touch; RSS is what it has touched and still holds. A container's memory limit counts pages in RAM, never reserved addresses, so watch RSS. Lesson 8 of this track takes apart what fills the rest of it.\n\nThe heap fills in by demand paging like everything else. The JVM faults in each heap page the first time it puts objects there, so a fresh JVM pays its faults during its first minutes of traffic, spread across requests. `-XX:+AlwaysPreTouch` makes it touch every heap page at start-up instead. With `-Xms1g -Xmx1g`, maximum RSS goes from 179 MB to 1,115 MB, because the whole heap is in RAM before `main` runs. Minor faults go from about 5,100 to anywhere between 7,900 and 56,000 in my runs. That's well under the 262,144 that 4 KB pages would need, because this kernel gives parts of the heap 2 MB pages (the `-Xmx4g` run had 137 MB of `AnonHugePages`), and how much it got changed from run to run. Start-up stayed around 0.04 s: the JVM pre-touches the heap in 4 MB chunks on its GC threads in parallel, and the run used 0.08 to 0.10 s of system time inside 0.04 s of wall time.\n\nTurn it on for long-running services that need steady latency: the faults happen once, before the first request. It also proves the memory is there. In a container limited to 300 MB, `-Xms400m` started and ran fine, because it touched little of its heap. With `-XX:+AlwaysPreTouch` added, the kernel killed it at start-up: exit code 137, lesson 2's 128 plus `SIGKILL`, and `oom_kill 1` in the container's `memory.events`. Better there, where you notice at once, than hours later when traffic finally grows the heap into the limit. The price is that RSS is the whole heap from the first second.\n\nLast, page size isn't universal. The lab box's arm64 kernel uses 4 KB pages and macOS on Apple Silicon uses 16 KB. Code that rounds to pages, or reasons about how many pages a buffer spans, should ask the system (`getconf PAGESIZE`) instead of assuming 4096.",
+   "try": {
+    "title": "VSZ, RSS and AlwaysPreTouch in a JVM",
+    "minutes": 4,
+    "steps": [
+     "`Idle` allocates 64 MB of arrays and waits. Start it with `-Xmx4g` and compare VSZ with RSS.",
+     "Then start it twice with a 1 GB heap, without and with `-XX:+AlwaysPreTouch`, and predict how maximum RSS and the fault count change."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l06/demo/Idle.java\njava -Xmx4g -cp /tmp/out sfz.os.l06.demo.Idle 20 & pid=$!\nsleep 3\nps -o pid,vsz,rss,comm -p $pid\ngrep -E \"^(Rss|AnonHugePages)\" /proc/$pid/smaps_rollup\nkill $pid\nfor flag in -XX:-AlwaysPreTouch -XX:+AlwaysPreTouch; do\n  echo \"== $flag\"\n  /usr/bin/time -v java -Xms1g -Xmx1g $flag -cp /tmp/out sfz.os.l06.demo.Idle 0 2>&1 | grep -E \"Elapsed|Minor|Maximum resident\"\ndone",
+     "file": "labs/os/src/demo/java/sfz/os/l06/demo/Idle.java"
+    },
+    "expect": "```text\npid 40 holds 64 MB of arrays\n  PID    VSZ   RSS COMMAND\n   40 7304252 181196 java\nRss:              181196 kB\nAnonHugePages:    137216 kB\n== -XX:-AlwaysPreTouch\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tMaximum resident set size (kbytes): 178836\n\tMinor (reclaiming a frame) page faults: 5113\n== -XX:+AlwaysPreTouch\n\tElapsed (wall clock) time (h:mm:ss or m:ss): 0:00.04\n\tMaximum resident set size (kbytes): 1115084\n\tMinor (reclaiming a frame) page faults: 41066\n```\n\n7.3 GB reserved, 181 MB resident, 137 MB of it in 2 MB pages. With pre-touch the JVM holds the whole 1 GB heap before `main` runs. The fault count moves between runs (from about 7,900 to 56,000 in mine) depending on how much of the heap gets 2 MB pages."
+   },
+   "refs": [
     {
-      "q": "From lesson 3: a JVM starts 500 platform threads, each with a 2 MB stack reserved. VSZ grows by about 1 GB, but RSS by only a few tens of MB. Why?",
-      "options": [
-        "The kernel compresses the stacks of idle threads",
-        "The JVM shares one stack among threads that are waiting",
-        "Each stack is a reserved region, and only the pages a thread has actually touched have frames in RAM",
-        "`ps` counts stacks in VSZ by mistake"
-      ],
-      "answer": 2,
-      "from": "os-03",
-      "why": "A thread stack is a region like the 1 GB `mmap` in this lesson: its pages fault in on first touch. A thread that only goes a few calls deep touches a few pages at the top of its 2 MB, so RSS counts only those. The rest stays reserved address space, which VSZ counts."
+     "title": "The java command (JDK 25): AlwaysPreTouch, UseLargePages",
+     "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/java.html",
+     "kind": "docs"
     },
     {
-      "q": "A fraud service probes a 64 MB in-memory table at random, once per request. The CPU's TLB holds 2,048 translations. With 4 KB pages, about what share of probes miss the TLB?",
-      "options": [
-        "Most of them: 64 MB is 16,384 pages, eight times what the TLB holds",
-        "Almost none: 2,048 entries is plenty for one table",
-        "About half",
-        "None after the first pass, because the TLB keeps every page it has seen"
-      ],
-      "answer": 0,
-      "why": "The TLB can hold 2,048 of the table's 16,384 pages, so a random probe finds its page there about one time in eight. With 2 MB pages the table is 32 pages, and nearly every probe hits. The TLB evicts as it goes, like any cache; it can't keep everything it has seen."
-    },
-    {
-      "q": "`/usr/bin/time -v` reports 300,000 minor page faults and 0 major ones for a nightly settlement job. What does that tell you?",
-      "options": [
-        "The job was swapping heavily",
-        "The job touched about 1.2 GB of new memory with 4 KB pages, and nothing had to come from disk",
-        "The job crashed 300,000 times and was restarted",
-        "The job's data was read from files 300,000 times"
-      ],
-      "answer": 1,
-      "why": "Minor faults are first touches the kernel served from RAM, typically by mapping zeroed pages. 300,000 × 4 KB is about 1.2 GB. Swapping and reading uncached files would show as major faults, and there were none."
-    },
-    {
-      "q": "A service runs with `-Xms4g -Xmx4g` in a container with a 3 GB memory limit, without `AlwaysPreTouch`. What happens?",
-      "options": [
-        "The JVM refuses to start because -Xms exceeds the limit",
-        "Nothing ever goes wrong: the heap is virtual, so the limit doesn't apply",
-        "The container is OOM-killed at start-up while the heap is reserved",
-        "It starts and runs, and is OOM-killed later, once the heap pages it has touched plus everything else pass 3 GB"
-      ],
-      "answer": 3,
-      "why": "Reserving the 4 GB heap only creates a region; the memory limit counts pages in RAM. As the heap fills, its pages fault in and the container's charge grows until it hits 3 GB and the kernel kills the process, possibly hours into traffic. With `AlwaysPreTouch` the same JVM would be killed at start-up instead."
-    },
-    {
-      "q": "Touching 1 GB of 4 KB pages in the lab box made the process's page tables grow by about 2 MB. Where does 2 MB come from?",
-      "options": [
-        "Every 4 KB page needs its own 4 KB table",
-        "The TLB is saved to RAM as the process runs",
-        "262,144 pages × 8 bytes per entry: 512 level-3 tables of 4 KB each",
-        "The kernel keeps a flat array covering the whole 1 GB region"
-      ],
-      "answer": 2,
-      "why": "Each last-level table holds 512 entries of 8 bytes and maps 2 MB, so 1 GB needs 512 of them, plus a couple of tables above. A table per page would cost 1 GB, and a flat array over the whole 48-bit address space would cost 512 GB."
+     "title": "proc_pid_status(5): VmSize, VmRSS, VmPTE",
+     "url": "https://man7.org/linux/man-pages/man5/proc_pid_status.5.html",
+     "kind": "docs"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "Page size in the lab box, and on an Apple Silicon Mac?",
-      "back": "4 KB (4096) in the lab box's arm64 Linux, 16 KB (16384) on macOS. Ask with `getconf PAGESIZE`."
-    },
-    {
-      "front": "How does a 48-bit address split with 4 KB pages and four levels?",
-      "back": "Four 9-bit table indices (bits 47-39, 38-30, 29-21, 20-12) and a 12-bit offset (bits 11-0)."
-    },
-    {
-      "front": "Why is the page table a tree instead of an array?",
-      "back": "An array for 2^36 pages at 8 bytes each would be 512 GB per process. A tree only has tables under addresses that are mapped."
-    },
-    {
-      "front": "What is the TLB's reach?",
-      "back": "Entries × page size: the memory it can translate without a walk. 2,000 entries cover 8 MB with 4 KB pages, 4 GB with 2 MB pages."
-    },
-    {
-      "front": "Minor fault or major fault?",
-      "back": "Minor: the kernel resolves it from RAM (a zeroed page, a cached file page). Major: it must read from disk first (an uncached file page, swap)."
-    },
-    {
-      "front": "VSZ vs RSS?",
-      "back": "VSZ: total size of all reserved regions. RSS: pages actually in RAM. Memory limits and the OOM killer care about RSS."
-    },
-    {
-      "front": "What does `-XX:+AlwaysPreTouch` do?",
-      "back": "Touches every heap page at start-up, so the page faults (and the full RSS) happen before the first request instead of during traffic."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Virtual address",
-      "plain": "An address as a program sees it, private to its process; the hardware translates it to a physical one."
-    },
-    {
-      "term": "Page and frame",
-      "plain": "A fixed-size piece of virtual memory (4 KB in the lab box) and the same-size piece of physical RAM it maps to."
-    },
-    {
-      "term": "Page table",
-      "plain": "The per-process tree of tables that maps virtual pages to frames. The hardware walks it; the kernel fills it."
-    },
-    {
-      "term": "TLB",
-      "plain": "Translation lookaside buffer: the CPU's small cache of recent page-to-frame translations."
-    },
-    {
-      "term": "Page fault",
-      "plain": "The exception the CPU raises when a translation is missing or not allowed, which hands control to the kernel."
-    },
-    {
-      "term": "Demand paging",
-      "plain": "Giving a page RAM only when it is first touched, not when it is reserved."
-    },
-    {
-      "term": "RSS and VSZ",
-      "plain": "Resident set size (pages of the process in RAM) and virtual size (all its reserved address space)."
-    },
-    {
-      "term": "Huge page",
-      "plain": "A 2 MB page mapped by one higher-level entry, so one TLB entry covers 512 times as much memory."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A teammate sees a JVM with `-Xmx8g` showing VSZ of 11 GB and RSS of 900 MB and asks which number is real, and what `-XX:+AlwaysPreTouch` would change. Explain.",
-    "answer": "Both are real, but they measure different things. The JVM reserves address space for the whole 8 GB heap at start-up, plus thread stacks, the code cache and class metadata, and VSZ adds up every reserved region: 11 GB. Reserving costs no RAM. The kernel gives a page RAM only the first time it's touched, by taking a page fault, zeroing a frame and filling in the page table. RSS counts the pages that are actually in RAM, 900 MB, and that's the number the container's memory limit and the OOM killer look at. RSS will grow toward the heap size as the heap gets used. `AlwaysPreTouch` makes the JVM touch every heap page during start-up, so RSS would be over 8 GB from the first second, start-up does all the faulting before traffic arrives, and if the pod's limit can't hold the heap we find out at deploy time instead of during peak load."
+   ]
+  }
+ ],
+ "analogy": "A page table is a hotel's room list, one per guest group. Every group's booking says \"rooms 1 to 40\", and the front desk's list says which real room each of those numbers means for that group, so two groups' room 12 are different rooms and nobody can walk into another group's. The TLB is the sticky note on the desk with the last few lookups, so a busy guest doesn't wait for the full list every time. Demand paging is a hotel that confirms 40 rooms but makes each one up only when the guest first opens its door. The analogy breaks on the cost of asking. A guest at the desk waits seconds; a TLB miss costs a few dozen nanoseconds, and a program makes billions of accesses, so in a computer that small cost decides whether a hash index is fast.",
+ "in_your_world": "A Quarkus service in a pod with a 2 GB memory limit, started with `-Xmx1536m`, might show VSZ around 5 GB and RSS around 400 MB right after deploy, and RSS creeps up for the first hour as the heap's pages get touched. Alerts set on VSZ are noise; the pod's limit and the OOM killer count RSS. If you'd rather find out at deploy time that the heap doesn't fit, start with `-Xms` equal to `-Xmx` and `-XX:+AlwaysPreTouch`: RSS jumps to the full heap at once, and a pod that can't hold it dies before it takes traffic. The TLB shows up in in-memory structures: an exchange-rate cache or a fraud model of a few hundred MB, read at random on every authorization, misses the TLB on most lookups with 4 KB pages. Huge pages (THP, or `-XX:+UseLargePages`) can make those lookups noticeably faster, and it's the same reason Oracle hosts are usually set up with reserved huge pages for the database's shared memory.",
+ "mistake": "Reading VSZ as memory use. A JVM with `-Xmx4g` shows 7.3 GB of VSZ while it holds 181 MB of RAM, so dashboards that plot VSZ or alerts set on it fire for no reason, and people cut the heap of a perfectly healthy service. VSZ counts every reserved address: the whole heap from the start, 2 MB of stack per thread, the code cache, class metadata and more. RAM is only ever spent on pages that were touched. The fix is to watch RSS (or the container's memory charge), and to remember that RSS for a JVM grows toward `-Xmx` over time as the heap is used, unless `AlwaysPreTouch` makes it jump there at once.",
+ "compare": {
+  "title": "Touching 1 GB with 4 KB pages and with 2 MB pages",
+  "a": {
+   "label": "4 KB pages (MADV_NOHUGEPAGE)",
+   "lang": "text",
+   "title": "touch.c 1024 4k",
+   "src": "reserved 1024 MB at 0xffff62c00000, page size 4096 bytes, RSS 1 MB, page tables 40 KB\ntouched (4k): 262147 page faults in 129 ms (0.49 us each), RSS 1025 MB, page tables 2092 KB"
   },
-  "deeper": {
-    "minutes": 10,
-    "body": "Page tables are memory too, and you can see their cost. `VmPTE` in `/proc/<pid>/status` is the size of a process's page tables. The idle JVM above had 692 KB of them. `touch.c` went from 44 KB to 2,092 KB after touching 1 GB, which is the rule of thumb: about 2 MB of tables per GB of memory mapped with 4 KB pages, 0.2%. A process that maps 100 GB of a file this way spends 200 MB on tables alone, and every process that maps the same file pays it again.\n\nThe lab box's kernel has THP on for everything:\n\n```text\n$ cat /sys/kernel/mm/transparent_hugepage/enabled\n[always] madvise never\n```\n\nWith `always`, any large enough anonymous region can get 2 MB pages, which is why the JVM's heap showed `AnonHugePages` without asking. With `madvise`, only regions that ask for them with `madvise(MADV_HUGEPAGE)` get them; `touch.c huge` and the JVM's `-XX:+UseTransparentHugePages` both ask that way. A kernel thread, `khugepaged`, also scans memory and collapses runs of 4 KB pages into 2 MB pages later. Huge pages make TLB reach much larger; the costs are memory (a region that touches one byte in a 2 MB block holds 2 MB) and occasional stalls while the kernel finds or assembles a free 2 MB block.\n\nThe other big source of page faults is `mmap` of files, which lesson 7 of this track covers. A file mapping's pages come from the page cache, the kernel's copy of file data (lesson 9). If the page is cached, the fault is minor and just maps it; if not, the fault is major and waits for the disk. Kafka's index files and many databases rely on exactly this, which is why a cold page cache after a restart shows up as a burst of major faults."
+  "b": {
+   "label": "2 MB pages (MADV_HUGEPAGE)",
+   "lang": "text",
+   "title": "touch.c 1024 huge",
+   "src": "reserved 1024 MB at 0xffff65200000, page size 4096 bytes, RSS 1 MB, page tables 44 KB\ntouched (huge): 515 page faults in 79 ms, RSS 1025 MB, page tables 2096 KB"
   },
-  "sources": [
-    {
-      "title": "OSTEP chapter 18: Paging: Introduction",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf"
-    },
-    {
-      "title": "OSTEP chapter 19: Paging: Faster Translations (TLBs)",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf"
-    },
-    {
-      "title": "OSTEP chapter 20: Paging: Smaller Tables",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf"
-    },
-    {
-      "title": "Memory Layout on AArch64 Linux (kernel documentation)",
-      "url": "https://docs.kernel.org/arch/arm64/memory.html"
-    },
-    {
-      "title": "Transparent Hugepage Support (kernel documentation)",
-      "url": "https://docs.kernel.org/admin-guide/mm/transhuge.html"
-    }
+  "note": "Same gigabyte of RAM either way. Huge pages need 512 faults instead of 262,144, but the time doesn't drop by the same factor, because most of it goes to zeroing 1 GB of memory, which both runs must do. The big win comes later, in the TLB: 16 MB of this buffer needs 4,096 translations with small pages and 8 with huge ones. `getconf PAGESIZE` still says 4096 in both runs, because huge pages are an extra size the kernel uses for some regions, not a new base page size."
+ },
+ "worked": {
+  "title": "Read a JVM's memory from outside the JVM",
+  "steps": [
+   {
+    "say": "Start with the two totals. VSZ is reserved address space, RSS is RAM. A big gap is normal for a JVM.",
+    "code": "ps -o pid,vsz,rss,min_flt,maj_flt,comm -p $pid\n#   PID    VSZ   RSS  MINFL  MAJFL COMMAND\n#    40 7304252 179640 5913      0 java",
+    "lang": "bash"
+   },
+   {
+    "say": "Split RSS into anonymous memory (heap, stacks, malloc) and file pages (the JDK's code and libraries, mapped from files). Add the page tables' own cost while you're there.",
+    "code": "grep -E '^(VmSize|VmRSS|RssAnon|RssFile|VmPTE)' /proc/$pid/status\n# VmSize:\t 7304252 kB\n# VmRSS:\t  179640 kB\n# RssAnon:\t  157792 kB\n# RssFile:\t   21848 kB\n# VmPTE:\t     692 kB",
+    "lang": "bash"
+   },
+   {
+    "say": "Check how much of it sits in huge pages. With THP set to `always`, a JVM heap often gets 2 MB pages without asking.",
+    "code": "cat /sys/kernel/mm/transparent_hugepage/enabled\n# [always] madvise never\ngrep AnonHugePages /proc/$pid/smaps_rollup\n# AnonHugePages:    137216 kB",
+    "lang": "bash"
+   },
+   {
+    "say": "Read the faults. `MINFL` (5,913 at start-up) is first touches: expected while the heap grows, gone once it has. `MAJFL` above 0 and climbing under steady traffic means pages are coming from disk: a memory-mapped file that isn't cached, or swap. That's the number to alert on.",
+    "code": "watch -n 5 ps -o min_flt,maj_flt,rss -p $pid",
+    "lang": "bash"
+   }
   ]
+ },
+ "lab": {
+  "title": "Build a page-table walker with a TLB",
+  "minutes": 15,
+  "files": [
+   "labs/os/src/main/kotlin/sfz/os/l06/Paging.kt",
+   "labs/os/src/test/resources/sfz/os/l06/touch-1g.txt"
+  ],
+  "run": "./gradlew :os:test --tests 'sfz.os.l06.*'",
+  "steps": [
+   "Open `touch-1g.txt`: real output of this lesson's `touch.c` in the lab box. The tests replay that run on your model and compare the fault count and the page-table size.",
+   "Read `Paging.kt`. The constants, `Region`, `Outcome` and the `Mmu` counters are written for you.",
+   "Run the tests from the `labs` folder. All nine fail.",
+   "Write `Paging.split`: shift and mask, four times for the indices and once for the offset.",
+   "Write `PageTable.lookup` and `map`. `map` creates a `Table` wherever an entry is empty, and counts it in `tables`.",
+   "Write the `Tlb`: an LRU cache of `capacity` translations.",
+   "Write `Mmu.access`: TLB, then walk, then fault or segfault. Then look at the cliff test: a 64-entry TLB serves a loop over 64 pages perfectly and a loop over 65 pages not at all."
+  ],
+  "hints": [
+   "Index for level `l` (0 is the root): `((va ushr (12 + 9 * (3 - l))) and 511).toInt()`. Offset: `(va and 4095).toInt()`.",
+   "`object : LinkedHashMap<Long, Long>(16, 0.75f, true) { override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, Long>) = size > capacity }` is a complete LRU cache: `true` orders entries by access, and the override evicts the oldest.",
+   "In `access`, count a fault or a segfault as a TLB miss too, and add `Paging.LEVELS` to `walkReads` on every miss.",
+   "The model's 516 tables are 2,064 KB. The real run grew by 2,052 KB, because the process already had a root and a level 1 table before `mmap`."
+  ],
+  "done_when": "All nine tests in `PagingTest` pass."
+ },
+ "drill": {
+  "title": "Split an address by hand",
+  "minutes": 4,
+  "prompt": "Split `0x0000_7f3a_1234_5678` into its four 9-bit table indices and its 12-bit offset, as Kotlin you could run. Then say how many page faults touching 256 MB costs with 4 KB pages and with 2 MB pages.",
+  "answer": {
+   "lang": "kotlin",
+   "src": "val va = 0x0000_7f3a_1234_5678L\nval indices = (0 until 4).map { level -> ((va ushr (39 - 9 * level)) and 511).toInt() }\nval offset = (va and 4095).toInt()\nprintln(indices)              // [254, 232, 145, 325]\nprintln(offset.toString(16))  // 678\n\n// 256 MB / 4 KB = 65,536 faults; 256 MB / 2 MB = 128 faults"
+  }
+ },
+ "recap": [
+  "Every process has its own virtual addresses. A per-process page table maps each 4 KB virtual page (16 KB on Apple Silicon) to a physical frame; the low 12 bits of an address are the offset.",
+  "The table is a tree: four levels of 512-entry tables, 9 bits of the address each, so a 256 TB address space needs tables only where something is mapped.",
+  "The TLB caches recent translations. Its reach is entries times page size; past it, every access pays a four-read walk. 2 MB huge pages multiply the reach by 512.",
+  "`mmap` only records a region. The first touch of each page is a page fault that the kernel fills with a zeroed frame: a minor fault. A major fault waits for disk; an address in no region gets `SIGSEGV`.",
+  "VSZ is reserved addresses, RSS is pages in RAM. A JVM reserves its whole `-Xmx` up front and faults the heap in as it uses it, unless `-XX:+AlwaysPreTouch` touches it all at start-up."
+ ],
+ "quiz": [
+  {
+   "q": "From lesson 3: a JVM starts 500 platform threads, each with a 2 MB stack reserved. VSZ grows by about 1 GB, but RSS by only a few tens of MB. Why?",
+   "options": [
+    "The kernel compresses the stacks of idle threads",
+    "The JVM shares one stack among threads that are waiting",
+    "Each stack is a reserved region, and only the pages a thread has actually touched have frames in RAM",
+    "`ps` counts stacks in VSZ by mistake"
+   ],
+   "answer": 2,
+   "from": "os-03",
+   "why": "A thread stack is a region like the 1 GB `mmap` in this lesson: its pages fault in on first touch. A thread that only goes a few calls deep touches a few pages at the top of its 2 MB, so RSS counts only those. The rest stays reserved address space, which VSZ counts."
+  },
+  {
+   "q": "A fraud service probes a 64 MB in-memory table at random, once per request. The CPU's TLB holds 2,048 translations. With 4 KB pages, about what share of probes miss the TLB?",
+   "options": [
+    "Most of them: 64 MB is 16,384 pages, eight times what the TLB holds",
+    "Almost none: 2,048 entries is plenty for one table",
+    "About half",
+    "None after the first pass, because the TLB keeps every page it has seen"
+   ],
+   "answer": 0,
+   "why": "The TLB can hold 2,048 of the table's 16,384 pages, so a random probe finds its page there about one time in eight. With 2 MB pages the table is 32 pages, and nearly every probe hits. The TLB evicts as it goes, like any cache; it can't keep everything it has seen."
+  },
+  {
+   "q": "`/usr/bin/time -v` reports 300,000 minor page faults and 0 major ones for a nightly settlement job. What does that tell you?",
+   "options": [
+    "The job was swapping heavily",
+    "The job touched about 1.2 GB of new memory with 4 KB pages, and nothing had to come from disk",
+    "The job crashed 300,000 times and was restarted",
+    "The job's data was read from files 300,000 times"
+   ],
+   "answer": 1,
+   "why": "Minor faults are first touches the kernel served from RAM, typically by mapping zeroed pages. 300,000 × 4 KB is about 1.2 GB. Swapping and reading uncached files would show as major faults, and there were none."
+  },
+  {
+   "q": "A service runs with `-Xms4g -Xmx4g` in a container with a 3 GB memory limit, without `AlwaysPreTouch`. What happens?",
+   "options": [
+    "The JVM refuses to start because -Xms exceeds the limit",
+    "Nothing ever goes wrong: the heap is virtual, so the limit doesn't apply",
+    "The container is OOM-killed at start-up while the heap is reserved",
+    "It starts and runs, and is OOM-killed later, once the heap pages it has touched plus everything else pass 3 GB"
+   ],
+   "answer": 3,
+   "why": "Reserving the 4 GB heap only creates a region; the memory limit counts pages in RAM. As the heap fills, its pages fault in and the container's charge grows until it hits 3 GB and the kernel kills the process, possibly hours into traffic. With `AlwaysPreTouch` the same JVM would be killed at start-up instead."
+  },
+  {
+   "q": "Touching 1 GB of 4 KB pages in the lab box made the process's page tables grow by about 2 MB. Where does 2 MB come from?",
+   "options": [
+    "Every 4 KB page needs its own 4 KB table",
+    "The TLB is saved to RAM as the process runs",
+    "262,144 pages × 8 bytes per entry: 512 level-3 tables of 4 KB each",
+    "The kernel keeps a flat array covering the whole 1 GB region"
+   ],
+   "answer": 2,
+   "why": "Each last-level table holds 512 entries of 8 bytes and maps 2 MB, so 1 GB needs 512 of them, plus a couple of tables above. A table per page would cost 1 GB, and a flat array over the whole 48-bit address space would cost 512 GB."
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "Page size in the lab box, and on an Apple Silicon Mac?",
+   "back": "4 KB (4096) in the lab box's arm64 Linux, 16 KB (16384) on macOS. Ask with `getconf PAGESIZE`."
+  },
+  {
+   "front": "How does a 48-bit address split with 4 KB pages and four levels?",
+   "back": "Four 9-bit table indices (bits 47-39, 38-30, 29-21, 20-12) and a 12-bit offset (bits 11-0)."
+  },
+  {
+   "front": "Why is the page table a tree instead of an array?",
+   "back": "An array for 2^36 pages at 8 bytes each would be 512 GB per process. A tree only has tables under addresses that are mapped."
+  },
+  {
+   "front": "What is the TLB's reach?",
+   "back": "Entries × page size: the memory it can translate without a walk. 2,000 entries cover 8 MB with 4 KB pages, 4 GB with 2 MB pages."
+  },
+  {
+   "front": "Minor fault or major fault?",
+   "back": "Minor: the kernel resolves it from RAM (a zeroed page, a cached file page). Major: it must read from disk first (an uncached file page, swap)."
+  },
+  {
+   "front": "VSZ vs RSS?",
+   "back": "VSZ: total size of all reserved regions. RSS: pages actually in RAM. Memory limits and the OOM killer care about RSS."
+  },
+  {
+   "front": "What does `-XX:+AlwaysPreTouch` do?",
+   "back": "Touches every heap page at start-up, so the page faults (and the full RSS) happen before the first request instead of during traffic."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Virtual address",
+   "plain": "An address as a program sees it, private to its process; the hardware translates it to a physical one."
+  },
+  {
+   "term": "Page and frame",
+   "plain": "A fixed-size piece of virtual memory (4 KB in the lab box) and the same-size piece of physical RAM it maps to."
+  },
+  {
+   "term": "Page table",
+   "plain": "The per-process tree of tables that maps virtual pages to frames. The hardware walks it; the kernel fills it."
+  },
+  {
+   "term": "TLB",
+   "plain": "Translation lookaside buffer: the CPU's small cache of recent page-to-frame translations."
+  },
+  {
+   "term": "Page fault",
+   "plain": "The exception the CPU raises when a translation is missing or not allowed, which hands control to the kernel."
+  },
+  {
+   "term": "Demand paging",
+   "plain": "Giving a page RAM only when it is first touched, not when it is reserved."
+  },
+  {
+   "term": "RSS and VSZ",
+   "plain": "Resident set size (pages of the process in RAM) and virtual size (all its reserved address space)."
+  },
+  {
+   "term": "Huge page",
+   "plain": "A 2 MB page mapped by one higher-level entry, so one TLB entry covers 512 times as much memory."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate sees a JVM with `-Xmx8g` showing VSZ of 11 GB and RSS of 900 MB and asks which number is real, and what `-XX:+AlwaysPreTouch` would change. Explain.",
+  "answer": "Both are real, but they measure different things. The JVM reserves address space for the whole 8 GB heap at start-up, plus thread stacks, the code cache and class metadata, and VSZ adds up every reserved region: 11 GB. Reserving costs no RAM. The kernel gives a page RAM only the first time it's touched, by taking a page fault, zeroing a frame and filling in the page table. RSS counts the pages that are actually in RAM, 900 MB, and that's the number the container's memory limit and the OOM killer look at. RSS will grow toward the heap size as the heap gets used. `AlwaysPreTouch` makes the JVM touch every heap page during start-up, so RSS would be over 8 GB from the first second, start-up does all the faulting before traffic arrives, and if the pod's limit can't hold the heap we find out at deploy time instead of during peak load."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "Page tables are memory too, and you can see their cost. `VmPTE` in `/proc/<pid>/status` is the size of a process's page tables. The idle JVM above had 692 KB of them. `touch.c` went from 44 KB to 2,092 KB after touching 1 GB, which is the rule of thumb: about 2 MB of tables per GB of memory mapped with 4 KB pages, 0.2%. A process that maps 100 GB of a file this way spends 200 MB on tables alone, and every process that maps the same file pays it again.\n\nThe lab box's kernel has THP on for everything:\n\n```text\n$ cat /sys/kernel/mm/transparent_hugepage/enabled\n[always] madvise never\n```\n\nWith `always`, any large enough anonymous region can get 2 MB pages, which is why the JVM's heap showed `AnonHugePages` without asking. With `madvise`, only regions that ask for them with `madvise(MADV_HUGEPAGE)` get them; `touch.c huge` and the JVM's `-XX:+UseTransparentHugePages` both ask that way. A kernel thread, `khugepaged`, also scans memory and collapses runs of 4 KB pages into 2 MB pages later. Huge pages make TLB reach much larger; the costs are memory (a region that touches one byte in a 2 MB block holds 2 MB) and occasional stalls while the kernel finds or assembles a free 2 MB block.\n\nThe other big source of page faults is `mmap` of files, which lesson 7 of this track covers. A file mapping's pages come from the page cache, the kernel's copy of file data (lesson 9). If the page is cached, the fault is minor and just maps it; if not, the fault is major and waits for the disk. Kafka's index files and many databases rely on exactly this, which is why a cold page cache after a restart shows up as a burst of major faults."
+ },
+ "sources": [
+  {
+   "title": "OSTEP chapter 18: Paging: Introduction",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-paging.pdf"
+  },
+  {
+   "title": "OSTEP chapter 19: Paging: Faster Translations (TLBs)",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-tlbs.pdf"
+  },
+  {
+   "title": "OSTEP chapter 20: Paging: Smaller Tables",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-smalltables.pdf"
+  },
+  {
+   "title": "Memory Layout on AArch64 Linux (kernel documentation)",
+   "url": "https://docs.kernel.org/arch/arm64/memory.html"
+  },
+  {
+   "title": "Transparent Hugepage Support (kernel documentation)",
+   "url": "https://docs.kernel.org/admin-guide/mm/transhuge.html"
+  }
+ ]
 }

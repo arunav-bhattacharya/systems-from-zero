@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lesson nosql-12: a merchants index with five merchants, for the search Try-it.
+# Lesson store-08: a merchants index with five merchants, for the search Try-it.
 # Run from the labs folder: sh env/opensearch/nosql-12-merchants.sh   (safe to run again)
 OS=${OS:-http://localhost:9200}
 curl -s -X DELETE "$OS/merchants" > /dev/null

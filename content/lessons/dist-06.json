@@ -1,0 +1,453 @@
+{
+  "id": "dist-06",
+  "title": "Ordering without a shared clock: logical clocks and IDs",
+  "minutes": 40,
+  "goal": "By the end you can stamp events so that a cause always sorts before its effect, with Lamport and hybrid logical clocks, say what neither stamp can tell you, choose an id scheme by the order it really promises, and fix a Snowflake generator whose clock steps back.",
+  "warmup": {
+    "q": "Node A authorizes pay-81723 and sends a message to node B, which captures it 5 ms later. A's clock is 40 ms ahead of B's, and both stamp events with `System.currentTimeMillis()`. Sorted by timestamp, which event comes first?",
+    "options": [
+      "The authorization: it really happened first",
+      "The capture, by 35 ms",
+      "They tie, because NTP keeps the clocks within a millisecond",
+      "It depends on which node does the sorting"
+    ],
+    "answer": 1,
+    "why": "A's stamp is real time plus 40 ms, B's is real time, and B's event is only 5 ms later, so B's stamp is 35 ms smaller. The order of wall-clock stamps from two machines is right only when the gap between the events is bigger than the skew. NTP often keeps servers within milliseconds, but lesson 3 showed it can't promise that. Who sorts doesn't matter: the stamps are already wrong."
+  },
+  "sections": [
+    {
+      "h": "A wall-clock timestamp can put the effect before its cause",
+      "body": "Node A authorizes payment pay-81723 at 10:00:00.100 and sends a message to node B, which captures the payment 5 ms later. A's clock runs 40 ms ahead of B's, well within what NTP over the internet can leave between two servers (lesson 3). A stamps the authorization 10:00:00.140, and B stamps the capture 10:00:00.105. Sort the events by timestamp and the capture comes first, 35 ms before the authorization it depends on. An audit that replays events in timestamp order would capture a payment that doesn't exist yet.\n\nThat happens whenever the skew between two clocks is larger than the delay of a message between them. The Try it measures it on generated histories with 4 nodes and messages that take 1 to 20 ms. When the clocks agree, no message ever arrives before it was sent. With up to 10 ms of skew, 153 of 1,950 messages do, and with 50 ms, a third of them.\n\nWhat order do we actually need? The Replication track's lesson on concurrent writes named it: **happens-before**. Event a happened before event b (written a → b) if they ran on the same node and a came first, or a is the sending of a message and b is its receipt, or a chain of such steps leads from a to b. If neither a → b nor b → a, the two are concurrent: neither could have known about the other, whatever the clocks say. Happens-before is about what could have influenced what, not about time.\n\nSo the rule a timestamp T has to follow fits on one line: if a → b, then T(a) < T(b). Concurrent events may come out in either order, as long as everyone agrees on it. Wall clocks break that rule. They also do something we'd like to keep, which is to say roughly when an event happened.\n\nHere is the idea every scheme in this lesson builds on. A cause can reach an effect only along a node's own sequence of events or along a message. If a timestamp can only grow along both, by counting on each node and by carrying the number inside every message so that the receiver jumps past it, an effect can never get a smaller timestamp than its cause, whatever the clocks do.",
+      "try": {
+        "title": "Count effects stamped before their causes",
+        "minutes": 3,
+        "steps": [
+          "Run the demo from the `labs` folder. For each amount of clock skew it generates 20 histories of 300 events on 4 nodes, finds every pair where a happened before b using vector clocks, and counts the pairs where b's wall-clock stamp is earlier than a's.",
+          "Before you look: at what skew do backward messages start, given that messages take 1 to 20 ms? What will the Lamport and HLC columns say?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.CausalityDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.CausalityDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l06/demo/CausalityDemo.kt"
+        },
+        "expect": "```text\nmax skew   messages backwards   causal pairs backwards   Lamport backwards   HLC backwards\n    0 ms       0 of  1954          0 of   773170                   0               0\n    2 ms      17 of  1950         35 of   772763                   0               0\n    5 ms      56 of  1950        134 of   772763                   0               0\n   10 ms     153 of  1950        533 of   772763                   0               0\n   20 ms     322 of  1950       2369 of   772763                   0               0\n   50 ms     657 of  1950      15890 of   772763                   0               0\n```\n\nWith clocks that agree, nothing goes backwards. From 2 ms of skew, some messages \"arrive\" before they were sent, the ones faster than the skew between their two nodes, and with 50 ms about a third do. Causal pairs, which include long chains through several nodes, go wrong less often, but they go wrong. Lamport and HLC stamps never do, whatever the skew: that is the property the lab's tests check on random histories."
+      }
+    },
+    {
+      "h": "Lamport timestamps: count events, and jump past every message",
+      "body": "Leslie Lamport described the simplest version in 1978. Every node keeps a counter that starts at 0:\n\n- Before each local event or send, the node adds 1 and stamps the event with the counter.\n- A message carries the sender's stamp.\n- On receipt, the node sets its counter to the larger of its own and the message's, then adds 1 for the receive.\n\nA stamp is the pair (counter, node id). To compare two, compare the counters, and if they are equal, put the smaller node id first. That tie-break makes the order total: any two events from any nodes have a definite order. The stepper builds one. Capture's counter is 1 when a message stamped 2 arrives, so the receive becomes 3, and everything capture does afterwards sorts after the authorization.\n\nIt works because along one node's events the counter only grows, and across a message the receiver ends up strictly above the sender. A chain from a to b is made of nothing but those two kinds of step, so T(a) < T(b). No clock is involved, so no skew or NTP step can break it.\n\nThere are three things it can't do. First, it can't tell before from concurrent. L(a) < L(b) holds for every a → b, and also for plenty of concurrent pairs, so a smaller stamp means neither \"came first\" nor \"could have caused\". Detecting concurrency takes vector clocks, as the Replication track used for siblings: one counter per node in every stamp, compared entry by entry, and two vectors that each have a larger entry are concurrent. The price is the size: a counter for every node, in every stamp. Second, a Lamport stamp has nothing to do with time, so you can't ask for everything after 10:00. A node that rarely hears from others counts at its own pace, and its counter can be thousands away from a busy node's. Third, concurrent events are ordered by counter and node id, so two events that a person saw happen in one order can be stamped in the other. The Try it prints pairs like that, and section 5 shows what they cost.",
+      "stepper": {
+        "title": "Lamport timestamps on three services",
+        "intro": "Node ids in brackets break ties. Highlighted circles are what changed.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Each of three nodes counts its own events: auth 1, capture 1, ledger 1 to 3\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"74.0\" text-anchor=\"start\">auth (0)</text><line class=\"ln\" x1=\"100.0\" y1=\"70.0\" x2=\"135.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"165.0\" y1=\"70.0\" x2=\"620.0\" y2=\"70.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"154.0\" text-anchor=\"start\">capture (1)</text><line class=\"ln\" x1=\"100.0\" y1=\"150.0\" x2=\"125.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"150.0\" x2=\"620.0\" y2=\"150.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger (2)</text><line class=\"ln\" x1=\"100.0\" y1=\"230.0\" x2=\"125.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"230.0\" x2=\"200.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"230.0\" y1=\"230.0\" x2=\"275.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"305.0\" y1=\"230.0\" x2=\"620.0\" y2=\"230.0\"/><circle class=\"box-a\" cx=\"150\" cy=\"70\" r=\"15\"/><text class=\"t-s t-a\" x=\"150.0\" y=\"74.0\" text-anchor=\"middle\">1</text><circle class=\"box-a\" cx=\"140\" cy=\"150\" r=\"15\"/><text class=\"t-s t-a\" x=\"140.0\" y=\"154.0\" text-anchor=\"middle\">1</text><circle class=\"box-a\" cx=\"140\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"140.0\" y=\"234.0\" text-anchor=\"middle\">1</text><circle class=\"box-a\" cx=\"215\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"215.0\" y=\"234.0\" text-anchor=\"middle\">2</text><circle class=\"box-a\" cx=\"290\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"290.0\" y=\"234.0\" text-anchor=\"middle\">3</text></svg>",
+            "say": "Each node counts its own events, starting at 1. Auth authorizes pay-81723 (1); capture and ledger are busy with other payments. So far the counters say nothing about each other."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Auth sends m1 stamped 2; capture, at 1, receives it as 3\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"74.0\" text-anchor=\"start\">auth (0)</text><line class=\"ln\" x1=\"100.0\" y1=\"70.0\" x2=\"135.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"165.0\" y1=\"70.0\" x2=\"225.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"255.0\" y1=\"70.0\" x2=\"620.0\" y2=\"70.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"154.0\" text-anchor=\"start\">capture (1)</text><line class=\"ln\" x1=\"100.0\" y1=\"150.0\" x2=\"125.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"150.0\" x2=\"305.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"335.0\" y1=\"150.0\" x2=\"620.0\" y2=\"150.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger (2)</text><line class=\"ln\" x1=\"100.0\" y1=\"230.0\" x2=\"125.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"230.0\" x2=\"200.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"230.0\" y1=\"230.0\" x2=\"275.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"305.0\" y1=\"230.0\" x2=\"620.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"250.6\" y1=\"80.6\" x2=\"308.0\" y2=\"138.0\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"292.0\" y=\"106.0\" text-anchor=\"start\">m1 carries 2</text><circle class=\"box\" cx=\"150\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"150.0\" y=\"74.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"140\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"154.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"140\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"234.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"215\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"215.0\" y=\"234.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"290\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"290.0\" y=\"234.0\" text-anchor=\"middle\">3</text><circle class=\"box-a\" cx=\"240\" cy=\"70\" r=\"15\"/><text class=\"t-s t-a\" x=\"240.0\" y=\"74.0\" text-anchor=\"middle\">2</text><circle class=\"box-a\" cx=\"320\" cy=\"150\" r=\"15\"/><text class=\"t-s t-a\" x=\"320.0\" y=\"154.0\" text-anchor=\"middle\">3</text></svg>",
+            "say": "Auth counts the send (2) and puts 2 in message m1. Capture's counter is 1, so on receipt it jumps to max(1, 2) + 1 = 3. Everything capture does from now on sorts after the authorization."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Capture sends m2 stamped 4; ledger, already at 5, receives it as 6\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"74.0\" text-anchor=\"start\">auth (0)</text><line class=\"ln\" x1=\"100.0\" y1=\"70.0\" x2=\"135.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"165.0\" y1=\"70.0\" x2=\"225.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"255.0\" y1=\"70.0\" x2=\"620.0\" y2=\"70.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"154.0\" text-anchor=\"start\">capture (1)</text><line class=\"ln\" x1=\"100.0\" y1=\"150.0\" x2=\"125.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"150.0\" x2=\"305.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"335.0\" y1=\"150.0\" x2=\"385.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"415.0\" y1=\"150.0\" x2=\"620.0\" y2=\"150.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger (2)</text><line class=\"ln\" x1=\"100.0\" y1=\"230.0\" x2=\"125.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"230.0\" x2=\"200.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"230.0\" y1=\"230.0\" x2=\"275.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"305.0\" y1=\"230.0\" x2=\"350.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"380.0\" y1=\"230.0\" x2=\"425.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"455.0\" y1=\"230.0\" x2=\"515.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"545.0\" y1=\"230.0\" x2=\"620.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"250.6\" y1=\"80.6\" x2=\"308.0\" y2=\"138.0\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"292.0\" y=\"106.0\" text-anchor=\"start\">m1 carries 2</text><line class=\"ln\" x1=\"412.8\" y1=\"157.9\" x2=\"515.5\" y2=\"221.1\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"478.0\" y=\"186.0\" text-anchor=\"start\">m2 carries 4</text><circle class=\"box\" cx=\"150\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"150.0\" y=\"74.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"240\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"240.0\" y=\"74.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"140\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"154.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"320\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"320.0\" y=\"154.0\" text-anchor=\"middle\">3</text><circle class=\"box-a\" cx=\"400\" cy=\"150\" r=\"15\"/><text class=\"t-s t-a\" x=\"400.0\" y=\"154.0\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"140\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"234.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"215\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"215.0\" y=\"234.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"290\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"290.0\" y=\"234.0\" text-anchor=\"middle\">3</text><circle class=\"box-a\" cx=\"365\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"365.0\" y=\"234.0\" text-anchor=\"middle\">4</text><circle class=\"box-a\" cx=\"440\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"440.0\" y=\"234.0\" text-anchor=\"middle\">5</text><circle class=\"box-a\" cx=\"530\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"530.0\" y=\"234.0\" text-anchor=\"middle\">6</text></svg>",
+            "say": "Capture sends m2 with 4. Ledger has counted to 5 on its own, so the receive becomes max(5, 4) + 1 = 6. A receive always ends up above the send that caused it, which is the whole guarantee."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Auth's send (2,0) sorts before ledger's third event (3,2), although their vector clocks are incomparable\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"74.0\" text-anchor=\"start\">auth (0)</text><line class=\"ln\" x1=\"100.0\" y1=\"70.0\" x2=\"135.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"165.0\" y1=\"70.0\" x2=\"225.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"255.0\" y1=\"70.0\" x2=\"620.0\" y2=\"70.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"154.0\" text-anchor=\"start\">capture (1)</text><line class=\"ln\" x1=\"100.0\" y1=\"150.0\" x2=\"125.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"150.0\" x2=\"305.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"335.0\" y1=\"150.0\" x2=\"385.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"415.0\" y1=\"150.0\" x2=\"620.0\" y2=\"150.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger (2)</text><line class=\"ln\" x1=\"100.0\" y1=\"230.0\" x2=\"125.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"230.0\" x2=\"200.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"230.0\" y1=\"230.0\" x2=\"275.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"305.0\" y1=\"230.0\" x2=\"350.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"380.0\" y1=\"230.0\" x2=\"425.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"455.0\" y1=\"230.0\" x2=\"515.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"545.0\" y1=\"230.0\" x2=\"620.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"250.6\" y1=\"80.6\" x2=\"308.0\" y2=\"138.0\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"292.0\" y=\"106.0\" text-anchor=\"start\">m1 carries 2</text><line class=\"ln\" x1=\"412.8\" y1=\"157.9\" x2=\"515.5\" y2=\"221.1\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"478.0\" y=\"186.0\" text-anchor=\"start\">m2 carries 4</text><circle class=\"box\" cx=\"150\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"150.0\" y=\"74.0\" text-anchor=\"middle\">1</text><circle class=\"box-a\" cx=\"240\" cy=\"70\" r=\"15\"/><text class=\"t-s t-a\" x=\"240.0\" y=\"74.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"140\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"154.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"320\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"320.0\" y=\"154.0\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"400\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"400.0\" y=\"154.0\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"140\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"234.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"215\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"215.0\" y=\"234.0\" text-anchor=\"middle\">2</text><circle class=\"box-a\" cx=\"290\" cy=\"230\" r=\"15\"/><text class=\"t-s t-a\" x=\"290.0\" y=\"234.0\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"365\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"365.0\" y=\"234.0\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"440\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"440.0\" y=\"234.0\" text-anchor=\"middle\">5</text><circle class=\"box\" cx=\"530\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"530.0\" y=\"234.0\" text-anchor=\"middle\">6</text><text class=\"t-s t-a\" x=\"240.0\" y=\"102.0\" text-anchor=\"middle\">[2,0,0]</text><text class=\"t-s t-a\" x=\"290.0\" y=\"266.0\" text-anchor=\"middle\">[0,0,3]</text></svg>",
+            "say": "(2, auth) is smaller than (3, ledger), so Lamport puts auth's send first. But neither could have influenced the other: their vector clocks, [2,0,0] and [0,0,3], are incomparable. A smaller Lamport stamp doesn't mean earlier, and it doesn't mean cause."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"All eleven stamps sorted by counter and then node id form one list\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"74.0\" text-anchor=\"start\">auth (0)</text><line class=\"ln\" x1=\"100.0\" y1=\"70.0\" x2=\"135.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"165.0\" y1=\"70.0\" x2=\"225.0\" y2=\"70.0\"/><line class=\"ln\" x1=\"255.0\" y1=\"70.0\" x2=\"620.0\" y2=\"70.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"154.0\" text-anchor=\"start\">capture (1)</text><line class=\"ln\" x1=\"100.0\" y1=\"150.0\" x2=\"125.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"150.0\" x2=\"305.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"335.0\" y1=\"150.0\" x2=\"385.0\" y2=\"150.0\"/><line class=\"ln\" x1=\"415.0\" y1=\"150.0\" x2=\"620.0\" y2=\"150.0\"/><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger (2)</text><line class=\"ln\" x1=\"100.0\" y1=\"230.0\" x2=\"125.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"155.0\" y1=\"230.0\" x2=\"200.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"230.0\" y1=\"230.0\" x2=\"275.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"305.0\" y1=\"230.0\" x2=\"350.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"380.0\" y1=\"230.0\" x2=\"425.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"455.0\" y1=\"230.0\" x2=\"515.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"545.0\" y1=\"230.0\" x2=\"620.0\" y2=\"230.0\"/><line class=\"ln\" x1=\"250.6\" y1=\"80.6\" x2=\"308.0\" y2=\"138.0\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"292.0\" y=\"106.0\" text-anchor=\"start\">m1 carries 2</text><line class=\"ln\" x1=\"412.8\" y1=\"157.9\" x2=\"515.5\" y2=\"221.1\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"478.0\" y=\"186.0\" text-anchor=\"start\">m2 carries 4</text><circle class=\"box\" cx=\"150\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"150.0\" y=\"74.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"240\" cy=\"70\" r=\"15\"/><text class=\"t-s\" x=\"240.0\" y=\"74.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"140\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"154.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"320\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"320.0\" y=\"154.0\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"400\" cy=\"150\" r=\"15\"/><text class=\"t-s\" x=\"400.0\" y=\"154.0\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"140\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"140.0\" y=\"234.0\" text-anchor=\"middle\">1</text><circle class=\"box\" cx=\"215\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"215.0\" y=\"234.0\" text-anchor=\"middle\">2</text><circle class=\"box\" cx=\"290\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"290.0\" y=\"234.0\" text-anchor=\"middle\">3</text><circle class=\"box\" cx=\"365\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"365.0\" y=\"234.0\" text-anchor=\"middle\">4</text><circle class=\"box\" cx=\"440\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"440.0\" y=\"234.0\" text-anchor=\"middle\">5</text><circle class=\"box\" cx=\"530\" cy=\"230\" r=\"15\"/><text class=\"t-s\" x=\"530.0\" y=\"234.0\" text-anchor=\"middle\">6</text><text class=\"t-s t-code\" x=\"320.0\" y=\"288.0\" text-anchor=\"middle\">(1,0) (1,1) (1,2) (2,0) (2,2) (3,1) (3,2) (4,1) (4,2) (5,2) (6,2)</text></svg>",
+            "say": "Sort by counter, then node id, and every event gets one place in one list. The list agrees with every cause and effect. Concurrent events land in an order that is arbitrary but the same for everyone."
+          }
+        ]
+      },
+      "try": {
+        "title": "Stamp a history by hand, then check it",
+        "minutes": 4,
+        "steps": [
+          "Run the demo. It prints a 10-event history on 3 nodes with each event's wall clock, Lamport stamp and vector clock. Cover the Lamport column first and work it out yourself from the rules, row by row. Rows are in real-time order; `recv m1` takes the stamp of `send m1`.",
+          "Look at row 6: `n1 recv m1` has a wall clock of 18 ms, earlier than the 33 ms at which m1 was sent. What does its Lamport stamp say instead?",
+          "Read the pairs at the end. Rerun with `-Pargs='5'` for another history."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.LamportDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.LamportDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l06/demo/LamportDemo.kt"
+        },
+        "expect": "```text\nclock offsets: n0 +29 ms, n1 +12 ms, n2 +25 ms\n #  node  event       wall ms  Lamport  vector\n 0  n0    send m0         29  (1,0)    [1,0,0]\n 1  n0    local           32  (2,0)    [2,0,0]\n 2  n0    send m1         33  (3,0)    [3,0,0]\n 3  n2    recv m0         30  (2,2)    [1,0,1]\n 4  n2    send m2         30  (3,2)    [1,0,2]\n 5  n2    local           30  (4,2)    [1,0,3]\n 6  n1    recv m1         18  (4,1)    [3,1,0]\n 7  n0    send m3         37  (4,0)    [4,0,0]\n 8  n0    recv m2         38  (5,0)    [5,0,2]\n 9  n1    local           21  (5,1)    [3,2,0]\nconcurrent pairs (vectors incomparable): 20. Lamport orders every one; some against real time:\n  #3 (2,2) sorts before #2 (3,0), but #2 happened first; [3,0,0] and [1,0,1] are incomparable\n  #6 (4,1) sorts before #5 (4,2), but #5 happened first; [1,0,3] and [3,1,0] are incomparable\n  #7 (4,0) sorts before #5 (4,2), but #5 happened first; [1,0,3] and [4,0,0] are incomparable\n```\n\nRow 6 shows the jump: n1 had counted nothing, the message carried 3, so the receive gets 4, after the send in Lamport order even though n1's clock says 18 ms. The last lines show what Lamport can't do: #2 happened before #3 in real time, yet (2,2) sorts before (3,0), and nothing is wrong with that, because neither could have influenced the other. Their vectors are incomparable, which only a vector clock can tell you."
+      },
+      "refs": [
+        {
+          "title": "Time, Clocks, and the Ordering of Events in a Distributed System (Lamport, 1978)",
+          "url": "https://doi.org/10.1145/359545.359563",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Hybrid logical clocks: wall-clock time when the clocks agree, a counter when they don't",
+      "body": "Kulkarni, Demirbas and colleagues asked in 2014 for both: Lamport's guarantee and a value close to the wall clock, in 64 bits. The obvious attempt uses the physical time pt as the counter and bumps it with Lamport's rule: l = max(l + 1, l of the message + 1, pt). Their paper shows that this fails: every bump adds one unit, and messages going round a loop of nodes can push l ahead of physical time without limit.\n\nThe fix splits the stamp in two. l is the largest wall-clock reading the node has heard of, its own or one carried in a message. c counts events that share the same l. The rules:\n\n- Local event or send: l becomes the larger of the old l and the node's wall clock. If l didn't change, c goes up by one; if l moved forward, c starts again at 0.\n- Receive: l becomes the largest of the old l, the message's l and the wall clock. Then c continues the count of whichever l won: one more than the larger c if the old l and the message's l were tied, one more than that side's c if only one of them won, and 0 if the wall clock was ahead of both.\n\nCompare stamps by l, then c. Every step makes (l, c) larger, and a receive ends up above the message, so happens-before is kept exactly as with Lamport. And because l is always some node's wall-clock reading, it stays close to real time: l is never behind the node's own clock, and never ahead of it by more than the largest disagreement between two clocks, called ε. When NTP steps a clock back, l stays put and c counts until the clock catches up, so stamps never go backwards. Packed into 64 bits, 48 for l and 16 for c, a stamp sorts as a plain Long.\n\nHow large does c get? On EC2, with clocks an average of 9 ms apart, the authors measured c = 0 for 65.6% of events and almost never above 5. With 3 ms they found c = 0 for 91.2% of events and 1 for the rest. Across four AWS regions it was 0 for about 95%, because network delays between regions were far longer than the skew. The Try it shows the same shape on the lab's simulator.\n\nHLCs are the clock inside several databases. CockroachDB and YugabyteDB stamp transactions with them, and MongoDB's causally consistent sessions pass a cluster time back and forth with every operation, which the 2019 paper on its implementation describes as a hybrid logical clock. The physical half is only meaningful while clocks stay close, so these systems police it: YugabyteDB shuts down a server whose clock is more than 500 ms off by default, and CockroachDB does the same when a node's offset from the others reaches 80% of its 500 ms maximum.",
+      "try": {
+        "title": "See how big the counter gets",
+        "minutes": 3,
+        "steps": [
+          "Run the demo. For skews from 1 to 100 ms it replays 20 histories of 500 events through the lab's hybrid clock and prints how often c is 0, 1 or more, its largest value, and how far l ran ahead of each node's own wall clock.",
+          "Predict the row for 3 ms first, using the paper's 91.2% as a guide. Then compare the last column with the skew in each row."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.HlcDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.HlcDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l06/demo/HlcDemo.kt"
+        },
+        "expect": "```text\nmax skew    c = 0    c = 1   c >= 2   max c   l - wall clock: max   mean\n    1 ms    90.2%     8.9%     0.9%       3                  0 ms    0.0 ms\n    3 ms    90.3%     8.9%     0.9%       3                  0 ms    0.0 ms\n    9 ms    89.4%     9.4%     1.2%       3                  4 ms    0.0 ms\n   30 ms    80.6%    12.7%     6.7%      10                 25 ms    0.7 ms\n  100 ms    53.5%    13.7%    32.7%      19                 88 ms   12.4 ms\n```\n\nWith a few milliseconds of skew, c is 0 for about 90% of events. At 1 and 3 ms every nonzero c comes from two events in the same millisecond on one node. l never runs ahead of the local clock by more than the skew: 4 ms at 9, 25 ms at 30, 88 ms at 100. At 1 and 3 ms it never runs ahead at all, because a message takes at least 5 ms here, longer than the skew, the same reason the paper saw c = 0 for 95% of events across regions. Only at 100 ms, more than the message delay, does c grow often. The simulator uses whole milliseconds, so the shape matches the paper and the exact numbers don't."
+      },
+      "refs": [
+        {
+          "title": "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases (Kulkarni et al., 2014)",
+          "url": "https://cse.buffalo.edu/tech-reports/2014-04.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Causal consistency and read and write concerns (MongoDB docs)",
+          "url": "https://www.mongodb.com/docs/manual/core/read-isolation-consistency-recency/",
+          "kind": "docs"
+        },
+        {
+          "title": "Accurate clock management in YugabyteDB",
+          "url": "https://www.yugabyte.com/blog/accurate-clock-management-in-yugabytedb/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "IDs: who hands out the next number, and what its order promises",
+      "body": "Records need ids, and an id is a close relative of a timestamp: it must be unique, and we'd like its order to mean something. Every scheme answers two questions: who picks the next number, and what does sorting by it tell you?\n\nOne counter. A database sequence, PostgreSQL's `nextval` or an Oracle sequence, is one node handing out the next number. If one insert finished before another began, the second gets the larger id. That is the strongest order any scheme here gives, and it costs a trip to one place for every id. Two details weaken it. A sequence never rolls back, so an aborted transaction leaves a gap. And with a cache (`CACHE 20`), a PostgreSQL session or an Oracle RAC instance takes a block of 20 values at a time, so ids from two of them interleave out of time order, the same as handing blocks of ids to different servers.\n\nRandom. UUIDv4 has 122 random bits. Any node can make one without asking anybody, collisions are not a practical worry, and the order means nothing: in a B-tree index every insert lands on a random page.\n\nTime plus something unique. These put milliseconds in the top bits, so ids sort roughly by creation time and new rows land at the right edge of a B-tree, which is what makes them good primary keys. The figure shows the layouts.\n\n- UUIDv7 comes from RFC 9562 (May 2024), which replaced RFC 4122. It holds 48 bits of Unix milliseconds, the version, and 74 bits that are random or partly a counter. The RFC asks each generator to keep its own output increasing and offers three ways (a counter, a random increment, or extra sub-millisecond clock bits), but promises nothing across generators. PostgreSQL 18's `uuidv7()` uses sub-millisecond bits; its docs promise no order, and the commit that added it makes values increase within one session only. JDK 26's `UUID.ofEpochMillis(ms)` takes the timestamp from you and fills the rest at random, so its output increases only if your timestamps do. Kotlin's `Uuid.generateV7()` (still `@ExperimentalUuidApi`) guarantees increasing values within one process, using a counter, and nothing across processes or hosts.\n- Snowflake, Twitter's 2010 design, packs 41 bits of milliseconds since its own epoch, 10 bits of machine id and a 12-bit sequence into a 64-bit Long: 4,096 ids per millisecond per machine. When the clock ran backwards, Twitter's generator refused to make ids until time passed the last one it had issued.\n- ULID has 48 bits of milliseconds and 80 random bits, written as 26 characters that sort as text. Its optional monotonic mode adds one to the random part within the same millisecond.\n\nAt best, all of these order the ids of one generator. Across machines their order is the order of the machines' clocks: in the Try it, the capture made on a machine 40 ms behind gets a smaller id than the authorization that caused it. On one machine, a clock that steps back makes a naive generator repeat ids. The lab fixes that the way an HLC would: never use a millisecond older than the last one, and when 4,096 ids have used up a millisecond, borrow the next.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"Bit layouts of Snowflake, UUIDv7, ULID, HLC and TiDB timestamp oracle values, each with a time field in the top bits\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"40.0\" text-anchor=\"start\">Snowflake, 64 bits</text><rect class=\"box\" x=\"150.0\" y=\"14.0\" width=\"52.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"176.0\" y=\"33.0\" text-anchor=\"middle\">0</text><text class=\"t-s t-m\" x=\"176.0\" y=\"49.0\" text-anchor=\"middle\">sign</text><rect class=\"box-a\" x=\"206.0\" y=\"14.0\" width=\"206.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"309.0\" y=\"33.0\" text-anchor=\"middle\">ms since epoch</text><text class=\"t-s t-m\" x=\"309.0\" y=\"49.0\" text-anchor=\"middle\">41 bits</text><rect class=\"box\" x=\"416.0\" y=\"14.0\" width=\"86.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"459.0\" y=\"33.0\" text-anchor=\"middle\">machine</text><text class=\"t-s t-m\" x=\"459.0\" y=\"49.0\" text-anchor=\"middle\">10 bits</text><rect class=\"box\" x=\"506.0\" y=\"14.0\" width=\"114.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"563.0\" y=\"33.0\" text-anchor=\"middle\">sequence</text><text class=\"t-s t-m\" x=\"563.0\" y=\"49.0\" text-anchor=\"middle\">12 bits</text><text class=\"t-s t-m\" x=\"16.0\" y=\"96.0\" text-anchor=\"start\">UUIDv7, 128 bits</text><rect class=\"box-a\" x=\"150.0\" y=\"70.0\" width=\"146.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"223.0\" y=\"89.0\" text-anchor=\"middle\">unix_ts_ms</text><text class=\"t-s t-m\" x=\"223.0\" y=\"105.0\" text-anchor=\"middle\">48 bits</text><rect class=\"box\" x=\"300.0\" y=\"70.0\" width=\"48.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"324.0\" y=\"89.0\" text-anchor=\"middle\">ver</text><text class=\"t-s t-m\" x=\"324.0\" y=\"105.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"352.0\" y=\"70.0\" width=\"76.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"390.0\" y=\"89.0\" text-anchor=\"middle\">rand_a</text><text class=\"t-s t-m\" x=\"390.0\" y=\"105.0\" text-anchor=\"middle\">12 bits</text><rect class=\"box\" x=\"432.0\" y=\"70.0\" width=\"48.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"456.0\" y=\"89.0\" text-anchor=\"middle\">var</text><text class=\"t-s t-m\" x=\"456.0\" y=\"105.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"484.0\" y=\"70.0\" width=\"136.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"552.0\" y=\"89.0\" text-anchor=\"middle\">rand_b</text><text class=\"t-s t-m\" x=\"552.0\" y=\"105.0\" text-anchor=\"middle\">62 bits</text><text class=\"t-s t-m\" x=\"16.0\" y=\"152.0\" text-anchor=\"start\">ULID, 128 bits</text><rect class=\"box-a\" x=\"150.0\" y=\"126.0\" width=\"176.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"238.0\" y=\"145.0\" text-anchor=\"middle\">time in ms</text><text class=\"t-s t-m\" x=\"238.0\" y=\"161.0\" text-anchor=\"middle\">48 bits</text><rect class=\"box\" x=\"330.0\" y=\"126.0\" width=\"290.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"475.0\" y=\"145.0\" text-anchor=\"middle\">random</text><text class=\"t-s t-m\" x=\"475.0\" y=\"161.0\" text-anchor=\"middle\">80 bits</text><text class=\"t-s t-m\" x=\"16.0\" y=\"208.0\" text-anchor=\"start\">HLC, 64 bits</text><rect class=\"box-a\" x=\"150.0\" y=\"182.0\" width=\"326.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"313.0\" y=\"201.0\" text-anchor=\"middle\">l: wall-clock ms</text><text class=\"t-s t-m\" x=\"313.0\" y=\"217.0\" text-anchor=\"middle\">48 bits</text><rect class=\"box\" x=\"480.0\" y=\"182.0\" width=\"140.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"550.0\" y=\"201.0\" text-anchor=\"middle\">c: counter</text><text class=\"t-s t-m\" x=\"550.0\" y=\"217.0\" text-anchor=\"middle\">16 bits</text><text class=\"t-s t-m\" x=\"16.0\" y=\"264.0\" text-anchor=\"start\">TiDB TSO, 64 bits</text><rect class=\"box-a\" x=\"150.0\" y=\"238.0\" width=\"316.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"308.0\" y=\"257.0\" text-anchor=\"middle\">physical ms</text><text class=\"t-s t-m\" x=\"308.0\" y=\"273.0\" text-anchor=\"middle\">46 bits</text><rect class=\"box\" x=\"470.0\" y=\"238.0\" width=\"150.0\" height=\"44.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"545.0\" y=\"257.0\" text-anchor=\"middle\">logical</text><text class=\"t-s t-m\" x=\"545.0\" y=\"273.0\" text-anchor=\"middle\">18 bits</text></svg>",
+        "caption": "Every layout puts time in the top bits (blue), so sorting the number sorts by time; what follows decides uniqueness. Field widths are not to scale."
+      },
+      "try": {
+        "title": "Step a Snowflake clock back one second",
+        "minutes": 3,
+        "steps": [
+          "Run the demo. One machine makes an id every 500 ms; before the fourth id, NTP steps its clock back one second. The demo runs the naive generator from the lab's stub, then the fixed one, then two machines whose clocks are 40 ms apart.",
+          "Predict the naive generator's fourth to sixth ids before you look."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.SnowflakeDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.SnowflakeDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l06/demo/SnowflakeDemo.kt"
+        },
+        "expect": "```text\nnaive generator:\n  id 109051904000028672  ms +0  seq 0\n  id 109051906097180672  ms +500  seq 0\n  id 109051908194332672  ms +1000  seq 0\n  id 109051904000028672  ms +0  seq 0   <- not larger than the one before\n  id 109051906097180672  ms +500  seq 0\n  id 109051908194332672  ms +1000  seq 0\n  3 distinct of 6, increasing: false\nfixed generator:\n  id 109051904000028672  ms +0  seq 0\n  id 109051906097180672  ms +500  seq 0\n  id 109051908194332672  ms +1000  seq 0\n  id 109051908194332673  ms +1000  seq 1\n  id 109051908194332674  ms +1000  seq 2\n  id 109051908194332675  ms +1000  seq 3\n  6 distinct of 6, increasing: true\ntwo machines, 40 ms apart: authorization id 109051904167776256, capture id 109051904020979712, capture sorts first: true\n```\n\nThe naive generator walks back through milliseconds it has already used, and with sequence 0 each time, its last three ids are exact copies of its first three: three primary-key collisions. The fixed one stays on the last millisecond and counts up the sequence; it would follow the clock again once the clock passed +1000 ms, as the lab's tests check. Neither can fix the last line: the capture, made on the machine whose clock is 40 ms behind, sorts before the authorization that caused it."
+      },
+      "refs": [
+        {
+          "title": "RFC 9562: Universally Unique IDentifiers (UUIDs)",
+          "url": "https://www.rfc-editor.org/rfc/rfc9562.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: UUID functions",
+          "url": "https://www.postgresql.org/docs/18/functions-uuid.html",
+          "kind": "docs"
+        },
+        {
+          "title": "UUID.ofEpochMillis (JDK 26)",
+          "url": "https://docs.oracle.com/en/java/javase/26/docs/api/java.base/java/util/UUID.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Uuid.generateV7 (Kotlin standard library)",
+          "url": "https://kotlinlang.org/api/core/kotlin-stdlib/kotlin.uuid/-uuid/-companion/generate-v7.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Snowflake (Twitter, 2010)",
+          "url": "https://github.com/twitter-archive/snowflake/tree/snowflake-2010",
+          "kind": "read"
+        },
+        {
+          "title": "ULID specification",
+          "url": "https://github.com/ulid/spec",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Causality isn't real time: a timestamp oracle for what no message connects",
+      "body": "Lamport stamps and HLCs promise one thing: a new stamp is larger than every stamp the node has heard of. When no message connects two events, they promise nothing about their order, even if a person watched one happen after the other.\n\nThe risk team puts a payout hold on merchant M-0042. The hold commits on the merchants shard at 1,000 ms with HLC (1000, 0). The merchants service sends the merchant a webhook, and the merchant's own server reacts by requesting a payout. The request commits on the payouts shard 30 ms later, and that shard's clock is 80 ms behind, so the payout gets HLC (950, 0). The rule is that a hold blocks every payout created after it. By timestamp, the payout came first, so it is paid. In real time the hold came first, by 30 ms, and the payout was a reaction to it. The causal link ran through the merchant's server, outside the system, and no stamp went with it. Lamport stamps do no better: the payouts shard has counted fewer events, so its stamp is lower still.\n\nThere are three ways out. The first is to carry the stamp across the gap: put the hold's HLC in the webhook, require it back with the payout request, and have the payouts shard call `receive` with it first. MongoDB lets a client do this by advancing one causally consistent session to another session's cluster time. It works only if every channel carries the stamp, including the ones you don't control. The second is to take every timestamp from one counter, a **timestamp oracle**. TiDB's placement driver hands them out from one leader, 46 bits of physical milliseconds plus an 18-bit logical counter. Whatever starts after something else has committed gets a larger number, because one node orders them all. An oracle saves a high-water mark ahead of what it has handed out (the demo saves one every 1,000 numbers), so after a failover the new leader skips numbers but never repeats one. The cost is a round trip to that one leader, in one region, for every transaction. The third is clocks with a known error bound and a wait before each commit until the bound has passed, which is what Spanner does with TrueTime; the Consensus track's lesson on distributed SQL covers it.\n\nWhich one to use comes down to the order you need:\n\n| You need | Use | It can't |\n|---|---|---|\n| Unique ids, nothing more | UUIDv4 | sort by time |\n| Primary keys that sort roughly by time | UUIDv7, Snowflake, ULID | order ids made on different machines |\n| Causes before effects | Lamport or HLC stamps on every message | spot concurrency, or order events no message connects |\n| To know which writes were concurrent | Vector clocks | stay small with many nodes |\n| Real-time order across unrelated events | One sequence or timestamp oracle, or bounded clocks and a wait | scale past one leader, or skip the wait |",
+      "try": {
+        "title": "Pay out a held merchant, then stop it",
+        "minutes": 3,
+        "steps": [
+          "Run the demo. The hold commits on the merchants shard, a webhook reaches the merchant, and the merchant's server asks the payouts shard for a payout 30 ms later. The payouts shard's clock is 80 ms behind.",
+          "Before you look: which of the three stamps (HLC, Lamport, oracle) orders the payout after the hold?",
+          "In `ExternalOrderDemo.kt`, change `real - 80` to `real - 20` and run it again. Why does HLC get it right now?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.ExternalOrderDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l06.demo.ExternalOrderDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l06/demo/ExternalOrderDemo.kt"
+        },
+        "expect": "```text\n1,000 ms  hold on M-0042 commits on the merchants shard with HLC (1000,0)\n1,030 ms  payout P-9 commits on the payouts shard with HLC (950,0)\n        rule check: is P-9 after the hold? false  ->  PAID, although the hold came first\n        with Lamport stamps: hold (501,0), payout (301,1), payout after hold: false\n        with a timestamp oracle: hold 1, payout 2, payout after hold: true  ->  blocked\n        the oracle fails over; the next timestamp is 1001: numbers skipped, none reused\n```\n\nThe HLC and Lamport stamps both put the payout first, because no message connected the two shards. The oracle orders them by when they asked, one after the other. Its failover jumps to 1,001: the saved mark was 1,000, so the new leader can't reuse a number. With the clock only 20 ms behind, less than the 30 ms between the events, the HLC stamps come out (1000,0) and (1010,0) and the payout is blocked: HLC gets real-time order right only when the gap is wider than the skew."
+      },
+      "refs": [
+        {
+          "title": "TimeStamp Oracle (TiDB docs)",
+          "url": "https://docs.pingcap.com/tidb/stable/tso",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Three authors write one serial and mail drafts to each other. Each numbers a new chapter one higher than the highest number they have seen, in their own work or in any draft they received. A chapter that answers another always has a higher number than the one it answers, so readers who sort by number never meet a reply before its question. Two authors who haven't written to each other in weeks will both produce a \"chapter 12\"; the tie goes to the author whose name comes first. That is a Lamport clock. Writing the date next to each number, and using the date whenever it is later than the number would be, is roughly an HLC. The analogy breaks on the post: a letter that crosses an ocean still carries its number, but a phone call between two authors carries nothing, and a reply prompted by a call can end up with a lower number than the chapter it answers, which is section 5's hold and payout.",
+  "in_your_world": "Kafka gives you one counter per partition: offsets are a total order inside a partition and none across partitions, which is why a payment's events share a key. Across services, put an HLC in a record header (`clock.send().pack()` as 8 bytes) and call `receive` when you consume, and the audit service can sort a payment's events across topics without trusting any pod's clock. Oracle sequences default to `CACHE 20` and, on RAC, `NOORDER`, so ids from two instances don't follow time: don't sort settlement rows by id and call it the order of events. For primary keys, UUIDv7 from PostgreSQL 18 or Kotlin's `Uuid.generateV7()` keeps B-tree inserts at the right edge. For a rule like \"a hold blocks later payouts\", check the hold inside the transaction that creates the payout, or take both stamps from one sequence; never compare stamps from two shards that no message connects.",
+  "mistake": "The common mistake is sorting events from different services by their wall-clock `created_at`, or by their UUIDv7 or Snowflake ids, and reading the result as cause and effect. It looks right in tests because one laptop has one clock. In production a capture from a pod whose clock is 40 ms behind sorts before its authorization, and a reconciliation job flags it. People do it because an id that encodes time looks like a timestamp, and a timestamp looks like the truth. Fix it by naming the order you need: per generator (UUIDv7 is fine), causal (carry a Lamport or HLC stamp on every message and sort by that), or real time across unrelated events (one counter, or a design that reads the earlier event inside the later one's transaction).",
+  "compare": {
+    "title": "Lamport and hybrid clocks, receive side by side",
+    "a": {
+      "label": "Lamport",
+      "lang": "kotlin",
+      "title": "Lamport.kt",
+      "src": "fun receive(message: Stamp): Stamp {\n    counter = maxOf(counter, message.counter) + 1\n    return Stamp(counter, node)\n}"
+    },
+    "b": {
+      "label": "Hybrid logical clock",
+      "lang": "kotlin",
+      "title": "Hybrid.kt",
+      "src": "fun receive(m: Hlc): Hlc {\n    val pt = physical()\n    val l = maxOf(last.l, m.l, pt)\n    val c = when {\n        l == last.l && l == m.l -> maxOf(last.c, m.c) + 1\n        l == last.l -> last.c + 1\n        l == m.l -> m.c + 1\n        else -> 0\n    }\n    return set(l, c)\n}"
+    },
+    "note": "Both take the maximum of what the node has seen and what the message carries, and both end strictly above the message. That is the whole of the causality guarantee. The hybrid clock adds the wall clock as a third candidate for the maximum and keeps the counter separate from the time, so l stays a real wall-clock reading and c absorbs the ties. Lamport's counter has no units; the hybrid stamp's l is milliseconds you can query by."
+  },
+  "worked": {
+    "title": "Choose ids and stamps for the payments platform",
+    "steps": [
+      {
+        "say": "Write down, for each kind of record, which order the business needs. Most need far less than people assume.",
+        "code": "record                 order needed                       why\npayments.id            unique; roughly by time            B-tree locality, nothing else\npayment events         cause before effect, per payment   audit replays a payment's story\nholds vs payouts       real time, across shards           a hold must block later payouts\nidempotency keys       unique, made by the client         safe retries",
+        "lang": "text"
+      },
+      {
+        "say": "Primary keys: let PostgreSQL 18 make UUIDv7s. Three made in one statement share a millisecond and still increase, because the 12 bits after the millisecond hold a sub-millisecond fraction (real output below).",
+        "code": "CREATE TABLE payments (\n    id     uuid   PRIMARY KEY DEFAULT uuidv7(),\n    amount bigint NOT NULL\n);\n\nSELECT uuidv7() AS id, uuid_extract_timestamp(uuidv7()) AS ts FROM generate_series(1, 3);\n                  id                  |             ts\n--------------------------------------+----------------------------\n 01a1b9df-4ade-7ab8-a14b-99736efb0039 | 2026-11-08 06:36:21.086+00\n 01a1b9df-4ade-7b38-98fd-f1a1963d2b46 | 2026-11-08 06:36:21.086+00\n 01a1b9df-4ade-7b48-9ed3-8eb21f97de78 | 2026-11-08 06:36:21.086+00\n(3 rows)",
+        "lang": "sql"
+      },
+      {
+        "say": "Ids made in the JVM, such as idempotency keys a client creates before it calls you: Kotlin's generator increases within the process, here with its counter visible in the fourth group (`73d1`, `73d2`, ...). Across pods, it promises nothing.",
+        "code": "@OptIn(ExperimentalUuidApi::class)\nval key = Uuid.generateV7()\n\n// five in a row (the lab's UuidDemo):\n// 01a1b9df-0281-73d1-b446-18ca5017446a  ms=1794119762561\n// 01a1b9df-0281-73d2-93f6-5f9480857687  ms=1794119762561\n// 01a1b9df-0281-73d3-8218-6bd5837a2022  ms=1794119762561",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Payment events between services: one hybrid clock per service, its stamp in a Kafka header, `receive` on every consume. Now the audit can sort a payment's events by `hlc` and every effect follows its cause.",
+        "code": "// producing\nval stamp = clock.send().pack()\nrecord.headers().add(\"hlc\", ByteBuffer.allocate(8).putLong(stamp).array())\n\n// consuming\nval header = consumerRecord.headers().lastHeader(\"hlc\")\nval seen = clock.receive(Hlc.unpack(ByteBuffer.wrap(header.value()).long))\naudit.insert(paymentId, event, hlc = seen.pack())",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Holds and payouts need real-time order, which no stamp from two shards gives. Take both from one sequence with no cache. The hold committed before the payout request began, so the payout's `nextval` is larger, and gaps don't matter.",
+        "code": "CREATE SEQUENCE commit_order CACHE 1;\n\nINSERT INTO holds   (merchant_id, commit_order) VALUES ('M-0042', nextval('commit_order'));\nINSERT INTO payouts (merchant_id, commit_order) VALUES ('M-0042', nextval('commit_order'));\n\n-- the rule: a payout is blocked by any hold with a smaller commit_order",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Lamport and hybrid clocks against vector clocks, and a Snowflake that survives a clock step",
+    "minutes": 15,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/dist/l06/Lamport.kt",
+      "labs/sim/src/main/kotlin/sfz/dist/l06/Hybrid.kt",
+      "labs/sim/src/main/kotlin/sfz/dist/l06/Snowflake.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.dist.l06.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All 19 fail: the clocks throw `NotImplementedError`, and the Snowflake tests fail on the stub's wrong ids.",
+      "Read `History.kt`, which is given. `Histories.generate` plays a seeded history of local events, sends and receives on N nodes with skewed wall clocks; `vectorStamps` gives the exact happens-before relation; `lamportStamps` and `hlcStamps` replay the history through your clocks.",
+      "In `Lamport.kt`, write `compareTo`, `local` and `receive`. `LamportTest` passes, and so does the uniqueness property in `CausalityPropertyTest`.",
+      "In `Hybrid.kt`, write `pack`, `unpack`, `local` and `receive` from the rules in section 3. `HybridTest` and the rest of `CausalityPropertyTest` pass: jqwik checks happens-before against vector clocks on hundreds of random histories, the bound on l, and stamps that keep growing through a clock step.",
+      "In `Snowflake.kt`, fix `next()`. All 19 pass.",
+      "Experiment: in `HybridClock.receive`, leave `m.l` out of the maximum. Run `CausalityPropertyTest` and read the history jqwik reports. Put it back."
+    ],
+    "hints": [
+      "`compareValuesBy(this, other, Stamp::counter, Stamp::node)`.",
+      "`pack` is `(l shl 16) or c.toLong()`; `unpack` is `Hlc(packed ushr 16, (packed and 0xFFFF).toInt())`.",
+      "In `local`: `val l = maxOf(last.l, physical())`, then `c = if (l == last.l) last.c + 1 else 0`. Store the result in `last`.",
+      "In `receive`, a `when` with four branches, in the order of the KDoc. Check the tie of both l values first.",
+      "In `next()`: `var ms = maxOf(clock(), lastMs)`; if `ms == lastMs`, count up and, past `MAX_SEQUENCE`, use `lastMs + 1` with sequence 0."
+    ],
+    "done_when": "All 19 tests in `sfz.dist.l06` pass."
+  },
+  "drill": {
+    "title": "A hybrid clock from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Write `local()` and `receive(m)` for a hybrid logical clock with fields `l` and `c` and a `physical()` wall clock. Then one line on what happens to l when the wall clock steps back.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun local(): Hlc {\n    val l = maxOf(last.l, physical())\n    val c = if (l == last.l) last.c + 1 else 0\n    return set(l, c)\n}\n\nfun receive(m: Hlc): Hlc {\n    val l = maxOf(last.l, m.l, physical())\n    val c = when {\n        l == last.l && l == m.l -> maxOf(last.c, m.c) + 1\n        l == last.l -> last.c + 1\n        l == m.l -> m.c + 1\n        else -> 0\n    }\n    return set(l, c)\n}\n// a clock that steps back loses the max: l stays where it was and c counts up until the clock catches up"
+    }
+  },
+  "recap": [
+    "Wall-clock stamps from two machines put an effect before its cause whenever the skew is larger than the message delay between them.",
+    "Happens-before: same node in order, a send before its receive, and chains of those. The rule for a timestamp: if a happened before b, T(a) < T(b).",
+    "Lamport stamps (counter, node) count events and jump past every message: a total order that respects causality, with no notion of time and no way to spot concurrency. Vector clocks spot it, at one counter per node.",
+    "Hybrid logical clocks keep Lamport's guarantee in 64 bits whose top 48 are a real wall-clock reading, never more than the clock skew ahead; the counter is almost always 0 or 1. CockroachDB, YugabyteDB and MongoDB's cluster time use them.",
+    "UUIDv7, Snowflake and ULID sort by time for one generator at most. Only one counter (a sequence, TiDB's timestamp oracle) or bounded clocks with a wait give real-time order across events no message connects."
+  ],
+  "quiz": [
+    {
+      "q": "From lesson 3: NTP steps node B's wall clock back 300 ms. Which of B's stamps can now come out smaller than ones it made before the step?",
+      "options": [
+        "Its hybrid logical clock stamps",
+        "Its Lamport stamps",
+        "Its `System.currentTimeMillis()` readings, and anything built only on them, such as a naive Snowflake id",
+        "All three"
+      ],
+      "answer": 2,
+      "why": "A wall-clock reading follows the step back, and so does an id that copies it. A Lamport clock never reads a clock. A hybrid clock takes the maximum of its last l and the wall clock, so after a step back l stays where it was and only c grows. That is why lesson 3 measures durations on a monotonic clock, and why the lab's Snowflake fix borrows the same trick.",
+      "from": "dist-03"
+    },
+    {
+      "q": "Event x on node 1 has Lamport stamp (12, 1) and event y on node 3 has (40, 3). What can you conclude?",
+      "options": [
+        "x happened before y",
+        "y did not happen before x; x may have happened before y, or they may be concurrent",
+        "x and y are concurrent",
+        "Nothing: Lamport stamps from different nodes can't be compared"
+      ],
+      "answer": 1,
+      "why": "If y had happened before x, y's stamp would be smaller, so that is ruled out. The rest is open: Lamport stamps give a smaller number to every cause, but also to many events that caused nothing. Only vector clocks tell concurrent from before. Stamps from different nodes compare fine; that's what the node id tie-break is for."
+    },
+    {
+      "q": "A hybrid clock's last stamp is (5000, 3) and its wall clock reads 5000. A message arrives stamped (5020, 7). What stamp does the receive get?",
+      "options": [
+        "(5000, 4)",
+        "(5021, 0)",
+        "(5020, 0)",
+        "(5020, 8)"
+      ],
+      "answer": 3,
+      "why": "l is the largest of 5000, 5020 and 5000, so 5020, which came from the message alone. c then continues the message's count: 7 + 1. (5020, 0) would tie with nothing but would sort below the message's own (5020, 7), breaking happens-before. (5021, 0) is the naive version that adds a unit to l, which can drift away from real time without limit. (5000, 4) ignores the message."
+    },
+    {
+      "q": "Three services insert into one table with primary keys from Kotlin's `Uuid.generateV7()`. What does sorting the table by id give you?",
+      "options": [
+        "Creation order within each process, and across services only as good as their clocks",
+        "Exact creation order across all three services",
+        "No order at all: the bits after the timestamp are random",
+        "Commit order, because the database assigns the ids"
+      ],
+      "answer": 0,
+      "why": "Kotlin keeps its output increasing within one process with a counter and promises nothing across processes or hosts. The top 48 bits are each service's own wall clock, so ids from a service whose clock is behind sort too early. The random bits come after the timestamp, so the order is roughly by time. The ids were made in the JVMs before the insert, so they know nothing of commit order."
+    },
+    {
+      "q": "Holds live on one shard, payouts on another, and the merchant's own server sits between them. Which change makes \"a hold blocks payouts created after it\" correct?",
+      "options": [
+        "Replace the shards' hybrid clocks with Lamport clocks",
+        "Synchronize the shards' clocks with NTP every minute instead of every hour",
+        "Take both shards' commit stamps from one timestamp oracle",
+        "Compare the UUIDv7 ids of the hold and the payout instead"
+      ],
+      "answer": 2,
+      "why": "The payout request started after the hold committed, so one counter gives it the larger number, whatever the clocks say. No message connected the shards, so Lamport and hybrid clocks have nothing to carry; Lamport is worse, since it ignores time entirely. More frequent NTP shrinks the skew without bounding it. UUIDv7 ids are wall-clock stamps from two machines, the original problem."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "When did event a happen before event b?",
+      "back": "Same node and a first; or a is a send and b its receive; or a chain of those leads from a to b. Otherwise they are concurrent."
+    },
+    {
+      "front": "The three rules of a Lamport clock?",
+      "back": "Add 1 before each local event or send; send the counter with every message; on receive, set the counter to max(own, message) + 1."
+    },
+    {
+      "front": "What can't a Lamport stamp tell you?",
+      "back": "Whether two events were concurrent (a smaller stamp doesn't mean earlier or cause), and anything about wall-clock time."
+    },
+    {
+      "front": "What are l and c in a hybrid logical clock?",
+      "back": "l: the largest wall-clock reading the node has heard of (48 bits). c: a counter for events that share that l (16 bits)."
+    },
+    {
+      "front": "How far can an HLC's l be from the node's own wall clock?",
+      "back": "Never behind it, and never ahead by more than the largest skew between two clocks. A clock stepping back leaves l where it was."
+    },
+    {
+      "front": "Who keeps UUIDv7 ids increasing?",
+      "back": "Each generator, at best: PostgreSQL 18 within one session, Kotlin's generateV7 within one process, JDK 26's ofEpochMillis only if your timestamps are. Nothing across machines."
+    },
+    {
+      "front": "What fixes a Snowflake generator whose clock steps back?",
+      "back": "Never use a millisecond older than the last one issued (keep counting the sequence on it), and borrow the next millisecond when 4,096 are used. Twitter's original refused to issue ids instead."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Happens-before",
+      "plain": "Event a happened before b if a could have influenced b: same node in order, a send before its receive, or a chain of those."
+    },
+    {
+      "term": "Concurrent events",
+      "plain": "Two events where neither happened before the other; no message path connects them."
+    },
+    {
+      "term": "Lamport timestamp",
+      "plain": "A (counter, node id) pair from a counter that counts events and jumps past every message it receives."
+    },
+    {
+      "term": "Vector clock",
+      "plain": "One counter per node in every stamp; comparing entry by entry shows exactly which events were concurrent."
+    },
+    {
+      "term": "Hybrid logical clock (HLC)",
+      "plain": "A stamp of the largest wall-clock reading heard so far plus a counter, which respects causality and stays close to real time."
+    },
+    {
+      "term": "UUIDv7",
+      "plain": "A 128-bit id with Unix milliseconds in its top 48 bits, so ids sort roughly by creation time (RFC 9562)."
+    },
+    {
+      "term": "Timestamp oracle",
+      "plain": "One service that hands out every timestamp from a single counter, so later requests always get larger numbers."
+    }
+  ],
+  "explain_back": {
+    "prompt": "The reconciliation report sorts a payment's events by their UUIDv7 ids and sometimes shows a refund before the capture it reverses. Explain why, and what you'd change.",
+    "answer": "A UUIDv7 id starts with the wall clock of whichever pod made it, and each generator only keeps its own ids in order. The capture and the refund come from different services, so their ids are ordered by two different clocks. If the refund service's clock is behind by more than the time between the two events, its id sorts first, even though the refund was a reaction to the capture. I'd keep UUIDv7 for primary keys, where it is only there for B-tree locality, and add a causal stamp: each service keeps a hybrid logical clock, puts its stamp in the Kafka header of every event it emits, and calls receive on every event it consumes. The refund service has seen the capture's event before it refunds, so the refund's stamp is larger, and the report sorts by that stamp. If the report ever needs to order events that no message connects, like a hold and a payout, a stamp can't help; those need one counter or a check inside one transaction."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**How big the HLC counter can get.** The paper proves that c stays bounded: roughly the clock skew divided by the minimum time the clocks advance during a message, plus one. That is why 16 bits are plenty when clocks are within milliseconds and messages take milliseconds, and why a clock that is badly off can make c climb, as the 100 ms row of the Try it shows.\n\n**Vector clocks and version vectors.** Storing a counter per node is fine for a handful of replicas and hopeless for every client of a large system. Dynamo-style stores keep one entry per replica that coordinated a write, not per client, which the Replication track's lesson on concurrent writes uses; systems that need concurrency detection for many writers prune old entries and accept the occasional false conflict.\n\n**ULID's monotonic mode.** The ULID spec's monotonic mode adds one to the 80-bit random part for each id in the same millisecond, and fails if that would overflow. The spec doesn't say whether one process or the whole system is the scope; in practice it is one generator, like UUIDv7.\n\n**Snowflake's own promise.** Twitter's README described the ids as roughly sorted, within tens of milliseconds as a target, and relied on NTP to keep machines close. The order across machines was only ever as good as the clocks, which is the cost of not asking anyone for the next number.\n\n**Real-time order with clocks.** Spanner's TrueTime returns an interval that the true time is guaranteed to lie in, and a transaction waits out that interval before it reports its commit, so anything that starts afterwards gets a later timestamp. The Consensus track's lesson on distributed SQL covers it, along with CockroachDB's alternative. Designing Data-Intensive Applications, 2nd edition, chapter 10, treats logical clocks and id generators together with linearizability."
+  },
+  "sources": [
+    {
+      "title": "Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases (Kulkarni, Demirbas, Madeppa, Avva, Leone, 2014)",
+      "url": "https://cse.buffalo.edu/tech-reports/2014-04.pdf"
+    },
+    {
+      "title": "RFC 9562: Universally Unique IDentifiers (UUIDs)",
+      "url": "https://www.rfc-editor.org/rfc/rfc9562.html"
+    },
+    {
+      "title": "Snowflake (Twitter, 2010 release)",
+      "url": "https://github.com/twitter-archive/snowflake/tree/snowflake-2010"
+    },
+    {
+      "title": "TimeStamp Oracle (TiDB docs)",
+      "url": "https://docs.pingcap.com/tidb/stable/tso"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 10",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

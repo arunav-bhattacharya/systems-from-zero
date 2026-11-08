@@ -15,7 +15,7 @@ class AggregationTest {
 
     @Test
     fun `merchant_status_report has one row per merchant with per-status counts`() = rollback {
-        val rows = exercise(4, "merchant_status_report")
+        val rows = exercise("sql/l04", "merchant_status_report")
         rows.assertColumns("merchant_id", "name", "payments", "succeeded", "failed", "failed_pct")
         rows.assertRowsInOrder(
             row(1, "Northwind Grocers", 8, 7, 0, 0),             // one payment is pending
@@ -37,7 +37,7 @@ class AggregationTest {
                 "(101, 2, 8, 450, 'succeeded', '2026-07-01 12:05+00'), " +
                 "(102, 2, 8, 450, 'pending', '2026-07-01 12:10+00')",
         )
-        exercise(4, "merchant_status_report").assertRowsInOrder(
+        exercise("sql/l04", "merchant_status_report").assertRowsInOrder(
             row(1, "Northwind Grocers", 8, 7, 0, 0),
             row(2, "Blue Fern Cafe", 6, 3, 3, 50),
             row(3, "Metro Transit", 5, 4, 0, 0),
@@ -51,7 +51,7 @@ class AggregationTest {
 
     @Test
     fun `quarterly_channel_rollup adds a subtotal per quarter and a grand total`() = rollback {
-        val rows = exercise(4, "quarterly_channel_rollup")
+        val rows = exercise("sql/l04", "quarterly_channel_rollup")
         rows.assertColumns("quarter", "channel", "payments", "volume_minor")
         rows.assertRowsInOrder(
             row("2026-Q1", "android", 3, 40498),
@@ -75,7 +75,7 @@ class AggregationTest {
             "INSERT INTO payments (payment_id, card_id, merchant_id, amount_minor, status, created_at) " +
                 "VALUES (100, 1, 1, 1000, 'succeeded', '2026-05-05 10:00+00')",
         )
-        exercise(4, "quarterly_channel_rollup").assertRowsInOrder(
+        exercise("sql/l04", "quarterly_channel_rollup").assertRowsInOrder(
             row("2026-Q1", "android", 3, 40498),
             row("2026-Q1", "ios", 4, 23664),
             row("2026-Q1", "pos", 4, 11980),
@@ -93,7 +93,7 @@ class AggregationTest {
 
     @Test
     fun `customer_net_spend counts each payment once`() = rollback {
-        val rows = exercise(4, "customer_net_spend")
+        val rows = exercise("sql/l04", "customer_net_spend")
         rows.assertColumns("customer_id", "full_name", "paid_minor", "refunded_minor", "net_minor")
         rows.assertRowsInOrder(
             row(1, "Asha Rao", 120555, 0, 120555),
@@ -116,7 +116,7 @@ class AggregationTest {
                 "(50, 13, 1000, 'customer_request', '2026-03-05 10:00+00'), " +
                 "(51, 13, 2000, 'customer_request', '2026-03-06 10:00+00')",
         )
-        exercise(4, "customer_net_spend").assertRowsInOrder(
+        exercise("sql/l04", "customer_net_spend").assertRowsInOrder(
             row(1, "Asha Rao", 120555, 0, 120555),
             row(2, "Ben Carter", 170768, 6880, 163888),
             row(3, "Chloe Martin", 20914, 0, 20914),

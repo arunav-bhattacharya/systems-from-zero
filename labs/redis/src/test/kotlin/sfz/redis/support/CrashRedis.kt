@@ -8,7 +8,7 @@ import redis.clients.jedis.RedisClient
 import redis.clients.jedis.exceptions.JedisException
 
 /**
- * A Redis server that the persistence tests (lesson 10) can crash on purpose, started the first time
+ * A Redis server that the persistence tests (lesson 9) can crash on purpose, started the first time
  * a test touches it and shared by every test in the JVM.
  *
  * Inside the container a small shell loop runs `redis-server /conf/redis.conf` and starts it again

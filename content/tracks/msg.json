@@ -1,0 +1,128 @@
+{
+  "id": "msg",
+  "intro": "By the end of this track you can follow a payment event from the service that writes it to the last service that reads it, through the two designs every message broker is built on, and predict what a crash, a slow consumer, a rebalance, a poison message or a retry does on the way. The first design is the **queue**: the broker tracks every message, hands each to one consumer and deletes it once acknowledged (lesson 1, with RabbitMQ as the example). The second is the **log**: the broker keeps everything in order and each reader keeps one number, its position (lessons 2 to 11, with Apache Kafka 4.4). You build the log from the disk up: partitions and segments, replication and the ISR, producers, consumers and their commits, consumer groups and rebalancing, failure handling, transactions, and share groups, which put a queue back on top of the log. Lesson 12 meets both designs again, smaller, in Redis pub/sub and Streams. Every lesson starts from a failure you could meet in a payments platform (a lost write, a double charge, a stuck partition) and ends with the setting or pattern that prevents it.\n\nYou need to read Java and Kotlin, have JDK 21 or newer, and have Docker for the broker-backed tests and Try-its. Every code sample comes in both languages. The track uses ideas from earlier tracks and repeats each one in a line when it needs it: replication logs and leaders (Replication), fixed partitions and rebalancing (Partitioning), two-phase commit (Transactions), timeouts and fencing tokens (Faults, time and truth), and Redis and idempotency keys (Caching). It assumes Apache Kafka 4.4 (KRaft only, `linger.ms=5`, idempotence on by default, the new consumer protocol available but not the client default, share groups production-ready since 4.2), RabbitMQ 4.x quorum queues, and Redis 8.10.\n\nLessons 1 to 11 keep their labs in `labs/kafka`, one package per lesson (`sfz.msg.l01` to `l11`); lesson 12's lab is in `labs/redis` (`sfz.msg.l12`). Each lab is a small model of the mechanism (a queue and an exchange, a log, an ISR, an assignor, a transactional partition, a share partition) plus, from lesson 2 on, a client that the tests run against a real Kafka 4.4 broker or Redis 8.10 server started by Testcontainers, or against `MockConsumer` and `MockProducer` where no broker is needed. Run `./gradlew :kafka:test --tests 'sfz.msg.l07.*'` from the `labs` folder (`:redis:` for lesson 12). The Try-its use `labs/env/kafka.yml` (one broker on `localhost:9092`), `labs/env/kafka-cluster.yml` (three brokers) and `labs/env/redis.yml`, and `./gradlew :kafka:demo -Pmain=...` for the demos.",
+  "cheatsheet": "## Two designs (lessons 1, 2 and 11)\n\n| | Queue (RabbitMQ quorum queue) | Log, consumer group (Kafka) | Log, share group (Kafka 4.2+) |\n|---|---|---|---|\n| Progress kept as | a state per message | one committed offset per group and partition | a state per in-flight record |\n| After success | message deleted | record stays until retention | record stays until retention |\n| Parallelism | any number of competing consumers | at most one member per partition | any number of members |\n| Order | lost once redelivery meets two consumers | kept per partition, so per key | lost |\n| Silent consumer | redelivery when its channel closes | partitions move after the session timeout or `max.poll.interval.ms` | each record's lock runs out (30 s) |\n| Poison message | delivery limit 20, then drop or dead-letter exchange | blocks its partition until your code acts | delivery limit 5, then archive or `dlq.` topic (4.4) |\n| Replay, a second reader | needs its own queue, from now on | any group, from any offset | yes, it is a log |\n\nQueue facts: the consumer acknowledges each message; unacknowledged deliveries return to the queue when the consumer goes away, flagged as redelivered, which reorders messages once there are two consumers; prefetch caps the unacknowledged deliveries per consumer; auto-ack is at-most-once. An exchange copies a message into every queue whose binding matches: fan-out across queues, load balancing inside one. Quorum queues dead-letter at-most-once by default.\n\n## The log on disk (lessons 2 and 3)\n\nA topic is a set of partitions. A partition is an append-only log: the broker gives each record the next offset, offsets never change, and order exists only inside a partition. A reader's state is one number per partition, the offset of the next record; a group saves it in `__consumer_offsets` as its committed offset. Reading deletes nothing.\n\n| On disk | Rule |\n|---|---|\n| Segment | files named by base offset (`.log`, `.index`, `.timeindex`); only the active segment takes appends; rolls at `segment.bytes` 1 GiB or `segment.ms` 7 days |\n| Retention (`cleanup.policy=delete`) | deletes whole closed segments once their newest record is older than `retention.ms` (7 days) or the partition is over `retention.bytes`; the earliest offset jumps a segment at a time |\n| Compaction (`cleanup.policy=compact`) | keeps at least the last record per key in closed segments; offsets and order never change; a tombstone (null value) deletes a key after `delete.retention.ms` (1 day) |\n| Tiered storage | `remote.storage.enable=true`: closed segments go to object storage, `local.retention.ms` keeps the newest on disk; needs a plugin; no compacted topics |\n\n## The cluster (lesson 4)\n\n| Term | Meaning |\n|---|---|\n| KRaft controllers | keep metadata in the Raft log `__cluster_metadata`; run 3 or 5; ZooKeeper is gone since 4.0 |\n| Leader, followers | one leader per partition takes writes; followers fetch from it |\n| ISR | replicas that keep up; a follower drops out after `replica.lag.time.max.ms` (30 s) or when its broker is fenced |\n| High watermark | the smallest log end offset in the ISR; consumers read only below it |\n| `acks=all` | waits for the current ISR, which can be the leader alone |\n| `min.insync.replicas` | the floor for `acks=all` (default 1): below it writes fail with `NOT_ENOUGH_REPLICAS`; use RF 3 and 2 for money |\n\n## Producing (lessons 5 and 6)\n\n- Partition of a keyed record: `(murmur2(key bytes) & 0x7fffffff) % partitions`. Same key, same partition, same order. Key payments by account id. Adding partitions moves most keys.\n- No key: sticky runs of about `batch.size`, steered away from slow brokers (KIP-794).\n- `send()` appends to a batch and returns a Future. A batch leaves when full (`batch.size` 16 KB) or old (`linger.ms` 5 ms since 4.0).\n- Retries run on their own until `delivery.timeout.ms` (2 min). A `TimeoutException` means unknown, not unwritten.\n- Idempotence (default): producer id plus sequence numbers; the leader drops duplicates of retries. It needs `acks=all`, retries and at most 5 in flight; `acks=1` turns it off silently.\n\n## Consuming (lessons 7 to 9)\n\n| Setting or fact | Value and meaning |\n|---|---|\n| Thread safety | one thread per consumer; only `wakeup()` may be called from another |\n| Position and committed offset | position: next offset `poll` returns, in memory; committed: the group's saved bookmark in `__consumer_offsets` |\n| Commit | the next offset to read: last processed + 1; cumulative, one number covers everything before it |\n| Commit after processing | at-least-once: duplicates after a crash, so dedupe with an idempotency key in the same database transaction |\n| Commit before processing | at-most-once: a crash loses records |\n| `enable.auto.commit` | `true` by default, every 5 s inside `poll`; at-least-once only if each batch is finished before the next `poll` |\n| `auto.offset.reset` | `latest` by default for a group with no committed offset |\n| `max.poll.records` / `max.poll.interval.ms` | 500 / 5 min: miss the interval and the member leaves the group |\n| Consumer group | fixed partitions over readers: one owner per partition; moving one moves its ownership and bookmark, not its data |\n| Rebalance | eager (the default assignor list uses Range) hands back everything; cooperative moves only what must move; KIP-848 (`group.protocol=consumer`, not the 4.4 client default) lets the broker assign and members reconcile alone |\n| Handover | commit in `onPartitionsRevoked`; never commit in `onPartitionsLost` |\n| Liveness | session timeout 45 s for dead processes, `max.poll.interval.ms` for stuck loops; `group.instance.id` keeps partitions through a restart |\n| Poison pill | blocks its partition: bounded retries with backoff for transient errors, a dead-letter topic with origin headers (ack before commit) for permanent ones, retry topics for long waits, park the key to keep per-account order |\n\n## Transactions (lesson 10)\n\n`transactional.id` + `initTransactions` (bumps the epoch, a fencing token, and aborts what an older instance left open) + `beginTransaction` + sends + `sendOffsetsToTransaction(offsets, consumer.groupMetadata())` + `commitTransaction`. After an abort, seek back to the batch.\n\n| Two-phase commit | Kafka transaction |\n|---|---|\n| Coordinator | transaction coordinator, state in `__transaction_state` |\n| Participants | the partitions written to, plus the group's `__consumer_offsets` partition |\n| Commit point | prepare-commit written to `__transaction_state` |\n| Phase two | COMMIT or ABORT markers, one offset each, in every participant |\n| In-doubt participant | open transaction: `read_committed` readers stop at the last stable offset |\n\nReaders need `isolation.level=read_committed` (default `read_uncommitted`). Cost in Confluent's 2017 test: about 3% producer throughput with 1 KB records and 100 ms transactions. Covers Kafka writes and offsets only: calls and database writes need idempotency keys or an outbox. KIP-939 (Kafka in outside two-phase commit) hasn't shipped in 4.4.\n\n## Share groups and operations (lesson 11)\n\n| Share group | Rule |\n|---|---|\n| Record states | available, acquired (lock `share.record.lock.duration.ms` 30 s), acknowledged, archived |\n| Acknowledgements | ACCEPT done, RELEASE retry, REJECT archive, RENEW extend the lock (explicit mode) |\n| Delivery limit | `share.delivery.count.limit` 5, then archived; DLQ to a `dlq.` topic with `share.version` 2 (4.4, may still change) |\n| Start | `share.auto.offset.reset` is `latest` by default |\n| Small clusters | under 3 brokers set `share.coordinator.state.topic.replication.factor` and `.min.isr` to 1 |\n\nPartitions: max(target / per-partition producer rate, target / per-consumer rate), plus growth. Lag: log end offset minus committed offset, per partition; alert on growth and on the age of the oldest record. Tiered storage (production-ready since 3.9) moves closed segments to object storage.\n\n## Redis pub/sub and Streams (lesson 12)\n\n| Command | What it does |\n|---|---|\n| `PUBLISH` / `SUBSCRIBE` | at-most-once broadcast to whoever is connected; nothing stored |\n| `XADD key * f v` | append; ID `<ms>-<seq>`; `MAXLEN ~ n` or `MINID ~ id` trims |\n| `XREAD BLOCK ms STREAMS key id` | read after your own position; every reader sees every entry |\n| `XGROUP CREATE key g $ MKSTREAM` | a consumer group starting at the end |\n| `XREADGROUP GROUP g c STREAMS key >` | new entries, one consumer each, recorded in the PEL until `XACK` |\n| `XPENDING`, `XAUTOCLAIM` | inspect and take over idle pending entries; the delivery count marks poison |\n| `XACKDEL` / `XDELEX` (8.2) | acknowledge and delete; `KEEPREF`, `DELREF`, `ACKED` |\n| `XREADGROUP ... CLAIM ms` (8.4) | idle pending entries first, then new ones |\n| `XADD ... IDMP pid iid` (8.6) | dedupes a producer's retries within a window |\n| `XNACK` (8.8) | hand pending entries back at once; SILENT, FAIL or FATAL sets the delivery count |\n\nA stream is one partition in memory: replication is asynchronous, so a failover can lose acknowledged entries.",
+  "recap": [
+    "Two questions classify any messaging system: what it keeps after a message is handled, and what it tracks per reader. A queue tracks every message and deletes it on acknowledgement; a log keeps everything and tracks one offset per reader.",
+    "A partition is an append-only log with offsets that never change; order exists only inside a partition. Retention deletes whole segments, compaction keeps the latest record per key, and neither touches the active segment.",
+    "A write is committed when the ISR has it. `acks=all` waits for the ISR, and `min.insync.replicas` sets how small the ISR may get: replication factor 3 with 2 for money.",
+    "The key picks the partition, so key payments by account and choose the partition count up front. The idempotent producer, on by default, stops its own retries from duplicating or reordering; it doesn't dedupe your resends.",
+    "Delivery guarantees come from when the reader records progress: before the work is at-most-once, after it is at-least-once. Make processing idempotent with an idempotency key stored in the same transaction as the effect.",
+    "A consumer group is fixed partitions over readers. Rebalances move ownership and bookmarks; commit on revoke, prefer the new consumer protocol, and keep batches well inside `max.poll.interval.ms`.",
+    "A poison record stops its whole partition, because nothing in a consumer group counts attempts. Bounded retries, a dead-letter topic written before the commit, and a parked key keep the rest flowing in order.",
+    "Kafka transactions are two-phase commit inside Kafka: outputs and offsets become visible together to `read_committed` readers. Anything outside Kafka still needs idempotency keys or an outbox.",
+    "Share groups and Redis Streams consumer groups are queues built on logs: per-record acknowledgement and no order, but the records stay for other readers. Redis keeps its log in memory and leaves recovery and dead-lettering to your code."
+  ],
+  "quiz": [
+    {
+      "q": "Two consumers share one RabbitMQ queue with manual acknowledgements. Consumer B crashes while it holds m3; consumer A has already processed m4. What happens to the order of m3 and m4?",
+      "options": [
+        "It is kept: the broker puts m3 back at its original position",
+        "It is broken: m3 is redelivered, so A processes it after m4",
+        "It is kept, because a queue is first in, first out",
+        "m3 is lost because B crashed before acknowledging it"
+      ],
+      "answer": 1,
+      "why": "Unacknowledged deliveries return to the queue when the consumer goes away, and m3 goes back to its old place. But A has already processed m4 by then, so the processing order is m4, m3. Load balancing plus redelivery reorders messages; a queue is first in, first out only at dispatch. Nothing is lost, because the broker kept m3 until it was acknowledged."
+    },
+    {
+      "q": "Which statement about retention and compaction is true?",
+      "options": [
+        "Retention deletes single records once they expire",
+        "Compaction removes all but the last record per key in every segment, including the active one",
+        "Retention deletes whole closed segments; compaction keeps the last record per key in closed segments and never changes offsets",
+        "Compaction renumbers offsets so the log has no gaps"
+      ],
+      "answer": 2,
+      "why": "Both work on closed segments. Retention drops whole segments whose newest record is too old, so the earliest offset jumps a segment at a time. Compaction rewrites closed segments to keep the latest record per key, leaving gaps in the offsets; the active segment is never cleaned."
+    },
+    {
+      "q": "A topic has replication factor 3 and the default `min.insync.replicas`. Both followers fall behind and leave the ISR. A producer with `acks=all` writes a payment, the leader acknowledges it, and the leader's disk dies. What happened?",
+      "options": [
+        "Nothing is lost: `acks=all` waits for all three replicas",
+        "The producer would have got `NOT_ENOUGH_REPLICAS`, so it retried elsewhere",
+        "The followers copy the record from the controller",
+        "The payment can be lost: `acks=all` waited for the ISR, which was only the leader; `min.insync.replicas=2` would have refused the write"
+      ],
+      "answer": 3,
+      "why": "`acks=all` means every replica currently in the ISR, and the ISR can shrink to the leader alone. The default `min.insync.replicas` is 1, so the write was accepted with one copy. With 2, the leader would have refused it while the ISR was too small, and the producer would have known."
+    },
+    {
+      "q": "Every payment of one account must be applied in order. Which setup gives you that?",
+      "options": [
+        "Key records by account id, read with a consumer group, and don't add partitions to the topic later",
+        "No key, so the sticky partitioner keeps related records together",
+        "Key by account id and read with a share group, so more members can work in parallel",
+        "Any key, as long as the producer has idempotence on"
+      ],
+      "answer": 0,
+      "why": "The key picks the partition, a partition keeps order, and a consumer group gives each partition to one member, so one account's payments are read in order by one consumer. Adding partitions later sends a key's new records to a different partition. Unkeyed records spread over partitions, a share group gives up order across members, and idempotence only stops a producer's retries from duplicating or reordering."
+    },
+    {
+      "q": "A payment consumer writes to Oracle and then commits its offset. It crashes between the two. What does the restart do, and what makes that safe?",
+      "options": [
+        "It skips the payment; nothing is needed",
+        "It processes the payment again; the idempotent producer removes the duplicate",
+        "Nothing, because Kafka transactions cover the Oracle write",
+        "It processes the payment again; an idempotency key checked in the same Oracle transaction makes the repeat harmless"
+      ],
+      "answer": 3,
+      "why": "Committing after processing is at-least-once: the restart begins at the committed offset and repeats the payment. The idempotent producer only dedupes a producer's own retries, and a Kafka transaction covers Kafka writes and offsets, not Oracle. The consumer must recognise the repeat itself."
+    },
+    {
+      "q": "A group of three members reads six partitions with `group.protocol=consumer`. A fourth member joins. Which partitions stop being processed during the rebalance?",
+      "options": [
+        "All six, until the new assignment arrives",
+        "Only the two that move to the new member, while they move",
+        "None, because the new member only takes partitions nobody owns",
+        "Only the partitions of the group leader"
+      ],
+      "answer": 1,
+      "why": "Six partitions over four members is 2, 2, 1, 1, so two old members each give up one partition. Under the new protocol each member reconciles on its own: the two owners revoke just those partitions, commit, and the coordinator hands them to the newcomer. The rest never pause. Stopping all six is eager rebalancing, which the classic default assignor list gives you."
+    },
+    {
+      "q": "One partition's lag climbs while the other eleven stay at 0. The ledger's handler throws `NumberFormatException` on one record every time. What should the consumer do?",
+      "options": [
+        "Raise `max.poll.interval.ms` so it has time to get through the record",
+        "Catch the exception, log it and commit past the record",
+        "Send the record to a dead-letter topic with its origin in headers, wait for the ack, commit past it, and park the account's later payments behind it",
+        "Add partitions so the record moves elsewhere"
+      ],
+      "answer": 2,
+      "why": "The record fails the same way every time, so more time changes nothing, and logging and committing loses a payment. A dead-letter topic written before the commit gets it out of the partition without losing it, and parking the account keeps its later payments from overtaking it. Adding partitions doesn't move existing records."
+    },
+    {
+      "q": "A fee service reads `payments` and writes `fees` in Kafka transactions, and also posts each fee to a billing API inside the loop. A commit times out, and the service aborts and retries the batch. What is true afterwards?",
+      "options": [
+        "`read_committed` readers see each fee once in `fees`, but the billing API got the retried calls too, unless it dedupes by an idempotency key",
+        "The abort rolled the billing calls back",
+        "`fees` holds duplicates for every reader",
+        "Kafka 4.4's two-phase commit made the billing API part of the transaction"
+      ],
+      "answer": 0,
+      "why": "The transaction makes the `fees` records and the input offsets one atomic write, so `read_committed` readers see each fee once (the aborted copies stay in the log for `read_uncommitted` readers). The HTTP calls are outside Kafka and ran again on the retry. KIP-939 hasn't shipped, and it would cover a database, not an HTTP API."
+    },
+    {
+      "q": "A topic has 6 partitions. Which kind of group can usefully run 20 members, each processing one record at a time?",
+      "options": [
+        "A consumer group: the broker splits each partition between members",
+        "A share group: every member reads every partition, and the broker hands out records one by one",
+        "Both, with `group.protocol=consumer`",
+        "Neither: 6 is the limit for any group"
+      ],
+      "answer": 1,
+      "why": "A consumer group gives each partition to one member, so 14 of 20 would sit idle, whatever the protocol. A share group has no such cap, at the price of order. The new consumer protocol changes how assignments are computed, not how many owners a partition has."
+    },
+    {
+      "q": "The settlement service restarts. Payments published while it was down went to Redis two ways: with `PUBLISH` on a channel, and with `XADD` to a stream it reads through a consumer group. What does it find when it comes back?",
+      "options": [
+        "Both sets of messages, because Redis keeps them until every reader has them",
+        "Neither: Redis drops everything for a disconnected client",
+        "Nothing from the channel, because pub/sub stored nothing; every stream entry, because the stream kept them and the group's position is still where it was",
+        "The channel's messages, but the stream entries were trimmed on disconnect"
+      ],
+      "answer": 2,
+      "why": "Pub/sub is at-most-once: a message reaches whoever is subscribed at that moment, and nothing else. A stream is a log in a key: the entries stay until trimmed, and the group's last-delivered ID and pending entries survive the restart, so `XREADGROUP ... >` returns what arrived meanwhile. Entries it held but never acknowledged are still pending under its name."
+    }
+  ]
+}

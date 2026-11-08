@@ -1,0 +1,460 @@
+{
+  "id": "enc-05",
+  "title": "Durable execution: workflows that survive crashes",
+  "minutes": 40,
+  "goal": "By the end you can explain how a durable-execution engine keeps a multi-step payment alive across crashes (an event history plus deterministic replay), write a Temporal workflow in Kotlin with compensations and per-step idempotency keys, and change its code without breaking runs already in flight.",
+  "warmup": {
+    "q": "A Temporal activity charges a card. The worker is killed with `kill -9` after the issuer approved the charge but before the worker reported success. What happens next?",
+    "options": [
+      "The charge is lost and the workflow fails",
+      "Temporal knows the charge happened and moves on to the next step",
+      "After the activity's timeout, Temporal runs the charge again, so the card is charged twice unless the call carries an idempotency key",
+      "The workflow starts over from the beginning and repeats every step"
+    ],
+    "answer": 2,
+    "why": "The server only learns an activity's result when a worker reports it. Here it saw an attempt start and never finish, so after the start-to-close timeout it retries the activity. Activities are at-least-once; the engine records progress once, but the side effect can happen twice. The fourth option is half right: a new worker does re-run the workflow code from the top, but steps already recorded in the history return their saved results instead of running again."
+  },
+  "sections": [
+    {
+      "h": "Three calls, and the process can die between any two",
+      "body": "An order in your shop takes three calls to three systems: charge the card at the issuer, reserve the item in the warehouse, hand the parcel to the courier. As plain code it is three lines:\n\n```kotlin\nval chargeId = bank.charge(order)\nval reservation = warehouse.reserve(order)\ncourier.ship(order, reservation)\n```\n\nNow a deploy restarts the pod between the first and the second line. The card is charged and nothing is reserved, and nothing will ever run the second line for this order: the only record that the order was in progress was the stack of a thread that no longer exists. You can't wrap the three calls in one database transaction either. They go to three systems, and one of them is a card network that takes no part in your transactions. (The Transactions track's lesson on atomic commit shows what committing across machines takes, and why few systems offer it.)\n\nThe first fix that comes to mind is to run the whole order again after a crash. That turns every crash after the charge into a second charge. The classic fix is to write progress down. Add a `status` column to `orders` and update it after each step, in its own local transaction: `NEW`, `CHARGED`, `RESERVED`, `SHIPPED`. A sweeper job runs every minute, finds orders stuck halfway (not `SHIPPED` and untouched for five minutes) and continues each one from its recorded status.\n\nThe Try runs 10,000 orders through these strategies, with a crash at each of six points (before and after each side effect) with probability 0.5%. With no recovery, 247 orders end charged and never shipped. Restarting from the top ships them all and charges 247 cards twice. The status column cuts that to 50, and those 50 are the crashes that landed after the bank charged but before the `UPDATE` committed. That gap never closes, because no local transaction can include the bank's side effect. Only an idempotency key on the charge (`order-42/charge`, as in lesson 4 of this track) brings it to zero.\n\nSo a status column works, with keys, and many payment systems run this way today. The cost shows as the processes multiply. Each one rebuilds the same machinery: a lock so two sweepers don't take the same order, retries with backoff, a timeout per step, the keys. A rule like \"refund if the courier hasn't collected within three days\" becomes another status and another polling query. The process itself is spread over a column, a cron job and a handler per status, and adding a step means migrating every order already in flight to a new set of statuses. Brandur Leach's 2017 design for Stripe-style idempotency keys in Postgres is this approach done carefully: local work committed in atomic phases between external calls, with a recovery point recorded after each one.",
+      "try": {
+        "title": "Crash 10,000 orders four ways",
+        "minutes": 4,
+        "steps": [
+          "Open `CrashBetweenStepsDemo.kt`. It is plain Kotlin, no Temporal: each order runs the three steps, and a seeded random kills the process at one of six points.",
+          "Predict which strategies leave double charges, and how the status column compares with restarting from the top.",
+          "Run it from the `labs` folder with the command below.",
+          "Change `CRASH_CHANCE` to `0.02`, run it again, and see which numbers grow."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "CrashBetweenStepsDemo.kt",
+          "src": "package sfz.enc.l05.demo\n\nimport kotlin.random.Random\n\n/**\n * 10,000 orders run charge -> reserve -> ship, and the process sometimes dies. Each step has two places to die:\n * before its side effect, and after the side effect but before the program has written down that it happened.\n * Four ways to recover, and what each leaves behind. Plain Kotlin, no Temporal.\n */\n\nprivate const val ORDERS = 10_000\nprivate const val CRASH_CHANCE = 0.005 // at each of the 6 points\nprivate val STEPS = listOf(\"charge\", \"reserve\", \"ship\")\n\nprivate class Outcome {\n    var charges = 0; var reservations = 0; var parcels = 0\n    var chargedNotShipped = 0; var doubleCharged = 0\n}\n\nprivate enum class Recovery { NONE, RESTART_FROM_TOP, STATUS_COLUMN, STATUS_COLUMN_AND_KEYS }\n\nprivate fun run(recovery: Recovery, seed: Int): Outcome {\n    val rnd = Random(seed)\n    val out = Outcome()\n    repeat(ORDERS) { n ->\n        var status = 0 // the status column: how many steps are recorded as done\n        val keysSeen = HashSet<String>() // the bank's idempotency keys, for the last strategy\n        var chargesForOrder = 0\n        var finished = false\n        var attempts = 0\n        while (!finished && attempts < 10) {\n            attempts++\n            var crashed = false\n            val from = if (recovery == Recovery.STATUS_COLUMN || recovery == Recovery.STATUS_COLUMN_AND_KEYS) status else 0\n            for (i in from until STEPS.size) {\n                if (rnd.nextDouble() < CRASH_CHANCE) { crashed = true; break } // died before the side effect\n                when (STEPS[i]) { // the side effect\n                    \"charge\" -> {\n                        val key = \"order-$n/charge\"\n                        if (recovery != Recovery.STATUS_COLUMN_AND_KEYS || keysSeen.add(key)) { out.charges++; chargesForOrder++ }\n                    }\n                    \"reserve\" -> out.reservations++\n                    \"ship\" -> out.parcels++\n                }\n                if (rnd.nextDouble() < CRASH_CHANCE) { crashed = true; break } // died after it, before recording it\n                status = i + 1 // UPDATE orders SET status = ... (one local transaction)\n            }\n            if (!crashed) finished = true\n            if (recovery == Recovery.NONE) break // nobody comes back for it\n        }\n        if (chargesForOrder > 0 && !finished) out.chargedNotShipped++\n        if (chargesForOrder > 1) out.doubleCharged++\n    }\n    return out\n}\n\nfun main() {\n    println(\"$ORDERS orders; at each of 6 points the process dies with probability $CRASH_CHANCE\")\n    println(\"%-26s %8s %18s %14s\".format(\"recovery\", \"charges\", \"charged, unshipped\", \"double charges\"))\n    for (r in Recovery.entries) {\n        val o = run(r, seed = 7)\n        println(\"%-26s %8d %18d %14d\".format(r.name.lowercase().replace('_', ' '), o.charges, o.chargedNotShipped, o.doubleCharged))\n    }\n}\n",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l05.demo.CrashBetweenStepsDemoKt --console=plain -q",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l05/demo/CrashBetweenStepsDemo.kt"
+        },
+        "expect": "```text\n10000 orders; at each of 6 points the process dies with probability 0.005\nrecovery                    charges charged, unshipped double charges\nnone                           9959                247              0\nrestart from top              10255                  0            247\nstatus column                 10051                  0             50\nstatus column and keys        10000                  0              0\n```\nWith `0.02` the rows read 901 charged and unshipped, 936 double charges for restarting from the top, 200 for the status column and still 0 with keys. The status column's 50 (or 200) are the crashes between the bank's charge and the `UPDATE` that records it: about a fifth of the crashes that come after a charge, because one of the five crash points after the charge lies in that gap. The key closes it, because the bank, not your database, remembers what it already did."
+      },
+      "refs": [
+        {
+          "title": "Brandur Leach: Implementing Stripe-like Idempotency Keys in Postgres (2017)",
+          "url": "https://brandur.org/idempotency-keys",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "When a step fails for good: sagas and compensation",
+      "body": "A crash is a step that didn't finish. A refusal is different: the warehouse answers that the item is out of stock, and asking again won't change that. By then the card is charged. You can't roll a card charge back the way a database rolls back a transaction, because the money has moved and the customer may already see it in their banking app. What you can do is take a new action that cancels its effect: a refund.\n\nHector Garcia-Molina and Kenneth Salem named this pattern in 1987. A **saga** is a long-running process split into steps T1, T2 and so on, each a transaction of its own, and each paired with a compensating step (C1, C2 and so on) that semantically undoes it. If a step fails for good, the saga runs the compensations of the steps already done, newest first. For the order, the charge is undone by a refund and the reservation by a release. If the reservation fails, refund. If the courier refuses the parcel, release the item, then refund.\n\nThree properties of sagas catch people out. A compensation is a second action, and the first stays on the record: the customer's statement shows a charge and a refund, the card network may keep a fee, and a confirmation email that went out stays sent. A saga has no isolation: between the charge and the refund, anyone can see the order in its charged-but-not-reserved state, including the customer, the fraud service and tonight's reports. And a compensation must not fail for good. A refund that can't go through becomes a support ticket, so compensations are retried until they succeed, and they need idempotency keys as much as the forward steps do.\n\nOrder the steps so that whatever is hardest to undo comes last. Releasing a reservation is cheap and invisible; a refund is visible; a parcel in a courier's van can't be undone by any API call. So `ship` goes last, and nothing after it may fail.\n\nWhere does a saga keep track of which steps are done and which compensations are due? In the hand-built version, in the status column again, with extra statuses for each compensation. The next section moves that bookkeeping into an engine.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 210\" role=\"img\" aria-label=\"A saga: three steps, each of the first two with a compensating step, run newest first\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"30\" y=\"30\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"61\" text-anchor=\"middle\">T1 charge</text><rect class=\"box-a\" x=\"265\" y=\"30\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"61\" text-anchor=\"middle\">T2 reserve</text><rect class=\"box-a\" x=\"500\" y=\"30\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"61\" text-anchor=\"middle\">T3 ship</text><line class=\"ln\" x1=\"182\" y1=\"55\" x2=\"261\" y2=\"55\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"417\" y1=\"55\" x2=\"496\" y2=\"55\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"30\" y=\"140\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"171\" text-anchor=\"middle\">C1 refund</text><rect class=\"box-b\" x=\"265\" y=\"140\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171\" text-anchor=\"middle\">C2 release</text><line class=\"ln-d\" x1=\"105\" y1=\"82\" x2=\"105\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"340\" y1=\"82\" x2=\"340\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-bad\" x1=\"263\" y1=\"165\" x2=\"184\" y2=\"165\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"500\" y=\"156\" text-anchor=\"start\">no compensation:</text><text class=\"t-s t-m\" x=\"500\" y=\"176\" text-anchor=\"start\">a parcel can't be unsent</text><text class=\"t-s t-bad\" x=\"223\" y=\"125\" text-anchor=\"middle\">if T3 fails: C2, then C1</text></svg>",
+        "caption": "Each step that changes the outside world has a compensating step; when a later step fails for good, the saga runs the compensations of finished steps, newest first."
+      },
+      "refs": [
+        {
+          "title": "Garcia-Molina and Salem: Sagas (SIGMOD 1987)",
+          "url": "https://dl.acm.org/doi/10.1145/38713.38742",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Durable execution: record every step, then replay the code",
+      "body": "Durable execution keeps the three-line program and makes it survive the crash. It splits the program in two. **Activities** do the work that touches the outside world: `charge`, `reserve`, `ship`. They run in ordinary threads, may fail and may be retried. The **workflow** is the code that decides what happens next, with its `if`s, loops, waits and compensations, and it never touches the outside world itself.\n\nHere is how Temporal runs it. A Temporal server (a cluster with its own database; version 1.32 in November 2026) keeps an append-only **event history** for every workflow run. Workers are your processes, and they poll the server for tasks. When a worker runs the workflow code and reaches `activities.charge(...)`, the SDK does not call the bank. It sends the server a command, schedule activity `Charge`. The server appends `ActivityTaskScheduled` to the history and hands the task to an activity worker, which calls the bank and reports back. The server appends `ActivityTaskCompleted` with the charge id, and the workflow code carries on with that value. `Workflow.sleep(Duration.ofHours(24))` becomes a timer: the server records `TimerStarted`, and no thread waits for a day.\n\nNow kill the worker while the order sleeps. The history is safe in the server. A day later the timer fires and another worker gets the task. It has never seen this order, so it **replays**: it runs the workflow function from the first line, against the history. When the code reaches `charge`, the SDK finds the completed event and returns the recorded charge id at once, without calling the bank. The same happens for `reserve`, and the sleep returns because its timer has already fired. Then the code reaches `ship`, which has no event yet, so this time the SDK schedules it for real.\n\nThis is the write-ahead log from the Storage engines track, applied to a program. Write each step's result durably, and after a crash, rebuild the state by reading the log from the start.\n\nTwo practical details. A healthy worker rarely replays: it keeps recent workflows in memory, and the server sends a workflow's next task to that same worker (sticky execution). If the worker dies, the server gives the task to any worker after a short timeout, 5 seconds by default in the Java SDK. And Temporal has no released Kotlin SDK. From Kotlin you use the Java SDK, 1.40, with the `temporal-kotlin` module, which adds builders such as `ActivityOptions { ... }`.",
+      "stepper": {
+        "title": "An order survives a dead worker",
+        "intro": "Left: the workflow code. Middle: the history the server keeps. Right: two workers and the bank.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: worker-1 runs the order\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">worker-1 runs the order</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><rect class=\"box-a\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">running charge</text><rect class=\"box-dim\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">not started</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "Worker-1 runs the workflow code. At `charge` the SDK sends the server a command, schedule `Charge`. An activity worker calls the bank, and the server appends the result, `ch_1`, to the history. (The workflow-task events between these are left out.)"
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: reserve\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">reserve</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><rect class=\"box-a\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">running reserve</text><rect class=\"box-dim\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">not started</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "The same for `reserve`: scheduled, then done with `res_1`. Each step's result is now in the server's database, not only in worker-1's memory."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: the 24-hour wait\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">the 24-hour wait</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><rect class=\"box\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">idle</text><rect class=\"box-dim\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">not started</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "`Workflow.sleep(24 h)` becomes a timer: the server records `Timer started`. No thread sleeps for a day. Worker-1 goes on with other work."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: worker-1 dies\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">worker-1 dies</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><rect class=\"box-bad\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">killed</text><rect class=\"box-dim\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">not started</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "Worker-1 is killed: a deploy, an OOM kill, a lost node. Everything it held in memory about this order is gone. The history is untouched."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: the timer fires\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">the timer fires</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"209\" text-anchor=\"start\">6  Timer fired</text><rect class=\"box-dim\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">gone</text><rect class=\"box-a\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">gets the task</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "A day later the timer fires and the server hands the next task to worker-2, which has never seen this order. It fetches the history and runs the workflow function from the first line."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: worker-2 replays charge\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">worker-2 replays charge</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><text class=\"t-code t-s\" x=\"260\" y=\"209\" text-anchor=\"start\">6  Timer fired</text><rect class=\"box-dim\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">gone</text><rect class=\"box-a\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">replaying</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "The code reaches `charge` again. Event 2 already holds its result, so the SDK returns `ch_1` at once. The bank is not called: still one charge."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: reserve and sleep replay too\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">reserve and sleep replay too</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"209\" text-anchor=\"start\">6  Timer fired</text><rect class=\"box-dim\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">gone</text><rect class=\"box-a\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">replaying</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "`reserve` returns `res_1` from event 4. The sleep returns at once, because its timer has already fired (events 5 and 6). Worker-2 now has exactly the state worker-1 had."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Workflow code, its event history and two workers: past the history: ship for real\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">past the history: ship for real</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"210\" height=\"190\" rx=\"8\"/><text class=\"t-s t-m\" x=\"30\" y=\"58\" text-anchor=\"start\">workflow code</text><text class=\"t-code t-s\" x=\"30\" y=\"88\" text-anchor=\"start\">charge(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"116\" text-anchor=\"start\">reserve(...)</text><text class=\"t-code t-s\" x=\"30\" y=\"144\" text-anchor=\"start\">sleep(24 h)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"172\" text-anchor=\"start\">ship(...)</text><text class=\"t-code t-s t-a\" x=\"30\" y=\"200\" text-anchor=\"start\">return SHIPPED</text><rect class=\"box\" x=\"246\" y=\"36\" width=\"254\" height=\"248\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"58\" text-anchor=\"start\">event history (server)</text><text class=\"t-code t-s\" x=\"260\" y=\"84\" text-anchor=\"start\">1  Charge scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"109\" text-anchor=\"start\">2  Charge done: ch_1</text><text class=\"t-code t-s\" x=\"260\" y=\"134\" text-anchor=\"start\">3  Reserve scheduled</text><text class=\"t-code t-s\" x=\"260\" y=\"159\" text-anchor=\"start\">4  Reserve done: res_1</text><text class=\"t-code t-s\" x=\"260\" y=\"184\" text-anchor=\"start\">5  Timer started: 24 h</text><text class=\"t-code t-s\" x=\"260\" y=\"209\" text-anchor=\"start\">6  Timer fired</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"234\" text-anchor=\"start\">7  Ship scheduled</text><text class=\"t-code t-s t-a\" x=\"260\" y=\"259\" text-anchor=\"start\">8  Ship done: trk_1</text><rect class=\"box-dim\" x=\"520\" y=\"36\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"62\" text-anchor=\"middle\">worker-1</text><text class=\"t-s t-m\" x=\"602\" y=\"84\" text-anchor=\"middle\">gone</text><rect class=\"box-ok\" x=\"520\" y=\"118\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"144\" text-anchor=\"middle\">worker-2</text><text class=\"t-s t-m\" x=\"602\" y=\"166\" text-anchor=\"middle\">done</text><rect class=\"box\" x=\"520\" y=\"220\" width=\"164\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"602\" y=\"246\" text-anchor=\"middle\">bank</text><text class=\"t-s t-m\" x=\"602\" y=\"268\" text-anchor=\"middle\">cards charged: 1</text></svg>",
+            "say": "At `ship` the history runs out, so this time the SDK really schedules the activity. It runs, its result becomes event 8, and the workflow returns SHIPPED. One charge, one reservation, one parcel."
+          }
+        ]
+      },
+      "try": {
+        "title": "Kill a worker in the middle of an order",
+        "minutes": 4,
+        "steps": [
+          "Open `KillWorkerDemo.kt` and the shared `DemoOrders.kt`. The demo runs Temporal's in-memory test server inside the JVM (from `temporal-testing`), so there is nothing to install. Its workers turn sticky execution off, because this test server never moves a task away from a dead worker's sticky queue the way a real server does.",
+          "Predict which worker charges the card, and which worker runs `ship`.",
+          "Run it."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "KillWorkerDemo.kt",
+          "src": "package sfz.enc.l05.demo\n\n/**\n * Starts an order on worker-1, kills worker-1 while the order waits 24 hours for the courier,\n * then starts worker-2, which finishes the order from the history alone.\n */\nfun main() {\n    quiet()\n    newEnv().use { env ->\n        val client = env.workflowClient\n        val bank = FakeBank(honorKeys = true)\n        val first = startWorker(client, \"worker-1\", OrderV1::class.java, StepsImpl(bank))\n        val order = startOrder(client, \"order-42\")\n        waitForTimer(client, \"order-42\")\n        first.kill()\n        println(\"worker-1 killed while order-42 sleeps; it ran charge=${first.steps.runs(\"charge\")} reserve=${first.steps.runs(\"reserve\")}\")\n\n        val second = startWorker(client, \"worker-2\", OrderV1::class.java, StepsImpl(bank))\n        println(\"result: ${order.getResult(String::class.java)}\") // the test server skips the 24 hours\n        println(\"worker-2 ran charge=${second.steps.runs(\"charge\")} reserve=${second.steps.runs(\"reserve\")} ship=${second.steps.runs(\"ship\")}\")\n        println(\"cards charged: ${bank.charges.get()}\")\n        println()\n        println(\"the event history of order-42:\")\n        client.fetchHistory(\"order-42\").events.forEach { println(describe(it)) }\n        second.kill()\n    }\n}\n",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l05.demo.KillWorkerDemoKt --console=plain -q",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l05/demo/KillWorkerDemo.kt"
+        },
+        "expect": "```text\nworker-1 killed while order-42 sleeps; it ran charge=1 reserve=1\nresult: SHIPPED\nworker-2 ran charge=0 reserve=0 ship=1\ncards charged: 1\n\nthe event history of order-42:\n  1  WORKFLOW_EXECUTION_STARTED\n  2  WORKFLOW_TASK_SCHEDULED\n  3  WORKFLOW_TASK_STARTED        on worker-1\n  4  WORKFLOW_TASK_COMPLETED\n  5  ACTIVITY_TASK_SCHEDULED      Charge\n  6  ACTIVITY_TASK_STARTED        attempt 1 on worker-1\n  7  ACTIVITY_TASK_COMPLETED\n  ...\n 17  TIMER_STARTED                fires in 24 h\n 18  TIMER_FIRED\n 19  WORKFLOW_TASK_SCHEDULED\n 20  WORKFLOW_TASK_STARTED        on worker-2\n 21  WORKFLOW_TASK_COMPLETED\n 22  ACTIVITY_TASK_SCHEDULED      Ship\n 23  ACTIVITY_TASK_STARTED        attempt 1 on worker-2\n 24  ACTIVITY_TASK_COMPLETED\n 25  WORKFLOW_TASK_SCHEDULED\n 26  WORKFLOW_TASK_STARTED        on worker-2\n 27  WORKFLOW_TASK_COMPLETED\n 28  WORKFLOW_EXECUTION_COMPLETED\n```\n(events 8 to 16, the reserve and the timer's workflow tasks, trimmed). Worker-2 never called the bank or the warehouse. In the workflow task of events 19 to 21 it replayed the code from the first line against events 1 to 18, got `ch_1` and `res_1` from the history, and then sent one new command: schedule `Ship`. The test server skipped the 24 hours, so the demo takes about 2 seconds."
+      },
+      "refs": [
+        {
+          "title": "Temporal: Event History walkthrough with the Java SDK",
+          "url": "https://docs.temporal.io/encyclopedia/event-history/event-history-java",
+          "kind": "docs"
+        },
+        {
+          "title": "temporal-kotlin module (README)",
+          "url": "https://github.com/temporalio/sdk-java/blob/master/temporal-kotlin/README.md",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Exactly once means recorded once, so side effects still need keys",
+      "body": "Look again at the moment between the bank's answer and the `ActivityTaskCompleted` event. Suppose the activity worker charged the card and died before it could report back. The server knows only that an attempt started and never finished. After the activity's start-to-close timeout (the longest one attempt may take) it schedules another attempt, and the card is charged again. No engine can close this gap, for the same reason the status column couldn't: the bank's side effect and the engine's record of it are two writes in two systems.\n\nSo activities run **at least once**. Temporal's default activity retry policy never gives up: it waits 1 second, then doubles the wait up to 100 seconds between attempts. (Workflows themselves don't retry by default.) Temporal's own docs ask you to make activities idempotent, and the engine makes it easy. The workflow ID is stable for the life of the run, and each activity's input is recorded once in the history, so a key built from them, `\"$workflowId/charge\"`, is the same on every retry and every replay. Pass it to the bank, and the bank turns the second attempt into a replay. In the Try, the charge activity runs twice either way; the card is charged twice without the key and once with it.\n\nThat is what \"exactly once\" means in these engines: the workflow's progress, its decisions and recorded results, is applied once. Here is how the main ones compare in November 2026:\n\n| Engine | Where progress is recorded | How it resumes |\n|---|---|---|\n| Temporal (server 1.32, Java SDK 1.40) | an event history in the Temporal cluster, which workers poll | replays the workflow code against the history |\n| Restate (1.8, Java and Kotlin SDK 2.11) | a journal per invocation, in a Restate server that sits in front of your services and calls them | replays the handler, skipping completed steps |\n| DBOS Transact (Java 1.2) | checkpoint rows in your own PostgreSQL; a library, no extra server | re-runs the workflow, returning saved step outputs |\n| AWS Step Functions, Standard | the execution history of a state machine written in JSON | moves to the next state; no code replay |\n| AWS Lambda durable functions (since December 2025) | checkpoints written by the durable execution SDK | re-runs the handler from the start, skipping checkpointed steps |\n\nEach one qualifies the claim. Restate says an invocation runs exactly once regardless of failures, yet by the argument above a side effect inside a step can still repeat if the crash comes before the step's result is journaled. DBOS says steps are tried at least once and never re-executed once they complete. Step Functions Standard is exactly-once unless you configure `Retry`, and its Express type is at-least-once (asynchronous) or at-most-once (synchronous). Read every exactly-once claim as effectively once: at-least-once execution plus deduplication by key. The Messaging track meets the same claim in Kafka's transactions.",
+      "try": {
+        "title": "A charge that runs twice",
+        "minutes": 3,
+        "steps": [
+          "Open `AtLeastOnceDemo.kt`. `StepsImpl` in `DemoOrders.kt` charges the bank and then, on attempt 1 only, throws as if the worker had died before reporting back.",
+          "Predict, for a bank that ignores keys and one that honours them, how often the charge activity runs and how often the card is charged.",
+          "Run it."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "AtLeastOnceDemo.kt",
+          "src": "package sfz.enc.l05.demo\n\n/**\n * The first charge attempt moves the money and then dies before reporting back. Temporal retries it.\n * Run twice: against a bank that ignores idempotency keys, and against one that honours them.\n */\nfun main() {\n    quiet()\n    for (honorKeys in listOf(false, true)) {\n        newEnv().use { env ->\n            val bank = FakeBank(honorKeys)\n            val worker = startWorker(env.workflowClient, \"worker-1\", OrderV1::class.java, StepsImpl(bank, crashAfterCharge = true))\n            val result = startOrder(env.workflowClient, \"order-7\").getResult(String::class.java)\n            println(\"bank honours keys=$honorKeys: $result, charge activity ran ${worker.steps.runs(\"charge\")}x, card charged ${bank.charges.get()}x\")\n            if (!honorKeys) {\n                env.workflowClient.fetchHistory(\"order-7\").events\n                    .filter { it.hasActivityTaskScheduledEventAttributes() || it.hasActivityTaskStartedEventAttributes() || it.hasActivityTaskCompletedEventAttributes() }\n                    .take(3)\n                    .forEach { println(\"    \" + describe(it)) }\n            }\n            worker.kill()\n        }\n    }\n}\n",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l05.demo.AtLeastOnceDemoKt --console=plain -q",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l05/demo/AtLeastOnceDemo.kt"
+        },
+        "expect": "```text\nbank honours keys=false: SHIPPED, charge activity ran 2x, card charged 2x\n      5  ACTIVITY_TASK_SCHEDULED      Charge\n      6  ACTIVITY_TASK_STARTED        attempt 2 on worker-1\n      7  ACTIVITY_TASK_COMPLETED\nbank honours keys=true: SHIPPED, charge activity ran 2x, card charged 1x\n```\nThe workflow sees one charge either way: one scheduled event, one completed event. The failed first attempt left no event of its own; the server retried inside the activity and wrote down only the attempt that finished, attempt 2. The bank, though, saw two requests. Only the key `order-7/charge`, the same on both attempts, let it answer the second with the first charge."
+      },
+      "refs": [
+        {
+          "title": "Temporal: Retry policies",
+          "url": "https://docs.temporal.io/encyclopedia/retry-policies",
+          "kind": "docs"
+        },
+        {
+          "title": "Restate: Durable execution",
+          "url": "https://docs.restate.dev/concepts/durable_execution",
+          "kind": "docs"
+        },
+        {
+          "title": "DBOS Java: Workflows tutorial",
+          "url": "https://docs.dbos.dev/java/tutorials/workflow-tutorial",
+          "kind": "docs"
+        },
+        {
+          "title": "AWS Step Functions: Choosing a workflow type",
+          "url": "https://docs.aws.amazon.com/step-functions/latest/dg/choosing-workflow-type.html",
+          "kind": "docs"
+        },
+        {
+          "title": "AWS Lambda: Durable functions",
+          "url": "https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Changing workflow code under runs in flight",
+      "body": "Replay has one condition: given the same history, the workflow code must make the same decisions in the same order. So workflow code may not use anything that can differ between runs: `Random`, `UUID.randomUUID()`, the system clock, `Thread.sleep`, its own threads, files or network calls. The SDK has deterministic versions, `Workflow.randomUUID()`, `Workflow.currentTimeMillis()` and `Workflow.sleep(...)`, whose values come from the history on replay. Everything else belongs in activities, and Temporal's static checker, Workflow Check, catches many slips.\n\nThe harder case is your own deploy. Version 1 of the order workflow is charge, reserve, sleep, ship, and 40,000 orders are asleep in their 24-hour wait. Version 2 adds a fraud check before the charge. When a version-1 order wakes up on a version-2 worker, the worker replays it: the new code's first command is schedule `CheckFraud`, but the history says the first activity was `Charge`. The SDK stops with a `NonDeterministicException`. Temporal counts it as a failed workflow task and retries it, so the order stays open and stuck until you deploy code that matches its history.\n\nThere are two ways out. Patching keeps one path per history:\n\n```kotlin\nval version = Workflow.getVersion(\"fraud-check\", Workflow.DEFAULT_VERSION, 1)\nif (version >= 1 && !activities.checkFraud(orderId, amountCents)) return \"REJECTED\"\n```\n\nThe first time a run reaches `getVersion` for real, the SDK records a marker in the history with the newest version, 1. A version-1 history has no marker, so on replay `getVersion` returns `DEFAULT_VERSION` (-1) and the old path runs. When no older runs are left, delete the old branch but keep `getVersion(\"fraud-check\", 1, 1)` for a while before removing it. The other way out is to never replay old histories on new code. Temporal's Worker Versioning, generally available in 2026, can pin each run to the deployment version it started on. Restate makes every deployment immutable, and in-flight invocations finish on the one they started on. Either way, replay saved production histories against new code in CI with `WorkflowReplayer` before you deploy.\n\nA compiler can break determinism too. Kotlin 2.4 compiles a method reference such as `activities::charge` differently from Kotlin 2.2. Temporal's Java SDK up to 1.40 doesn't recognize the new form when you pass it to `Async.function` or `Async.procedure`, so it runs the call on a new workflow thread. That can change the order of commands, and workflows started under Kotlin 2.2 then fail with `NonDeterministicException` when they replay on code built with 2.4, with no source change at all. The fix reached the SDK's main branch in October 2026, after 1.40.0. The labs build with Kotlin 2.4.21 on SDK 1.40, so their workflow code calls activities directly and never passes method references to `Async` or `Saga`.",
+      "try": {
+        "title": "Replay a version-1 history against two version-2s",
+        "minutes": 3,
+        "steps": [
+          "Open `ReplayDemo.kt` and the three workflow classes in `DemoOrders.kt`: `OrderV1`, `OrderV2Naive` (fraud check added in front of the charge) and `OrderV2` (the same change behind `getVersion`).",
+          "Predict which replay fails, and at which event.",
+          "Run it."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ReplayDemo.kt",
+          "src": "package sfz.enc.l05.demo\n\nimport io.temporal.testing.WorkflowReplayer\n\n/**\n * Records the history of an order that ran on version 1, then replays it against two versions of the new code,\n * the way a CI job replays histories saved from production before a deploy.\n */\nfun main() {\n    quiet()\n    val history = newEnv().use { env ->\n        val worker = startWorker(env.workflowClient, \"worker-1\", OrderV1::class.java, StepsImpl(FakeBank(true)))\n        startOrder(env.workflowClient, \"order-9\").getResult(String::class.java)\n        worker.kill()\n        env.workflowClient.fetchHistory(\"order-9\")\n    }\n    println(\"a version-1 history with ${history.events.size} events\")\n\n    for (code in listOf(OrderV2Naive::class.java, OrderV2::class.java)) {\n        try {\n            WorkflowReplayer.replayWorkflowExecution(history, code)\n            println(\"${code.simpleName}: replays cleanly\")\n        } catch (e: Exception) {\n            // the replayer wraps the error; dig out the NonDeterministicException's own message\n            val text = generateSequence<Throwable>(e) { it.cause }.joinToString(\" \") { it.message ?: \"\" }\n            println(\"${code.simpleName}: \" + text.substringAfter(\"error=\").substringBefore(\" {WorkflowTaskStartedEventId\").replace(\"\\n\", \"\"))\n        }\n    }\n}\n",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l05.demo.ReplayDemoKt --console=plain -q",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l05/demo/ReplayDemo.kt"
+        },
+        "expect": "```text\na version-1 history with 28 events\nOrderV2Naive: io.temporal.worker.NonDeterministicException: [TMPRL1100] Failure handling event 5 of type 'EVENT_TYPE_ACTIVITY_TASK_SCHEDULED' during replay. [TMPRL1100] Command COMMAND_TYPE_SCHEDULE_ACTIVITY_TASK doesn't match event EVENT_TYPE_ACTIVITY_TASK_SCHEDULED with EventId=5 on check activityType with an expected value 'name: \"CheckFraud\"' and an actual value 'name: \"Charge\"'.\nOrderV2: replays cleanly\n```\nEvent 5 is the first scheduled activity. The naive version wanted to schedule `CheckFraud` there; the history says `Charge`. The patched version asks `getVersion`, finds no marker, takes the old path and matches every event. `WorkflowReplayer` is what a CI job runs over histories saved from production (fetched with `WorkflowClient.fetchHistory`) before a deploy."
+      },
+      "refs": [
+        {
+          "title": "Temporal: Versioning in the Java SDK",
+          "url": "https://docs.temporal.io/develop/java/workflows/versioning",
+          "kind": "docs"
+        },
+        {
+          "title": "Temporal: Worker Versioning",
+          "url": "https://docs.temporal.io/production-deployment/worker-deployments/worker-versioning",
+          "kind": "docs"
+        },
+        {
+          "title": "Temporal: Errors (non-determinism)",
+          "url": "https://docs.temporal.io/references/errors",
+          "kind": "docs"
+        },
+        {
+          "title": "Jack Kleeman: Solving durable execution's immutability problem (Restate, 2024)",
+          "url": "https://restate.dev/blog/solving-durable-executions-immutability-problem/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A durable workflow is a recipe cook who writes every finished step in a kitchen logbook: \"8:02 charged the card, ch_1. 8:03 reserved the item.\" If the cook collapses, the next cook doesn't start over or guess. They read the recipe from the top with the logbook open, skip every step the log says is done, use the results written there, and pick up at the first step with no entry. The analogy breaks in two places. A cook can glance at the stove and see that the water is already boiling; the engine sees only the log, so a step done but not yet logged gets done again, which is why each step carries a key. And a new cook will follow whatever recipe is in their hand: hand them an edited recipe and the log stops making sense.",
+  "in_your_world": "Your payment flows already run on Temporal, so look for three things in the workflow code. Every activity that calls an issuer, a ledger or Kafka should take a key built from the workflow ID and step name, and the receiving system must honour it, since Temporal will retry that activity. Every change to a workflow class that has runs in flight needs `Workflow.getVersion` (or pinned deployments with Worker Versioning), and a CI job that replays a few hundred real histories with `WorkflowReplayer` catches the ones you miss. And after the upgrade to Kotlin 2.4, search the workflow code for `Async.function(` and `Async.procedure(` with a `::` in the arguments: until a release after 1.40 includes the fix, replace each method reference with a direct call or a lambda, and replay histories started under Kotlin 2.2 before you ship.",
+  "mistake": "Believing that durable execution makes the charge happen exactly once. Teams move a payment flow into Temporal, read \"exactly once\" in a talk or a vendor page, and drop the idempotency key from the call to the issuer because the engine now handles failures. Then a worker is OOM-killed after the issuer approved a charge and before the activity reported back, Temporal retries the activity, and the customer is charged twice. The engine kept its promise: it records the workflow's progress once. The fix is to treat every activity as at-least-once: pass the issuer a key built from the workflow ID and the step (`\"$workflowId/charge\"`), make the issuer or your own ledger deduplicate on it, and set a start-to-close timeout so a dead attempt is noticed in seconds.",
+  "compare": {
+    "title": "The same order, hand-built and as a Temporal workflow",
+    "a": {
+      "label": "Status column and sweeper",
+      "lang": "kotlin",
+      "title": "runs every minute",
+      "src": "// every new process gets its own copy of this machinery\nval stuck = jdbc.query(\"\"\"\n    SELECT id, status FROM orders\n    WHERE status <> 'SHIPPED' AND updated_at < now() - interval '5 minutes'\n    FOR UPDATE SKIP LOCKED LIMIT 100\"\"\")\nfor (o in stuck) when (o.status) {\n    \"NEW\" -> { bank.charge(\"${o.id}/charge\", o); setStatus(o, \"CHARGED\") }\n    \"CHARGED\" -> try {\n        warehouse.reserve(\"${o.id}/reserve\", o); setStatus(o, \"RESERVED\")\n    } catch (e: OutOfStock) { setStatus(o, \"REFUNDING\") }\n    \"REFUNDING\" -> { bank.refund(\"${o.id}/refund\", o); setStatus(o, \"REFUNDED\") }\n    \"RESERVED\" -> if (pickupDue(o)) { courier.ship(\"${o.id}/ship\", o); setStatus(o, \"SHIPPED\") }\n}"
+    },
+    "b": {
+      "label": "Temporal workflow",
+      "lang": "kotlin",
+      "title": "replayed after any crash",
+      "src": "override fun process(orderId: String, amountCents: Long, sku: String): String {\n    val id = Workflow.getInfo().workflowId\n    val chargeId = activities.charge(\"$id/charge\", orderId, amountCents)\n    val reservationId = try {\n        activities.reserve(\"$id/reserve\", orderId, sku)\n    } catch (e: ActivityFailure) {\n        activities.refund(\"$id/refund\", chargeId)\n        return \"REFUNDED\"\n    }\n    Workflow.sleep(Duration.ofHours(24))   // a durable timer, not a polling query\n    activities.ship(\"$id/ship\", orderId, reservationId)\n    return \"SHIPPED\"\n}"
+    },
+    "note": "Both versions record progress durably and both need keys on every external call. The difference is where the process lives. On the left it is spread over a status column, a polling query, a lock (`SKIP LOCKED`, covered in the Transactions track) and a branch per status; the wait for pickup is a condition checked every minute, and a new step means new statuses. On the right the process is ordinary code read top to bottom, and the engine supplies the history, retries, timers and the move to another worker after a crash. The price on the right is determinism: that function must replay identically, so changing it needs `getVersion` or pinned deployments."
+  },
+  "worked": {
+    "title": "Start one workflow per Kafka event, even when the event arrives twice",
+    "steps": [
+      {
+        "say": "A consumer starts an order workflow for each \"order placed\" event. Kafka can deliver an event twice, for example after a consumer crash before its offset commit (the Messaging track covers when). The workflow ID is your dedupe key, so build it from the order ID, never from a random UUID.",
+        "code": "val options = WorkflowOptions.newBuilder()\n    .setWorkflowId(\"order-$orderId\")   // the business key\n    .setTaskQueue(\"orders\")\n    .setWorkflowIdReusePolicy(WorkflowIdReusePolicy.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE)\n    .build()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Start the run. While a run with that ID is open, a second start throws `WorkflowExecutionAlreadyStarted`: that is the duplicate delivery, so acknowledge the event and move on.",
+        "code": "fun startOrderOnce(client: WorkflowClient, orderId: String, amountCents: Long): Boolean = try {\n    client.newUntypedWorkflowStub(\"OrderWorkflow\", options).start(orderId, amountCents)\n    true\n} catch (e: WorkflowExecutionAlreadyStarted) {\n    false   // already started by an earlier delivery\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Mind the reuse policy. By default (`ALLOW_DUPLICATE`), once the first run has closed, the same ID may start a new run, so an event redelivered after the order finished would start the order again. `REJECT_DUPLICATE` keeps the ID taken for as long as the closed run's history is retained. `StartOnceDemo.kt` runs both deliveries and a late third one; with the default policy, the third line prints `true`.",
+        "code": "$ ./gradlew :flow:demo -Pmain=sfz.enc.l05.demo.StartOnceDemoKt --console=plain -q\nfirst delivery started a run:  true\nsecond delivery started a run: false\nafter the run closed, a third:  false\ncards charged: 1",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "An order workflow that survives a dead worker and a deploy",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/flow/src/main/kotlin/sfz/enc/l05/OrderWorkflowImpl.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l05/OrderApi.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l05/OrderActivitiesImpl.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l05/World.kt"
+    ],
+    "run": "./gradlew :flow:test --tests 'sfz.enc.l05.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 10 fail within seconds, because the stub's `TODO` fails every workflow. They use temporal-testing's in-memory server inside the JVM: no Docker, no Temporal CLI, and the 24-hour wait is skipped.",
+      "Read `OrderApi.kt` (the interfaces), `OrderActivitiesImpl.kt` (finished activities that count their runs and can fail right after their side effect) and `World.kt` (the fake bank, warehouse and courier).",
+      "In `OrderWorkflowImpl.kt`, write `process` as version 1 had it: charge, reserve, `Workflow.sleep(PICKUP_WAIT)`, ship, passing each activity a key built from `Workflow.getInfo().workflowId` and the step name.",
+      "Add the compensations: catch `ActivityFailure` around `reserve` (refund, return \"REFUNDED\") and around `ship` (release, refund, return \"CANCELLED\").",
+      "Add the fraud check at the top, behind `Workflow.getVersion(FRAUD_CHECK_CHANGE, Workflow.DEFAULT_VERSION, 1)`. Run all 10 tests. `CrashAndUpgradeTest` stops a worker in the middle of an order, and wakes a run started on `OrderWorkflowV1` (in the test folder) on your code.",
+      "Break it on purpose: replace the `getVersion` call with `val version = 1` and run `./gradlew :flow:test --tests 'sfz.enc.l05.CrashAndUpgradeTest'`. Three tests fail: two with a `NonDeterministicException` at event 5, and one because your history no longer has a version marker. Put the call back."
+    ],
+    "hints": [
+      "An activity that fails for good reaches workflow code as `io.temporal.failure.ActivityFailure`. Catch that, not `ApplicationFailure`, which is its cause.",
+      "Keys like `\"$id/charge\"` with `val id = Workflow.getInfo().workflowId` are the same on every retry and replay. `java.util.UUID.randomUUID()` in workflow code would differ on replay.",
+      "If the version-1 tests fail with a `NonDeterministicException`, either the fraud check runs before `getVersion` has answered, or your old path doesn't issue the same commands as `OrderWorkflowV1`, in the same order.",
+      "The harness makes a TODO or a non-determinism error fail the workflow at once (`setFailWorkflowExceptionTypes` in `OrderHarness.kt`). In production both only fail the workflow task, which Temporal retries until you deploy a fix."
+    ],
+    "done_when": "All 10 tests in `OrderWorkflowTest` and `CrashAndUpgradeTest` pass."
+  },
+  "drill": {
+    "title": "Write a patch from memory",
+    "minutes": 4,
+    "prompt": "The order workflow with the fraud check is in production. The next version must send a receipt (an activity `sendReceipt(key, orderId)`) right after `ship`, without breaking runs that are asleep before `ship` or replaying past it. Write the lines from `ship` to `return`. Then compare. Which versions did you pass to `getVersion`, and where does the key come from?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "val id = Workflow.getInfo().workflowId\nactivities.ship(\"$id/ship\", orderId, reservationId)\n// histories recorded past this point without a marker replay as DEFAULT_VERSION and skip the receipt\nval receipt = Workflow.getVersion(\"send-receipt\", Workflow.DEFAULT_VERSION, 1)\nif (receipt >= 1) {\n    activities.sendReceipt(\"$id/receipt\", orderId)\n}\nreturn \"SHIPPED\""
+    }
+  },
+  "recap": [
+    "A process that calls several systems can die between any two calls, and no local transaction can include a card network. Running it again from the top charges twice.",
+    "A status column plus a sweeper works, with keys, but every process rebuilds the locks, retries, timers and keys, and spreads its logic over a column and a cron job.",
+    "A saga pairs each step with a compensation and, when a step fails for good, runs the compensations of finished steps newest first. It has no isolation, and compensations must be retryable and idempotent.",
+    "Durable execution records each step's result in a durable log (Temporal's event history, Restate's journal, DBOS's Postgres checkpoints). After a crash, a worker replays the code and skips every recorded step.",
+    "\"Exactly once\" means the workflow's progress is recorded once. Activities run at least once, so pass every external call a key built from the workflow ID and step.",
+    "Workflow code must replay identically. Change it with `Workflow.getVersion` or pinned deployments, test with `WorkflowReplayer`, and with Kotlin 2.4 on SDK 1.40 keep method references away from `Async`."
+  ],
+  "quiz": [
+    {
+      "q": "A Temporal worker is killed while a workflow waits in `Workflow.sleep(Duration.ofDays(3))`. What happens to the wait?",
+      "options": [
+        "It is lost; someone must restart the workflow",
+        "The next worker starts the 3-day wait again from zero",
+        "The workflow fails with a timeout",
+        "It lives in the server as a timer; when it fires, any worker replays the workflow and continues"
+      ],
+      "answer": 3,
+      "why": "The sleep became a `TimerStarted` event, so the server owns the timer. When it fires, a worker replays the history (where the timer has fired) and goes on. Nothing restarts the wait: the second option would be true only of a `Thread.sleep`, which has no place in workflow code."
+    },
+    {
+      "q": "Which line is safe inside a Temporal workflow method?",
+      "options": [
+        "`if (Random.nextInt(100) < 5) activities.checkFraud(orderId, cents)`",
+        "`val key = Workflow.getInfo().workflowId + \"/charge\"`",
+        "`val now = System.currentTimeMillis()`",
+        "`Thread.sleep(1_000)` to back off before a retry"
+      ],
+      "answer": 1,
+      "why": "The workflow ID comes from the history, so it is the same on every replay. A random number or the system clock can differ on replay and change which commands the code issues, and `Thread.sleep` blocks a workflow thread without recording anything; use `Workflow.sleep`, `Workflow.currentTimeMillis` or `Workflow.newRandom` instead."
+    },
+    {
+      "q": "An activity calls the issuer's `POST /charges`, which honours an `Idempotency-Key`. Which key stops a retried activity from charging twice?",
+      "options": [
+        "`\"$workflowId/charge\"`, built in the workflow and passed in, the same on every attempt and replay",
+        "A UUID made inside the activity on each attempt",
+        "The activity's attempt number",
+        "None is needed, because Temporal's exactly-once guarantee covers it"
+      ],
+      "answer": 0,
+      "why": "As in lesson 4, a key must be made once per operation and sent on every attempt. A UUID made inside the activity is new on every attempt, which is exactly the \"new key each time\" client that charged 313 cards twice. Temporal records the workflow's progress once, but the activity body is at-least-once.",
+      "from": "enc-04"
+    },
+    {
+      "q": "You insert a new activity before `charge` and deploy without `getVersion`. Runs started on the old code wake up on the new workers. What happens by default?",
+      "options": [
+        "They run the new activity and continue normally",
+        "Temporal pins them to the old code automatically",
+        "Replay raises a `NonDeterministicException`; the workflow task fails and is retried, so the runs stay open and stuck until a compatible deploy",
+        "They are marked failed and their compensations run"
+      ],
+      "answer": 2,
+      "why": "Replay compares the new code's first command (schedule the new activity) with the history (schedule `Charge`) and stops. By default that fails only the workflow task, which Temporal retries, so nothing is lost but nothing moves. Pinning old runs to old code is what Worker Versioning does, but only if you deploy that way."
+    },
+    {
+      "q": "AWS Step Functions describes Standard workflows as exactly-once. When can a Task state's work run more than once?",
+      "options": [
+        "Never; that is what exactly-once means",
+        "Only in Express workflows",
+        "Only when you publish a new version of the state machine",
+        "When the state has a `Retry` configured: a failed attempt is run again, so the task must be idempotent"
+      ],
+      "answer": 3,
+      "why": "AWS's own table qualifies it: exactly-once unless you specify `Retry` behaviour. A task that did its work and then failed or timed out is run again. Express workflows are at-least-once or at-most-once by design, so the second option is true of them, but it is not the only case."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "In Temporal, what is the difference between a workflow and an activity?",
+      "back": "The workflow is deterministic code that decides what happens next and is replayed after a crash. An activity does the I/O, runs in a worker thread and is retried."
+    },
+    {
+      "front": "What does Temporal record when workflow code calls an activity?",
+      "back": "`ActivityTaskScheduled`, and when it finishes, `ActivityTaskStarted` and `ActivityTaskCompleted` with the result, in the run's event history."
+    },
+    {
+      "front": "Why do Temporal activities run at least once?",
+      "back": "A worker can do the side effect and die before reporting. The server sees an unfinished attempt and retries it after the timeout."
+    },
+    {
+      "front": "What does `Workflow.getVersion(id, DEFAULT_VERSION, 1)` return when replaying a history recorded before the change?",
+      "back": "`Workflow.DEFAULT_VERSION`, which is -1. A run that reaches it for real records a marker with version 1."
+    },
+    {
+      "front": "What is a saga?",
+      "back": "A long process split into steps, each with a compensating step. When a step fails for good, the compensations of finished steps run, newest first. There is no isolation."
+    },
+    {
+      "front": "What did Kotlin 2.4 change for Temporal's Java SDK up to 1.40?",
+      "back": "Method references passed to `Async.function` or `Async.procedure` compile to a form the SDK doesn't recognize, so it runs them on a new workflow thread. That can break replay of runs started under Kotlin 2.2."
+    },
+    {
+      "front": "How large can one Temporal workflow history get?",
+      "back": "51,200 events or 50 MB, with warnings from 10,240 events or 10 MB. Long loops use continue-as-new to start a fresh history."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Durable execution",
+      "plain": "Running ordinary code so that every step's result is recorded durably and the code can resume after a crash by replaying against that record."
+    },
+    {
+      "term": "Workflow",
+      "plain": "The deterministic code that orchestrates the steps of a process. The engine can replay it at any time."
+    },
+    {
+      "term": "Activity",
+      "plain": "One step that touches the outside world, such as a charge or an email. It runs at least once and may be retried."
+    },
+    {
+      "term": "Event history",
+      "plain": "Temporal's append-only log of everything that happened in one workflow run: activities scheduled and completed, timers, markers."
+    },
+    {
+      "term": "Replay",
+      "plain": "Running the workflow code from the start against its history, returning recorded results instead of repeating finished steps."
+    },
+    {
+      "term": "Non-determinism error",
+      "plain": "Replay found the code issuing different commands from those in the history, usually after a code change. Temporal retries the workflow task."
+    },
+    {
+      "term": "Saga",
+      "plain": "A sequence of steps, each with a compensating step that undoes it semantically, run newest first when a later step fails."
+    },
+    {
+      "term": "Compensation",
+      "plain": "A new action that cancels an earlier step's effect, such as a refund for a charge. Both actions stay on the record."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your team lead says: \"Once the payment flow is on Temporal we can drop the idempotency keys. Temporal gives us exactly-once.\" Explain what Temporal guarantees and what it doesn't.",
+    "answer": "Temporal guarantees that the workflow's progress is durable and applied once. Every activity's result is recorded in the event history, and after a crash any worker replays the workflow code against that history, skipping steps that are already recorded, so the flow never forgets where it was and never re-decides a step it has finished. It does not guarantee that an activity's side effect happens once. A worker can charge the card and die before reporting success; the server then sees an unfinished attempt and retries it, and the card network sees a second request. Activities are at-least-once by design. So we keep the keys: build one per step from the workflow ID (\"$workflowId/charge\"), which is stable across retries and replays, and make the issuer or our ledger deduplicate on it. Exactly-once for the business is at-least-once execution plus deduplication."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "A workflow history can't grow forever. Temporal limits one run to 51,200 events or 50 MB and starts warning at 10,240 events or 10 MB. A workflow that loops, such as a subscription that charges every month for years, calls continue-as-new: it closes the current run and starts a fresh one with the same workflow ID, carrying its state over as input, so each history stays short.\n\nWorkflows can also take input while they run. In Temporal, a signal is an asynchronous message into a running workflow (\"the courier collected the parcel\"), a query reads its state without touching the history, and an update is a synchronous, validated write that is recorded once accepted. A human approval step is a workflow waiting for a signal, possibly for days, at no cost.\n\nThe Java SDK has a `Saga` helper class that collects compensations and runs them in reverse. Its `addCompensation` takes a function, and from Kotlin that tempts you to write `saga.addCompensation(activities::refund, key, chargeId)`. Given the Kotlin 2.4 issue, pass a lambda instead, `saga.addCompensation { activities.refund(key, chargeId) }`, which behaves the same under every compiler version.\n\nThe idea is older than any of these engines. Microsoft's Durable Functions and Uber's Cadence, built by the engineers who went on to found Temporal, use the same history-and-replay model. For the book's framing of workflows, durable execution and its determinism caveats, see Designing Data-Intensive Applications, 2nd edition, chapter 5; the book returns to determinism in chapter 9, on the trouble with distributed systems."
+  },
+  "sources": [
+    {
+      "title": "Temporal documentation: Event History walkthrough with the Java SDK",
+      "url": "https://docs.temporal.io/encyclopedia/event-history/event-history-java"
+    },
+    {
+      "title": "Temporal documentation: Versioning in the Java SDK",
+      "url": "https://docs.temporal.io/develop/java/workflows/versioning"
+    },
+    {
+      "title": "Garcia-Molina and Salem: Sagas (SIGMOD 1987)",
+      "url": "https://dl.acm.org/doi/10.1145/38713.38742"
+    },
+    {
+      "title": "temporal-kotlin README (Kotlin 2.4 method references)",
+      "url": "https://github.com/temporalio/sdk-java/blob/master/temporal-kotlin/README.md"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 5",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

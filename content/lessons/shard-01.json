@@ -1,0 +1,384 @@
+{
+  "id": "shard-01",
+  "title": "Splitting data: key ranges, hashes and tenants",
+  "minutes": 40,
+  "goal": "By the end you can say why data gets split across machines when replicas don't help, place keys by key range and by hash and say what each one gives up, spot a key design that will make a hot spot, and decide when a tenant should get a shard or a cell of its own.",
+  "warmup": {
+    "q": "A payments table is split into 8 shards by key range on the creation time: each shard holds one stretch of time, and the boundaries were cut from this morning's data. This afternoon 10,000 new payments arrive. How many land on the busiest shard?",
+    "options": [
+      "About 1,250: eight shards share the work",
+      "About 2,500: the recent shards are a bit busier",
+      "All 10,000: every new payment sorts after every key already stored",
+      "It depends on how well the hash function mixes"
+    ],
+    "answer": 2,
+    "why": "Key-range sharding keeps keys sorted and gives each shard one stretch. A new payment's timestamp is later than every stored key, so it falls past the last boundary into the last shard, every time. The lab measures `[0, 0, 0, 0, 0, 0, 0, 10000]`. The hash option is the tempting one, but there is no hash here: range sharding never mixes keys, which is why it keeps time ranges cheap to scan."
+  },
+  "sections": [
+    {
+      "h": "Replicas copy everything, so they can't make the data smaller",
+      "body": "The Replication track gave every node a full copy of the data. That helps reads: three followers can serve three times the reads of one leader. It does nothing for two other limits. Every replica stores all the data, so a 3 TB ledger needs 3 TB on every replica. And every replica applies every write, so if the leader can't keep up with 25,000 inserts a second at the Black Friday peak, its followers can't either.\n\nPut numbers on it. A payments ledger holds 3 billion rows of about 1 KB with their indexes, 3 TB, and grows by 40 million rows (40 GB) a day. On a server with 4 TB of SSD, the last free terabyte lasts 25 days. Every insert goes through that server's one write-ahead log (the file every change is appended to first, from the Storage engines track), onto its disks.\n\nThe fix is to split the data. Cut the rows into parts and put each part on a different machine. Each part is a **shard**. A shard holds a subset of the rows, and every row belongs to exactly one shard. With 8 shards, each holds about 375 GB and takes about an eighth of the writes. Products give shards other names: a partition in Kafka, a range in CockroachDB, a region in HBase, a chunk in MongoDB, a tablet in Bigtable and ScyllaDB. A shard has nothing to do with a network partition, which is a broken link between machines. PostgreSQL says partitioning when it splits a table on one server; sharding spans servers.\n\nSharding and replication work together. Each shard is replicated the way the Replication track described, so a node holds several shards, leading some and following others. When a node dies, the shards it led fail over to followers on other nodes.\n\nSo a sharded store keeps two maps, as the figure shows. The first takes a row's partition key (the field, or fields, that decide where the row lives) to a shard. The second takes a shard to the nodes that hold its copies. This lesson is about the first map. Lesson 3 is about the second: moving shards between nodes, and finding them.\n\nThe first map has one job besides finding keys: spreading the load. If some shards hold more data or get more requests than others, the sharding is skewed. A shard with far more load than the rest is a hot spot. Skew eats the gain. If one of eight shards takes half the writes, the cluster tops out at twice what one machine can do, and the other seven wait.\n\nSharding has costs, so it isn't the first thing to reach for. A query that needs rows from several shards asks several machines. A transaction across shards needs a distributed commit, which the Transactions track covers. And it's hard to change later: Figma's database team needed about nine months to move its first table onto sharded PostgreSQL, with about ten seconds of partial unavailability at the cutover. Shard when one machine runs out of disk or write throughput, and pick the partition key so most requests touch one shard.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 256\" role=\"img\" aria-label=\"A partition key goes through map 1 to one of eight shards, and map 2 sends that shard to the three nodes that hold its copies, one leader and two followers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">partition key</text><text class=\"t-s t-m\" x=\"315\" y=\"30\" text-anchor=\"middle\">shard</text><text class=\"t-s t-m\" x=\"560\" y=\"30\" text-anchor=\"middle\">nodes holding copies</text><rect class=\"box\" x=\"20\" y=\"100\" width=\"150\" height=\"56\" rx=\"8\"/><text class=\"t t-code\" x=\"95.0\" y=\"124.0\" text-anchor=\"middle\">pay-81701</text><text class=\"t-s t-m\" x=\"95.0\" y=\"142.0\" text-anchor=\"middle\">or M-0042#14:05</text><line class=\"ln-a\" x1=\"170\" y1=\"128\" x2=\"248\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"210\" y=\"150\" text-anchor=\"middle\">map 1</text><text class=\"t-s t-m\" x=\"210\" y=\"166\" text-anchor=\"middle\">this lesson</text><rect class=\"box-a\" x=\"250\" y=\"100\" width=\"130\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"124.0\" text-anchor=\"middle\">shard 5 of 8</text><text class=\"t-s t-m\" x=\"315.0\" y=\"142.0\" text-anchor=\"middle\">range or hash</text><rect class=\"box-b\" x=\"462\" y=\"40\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"562.0\" y=\"67.0\" text-anchor=\"middle\">node-2: leader</text><line class=\"ln\" x1=\"380\" y1=\"128\" x2=\"460\" y2=\"62\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"462\" y=\"108\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"562.0\" y=\"135.0\" text-anchor=\"middle\">node-4: follower</text><line class=\"ln\" x1=\"380\" y1=\"128\" x2=\"460\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"462\" y=\"176\" width=\"200\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"562.0\" y=\"203.0\" text-anchor=\"middle\">node-7: follower</text><line class=\"ln\" x1=\"380\" y1=\"128\" x2=\"460\" y2=\"198\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"420\" y=\"222\" text-anchor=\"middle\">map 2</text><text class=\"t-s t-m\" x=\"420\" y=\"238\" text-anchor=\"middle\">lesson 3</text></svg>",
+        "caption": "Every sharded store keeps two maps: partition key to shard, and shard to the nodes that hold its copies."
+      },
+      "refs": [
+        {
+          "title": "How Figma's databases team lived to tell the scale (Figma blog)",
+          "url": "https://www.figma.com/blog/how-figmas-databases-team-lived-to-tell-the-scale/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Key ranges keep neighbours together, and pile new keys on the last shard",
+      "body": "The simplest first map keeps the keys in sorted order and gives each shard one unbroken stretch of them. With account numbers as the key, shard 0 holds `A-0000` up to `A-2499`, shard 1 holds `A-2500` up to `A-4999`, and so on. To find a key, the router keeps the sorted list of boundaries, three strings for four shards, and runs a binary search over it. That's **key-range sharding**. Even 100,000 shards is only a list of 100,000 strings.\n\nIts strength is the range scan. Keys stay sorted inside a shard, and neighbouring keys sit on the same shard. With the key `M-0042#<time>#<paymentId>`, all of merchant M-0042's payments for one day form one unbroken run. \"M-0042's payments since 09:00\" goes to one shard (two, if the run crosses a boundary) and reads its rows in order.\n\nThe boundaries can't be fixed in advance, because keys aren't spread evenly. Merchant ids starting with `M-00` might be a third of your rows. So the store takes boundaries from the data: cut a sorted sample into equal runs, then split any shard that grows too big. HBase splits a region when its files pass 10 GiB. MongoDB's ranged sharding, its default, uses ranges of 128 MB. CockroachDB splits a range at 512 MiB, and also splits one that gets too busy. Google's Bigtable did the same with tablets. Lesson 3 covers splitting and moving; in this lesson the boundaries are given.\n\nThe weakness is any key that grows over time: a timestamp, an auto-increment id, a MongoDB ObjectId, a UUIDv7 (time-ordered by design). Each new value is bigger than every old one, so it falls past the last boundary onto the last shard. Every insert goes to one machine while the others wait. Splitting doesn't help, as the stepper shows. The store splits the hot shard, and the new upper half becomes the last shard and takes every insert. MongoDB's docs say it directly: with a monotonically increasing key, the chunk whose upper bound is MaxKey receives most of the writes.\n\nThe fix is to put something before the time. With the key `merchant#time`, the afternoon's inserts spread over all the merchants' ranges. You pay on a different query: \"every payment from 14:00 to 14:05\", across all merchants, is now a small run inside each merchant's range, on every shard. Choose the order of the parts by asking which query must be cheap.\n\nA new, empty table is a special case of the same problem. It starts as one range, so every early write hits one shard until the first split. HBase and MongoDB let you pre-split: create the boundaries before loading data.",
+      "stepper": {
+        "title": "Time-ordered keys on range shards",
+        "intro": "Click Next. Watch where the inserts go.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 268\" role=\"img\" aria-label=\"Four range shards by time; a payment at 14:00 goes to shard 3, the one that starts at 14:00\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"210\" y=\"16\" width=\"260\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340.0\" y=\"37.0\" text-anchor=\"middle\">new payment, key = time</text><text class=\"t-s t-code\" x=\"340.0\" y=\"55.0\" text-anchor=\"middle\">14:00:00.005#pay-20001</text><rect class=\"box\" x=\"16\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"92.5\" y=\"158.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"92.5\" y=\"176.0\" text-anchor=\"middle\">from start</text><text class=\"t-s t-m\" x=\"92.5\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"181\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"257.5\" y=\"158.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"257.5\" y=\"176.0\" text-anchor=\"middle\">from 10:00</text><text class=\"t-s t-m\" x=\"257.5\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"346\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"422.5\" y=\"158.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"422.5\" y=\"176.0\" text-anchor=\"middle\">from 12:00</text><text class=\"t-s t-m\" x=\"422.5\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box-bad\" x=\"511\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"587.5\" y=\"158.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"587.5\" y=\"176.0\" text-anchor=\"middle\">from 14:00</text><text class=\"t-s t-a\" x=\"587.5\" y=\"216\" text-anchor=\"middle\">1 insert</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"587.5\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"252\" text-anchor=\"middle\">each shard holds one stretch of time, cut from the morning's data</text></svg>",
+            "say": "Four range shards, keyed by creation time. Each shard holds every key from its start up to the next shard's start, and the boundaries were cut from the morning's data so the shards are the same size. A payment created at 14:00:00.005 sorts after 14:00, so it belongs to shard 3."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 268\" role=\"img\" aria-label=\"All 10,000 afternoon payments go to shard 3; shards 0 to 2 get none\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"210\" y=\"16\" width=\"260\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340.0\" y=\"37.0\" text-anchor=\"middle\">the afternoon, key = time</text><text class=\"t-s t-code\" x=\"340.0\" y=\"55.0\" text-anchor=\"middle\">14:00 to 14:50</text><rect class=\"box\" x=\"16\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"92.5\" y=\"158.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"92.5\" y=\"176.0\" text-anchor=\"middle\">from start</text><text class=\"t-s t-m\" x=\"92.5\" y=\"216\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"181\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"257.5\" y=\"158.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"257.5\" y=\"176.0\" text-anchor=\"middle\">from 10:00</text><text class=\"t-s t-m\" x=\"257.5\" y=\"216\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"346\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"422.5\" y=\"158.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"422.5\" y=\"176.0\" text-anchor=\"middle\">from 12:00</text><text class=\"t-s t-m\" x=\"422.5\" y=\"216\" text-anchor=\"middle\">0</text><rect class=\"box-bad\" x=\"511\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"587.5\" y=\"158.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"587.5\" y=\"176.0\" text-anchor=\"middle\">from 14:00</text><text class=\"t-s t-a\" x=\"587.5\" y=\"216\" text-anchor=\"middle\">10,000</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"587.5\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"252\" text-anchor=\"middle\">every new key is bigger than every old one</text></svg>",
+            "say": "The rest of the afternoon does the same. Every new timestamp is later than every key already stored, so all 10,000 inserts land on shard 3, and shards 0, 1 and 2 get none. Four machines, one of them doing all the writing: the cluster writes no faster than one node."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 268\" role=\"img\" aria-label=\"Shard 3 is split at 14:25; new inserts now all go to shard 4\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"210\" y=\"16\" width=\"260\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340.0\" y=\"37.0\" text-anchor=\"middle\">the store splits shard 3</text><text class=\"t-s t-code\" x=\"340.0\" y=\"55.0\" text-anchor=\"middle\">new key 14:31:07.120</text><rect class=\"box\" x=\"16\" y=\"130\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"76.0\" y=\"158.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"76.0\" y=\"176.0\" text-anchor=\"middle\">from start</text><text class=\"t-s t-m\" x=\"76.0\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"148\" y=\"130\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"158.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"208.0\" y=\"176.0\" text-anchor=\"middle\">from 10:00</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"280\" y=\"130\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"340.0\" y=\"158.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"340.0\" y=\"176.0\" text-anchor=\"middle\">from 12:00</text><text class=\"t-s t-m\" x=\"340.0\" y=\"216\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"412\" y=\"130\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"472.0\" y=\"158.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"472.0\" y=\"176.0\" text-anchor=\"middle\">from 14:00</text><text class=\"t-s t-m\" x=\"472.0\" y=\"216\" text-anchor=\"middle\">no new inserts</text><rect class=\"box-bad\" x=\"544\" y=\"130\" width=\"120\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"604.0\" y=\"158.0\" text-anchor=\"middle\">shard 4</text><text class=\"t-s t-code\" x=\"604.0\" y=\"176.0\" text-anchor=\"middle\">from 14:25</text><text class=\"t-s t-a\" x=\"604.0\" y=\"216\" text-anchor=\"middle\">every insert</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"604.0\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"252\" text-anchor=\"middle\">the upper half of the split is the new last shard</text></svg>",
+            "say": "The store notices that shard 3 is big and busy and splits it at its middle key, 14:25. That helps the data size. It does nothing for the inserts: the upper half, shard 4, is now the last range, and every new payment goes there. Splitting moves the hot spot to the end; it can't spread it."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 268\" role=\"img\" aria-label=\"With the merchant first in the key, inserts spread over all four shards\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-b\" x=\"210\" y=\"16\" width=\"260\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340.0\" y=\"37.0\" text-anchor=\"middle\">key = merchant, then time</text><text class=\"t-s t-code\" x=\"340.0\" y=\"55.0\" text-anchor=\"middle\">M-0310#14:00:00.005#...</text><rect class=\"box-a\" x=\"16\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"92.5\" y=\"158.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"92.5\" y=\"176.0\" text-anchor=\"middle\">from start</text><text class=\"t-s t-a\" x=\"92.5\" y=\"216\" text-anchor=\"middle\">about 2,500</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"92.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"181\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"257.5\" y=\"158.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"257.5\" y=\"176.0\" text-anchor=\"middle\">from M-0125</text><text class=\"t-s t-a\" x=\"257.5\" y=\"216\" text-anchor=\"middle\">about 2,500</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"257.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"346\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"422.5\" y=\"158.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"422.5\" y=\"176.0\" text-anchor=\"middle\">from M-0250</text><text class=\"t-s t-a\" x=\"422.5\" y=\"216\" text-anchor=\"middle\">about 2,500</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"422.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"511\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"587.5\" y=\"158.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"587.5\" y=\"176.0\" text-anchor=\"middle\">from M-0375</text><text class=\"t-s t-a\" x=\"587.5\" y=\"216\" text-anchor=\"middle\">about 2,500</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"587.5\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"252\" text-anchor=\"middle\">new payments come from every merchant, so they spread</text></svg>",
+            "say": "Put the merchant before the time: `M-0310#14:00:00.005#pay-20001`. Now the boundaries are merchant ids, and the afternoon's payments come from all 500 merchants, so they spread over all four shards. All of one merchant's payments still sit together, sorted by time, on one shard."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 268\" role=\"img\" aria-label=\"The query for 14:00 to 14:05 must ask all four shards\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-b\" x=\"210\" y=\"16\" width=\"260\" height=\"50\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340.0\" y=\"37.0\" text-anchor=\"middle\">query: every payment</text><text class=\"t-s t-code\" x=\"340.0\" y=\"55.0\" text-anchor=\"middle\">from 14:00 to 14:05</text><rect class=\"box-a\" x=\"16\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"92.5\" y=\"158.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"92.5\" y=\"176.0\" text-anchor=\"middle\">from start</text><text class=\"t-s t-a\" x=\"92.5\" y=\"216\" text-anchor=\"middle\">asked</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"92.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"181\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"257.5\" y=\"158.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"257.5\" y=\"176.0\" text-anchor=\"middle\">from M-0125</text><text class=\"t-s t-a\" x=\"257.5\" y=\"216\" text-anchor=\"middle\">asked</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"257.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"346\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"422.5\" y=\"158.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"422.5\" y=\"176.0\" text-anchor=\"middle\">from M-0250</text><text class=\"t-s t-a\" x=\"422.5\" y=\"216\" text-anchor=\"middle\">asked</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"422.5\" y2=\"128\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"511\" y=\"130\" width=\"153\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"587.5\" y=\"158.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"587.5\" y=\"176.0\" text-anchor=\"middle\">from M-0375</text><text class=\"t-s t-a\" x=\"587.5\" y=\"216\" text-anchor=\"middle\">asked</text><line class=\"ln-a\" x1=\"340\" y1=\"66\" x2=\"587.5\" y2=\"128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"252\" text-anchor=\"middle\">a time range is now one small run inside every merchant's range</text></svg>",
+            "say": "The bill arrives on the other query. \"Every payment from 14:00 to 14:05\", for all merchants, was one shard with time first. With merchant first, those payments are a small run inside every merchant's range, on every shard, so the query asks all four. The order of the parts in the key decides which query is cheap."
+          }
+        ]
+      },
+      "try": {
+        "title": "Cut range shards from the morning, then insert the afternoon",
+        "minutes": 3,
+        "steps": [
+          "Read `RangeShardsDemo.kt`. It makes 20,000 morning payments and cuts 8 range shards from their keys, so each shard holds 2,500 of them. Then it inserts 10,000 afternoon payments and counts where they land. It does this twice: once with the time first in the key, once with the merchant first. No Docker needed.",
+          "Predict the afternoon's inserts per shard for each key. Which key makes \"14:00 to 14:05\" cheap, and which makes \"M-0042's day\" cheap?",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "RangeShardsDemo.kt",
+          "src": "package sfz.shard.l01.demo\n\nimport java.util.Random\n\n/** A payment on virtual time: milliseconds since midnight, no clock involved. */\ndata class Pay(val id: String, val merchant: String, val atMillis: Long)\n\nfun payments(count: Int, startMillis: Long, everyMillis: Long, firstId: Int, seed: Long): List<Pay> {\n    val rnd = Random(seed)\n    return (0 until count).map { i -> Pay(\"pay-${firstId + i}\", \"M-%04d\".format(rnd.nextInt(500)), startMillis + i * everyMillis) }\n}\n\nfun hours(h: Int, m: Int = 0) = (h * 60L + m) * 60_000L\n\n/** Key-range shards: sorted split points; a key belongs to the shard after the last boundary <= key. */\nclass Ranges(val boundaries: List<String>) {\n    fun shardOf(key: String) = boundaries.count { it <= key }\n\n    companion object {\n        // cut a sample into equal runs, so the shards follow the data\n        fun fromSample(keys: List<String>, n: Int) = keys.sorted().let { s -> Ranges((1 until n).map { s[it * s.size / n] }) }\n    }\n}\n\n/** Eight range shards cut from the morning's keys. Then the afternoon arrives. Where do the inserts go? */\nfun main() {\n    val morning = payments(20_000, startMillis = hours(8), everyMillis = 1_000, firstId = 0, seed = 7)\n    val afternoon = payments(10_000, startMillis = hours(14), everyMillis = 5, firstId = 20_000, seed = 8)\n    val day = morning + afternoon\n\n    val byTime = { p: Pay -> \"%013d#%s\".format(p.atMillis, p.id) }\n    val byMerchant = { p: Pay -> \"%s#%013d#%s\".format(p.merchant, p.atMillis, p.id) }\n\n    for ((name, key) in listOf(\"time first\" to byTime, \"merchant first\" to byMerchant)) {\n        val shards = Ranges.fromSample(morning.map(key), 8)\n        val inserts = IntArray(8).also { c -> afternoon.forEach { c[shards.shardOf(key(it))]++ } }\n        // which shards would a query have to ask? the ones that hold at least one matching payment\n        fun shardsHolding(match: (Pay) -> Boolean) = day.filter(match).map { shards.shardOf(key(it)) }.toSortedSet()\n        println(\"key = $name, for example ${key(afternoon[0])}\")\n        println(\"  afternoon inserts per shard: ${inserts.toList()}\")\n        println(\"  shards holding 14:00 to 14:05:  ${shardsHolding { it.atMillis in hours(14) until hours(14, 5) }}\")\n        println(\"  shards holding M-0042's day:    ${shardsHolding { it.merchant == \"M-0042\" }}\")\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l01.demo.RangeShardsDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l01/demo/RangeShardsDemo.kt"
+        },
+        "expect": "```text\nkey = time first, for example 0000050400000#pay-20000\n  afternoon inserts per shard: [0, 0, 0, 0, 0, 0, 0, 10000]\n  shards holding 14:00 to 14:05:  [7]\n  shards holding M-0042's day:    [0, 1, 2, 3, 4, 5, 6, 7]\nkey = merchant first, for example M-0364#0000050400000#pay-20000\n  afternoon inserts per shard: [1251, 1329, 1240, 1235, 1211, 1278, 1178, 1278]\n  shards holding 14:00 to 14:05:  [0, 1, 2, 3, 4, 5, 6, 7]\n  shards holding M-0042's day:    [0]\n```\n\nThe numbers are the same on every machine: the payments come from a seeded random generator on virtual time. With time first, all 10,000 inserts go to shard 7, the last range, and a time window is one shard. With merchant first, the inserts spread (1,178 to 1,329 per shard) and one merchant's whole day is one shard, but a time window touches all eight. Neither key is better. Each one makes a different query cheap."
+      },
+      "refs": [
+        {
+          "title": "MongoDB manual: ranged sharding",
+          "url": "https://www.mongodb.com/docs/manual/core/ranged-sharding/",
+          "kind": "docs"
+        },
+        {
+          "title": "CockroachDB docs: the distribution layer (ranges and splits)",
+          "url": "https://docs.cockroachlabs.com/docs/stable/architecture/distribution-layer",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Hashing spreads the keys and scatters the ranges",
+      "body": "Hash sharding goes the other way. Before placing a key, run it through a hash function, which turns any string into a number that looks random: `pay-20000` and `pay-20001` come out nowhere near each other. Then pick the shard from the number. The simplest rule is `hash mod N`, where N is the number of shards. With 8 shards, `A-1001` hashes to 1005131691884159963, which leaves remainder 3, so it lives on shard 3.\n\nKeys that grow over time now spread evenly, because consecutive timestamps hash to unrelated numbers. The Try-it's 10,000 afternoon payments, keyed by time, land between 1,202 and 1,299 per shard.\n\nThe hash must give the same number in every process, on every machine, every day, or a key written today can't be found tomorrow. It doesn't need to be cryptographic, only stable and well mixed. Cassandra and ScyllaDB use Murmur3, and the Dynamo paper used MD5. Java's `String.hashCode()` is stable but mixes badly: `pay-1`, `pay-2` and `pay-3` hash to 106441804, 106441805 and 106441806. `Object.hashCode()` isn't even stable, because it changes from one JVM run to the next.\n\nWhat hashing gives up is the range scan over the partition key. \"Every payment from 14:00 to 14:05\" was one shard with range sharding. Now those payments are scattered, and the query asks all 8 shards, because nothing tells the router which shards it could skip.\n\nCassandra and DynamoDB win part of it back with a two-part key. The first part, the partition key, is hashed to choose the shard. The second part (clustering columns in Cassandra, the sort key in DynamoDB) keeps rows sorted inside one partition. Make the merchant the partition key and the time the second part, and \"M-0042's payments since 09:00\" is one partition on one shard, read in order. Only scans across partition keys are lost. Figma made this trade when it sharded PostgreSQL. It hashes its shard keys (UserID, FileID, OrgID) because auto-increment and timestamp-prefixed ids would have made hot spots, and accepts that range scans over those keys get slower.\n\nReal stores rarely use `hash mod N` itself, because of what happens the day N changes (lesson 3 counts it). DynamoDB, YugabyteDB and MongoDB's hashed sharding cut the hash space into ranges that split like key ranges. Cassandra gives each node 16 ranges on a ring of hash values, the subject of lesson 2. ScyllaDB, which speaks Cassandra's protocol, left the ring behind: since ScyllaDB 2025.1, new keyspaces use tablets by default. A tablet is a range of one table's hash space; tablets split as the table grows, merge as it shrinks, and a load balancer moves them between nodes.\n\nHashing has one blind spot: a single hot key. Every row with one partition key shares one shard, whatever the hash. Partition by merchant on Black Friday, let M-0042 take every fifth payment, and its shard gets 3,094 of 10,000 inserts while the others get about 950. **A hash spreads keys, not requests.** Lesson 2 shows how to split a hot key.",
+      "try": {
+        "title": "Hash the same payments, then add Black Friday",
+        "minutes": 3,
+        "steps": [
+          "Read `HashShardsDemo.kt`. It uses the range demo's afternoon payments, and a Black Friday copy where M-0042 takes every fifth payment. Shards are `md5(key) mod 8`. It tries two partition keys: time plus payment id, and the merchant alone (with rows sorted by time inside each merchant, as Cassandra would).",
+          "Predict: with the merchant as partition key on Black Friday, how many of the 10,000 inserts does M-0042's shard get?",
+          "Run it from the `labs` folder. Then compare the last line with the hashes in your own JVM."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "HashShardsDemo.kt",
+          "src": "package sfz.shard.l01.demo\n\nimport java.nio.ByteBuffer\nimport java.security.MessageDigest\nimport java.util.Random\n\n/** The first 8 bytes of MD5: the same number in every process, and neighbouring keys land far apart. */\nfun md5(key: String): Long = ByteBuffer.wrap(MessageDigest.getInstance(\"MD5\").digest(key.toByteArray())).long\n\n/** Hash sharding: shard = hash mod 8. Same payments as the range demo, plus a Black Friday afternoon. */\nfun main() {\n    val shardOf = { key: String -> Math.floorMod(md5(key), 8L).toInt() }\n    val afternoon = payments(10_000, startMillis = hours(14), everyMillis = 5, firstId = 20_000, seed = 8)\n    // Black Friday: the same afternoon, but M-0042 takes every fifth payment\n    val blackFriday = afternoon.mapIndexed { i, p -> if (i % 5 == 0) p.copy(merchant = \"M-0042\") else p }\n\n    val byTime = { p: Pay -> \"%013d#%s\".format(p.atMillis, p.id) }\n    val byMerchant = { p: Pay -> p.merchant } // the partition key alone; rows sort by time inside it\n\n    for ((name, key) in listOf(\"time + id\" to byTime, \"merchant\" to byMerchant)) {\n        fun inserts(day: List<Pay>) = IntArray(8).also { c -> day.forEach { c[shardOf(key(it))]++ } }.toList()\n        fun shardsHolding(match: (Pay) -> Boolean) = blackFriday.filter(match).map { shardOf(key(it)) }.toSortedSet()\n        println(\"partition key = $name\")\n        println(\"  normal afternoon, inserts per shard: ${inserts(afternoon)}\")\n        println(\"  Black Friday,     inserts per shard: ${inserts(blackFriday)}\")\n        println(\"  shards holding 14:00 to 14:05:  ${shardsHolding { it.atMillis in hours(14) until hours(14, 5) }}\")\n        println(\"  shards holding M-0042's day:    ${shardsHolding { it.merchant == \"M-0042\" }}\")\n    }\n    println(\"String.hashCode() of pay-1, pay-2, pay-3: ${listOf(\"pay-1\", \"pay-2\", \"pay-3\").map { it.hashCode() }}\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l01.demo.HashShardsDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l01/demo/HashShardsDemo.kt"
+        },
+        "expect": "```text\npartition key = time + id\n  normal afternoon, inserts per shard: [1248, 1223, 1202, 1229, 1277, 1264, 1299, 1258]\n  Black Friday,     inserts per shard: [1248, 1223, 1202, 1229, 1277, 1264, 1299, 1258]\n  shards holding 14:00 to 14:05:  [0, 1, 2, 3, 4, 5, 6, 7]\n  shards holding M-0042's day:    [0, 1, 2, 3, 4, 5, 6, 7]\npartition key = merchant\n  normal afternoon, inserts per shard: [1173, 1307, 1397, 1195, 1167, 1379, 1024, 1358]\n  Black Friday,     inserts per shard: [927, 1028, 1136, 969, 940, 1083, 823, 3094]\n  shards holding 14:00 to 14:05:  [0, 1, 2, 3, 4, 5, 6, 7]\n  shards holding M-0042's day:    [7]\nString.hashCode() of pay-1, pay-2, pay-3: [106441804, 106441805, 106441806]\n```\n\nHashing time plus id spreads perfectly, even on Black Friday, but every query is a scatter to all 8 shards. Hashing the merchant keeps M-0042's day on one shard (shard 7), and so on Black Friday shard 7 takes 3,094 inserts against about 950 for the rest. With 500 merchants over 8 shards the normal afternoon is already uneven (1,024 to 1,397): a few hundred keys don't average out as well as 10,000 do. The last line shows why `String.hashCode()` is a poor shard hash: neighbouring keys get neighbouring numbers."
+      },
+      "refs": [
+        {
+          "title": "MongoDB manual: hashed sharding",
+          "url": "https://www.mongodb.com/docs/manual/core/hashed-sharding/",
+          "kind": "docs"
+        },
+        {
+          "title": "Announcing ScyllaDB 2025.1 (tablets by default)",
+          "url": "https://www.scylladb.com/2025/04/08/announcing-scylladb-2025-1",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Tenants: a shard per customer, and cells around them",
+      "body": "Many services have a natural partition key: the customer. A payments platform serves merchants, a SaaS product serves companies, and nearly every request names one tenant and touches only that tenant's data. Sharding by tenant puts each tenant's rows on one shard, either a shard of its own or one shared with other small tenants.\n\nNotion sharded its PostgreSQL database this way. Every block (a paragraph, a to-do, a page) belongs to exactly one workspace, and users almost always work inside one workspace, so the workspace ID became the partition key. Notion made 480 logical shards, each a Postgres schema with its own copy of every sharded table, and put 15 of them on each of 32 physical databases. When some of those databases passed 90% CPU at peak, Notion re-sharded onto 96 machines with 5 logical shards each, and peak utilization fell to about 20%. The logical shards stayed at 480 throughout; lesson 3 explains why that number matters.\n\nSharding by tenant buys isolation. A tenant whose month-end report scans its whole history slows its own shard, not everyone's. A bug in an access check is less likely to show one tenant's rows to another when they live in separate databases. You can restore one tenant from a backup without touching the others, export or delete one tenant's data for a GDPR request, keep a tenant in the region its law requires, and roll out a schema migration one tenant at a time.\n\nA cell takes the same idea past the database. A cell is a complete copy of the stack, services and storage, serving a fixed set of tenants and sharing nothing with other cells. A thin router in front maps each tenant to its cell, by a hash and a mod or by a lookup table, and that router is the only shared part. AWS's Well-Architected guidance gives the arithmetic: with 10 cells, a failure inside one cell, such as a bad deploy, leaves 90% of requests unaffected. It also says to cap each cell's size, grow by adding cells, and deploy to one cell at a time.\n\nThe catch is that tenants differ in size by orders of magnitude. Notion's post notes that one large enterprise customer can generate more load than many average workspaces combined. In the Try-it, 1,000 merchants follow a Zipf curve (the k-th biggest sends 1/k as much as the biggest), and the biggest sends 13.4% of all payments. Hash it onto 10 cells and it shares its cell with 97 other merchants. It is their noisy neighbour: when it spikes, all 97 slow down, and a bad deploy to that cell hits 17.9% of payments. Placement that knows sizes gives the biggest merchant a cell of its own and spreads the rest evenly.\n\nThree problems stay open. A tenant too big for one shard has to be sharded inside itself, which brings back everything earlier in this lesson. Thousands of tiny tenants with a database each cost too much, so they share. And a feature that joins data across tenants, such as a platform-wide fraud model, has to read every shard. Figma sits in the middle: it shards by a few keys (UserID, FileID, OrgID) and groups the tables that share a key into colos, so joins and transactions work as long as they stay within one key.",
+      "try": {
+        "title": "Place 1,000 merchants on 10 cells",
+        "minutes": 3,
+        "steps": [
+          "Read `TenantCellsDemo.kt`. It sizes 1,000 merchants on a Zipf curve, 20,000 payments a second in all, and places them on 10 cells twice: by a hash of the tenant id, and by size (a merchant over 2,000 a second gets a cell alone; the rest go biggest first onto the emptiest cell).",
+          "Predict: under hashing, how many merchants share the biggest merchant's cell?",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "TenantCellsDemo.kt",
+          "src": "package sfz.shard.l01.demo\n\n/** 1,000 merchants on 10 cells. Sizes follow a Zipf curve: the k-th biggest sends 1/k as much as the biggest. */\nfun main() {\n    val total = 20_000.0 // payments a second, all merchants together\n    val harmonic = (1..1_000).sumOf { 1.0 / it }\n    val merchants = (1..1_000).associate { k -> \"T-%04d\".format(k) to total / (k * harmonic) }\n    val cells = 10\n\n    // the thin router's rule: hash the tenant id mod the cell count\n    val byHash = merchants.keys.associateWith { Math.floorMod(md5(it), cells.toLong()).toInt() }\n\n    // size-aware: tenants over 2,000 a second get a cell alone; the rest go biggest first to the emptiest shared cell\n    val bySize = LinkedHashMap<String, Int>()\n    val loads = DoubleArray(cells)\n    var nextDedicated = 0\n    for ((id, rate) in merchants.entries.sortedByDescending { it.value }) {\n        val cell = if (rate >= 2_000.0) nextDedicated++ else (nextDedicated until cells).minBy { loads[it] }\n        bySize[id] = cell\n        loads[cell] += rate\n    }\n\n    println(\"T-0001 alone sends %.0f payments a second, %.1f%% of all\".format(merchants.getValue(\"T-0001\"), merchants.getValue(\"T-0001\") / total * 100))\n    for ((name, placement) in listOf(\"hash of tenant id\" to byHash, \"size-aware\" to bySize)) {\n        val perCell = DoubleArray(cells).also { l -> placement.forEach { (id, c) -> l[c] += merchants.getValue(id) } }\n        val home = placement.getValue(\"T-0001\")\n        val neighbours = placement.count { (id, c) -> c == home && id != \"T-0001\" }\n        println(name)\n        println(\"  payments a second per cell: ${perCell.map { \"%.0f\".format(it) }}\")\n        println(\"  T-0001 is in cell $home with $neighbours other merchants\")\n        println(\"  a bad deploy to cell $home hits %.1f%% of payments; to the quietest cell, %.1f%%\"\n            .format(perCell[home] / total * 100, perCell.min() / total * 100))\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l01.demo.TenantCellsDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l01/demo/TenantCellsDemo.kt"
+        },
+        "expect": "```text\nT-0001 alone sends 2672 payments a second, 13.4% of all\nhash of tenant id\n  payments a second per cell: [1457, 1337, 1286, 1914, 2205, 980, 3573, 2739, 2921, 1588]\n  T-0001 is in cell 6 with 97 other merchants\n  a bad deploy to cell 6 hits 17.9% of payments; to the quietest cell, 4.9%\nsize-aware\n  payments a second per cell: [2672, 1926, 1926, 1926, 1926, 1923, 1926, 1926, 1926, 1923]\n  T-0001 is in cell 0 with 0 other merchants\n  a bad deploy to cell 0 hits 13.4% of payments; to the quietest cell, 9.6%\n```\n\nHashing ignores size, so cell 6 carries T-0001 plus 97 others, 3,573 payments a second against 980 in the quietest cell. Size-aware placement isolates T-0001 and leaves the other nine cells within 3 payments a second of each other. The blast radius of one cell is now 9.6% to 13.4%, close to the 10% the cell count promises. The router still has to store T-0001's placement somewhere: a lookup table beats a pure hash once tenants differ this much."
+      },
+      "refs": [
+        {
+          "title": "Herding elephants: lessons learned from sharding Postgres at Notion",
+          "url": "https://www.notion.com/blog/sharding-postgres-at-notion",
+          "kind": "read"
+        },
+        {
+          "title": "AWS Well-Architected REL10-BP03: use bulkhead (cell-based) architectures",
+          "url": "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_fault_isolation_use_bulkhead.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of a depot that sorts parcels into eight bays, one van per bay. Sort by postcode range and each van gets a compact area: a driver doing one street finds all its parcels in one bay. But when a new housing estate gets all the new postcodes, its bay overflows while seven vans wait. Sort instead by the last digit of the tracking number and every bay fills at the same rate, but one street's parcels end up in all eight bays, so every van drives everywhere. A big online shop that ships thousands of parcels a day gets its own bay and van, so its peak doesn't delay everyone else's parcels. The analogy breaks on change: a depot can repaint its bay labels overnight, while a sharded store has to copy terabytes between live machines to move a boundary, which is what lesson 3 is about.",
+  "in_your_world": "Your Kafka topics already use hash sharding: the producer hashes the record key and takes it mod the topic's partition count (the Messaging track covers the details). Key payment events by merchant and each merchant's events stay in order on one partition, and M-0042's Black Friday lands on one partition and one consumer. In Oracle you may range-partition the ledger by `created_at`. That works on one server, because those partitions split storage, not machines, and dropping an old month is cheap. Move the same design onto shards on separate machines and the current month's shard takes every insert. On a merchant-facing platform, the merchant id is the natural partition key and cell key: it's in every request, and merchants rarely need each other's data. Keep a list of your biggest merchants by volume, and place them on purpose rather than by hash.",
+  "mistake": "The most common mistake is a partition key that grows over time at the front of a range-sharded key: a timestamp, an auto-increment id, a MongoDB ObjectId or a UUIDv7. It looks harmless, because the key is unique and every shard holds the same amount of old data. Teams test with a bulk load, where the data spreads nicely, and only see the problem under live traffic, when one shard takes every insert and splitting just moves the hot spot along. The fix is to choose the key from the write pattern. Put a well-spread field that isn't time first (merchant, account, tenant), or hash the key, and keep the time as the second part so range reads within one merchant stay cheap.",
+  "worked": {
+    "title": "Choose a partition key for the payments ledger",
+    "steps": [
+      {
+        "say": "Start from the access patterns and their rates at peak, not from the table. The ledger has four.",
+        "lang": "text",
+        "code": "AP1  insert a payment                     25,000 / s\nAP2  get a payment by id                   40,000 / s\nAP3  one merchant's payments for a day        300 / s   (merchant dashboard)\nAP4  every payment in the last 5 minutes     1 / min   (settlement batch)"
+      },
+      {
+        "say": "Try the creation time as a range key. AP4 is one shard, but AP1 sends all 25,000 inserts a second to the last shard. One node takes every write, so this fails on the busiest pattern. Reject it.",
+        "lang": "text",
+        "code": "key = created_at (range)\nAP1  every insert on the last shard          rejected\nAP4  1 shard"
+      },
+      {
+        "say": "Try the payment id, hashed. AP1 and AP2 spread and hit one shard each. AP3 must ask every shard: 300 dashboards a second on 16 shards is 4,800 shard requests a second. AP4 asks every shard, once a minute, which is fine.",
+        "lang": "text",
+        "code": "key = hash(payment_id)\nAP1  spread, 1 shard each\nAP2  1 shard\nAP3  16 shards per request = 4,800 shard requests / s\nAP4  16 shards, once a minute"
+      },
+      {
+        "say": "Try the merchant hashed, with the time as the sorted second part. AP3 becomes one partition read in time order. AP2 now needs the merchant too, so embed the merchant's shard in the payment id when you create it, or keep a small id-to-merchant lookup. AP1 spreads, except for merchants big enough to be hot keys: check the biggest against one shard's write capacity before you choose (lesson 2).",
+        "lang": "kotlin",
+        "code": "// the partition key decides the shard; the second part sorts rows inside it\ndata class LedgerKey(val merchantId: String, val createdAt: Instant, val paymentId: String)\n\nfun shardOf(k: LedgerKey, shards: Int): Int =\n    Math.floorMod(stableHash(k.merchantId), shards.toLong()).toInt() // time is NOT hashed\n\n// AP3: every key of one merchant hashes the same way, so its day is one shard and one sorted run"
+      },
+      {
+        "say": "Write the decision down with the numbers, so the next person can see what the key gave up.",
+        "lang": "text",
+        "code": "chosen: (hash(merchant_id), created_at, payment_id)\n  AP1  spread; hot-key check needed for the top merchants\n  AP2  1 shard, via the merchant embedded in the id\n  AP3  1 shard, rows in order\n  AP4  every shard, once a minute (accepted)"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a range router and a hash router, then place tenants on cells",
+    "minutes": 15,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/shard/l01/Sharding.kt",
+      "labs/sim/src/main/kotlin/sfz/shard/l01/Tenants.kt",
+      "labs/sim/src/main/kotlin/sfz/shard/l01/Workload.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.shard.l01.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All 16 fail with `NotImplementedError`. `Workload.kt` is given: payments on virtual time from a seeded generator, so every number in the tests is exact.",
+      "In `Sharding.kt`, write `RangeSharding.shardOf` as a binary search for the number of boundaries at or below the key, then `shardsForRange`. The boundary test and the jqwik property test (300 random keys checked against a plain count) pass.",
+      "Write `RangeSharding.fromSample` and `HashSharding.shardOf`. Watch `time-ordered keys send every new payment to the last range`: it asserts `[0, 0, 0, 0, 0, 0, 0, 10000]`.",
+      "In `Tenants.kt`, write `TenantPlacement.bySize`. All 16 pass.",
+      "Experiment: in `a hot merchant stays hot whatever the hash`, print `skew(byMerchant)`, then change `HashSharding(8)` to `HashSharding(64)` and run it again. More shards make the skew worse, not better: M-0042's 2,000 inserts don't shrink, while the average shard's load does."
+    ],
+    "hints": [
+      "Binary search: keep `lo = 0` and `hi = boundaries.size`. While `lo < hi`, look at `mid`: if `boundaries[mid] <= key`, the answer is above `mid`, so `lo = mid + 1`; otherwise `hi = mid`. Return `lo`.",
+      "`shardsForRange`: the first shard is `shardOf(fromInclusive)`, the last is the number of boundaries strictly below `toExclusive`. Return `(first..last).toSet()`, or an empty set when `fromInclusive >= toExclusive`.",
+      "`fromSample`: `sample.toSortedSet().toList()` sorts and drops duplicates. Boundary i (for i from 1 until `shards`) is `sorted[i * sorted.size / shards]`.",
+      "`Math.floorMod(stableHash(key), shardCount.toLong()).toInt()`. The hash is signed, and `%` on a negative number gives a negative shard.",
+      "`bySize`: sort with `compareByDescending<Tenant> { it.paymentsPerSecond }.thenBy { it.id }`, split with `partition { it.paymentsPerSecond >= dedicatedAt }`, and keep a `DoubleArray` of loads for the shared cells. `require(big.size < cells)` gives the error the last test expects."
+    ],
+    "done_when": "All 16 tests in `ShardingTest` and `TenantsTest` pass."
+  },
+  "drill": {
+    "title": "Both routers from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write `rangeShard(boundaries: List<String>, key: String): Int` (a binary search; a key equal to a boundary goes right) and `hashShard(key: String, shards: Int): Int` using a stable 64-bit hash. Then name one query each makes cheap and one it makes expensive.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun rangeShard(boundaries: List<String>, key: String): Int {\n    var lo = 0\n    var hi = boundaries.size\n    while (lo < hi) {\n        val mid = (lo + hi) ushr 1\n        if (boundaries[mid] <= key) lo = mid + 1 else hi = mid // equal goes right\n    }\n    return lo // the number of boundaries <= key\n}\n\nfun hashShard(key: String, shards: Int): Int =\n    Math.floorMod(stableHash(key), shards.toLong()).toInt() // stable across JVMs, never negative\n\n// range: a scan over neighbouring keys is cheap; a key that grows over time piles onto the last shard\n// hash:  inserts spread whatever the key looks like; a range over the partition key asks every shard"
+    }
+  },
+  "recap": [
+    "Shard when one machine runs out of disk or write throughput. Replicas copy every row and every write, so they scale only reads. Each row lives on one shard, and each shard is replicated.",
+    "A sharded store keeps two maps: partition key to shard (this lesson) and shard to nodes (lesson 3). Skew and hot spots are the first map's failures.",
+    "Key ranges keep neighbours together, so a range scan asks one shard, but a key that grows over time (timestamp, auto-increment id, ObjectId, UUIDv7) sends every insert to the last shard, and splitting only moves the hot spot along.",
+    "Hashing spreads keys whatever they look like, but a range over the partition key asks every shard. A hashed partition key plus a sorted second part (Cassandra, DynamoDB) keeps ranges cheap inside one partition. No hash splits one hot key.",
+    "Sharding by tenant (Notion's 480 workspace shards) and cells give isolation, per-tenant restore and deletion, and a small blast radius. Big tenants need placement by size, or sharding inside the tenant."
+  ],
+  "quiz": [
+    {
+      "q": "A MongoDB collection of payments uses ranged sharding on `{ createdAt: 1 }` across 6 shards, and the balancer is running. What does an insert-heavy workload do?",
+      "options": [
+        "Spreads over all 6 shards once the balancer has run",
+        "Sends nearly every insert to the shard holding the chunk with the highest createdAt values",
+        "Fails, because MongoDB refuses increasing shard keys",
+        "Spreads evenly, because MongoDB hashes every shard key"
+      ],
+      "answer": 1,
+      "why": "Every new createdAt is above every stored one, so it lands in the chunk whose upper bound is MaxKey, on one shard. The balancer can move old chunks to other shards, but every new insert still lands in the top chunk, on one shard. MongoDB hashes only if you ask for a hashed shard key."
+    },
+    {
+      "q": "A Cassandra table has `PRIMARY KEY ((merchant_id), created_at)`. Which query has to ask every node?",
+      "options": [
+        "M-0042's payments since 09:00",
+        "The newest payment of M-0042",
+        "The number of M-0042's payments today",
+        "Every payment from 14:00 to 14:05, for all merchants"
+      ],
+      "answer": 3,
+      "why": "The partition key, merchant_id, is hashed to pick the node, and created_at only sorts rows inside one merchant's partition. Anything about one merchant reads one partition. A time range across merchants touches every partition, and those are scattered over every node."
+    },
+    {
+      "q": "Payments are hash-sharded by merchant id, and M-0042 sends 20% of all writes. You grow from 8 shards to 64 to fix it. What happens to the busiest shard compared with the average one?",
+      "options": [
+        "It falls to about 1/64 of the writes, so the skew is gone",
+        "Nothing changes: the skew stays at 1.6",
+        "M-0042's shard still takes at least 20%, so it goes from about 1.6 times the average to about 13 times",
+        "The hot merchant's writes split over the new shards automatically"
+      ],
+      "answer": 2,
+      "why": "One partition key always lands on one shard, so M-0042's shard keeps at least 20% of the writes. The average shard's share falls from 1/8 to 1/64, so the ratio goes from 0.2 / 0.125 = 1.6 to 0.2 / 0.0156 = 12.8. More shards dilute everything except the hot key."
+    },
+    {
+      "q": "Notion shards blocks by workspace ID rather than by block ID. What does that buy?",
+      "options": [
+        "Users almost always work inside one workspace, so a request's blocks are on one shard and joins stay local",
+        "Workspace IDs are sequential, so range scans over them are cheap",
+        "Block IDs aren't unique across workspaces",
+        "PostgreSQL can't index UUIDs, and workspace IDs aren't UUIDs"
+      ],
+      "answer": 0,
+      "why": "Every block belongs to exactly one workspace, and most requests stay inside one workspace, so sharding by workspace keeps a request on one shard. Workspace IDs are UUIDs, which spread evenly; block-level sharding would scatter one page's blocks over many shards."
+    },
+    {
+      "q": "A platform puts 2,000 merchants into 10 cells by a hash of the merchant id. One merchant sends 15% of all payments. A bad deploy breaks the cell it's in. Roughly what share of payments fail?",
+      "options": [
+        "10%: one cell in ten",
+        "15%: only the big merchant's payments",
+        "About 23%: the big merchant plus about a tenth of everyone else",
+        "Under 10%, because the big merchant has a cell to itself"
+      ],
+      "answer": 2,
+      "why": "A hash ignores size, so that cell holds the big merchant plus about a tenth of the other merchants: 15% + 0.1 x 85% = 23.5%. The cell count promises 10% only when tenants are similar in size. Placing the biggest tenants by size, in cells of their own, brings each cell's blast radius back near 10%."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does sharding fix that replication doesn't?",
+      "back": "Data size and write throughput: each shard stores and writes only its part. Replicas copy every row and every write, so they scale only reads."
+    },
+    {
+      "front": "Key-range sharding: what's cheap, and what's dangerous?",
+      "back": "Range scans over the key are cheap (one shard). A key that grows over time sends every insert to the last shard, and splitting only moves the hot spot."
+    },
+    {
+      "front": "Hash sharding: what does it give up?",
+      "back": "Range scans over the partition key. Neighbouring keys land on different shards, so a range has to ask every shard."
+    },
+    {
+      "front": "Why not `String.hashCode()` as a shard hash?",
+      "back": "It mixes badly: `pay-1`, `pay-2` and `pay-3` hash to consecutive numbers. Use a stable, well-mixed hash such as Murmur3 or MD5."
+    },
+    {
+      "front": "Does hashing fix a hot key?",
+      "back": "No. Every row with one partition key lands on one shard, whatever the hash."
+    },
+    {
+      "front": "What is a cell?",
+      "back": "A complete copy of the stack (services and storage) that serves a subset of tenants and shares nothing with other cells. A thin router maps tenants to cells, so a failure stays inside one cell."
+    },
+    {
+      "front": "What changed in ScyllaDB 2025.1?",
+      "back": "New keyspaces use tablets by default: per-table ranges of the hash space that split and merge by size and move between nodes, instead of fixed vnode ranges on a ring."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Shard",
+      "plain": "One part of a dataset that's been split over machines. Every row lives in exactly one shard. Also called a partition, range, region, chunk or tablet."
+    },
+    {
+      "term": "Partition key",
+      "plain": "The field or fields of a row that decide which shard it lives on, such as the merchant id."
+    },
+    {
+      "term": "Key-range sharding",
+      "plain": "Keys stay sorted, and each shard holds one unbroken stretch of them, between two boundaries."
+    },
+    {
+      "term": "Hash sharding",
+      "plain": "Each key is hashed to a number that looks random, and the shard is chosen from that number."
+    },
+    {
+      "term": "Skew",
+      "plain": "Some shards hold more data or get more requests than others, so adding shards adds less capacity than it should."
+    },
+    {
+      "term": "Hot spot",
+      "plain": "One shard with far more load than the rest, often caused by a time-ordered key or one very busy key."
+    },
+    {
+      "term": "Cell",
+      "plain": "A complete, independent copy of a service and its storage for a fixed set of tenants, behind a thin router."
+    },
+    {
+      "term": "Noisy neighbour",
+      "plain": "A tenant whose load slows down the other tenants that share its shard or cell."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate wants to shard the payments ledger by key range on `created_at`, so that month-end reports read one shard. Explain what will happen to inserts, propose a key, and say what your key gives up.",
+    "answer": "Range sharding keeps keys sorted and gives each shard one stretch of them. Every new payment has a later `created_at` than every stored row, so it falls past the last boundary onto the last shard. All inserts go to one machine while the others sit idle, and splitting that shard doesn't help, because the upper half of the split becomes the new last shard. I'd make the merchant id the partition key, hashed, and keep `created_at` as the sorted second part of the key. Inserts then spread over all shards, and one merchant's payments for any time range are one sorted run on one shard, which is what the merchant dashboard needs. What it gives up is the time range across all merchants: the month-end report and the five-minute settlement window now ask every shard. That's acceptable because they run rarely, and a report that heavy belongs on a copy of the data built for analytics anyway. Before we commit, check the biggest merchants against one shard's write capacity, because a hash can't split one hot key."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Designing Data-Intensive Applications, 2nd edition, chapter 7 (the chapter is now called Sharding; the first edition said Partitioning) adds a section on sharding for multitenancy that is worth reading after this lesson. Its list of benefits matches the one above, and it adds a quieter point: rolling out a schema migration tenant by tenant reduces risk but is hard to do transactionally.\n\nTwo production stories make a good pair. Notion's post on sharding Postgres explains why it rejected native table partitioning and routed in the application instead, and why it picked 480 logical shards (a number with many factors) rather than 512. Figma's post explains why it built its own proxy instead of moving to CockroachDB, TiDB, Spanner or Vitess, and how it sharded logically, with Postgres views over one database, before sharding physically.\n\nOn the product side, Vitess shards MySQL by key ranges you choose, and Citus (a PostgreSQL extension) offers both row-based sharding and, since Citus 12, schema-based sharding, which gives each tenant its own schema. ScyllaDB's tablets are the newest take on the hash-range idea: the 2025.1 announcement describes how tablets, together with Raft-managed topology, let you add several nodes at the same time.\n\nSharding is also used inside one machine. Redis, VoltDB and FoundationDB run one single-threaded process per core and shard the keys between them, so cores never contend for a lock."
+  },
+  "sources": [
+    {
+      "title": "Notion: Herding elephants, lessons learned from sharding Postgres at Notion",
+      "url": "https://www.notion.com/blog/sharding-postgres-at-notion"
+    },
+    {
+      "title": "Notion: The Great Re-shard, adding Postgres capacity (again) with zero downtime",
+      "url": "https://www.notion.com/blog/the-great-re-shard"
+    },
+    {
+      "title": "Figma: How Figma's databases team lived to tell the scale",
+      "url": "https://www.figma.com/blog/how-figmas-databases-team-lived-to-tell-the-scale/"
+    },
+    {
+      "title": "AWS Well-Architected Framework, REL10-BP03: use bulkhead architectures to limit scope of impact",
+      "url": "https://docs.aws.amazon.com/wellarchitected/latest/reliability-pillar/rel_fault_isolation_use_bulkhead.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 7 (Kleppmann and Riccomini)",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

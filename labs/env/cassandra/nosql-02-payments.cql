@@ -1,4 +1,4 @@
--- Lesson nosql-02: the payments access patterns as Cassandra tables, one table per query.
+-- Lesson model-02: the payments access patterns as Cassandra tables, one table per query.
 -- Load it with: cqlsh -f /sfz/nosql-02-payments.cql   (safe to run again)
 
 CREATE KEYSPACE IF NOT EXISTS payments

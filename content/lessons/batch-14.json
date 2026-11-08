@@ -1,0 +1,389 @@
+{
+  "id": "batch-14",
+  "title": "What batch output is for: ETL, ML features and serving data",
+  "minutes": 40,
+  "goal": "By the end you can explain why ETL became ELT and what dbt does, build a training set with a point-in-time join that never leaks future data, and get a batch job's output to the services that read it by building it offline and switching to it atomically instead of writing it row by row.",
+  "warmup": {
+    "q": "A fraud model is trained on October's payments. Each payment is joined to its card's \"chargebacks in the last 30 days\" from the feature table, using the card's newest row. Scored on that training set, a simple rule catches 98% of fraud. What should you expect in production?",
+    "options": [
+      "About 98%: same features, same rule",
+      "Clearly less: the newest rows counted chargebacks caused by the very payments being labelled, which production never sees in time",
+      "More than 98%, because production has more data",
+      "It depends only on which model you train"
+    ],
+    "answer": 1,
+    "why": "The newest feature row was computed after the labels' payments, and for a fraudulent payment it includes the chargeback that payment itself caused. The rule learned to recognize fraud by its own consequence. In production the chargeback doesn't exist yet at authorization time. In this lesson's demo the same rule catches 98% offline and 62% on an honest, point-in-time training set, which is what production gets."
+  },
+  "sections": [
+    {
+      "h": "ETL became ELT when warehouse compute became elastic",
+      "body": "Every batch job in this track reads input it never changes and writes a new output. This lesson is about where those outputs go. There are four common answers: tables reshaped for analysts, reports and aggregates, training data for machine learning, and data that a running service reads. The first two are about getting data in shape; the last two send it back into the live system, which is where most of the mistakes happen.\n\nStart with getting data in shape. A payments company's data lives in several systems: payments in the Oracle ledger, merchants in the onboarding service's PostgreSQL, disputes in a vendor's tool. Each is shaped for its own transactions. The warehouse of lesson 10 needs them joined, cleaned and reshaped into facts and dimensions.\n\nVersion 1 is **ETL**: extract from each system, transform in a separate tier of servers, load the result into the warehouse. The transform came first because warehouse compute was expensive: an appliance with a fixed number of machines, shared by everyone. It breaks on change. A new question needs a field the transform dropped, so an engineer has to change the upstream job and reload, and the raw data that would have answered it is gone. The Lakehouse paper (CIDR 2021) cites a survey in which 86% of analysts said they used out-of-date data and 62% waited on engineering several times a month.\n\nVersion 2 is **ELT**: load the raw data first, as it is, into the lake or the warehouse, and transform it there afterwards, with SQL. It became possible when cloud warehouses and lakehouses made compute elastic and storage cheap: keeping every raw column costs little, and a new transform runs on demand. The tool most teams use for the T is **dbt**. Each transformation is a file holding one `SELECT`, called a model. A model names its inputs with `ref('stg_payments')`, so dbt builds the DAG of models from those references and runs them in order, turning each `SELECT` into a table, a view, or an incremental `MERGE` that the warehouse executes. It adds tests (`unique`, `not_null`, relationships) that run after each build. dbt moves no data itself: getting the raw tables in is another tool's job (Fivetran, Airbyte, Kafka Connect, or Spark). dbt-core 1.12 is current. The same platforms also run the reverse trip, **reverse ETL**: pushing warehouse results back into operational tools such as a CRM.\n\nThe analytics outputs are the ones you've met: the star of lesson 10, and pre-aggregated tables and cubes from the Storage track's materialized-views lesson, refreshed on a schedule or loaded into a real-time analytics database such as Druid or Pinot for dashboards. The rest of this lesson follows the outputs that a running system consumes.",
+      "refs": [
+        {
+          "title": "Lakehouse: A New Generation of Open Platforms (CIDR 2021)",
+          "url": "https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "dbt-core on PyPI",
+          "url": "https://pypi.org/project/dbt-core/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Training data must be joined as of each label's time",
+      "body": "A fraud model learns from labels: past payments, each marked fraud or not once its chargeback arrived (or didn't), weeks later. It learns from features too: numbers about each payment's card and merchant, such as \"chargebacks on this card in the last 30 days\". At authorization time, in production, the model will see each feature as it was at that moment. So the training set must show it each feature as it was at each label's moment, too.\n\nVersion 1 joins every label to the feature table as it is now: one row per card, the newest value. That's the easy join, and it is wrong in a way no test catches. A payment from 10 October that turned out to be fraud caused a chargeback on 12 October, which the feature job counted from 13 October on. The newest row for that card says 1. Joined to the 10 October label, it tells the model that fraud comes with a chargeback already on file, which is true only because the fraud itself caused it. This is **label leakage**: information from after the decision reaching the training data. In the Try it, the rule \"flag the card if it has had a chargeback\" catches 98% of fraud when scored on the leaky training set, and 62% on the honest one. 62% is what production gets.\n\nVersion 2 is a **point-in-time join**. For each label at time t, take the feature row whose event time is the newest one at or before t. That fixes the leak above and misses a second one. Feature tables have two timestamps: the time a value is *about* (asOf, midnight for a nightly job) and the time it was *written* (computedAt, 02:00 that night, or days later for a correction or a backfill). A payment at 01:00 on 13 October could not have seen the 13 October row, written at 02:00. And a correction of 12 October written on 15 October did not exist for any payment before 15 October. So the rule is: the newest row with asOf at or before t and computedAt at or before t, no older than a time-to-live (TTL) after which the value counts as missing. The stepper applies it.\n\nFeature stores do this for you. Feast scans backward from each label's timestamp up to the feature's TTL, using the event timestamp by default; its documentation describes `filter_by_created_timestamp=True`, which also requires that the value was created by then, to keep backfilled values out of training data. SQL engines have it as a join type: DuckDB's `ASOF JOIN` matches each row to the nearest earlier one, and Spark 4.3 added `ASOF JOIN` behind a setting that is off by default. A feature store also keeps two copies of each feature, filled by the same code: an offline store of history in lakehouse tables, for training and backfills, and an online store of latest values in a key-value store, for serving. That online store is the next section's problem.",
+      "stepper": {
+        "title": "A point-in-time join on one card's timeline",
+        "intro": "Card 7's nightly feature rows and two of its payments. Each payment may only see rows that existed when it happened.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 1 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-b\" x=\"98.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"128.0\" y=\"192\" text-anchor=\"middle\">fraud</text><rect class=\"box\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">Each night at 02:00 a row is written, as of midnight. On 10</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">Oct at 14:00 the card is used for fraud.</text></svg>",
+            "say": "Every night at 02:00 the feature job writes a row for the card, as of midnight: the number of chargebacks in the previous 30 days. On 10 October at 14:00 the card is used for fraud. Its chargeback will arrive on 12 October and show up in the 13 October row."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 2 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-bad\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-b\" x=\"98.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"128.0\" y=\"192\" text-anchor=\"middle\">fraud</text><line class=\"ln-bad\" x1=\"128.0\" y1=\"170\" x2=\"594\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">The newest row says 1: the chargeback that this very fraud</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">caused. The model learns from the future.</text></svg>",
+            "say": "The easy join takes the card's **newest** row: 15 October, value 1. That 1 is the chargeback this fraud caused. The model learns that frauds come with a chargeback on file, a pattern it will never see at authorization time."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 3 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box-ok\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-b\" x=\"98.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"128.0\" y=\"192\" text-anchor=\"middle\">fraud</text><line class=\"ln-a\" x1=\"128.0\" y1=\"170\" x2=\"94\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">Point in time: the newest row whose asOf and computedAt are</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">both before 14:00 on 10 Oct. Value 0.</text></svg>",
+            "say": "The point-in-time join takes the newest row whose asOf and computedAt are both at or before 10 October 14:00: the 10 October row, value 0. That's what a model would have read at the moment of the payment."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 4 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box-ok\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box-dim\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"420\" y=\"112\" text-anchor=\"start\">written 02:00</text><rect class=\"box-b\" x=\"344.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"374.0\" y=\"192\" text-anchor=\"middle\">ok</text><line class=\"ln-a\" x1=\"374.0\" y1=\"170\" x2=\"294\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">A payment on 13 Oct at 01:00. The 13 Oct row is in the table</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">now, but it was written at 02:00: skip it.</text></svg>",
+            "say": "A payment on 13 October at 01:00. The 13 October row is in the table today and its asOf, midnight, is earlier, but it was only written at 02:00. The join skips it and takes the 12 October row."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 5 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box-ok\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-dim\" x=\"274\" y=\"120\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"141\" text-anchor=\"middle\">1</text><line class=\"ln-d\" x1=\"314\" y1=\"136\" x2=\"570\" y2=\"136\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"470\" y=\"158\" text-anchor=\"middle\">correction of 12 Oct, written 15 Oct</text><rect class=\"box-b\" x=\"344.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"374.0\" y=\"192\" text-anchor=\"middle\">ok</text><line class=\"ln-a\" x1=\"374.0\" y1=\"170\" x2=\"294\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">On 15 Oct a correction of 12 Oct is written. The 13 Oct</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">payment still gets 0: the fix came later.</text></svg>",
+            "say": "On 15 October the team recomputes 12 October after a late chargeback report and writes a correction, value 1. The 13 October payment still gets 0: its asOf is old, but its computedAt is after the payment. This is the leak Feast's created-timestamp filter closes."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Point-in-time join, step 6 of 6: one card's nightly feature rows on a timeline and the row each label is joined to\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">card 7: the nightly feature 'chargebacks in the last 30 days', and its payments</text><line class=\"ln\" x1=\"50\" y1=\"226\" x2=\"610\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"70\" y1=\"220\" x2=\"70\" y2=\"232\"/><text class=\"t-s t-m\" x=\"70\" y=\"250\" text-anchor=\"middle\">10 Oct</text><line class=\"ln\" x1=\"170\" y1=\"220\" x2=\"170\" y2=\"232\"/><text class=\"t-s t-m\" x=\"170\" y=\"250\" text-anchor=\"middle\">11 Oct</text><line class=\"ln\" x1=\"270\" y1=\"220\" x2=\"270\" y2=\"232\"/><text class=\"t-s t-m\" x=\"270\" y=\"250\" text-anchor=\"middle\">12 Oct</text><line class=\"ln\" x1=\"370\" y1=\"220\" x2=\"370\" y2=\"232\"/><text class=\"t-s t-m\" x=\"370\" y=\"250\" text-anchor=\"middle\">13 Oct</text><line class=\"ln\" x1=\"470\" y1=\"220\" x2=\"470\" y2=\"232\"/><text class=\"t-s t-m\" x=\"470\" y=\"250\" text-anchor=\"middle\">14 Oct</text><line class=\"ln\" x1=\"570\" y1=\"220\" x2=\"570\" y2=\"232\"/><text class=\"t-s t-m\" x=\"570\" y=\"250\" text-anchor=\"middle\">15 Oct</text><text class=\"t-s t-m\" x=\"20\" y=\"84\" text-anchor=\"start\">rows</text><text class=\"t-s t-m\" x=\"20\" y=\"194\" text-anchor=\"start\">labels</text><rect class=\"box-ok\" x=\"74\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"94\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"174\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"194\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box-ok\" x=\"274\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"83\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"374\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"394\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"474\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"494\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"574\" y=\"62\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"594\" y=\"83\" text-anchor=\"middle\">1</text><rect class=\"box-dim\" x=\"274\" y=\"120\" width=\"40\" height=\"32\" rx=\"8\"/><text class=\"t-code\" x=\"294\" y=\"141\" text-anchor=\"middle\">1</text><line class=\"ln-d\" x1=\"314\" y1=\"136\" x2=\"570\" y2=\"136\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"470\" y=\"158\" text-anchor=\"middle\">correction of 12 Oct, written 15 Oct</text><rect class=\"box-b\" x=\"98.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"128.0\" y=\"192\" text-anchor=\"middle\">fraud</text><rect class=\"box-b\" x=\"344.0\" y=\"170\" width=\"60\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"374.0\" y=\"192\" text-anchor=\"middle\">ok</text><line class=\"ln-a\" x1=\"128.0\" y1=\"170\" x2=\"94\" y2=\"96\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"374.0\" y1=\"170\" x2=\"294\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"20\" y=\"264\" width=\"640\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"285\" text-anchor=\"middle\">In production the model reads exactly these rows, so a</text><text class=\"t-s\" x=\"340\" y=\"303\" text-anchor=\"middle\">model trained on them is scored honestly.</text></svg>",
+            "say": "In production, the model reads the newest value that has been written at the moment it decides: exactly what this join gives. Train on these rows and the score you measure offline is the score you get live."
+          }
+        ]
+      },
+      "try": {
+        "title": "Score a rule on a leaky and an honest training set",
+        "minutes": 4,
+        "steps": [
+          "Run `PointInTimeDemo`. It generates a month of payments on 5,000 cards, 5% of them compromised at some point, and the nightly chargeback feature. It builds the training set twice and scores the rule \"flag the payment if the card has had a chargeback\" on each.",
+          "Before reading: which training set makes the rule look better, and on which measure?",
+          "Why do the last two lines agree exactly?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "PointInTimeDemo.kt",
+          "src": "package sfz.batch.l14.demo\n\nimport java.time.Duration\nimport java.time.Instant\nimport kotlin.random.Random\n\n/**\n * A month of card payments with fraud labels, and the feature \"chargebacks on this card in the\n * last 30 days\", computed every night. The training set is built twice: once with each card's\n * newest feature value, once point in time. Then a one-line rule, \"flag the payment if the card\n * has had a chargeback\", is scored on both, and on what it would really see in production.\n */\nprivate data class Label(val card: Int, val at: Instant, val fraud: Boolean)\nprivate data class Row(val card: Int, val asOf: Instant, val computedAt: Instant, val value: Int)\n\nfun main() {\n    val start = Instant.parse(\"2026-10-01T00:00:00Z\")\n    val rnd = Random(11)\n    val labels = mutableListOf<Label>()\n    val chargebacks = mutableListOf<Pair<Int, Instant>>()\n    for (card in 0 until 5_000) {\n        val compromisedFrom = if (rnd.nextDouble() < 0.05) 3 + rnd.nextInt(24) else Int.MAX_VALUE\n        for (d in 0 until 30) {\n            val at = start.plus(Duration.ofDays(d.toLong())).plusSeconds(rnd.nextLong(86_400))\n            val fraud = d >= compromisedFrom && rnd.nextDouble() < 0.6\n            labels += Label(card, at, fraud)\n            if (fraud) chargebacks += card to at.plus(Duration.ofHours(48 + rnd.nextLong(144)))\n            else if (rnd.nextDouble() < 0.003) chargebacks += card to at.plus(Duration.ofHours(120 + rnd.nextLong(360)))\n        }\n    }\n    val byCard = chargebacks.groupBy({ it.first }, { it.second })\n    val rows = (0 until 5_000).flatMap { card ->\n        (0..30).map { d ->\n            val asOf = start.plus(Duration.ofDays(d.toLong()))\n            Row(card, asOf, asOf.plus(Duration.ofHours(2)), byCard[card].orEmpty().count { it < asOf && it >= asOf.minus(Duration.ofDays(30)) })\n        }\n    }\n    val history = rows.groupBy { it.card }.mapValues { (_, r) -> r.sortedBy { it.asOf } }\n\n    val newest = labels.map { l -> l to history.getValue(l.card).last() }\n    val pointInTime = labels.map { l -> l to history.getValue(l.card).lastOrNull { it.asOf <= l.at && it.computedAt <= l.at } }\n    println(\"labels: %,d payments, %,d of them fraud; feature rows: %,d\".format(labels.size, labels.count { it.fraud }, rows.size))\n    println(\"newest-row join:    %,d labels got a value computed after the payment\".format(newest.count { (l, r) -> r.computedAt > l.at }))\n    println(\"point-in-time join: %,d\".format(pointInTime.count { (l, r) -> r != null && r.computedAt > l.at }))\n\n    fun score(name: String, set: List<Pair<Label, Row?>>) {\n        val flagged = set.filter { (_, r) -> (r?.value ?: 0) >= 1 }\n        val caught = flagged.count { it.first.fraud }\n        println(\"%-38s flags %,6d payments: precision %3.0f%%, recall %3.0f%%\".format(name, flagged.size,\n            100.0 * caught / flagged.size, 100.0 * caught / labels.count { it.fraud }))\n    }\n    println(\"the rule \\\"the card has had a chargeback in the last 30 days\\\":\")\n    score(\"  trained on the newest-row join\", newest)\n    score(\"  trained on the point-in-time join\", pointInTime)\n    score(\"  in production (what it can see live)\", pointInTime)\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l14.demo.PointInTimeDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l14/demo/PointInTimeDemo.kt"
+        },
+        "expect": "```text\nlabels: 150,000 payments, 2,378 of them fraud; feature rows: 155,000\nnewest-row join:    150,000 labels got a value computed after the payment\npoint-in-time join: 0\nthe rule \"the card has had a chargeback in the last 30 days\":\n  trained on the newest-row join       flags 15,000 payments: precision  16%, recall  98%\n  trained on the point-in-time join    flags  4,690 payments: precision  31%, recall  62%\n  in production (what it can see live) flags  4,690 payments: precision  31%, recall  62%\n```\n\nThe newest feature row for every card is the one computed after the month ended, so all 150,000 labels got a value from their future. Scored on that leaky set, the rule seems to catch 98% of fraud (recall): nearly every fraud's own chargeback is already in its feature. On the point-in-time set it catches 62%, because a card's first fraudulent payments happen before any chargeback exists. In production the model reads exactly what the point-in-time join gave it, which is why the last two lines match: only the honest training set predicts what production will do. The data is generated from a fixed seed, so you get the same numbers."
+      },
+      "refs": [
+        {
+          "title": "Feast: point-in-time joins",
+          "url": "https://docs.feast.dev/getting-started/concepts/point-in-time-joins",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Don't write a batch job's output into a live database row by row",
+      "body": "Tonight's batch job has scored 1,000,000 merchants for risk, and the authorization service needs the scores by morning. The tempting design: each task of the job writes its rows straight into the production database, `UPDATE merchant_risk SET score = ? WHERE merchant_id = ?`, one row at a time, as it goes.\n\nIt breaks three ways. The first is throughput. A database round trip from a batch cluster costs about a millisecond or two, so take 2 ms, a pool of 20 connections, and 50 million card scores: 50,000,000 / 20 x 2 ms is 5,000 seconds, almost an hour and a half of the database's capacity, during which live authorizations compete with the batch writes. Give the job 200 tasks with their own connections and it can take the database down. The second is what readers see. While the job runs, half the rows hold tonight's scores and half hold yesterday's, and a service that reads several of them gets a mix that no run ever produced; in the Try it, a reader caught 568 new and 432 old scores in one sample. The third is failure. Batch jobs are all or nothing (lesson 13), and these writes aren't: a job that dies halfway leaves half the table updated, and its retry writes everything again.\n\nThere are two better designs. The first publishes through a log: the job writes its output to a Kafka topic, and the serving systems consume it at their own pace. Elasticsearch, Pinot, Druid, Venice and ClickHouse can all ingest from Kafka. The log absorbs the burst and lets several stores read the same output. All or nothing still needs one more message: a \"run complete\" marker, with consumers keeping the new run out of sight until it arrives.\n\nThe second builds the whole store inside the batch job, as files, and hands the files over at once: a **bulk load**. RocksDB, the LSM-tree engine from the Storage track, has an API for exactly this. `SstFileWriter` writes a sorted SST file offline, and it only accepts keys in strictly increasing order. `IngestExternalFile` then copies or links the file into the database. It blocks writes for a moment to give the whole file one global sequence number, flushes the memtable first if their key ranges overlap, puts the file in the lowest LSM level where it overlaps nothing, and resumes writes. The data skips the write-ahead log, the memtable and every compaction a million puts would have caused. Google's web index was built the same way, by 5 to 10 MapReduce passes over more than 20 TB of crawled pages; so are Pinot's segments when a Hadoop or Spark job builds them, and TiDB Lightning's imports. In the Try it, writing a sorted file of 1,000,000 scores took 67 ms, and nobody could see it until it was finished.",
+      "try": {
+        "title": "Update a live store in place, or build and switch",
+        "minutes": 3,
+        "steps": [
+          "Run `BulkLoadDemo`. It overwrites 1,000,000 merchant scores in a live map one by one while a reader samples 1,000 of them every 20 ms. Then it writes the same scores as a sorted file in a new folder and switches a pointer to it.",
+          "Predict what the reader sees halfway through the in-place update.",
+          "What would change if each in-place write were a 2 ms database round trip instead of a map update?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "BulkLoadDemo.kt",
+          "src": "package sfz.batch.l14.demo\n\nimport java.io.File\nimport java.nio.file.Files\nimport java.nio.file.StandardCopyOption\nimport java.util.concurrent.ConcurrentHashMap\nimport java.util.concurrent.atomic.AtomicBoolean\nimport kotlin.concurrent.thread\nimport kotlin.random.Random\n\n/**\n * Last night's batch job scored 1,000,000 merchants again. Two ways to get the new scores to the\n * service that reads them: write them one by one into the live store while it serves, or build a\n * new read-only file offline and switch to it in one step. A reader samples 1,000 merchants while\n * each runs.\n */\nfun main() {\n    val n = 1_000_000\n    val keys = Array(n) { \"merchant-%07d\".format(it) }\n    val pick = Random(1)\n    val sample = (0 until 1_000).map { keys[pick.nextInt(n)] }\n\n    // 1. row by row into the live store, in the order the job's tasks happen to finish\n    val live = ConcurrentHashMap<String, String>(n * 2)\n    keys.forEach { live[it] = \"run-1\" }\n    val seen = mutableListOf<Int>()\n    val writing = AtomicBoolean(true)\n    val reader = thread {\n        while (writing.get()) {\n            seen += sample.count { live[it] == \"run-2\" }\n            Thread.sleep(20)\n        }\n    }\n    val t0 = System.nanoTime()\n    for (i in keys.indices.shuffled(Random(2))) live[keys[i]] = \"run-2\"\n    writing.set(false)\n    reader.join()\n    val inPlaceMs = (System.nanoTime() - t0) / 1e6\n    val mixed = seen.filter { it in 1..999 }\n    println(\"in place: %,d writes in %.0f ms; the reader looked %d times while it ran, and %d of those reads mixed both runs\".format(\n        n, inPlaceMs, seen.size, mixed.size))\n    if (mixed.isNotEmpty()) println(\"  for example, %d of the 1,000 sampled merchants had new scores and %d still had old ones\".format(mixed[mixed.size / 2], 1_000 - mixed[mixed.size / 2]))\n\n    // 2. offline: write a sorted file in a new folder, then flip a pointer\n    val root = File(\"build/l14/scores\").apply { deleteRecursively(); mkdirs() }\n    val t1 = System.nanoTime()\n    val v2 = File(root, \"v2\").apply { mkdirs() }\n    File(v2, \"data\").bufferedWriter().use { w -> for (k in keys.sorted()) { w.write(k); w.write(\"\\trun-2\\n\") } }\n    val buildMs = (System.nanoTime() - t1) / 1e6\n    val tmp = File(root, \"CURRENT.tmp\").apply { writeText(\"v2\") }\n    val t2 = System.nanoTime()\n    Files.move(tmp.toPath(), File(root, \"CURRENT\").toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)\n    val swapUs = (System.nanoTime() - t2) / 1e3\n    println(\"offline: built a sorted file of %,d entries (%.1f MB) in %.0f ms, which no reader could see;\".format(\n        n, File(v2, \"data\").length() / 1e6, buildMs))\n    println(\"  then the switch took %.0f microseconds: a reader sees run 1 or run 2, never both\".format(swapUs))\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l14.demo.BulkLoadDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l14/demo/BulkLoadDemo.kt"
+        },
+        "expect": "```text\nin place: 1,000,000 writes in 226 ms; the reader looked 8 times while it ran, and 6 of those reads mixed both runs\n  for example, 568 of the 1,000 sampled merchants had new scores and 432 still had old ones\noffline: built a sorted file of 1,000,000 entries (23.0 MB) in 67 ms, which no reader could see;\n  then the switch took 720 microseconds: a reader sees run 1 or run 2, never both\n```\n\nThe in-place writes here go to an in-memory map, which is far faster than a database over a network (226 ms for a million writes instead of an hour), and even so most of the reader's samples mixed two runs of the model. With a real database the mixed window lasts as long as the whole load. The offline build wrote a sorted file nobody could read until it was done, and switching to it was one rename. Times vary with your machine; the mixed reads come from the threads' timing, so your counts will differ."
+      },
+      "refs": [
+        {
+          "title": "RocksDB wiki: creating and ingesting SST files",
+          "url": "https://github.com/facebook/rocksdb/wiki/Creating-and-Ingesting-SST-files",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Outputs never change, and switching versions is one atomic step",
+      "body": "A bulk-built store still has to replace yesterday's. Copying the new file over the old one in place brings back both problems of the last section: a reader during the copy reads half of each, and a crash in the middle leaves a broken store. The fix is the one this track keeps arriving at.\n\nNever change a published output. Each run writes a new version in a new place: `v41/`, `v42/`, `v43/`. Nobody reads a version until it is complete. One small mutable thing, a **pointer**, names the live version: a `CURRENT` file, a symbolic link, a row in a catalog, an alias in a search cluster. Publishing a version is one atomic replacement of that pointer. On a single file system that's a rename: write `CURRENT.tmp`, then rename it over `CURRENT`. POSIX's `rename` replaces the target in one step, so every reader finds either the old name or the new one, never a missing or half-written file. A reader reads the pointer once, then opens that version and keeps it for the whole request.\n\nWhat you get for free:\n\n- A crashed build is a folder nobody points at. The live version keeps serving, and the folder is deleted later.\n- A bad build is one publish away from being undone: publish the previous version again. It was never modified, so rolling back is instant and exact.\n- Clean-up is safe by rule: delete only versions that nothing points at and no reader still holds.\n\nYou've seen this design before. An Iceberg commit (lesson 11) writes new files where no reader looks, then swaps the table's metadata pointer in one compare-and-swap. RocksDB keeps its own `CURRENT` file naming the live manifest. Elasticsearch and OpenSearch let you switch an alias from the old index to the new one in one request. Designing Data-Intensive Applications calls the batch half of the idea human fault tolerance: if the output is wrong, fix the code and run again, and the old output was never destroyed. The pointer flip brings that to serving.\n\nIn the Try it, night 1 publishes v1. Night 2's build crashes after 400 of 1,000 lines, and readers never notice. Night 3 publishes v3 with a bug that sets every score to 0, and the rollback to v1 is a single publish.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 290\" role=\"img\" aria-label=\"A serving store with version folders v1 to v4 and a CURRENT file pointing at v3; v2 crashed and v4 is still being built\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"130\" height=\"76\" rx=\"8\"/><text class=\"t-code\" x=\"85.0\" y=\"74.0\" text-anchor=\"middle\">CURRENT</text><text class=\"t-s t-code\" x=\"85.0\" y=\"92.0\" text-anchor=\"middle\">\"v3\"</text><rect class=\"box\" x=\"175\" y=\"140\" width=\"112\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"231.0\" y=\"165.0\" text-anchor=\"middle\">v1/data</text><text class=\"t-s t-m\" x=\"231.0\" y=\"183.0\" text-anchor=\"middle\">1,000 lines</text><text class=\"t-s t-m\" x=\"231.0\" y=\"201.0\" text-anchor=\"middle\">old</text><rect class=\"box-dim\" x=\"297\" y=\"140\" width=\"112\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"353.0\" y=\"165.0\" text-anchor=\"middle\">v2/data</text><text class=\"t-s t-m\" x=\"353.0\" y=\"183.0\" text-anchor=\"middle\">400 lines</text><text class=\"t-s t-m\" x=\"353.0\" y=\"201.0\" text-anchor=\"middle\">crashed</text><rect class=\"box-ok\" x=\"419\" y=\"140\" width=\"112\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"475.0\" y=\"165.0\" text-anchor=\"middle\">v3/data</text><text class=\"t-s t-m\" x=\"475.0\" y=\"183.0\" text-anchor=\"middle\">1,000 lines</text><text class=\"t-s t-m\" x=\"475.0\" y=\"201.0\" text-anchor=\"middle\">live</text><rect class=\"box-dim\" x=\"541\" y=\"140\" width=\"112\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"597.0\" y=\"165.0\" text-anchor=\"middle\">v4/data</text><text class=\"t-s t-m\" x=\"597.0\" y=\"183.0\" text-anchor=\"middle\">being built</text><text class=\"t-s t-m\" x=\"597.0\" y=\"201.0\" text-anchor=\"middle\">not live</text><path class=\"ln-a\" d=\"M150 78 H475 V136\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"310\" y=\"64\" text-anchor=\"middle\">readers follow the pointer, then read one immutable file</text><text class=\"t-s\" x=\"340\" y=\"250\" text-anchor=\"middle\">publish: write CURRENT.tmp, then rename it over CURRENT, in one atomic step</text><text class=\"t-s t-m\" x=\"340\" y=\"274\" text-anchor=\"middle\">rollback: publish an older version again. Clean-up: delete what nothing points at.</text></svg>",
+        "caption": "A store built by a nightly job: one folder per build, never modified, and a CURRENT pointer that one rename moves from version to version."
+      },
+      "try": {
+        "title": "Three nights of builds: a good one, a crash and a bad one",
+        "minutes": 3,
+        "steps": [
+          "Run `SwapDemo`. Night 1 builds and publishes v1. Night 2's build dies after 400 lines. Night 3 publishes v3, which has a bug, and then v1 is published again.",
+          "After night 2, predict what a reader gets for merchant 42.",
+          "List the folders at the end. Which can a clean-up job delete right now?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SwapDemo.kt",
+          "src": "package sfz.batch.l14.demo\n\nimport java.io.File\nimport java.nio.file.Files\nimport java.nio.file.StandardCopyOption\n\n/**\n * Three nights of a serving store built by a batch job: a good build, a build that crashes\n * halfway, and a build with bad scores that is published and then rolled back. Prints the folder\n * and what a reader gets after each step.\n */\nfun main() {\n    val root = File(\"build/l14/store\").apply { deleteRecursively(); mkdirs() }\n    val current = File(root, \"CURRENT\")\n    fun publish(v: String) {\n        val tmp = File(root, \"CURRENT.tmp\").apply { writeText(v) }\n        Files.move(tmp.toPath(), current.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)\n    }\n    fun build(v: String, score: Int, crashAfter: Int = Int.MAX_VALUE) {\n        val dir = File(root, v).apply { mkdirs() }\n        File(dir, \"data\").bufferedWriter().use { w ->\n            for (m in 0 until 1_000) {\n                if (m == crashAfter) throw IllegalStateException(\"executor lost while writing $v\")\n                w.write(\"merchant-%04d\\t$score\\n\".format(m))\n            }\n        }\n    }\n    fun read(): String {\n        val v = current.readText()\n        val line = File(root, \"$v/data\").readLines().first { it.startsWith(\"merchant-0042\\t\") }\n        return \"CURRENT=$v, merchant-0042 scores ${line.substringAfter('\\t')}\"\n    }\n    fun show(step: String) {\n        val folders = root.list()!!.filter { it.startsWith(\"v\") }.sorted().joinToString { v ->\n            \"$v (${File(root, \"$v/data\").readLines().size} lines)\"\n        }\n        println(\"$step\\n  folders: $folders\\n  a reader: ${read()}\")\n    }\n\n    build(\"v1\", 17); publish(\"v1\"); show(\"night 1: build v1, publish\")\n    runCatching { build(\"v2\", 18, crashAfter = 400) }.onFailure { println(\"night 2: the build failed: ${it.message}\") }\n    show(\"  nothing was published\")\n    build(\"v3\", 0); publish(\"v3\"); show(\"night 3: build v3 with a bug (every score 0), publish\")\n    publish(\"v1\"); show(\"rollback: publish v1 again\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l14.demo.SwapDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l14/demo/SwapDemo.kt"
+        },
+        "expect": "```text\nnight 1: build v1, publish\n  folders: v1 (1000 lines)\n  a reader: CURRENT=v1, merchant-0042 scores 17\nnight 2: the build failed: executor lost while writing v2\n  nothing was published\n  folders: v1 (1000 lines), v2 (400 lines)\n  a reader: CURRENT=v1, merchant-0042 scores 17\nnight 3: build v3 with a bug (every score 0), publish\n  folders: v1 (1000 lines), v2 (400 lines), v3 (1000 lines)\n  a reader: CURRENT=v3, merchant-0042 scores 0\nrollback: publish v1 again\n  folders: v1 (1000 lines), v2 (400 lines), v3 (1000 lines)\n  a reader: CURRENT=v1, merchant-0042 scores 17\n```\n\nThe failed build left a 400-line `v2` that no pointer names, so readers kept getting v1 and nothing had to be repaired. The buggy v3 went live, as bad builds sometimes do, and undoing it was one more publish of v1, which nobody had touched. A clean-up job would now delete v2 and, once nobody reads it, v3. The folders are under `labs/sim/build/l14/store` if you want to look."
+      },
+      "refs": [
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition, chapter 11: serving derived data",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A batch job's output is like a printed timetable for a railway. You don't walk along the platforms crossing out departure times one by one while passengers read them: halfway through, half the boards show the old timetable and half the new, and a passenger connecting between two trains is in trouble. You print the whole new timetable in the back office, check it, and on the night of the change the station swaps every board at once; if the new one has an error, the old one is still in the drawer. Training data is the same idea backwards in time: to judge whether a passenger could have caught a train, you use the timetable that was on the board that day, not today's. The analogy breaks at the swap: a station needs a night and a crew, while a pointer flip in a file system or a catalog takes microseconds and every reader sees it at the same instant.",
+  "in_your_world": "Your authorization service probably already reads something a batch job produced: merchant risk tiers, card velocity limits, BIN tables, FX rates. Look at how it gets there. If a Spark job or a Temporal activity loops over rows and calls `UPDATE` on the Oracle tables the authorizer reads, every night has a window when half the merchants carry tonight's tier and half last night's, and a failed run leaves it that way. Build the table offline instead: write tonight's version under a new name (a new table or partition, or a RocksDB or Redis snapshot built by the job), check row counts and a few known merchants, then switch the pointer the service reads (a synonym in Oracle, a view, a config value, a key in Redis) in one step. Keep last night's version until tomorrow's has run cleanly, and rolling back a bad model is one statement. For the fraud team's training sets, ask one question: does each label's feature come from a row that existed at the payment's time, by both its event time and its write time?",
+  "mistake": "The common mistake is building training data with a plain join to the current feature table, because that's the table that exists and the join is one line. Nothing fails: the model trains, the offline metrics look excellent, and it underperforms in production for reasons nobody can find, because the training rows contained information from after each decision. It hides even better when the leak comes from a backfill or a correction, which have old event times and new write times. The fix is to keep feature history with both timestamps and to join point in time: the newest row whose event time and write time are both at or before the label's time, within a TTL. Use your feature store's historical retrieval or an ASOF or LATERAL join, and add a check to the pipeline that counts rows whose feature was written after their label.",
+  "compare": {
+    "title": "Getting tonight's scores to the service",
+    "a": {
+      "label": "Row by row into the live database",
+      "lang": "kotlin",
+      "title": "each task writes as it goes",
+      "src": "scores.foreachPartition { rows ->\n    pool.connection.use { c ->\n        val ps = c.prepareStatement(\"UPDATE merchant_risk SET score = ? WHERE merchant_id = ?\")\n        rows.forEach { r ->\n            ps.setDouble(1, r.score); ps.setLong(2, r.merchantId)\n            ps.executeUpdate()          // one round trip per row, visible at once\n        }\n    }\n}"
+    },
+    "b": {
+      "label": "Build offline, then switch",
+      "lang": "kotlin",
+      "title": "one new version, one pointer flip",
+      "src": "val version = \"v$runId\"\nscores.orderBy(\"merchant_id\").write().parquet(\"$root/$version\")   // nobody reads it yet\ncheck(spark.read().parquet(\"$root/$version\").count() == expected)\nval tmp = Files.writeString(Path.of(root, \"CURRENT.tmp\"), version)\nFiles.move(tmp, Path.of(root, \"CURRENT\"), ATOMIC_MOVE)   // every reader switches at once\n// rollback: publish the previous version again"
+    },
+    "note": "The left side spends one database round trip per row, competes with live traffic for the whole load, shows readers a mix of two runs, and leaves half the table updated if the job dies. The right side writes sequentially to files nobody reads, can be checked before anyone sees it, and becomes visible in one step that is also its rollback. The `Files.move` with `ATOMIC_MOVE` on the right is the publish the lab implements."
+  },
+  "worked": {
+    "title": "Ship tonight's merchant risk scores as a RocksDB snapshot",
+    "steps": [
+      {
+        "say": "Compute the scores as of the run's logical date, so a rerun produces the same file. Sort by key: an SST file only accepts keys in strictly increasing order, and the sort is cheap inside the batch job.",
+        "code": "val scores = spark.table(\"features.merchant_daily\")\n    .where(col(\"as_of\").equalTo(lit(logicalDate)))\n    .select(col(\"merchant_id\"), scoreExpression.alias(\"score\"))\n    .orderBy(\"merchant_id\")",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Write the sorted rows into an SST file with RocksJava's `SstFileWriter`. `finish()` writes the file's index and footer; until then the file is not a valid table.",
+        "code": "// key(): the id as 8 big-endian bytes, so byte order is numeric order; value(): the score as bytes\nOptions().use { opts ->\n    SstFileWriter(EnvOptions(), opts).use { w ->\n        w.open(\"$root/v$runId/scores.sst\")\n        for (row in scores.toLocalIterator()) {\n            w.put(key(row.getLong(0)), value(row.getDouble(1)))   // keys must strictly increase\n        }\n        w.finish()\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Ingest it into a fresh database directory for this version. RocksDB places the file directly into the LSM tree, with no write-ahead log, memtable or compaction for its data.",
+        "code": "RocksDB.open(Options().setCreateIfMissing(true), \"$root/v$runId/db\").use { db ->\n    IngestExternalFileOptions().use { io ->\n        db.ingestExternalFile(listOf(\"$root/v$runId/scores.sst\"), io)\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Check the new version before anyone reads it, then publish it by replacing the pointer in one atomic step. The service reads `CURRENT` per request (or watches it) and opens that version read-only.",
+        "code": "RocksDB.openReadOnly(Options(), \"$root/v$runId/db\").use { db ->\n    check(knownMerchants.all { db.get(key(it)) != null })     // spot-check before anyone reads it\n}\nval tmp = Files.writeString(root.resolve(\"CURRENT.tmp\"), \"v$runId\")\nFiles.move(tmp, root.resolve(\"CURRENT\"), StandardCopyOption.ATOMIC_MOVE)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Keep the previous version until the new one has served a full day. If the scores turn out wrong, rolling back is the same publish with the old name; delete versions only when nothing points at them.",
+        "code": "publish(\"v${runId - 1}\")                       // rollback\ndeleteVersionsOlderThan(keep = 2)          // clean-up, never the live one",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A training set without leaks, and a store you can swap",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/batch/l14/FraudData.kt",
+      "labs/sim/src/main/kotlin/sfz/batch/l14/ServingStore.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.batch.l14.*'",
+    "steps": [
+      "Run the tests. All eight fail on `TODO`s. Read `FraudData.kt`: labels, feature rows with both `asOf` and `computedAt`, the given `latestJoin` that leaks, and `leaks`, which counts rows whose feature didn't exist yet at the label's time.",
+      "Exercise 1, `TrainingSet.pointInTimeJoin`: for each label, the newest row of its card with `asOf` and `computedAt` at or before the label's time, no older than the TTL; on a tie of `asOf`, the later `computedAt`. `PointInTimeTest` checks hand-built cases first, then a month of data for 500 cards against a slow brute-force scan.",
+      "Exercise 2, `ServingStore.build`: refuse duplicate keys before creating anything, then write the sorted entries to the next version folder. Never touch `CURRENT`.",
+      "Exercise 3, `publish`, `current` and `open`: write the version's name to a temporary file and move it over `CURRENT` with `ATOMIC_MOVE`; read `CURRENT` once and open that version's file.",
+      "Run until all eight pass. The last test runs three reader threads while 29 versions are published; a publish that deletes `CURRENT` first, or writes it in place, fails it sooner or later."
+    ],
+    "hints": [
+      "Group the rows by card and sort each group with `compareBy({ it.asOf }, { it.computedAt })`. Binary-search the first row with `asOf` after the label, then walk back until a row has `computedAt <= label.at`, stopping when `asOf` is older than `label.at.minus(ttl)`.",
+      "Next version: list `root`, keep names matching `v\\d+`, and take one more than the highest (or `v1`). Check duplicates on the sorted list: equal keys are neighbours.",
+      "`Files.createTempFile(root, \"CURRENT\", \".tmp\")`, `Files.writeString(tmp, version)`, then `Files.move(tmp, root.resolve(\"CURRENT\"), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)`. Keep the temporary file in `root`: an atomic move only works within one file system."
+    ],
+    "done_when": "All eight tests in `PointInTimeTest` and `ServingStoreTest` pass."
+  },
+  "drill": {
+    "title": "A point-in-time join in SQL",
+    "minutes": 4,
+    "prompt": "From memory, write SQL that gives each row of `labels(payment_id, card_id, at, fraud)` the value from `card_features(card_id, as_of, computed_at, value)` that a model could have read at `at`: the newest row by `as_of` with both timestamps at or before `at`, at most 2 days old, or NULL if there is none.",
+    "answer": {
+      "lang": "sql",
+      "src": "SELECT l.payment_id, l.fraud, f.value\nFROM labels l\nLEFT JOIN LATERAL (\n    SELECT value\n    FROM card_features f\n    WHERE f.card_id = l.card_id\n      AND f.as_of <= l.at                        -- about the past\n      AND f.computed_at <= l.at                  -- and already written then\n      AND f.as_of >= l.at - INTERVAL '2 days'    -- the TTL\n    ORDER BY f.as_of DESC, f.computed_at DESC\n    LIMIT 1\n) f ON true;\n\n-- DuckDB's ASOF JOIN matches on as_of alone (ON l.card_id = f.card_id AND l.at >= f.as_of);\n-- filter out rows written later than their label separately, or corrections will leak"
+    }
+  },
+  "recap": [
+    "ETL transformed data before loading it because warehouse compute was scarce; ELT loads raw data first and transforms it inside the warehouse with SQL, and dbt manages those SQL models as a DAG with tests. dbt moves no data itself.",
+    "Training data must be point in time: each label gets the newest feature row whose event time and write time are both at or before the label's time, within a TTL. A plain join to current features leaks the future, and the model looks better offline than it will ever be live.",
+    "Feature stores keep an offline history for training and an online store of latest values for serving, filled by the same code; Feast's historical retrieval, DuckDB's ASOF JOIN and Spark 4.3's ASOF JOIN do the point-in-time part.",
+    "Don't write batch output into a live database row by row: it costs a round trip per row, shows readers a mix of two runs, and leaves half a table on failure. Publish through Kafka with a completion marker, or build the store offline and bulk-load it (RocksDB SST ingestion, index segments).",
+    "Never modify a published output. Write each run as a new version, and publish by replacing one pointer atomically; a crashed build is ignored, and rollback is publishing the previous version again."
+  ],
+  "quiz": [
+    {
+      "q": "Which statement about dbt is right?",
+      "options": [
+        "It extracts data from source databases and loads it into the warehouse",
+        "It compiles SELECT models into SQL that the warehouse runs, in the order given by their `ref()` dependencies",
+        "It replaces the warehouse's query engine with its own",
+        "It only works with ETL, transforming data before the load"
+      ],
+      "answer": 1,
+      "why": "dbt is the T of ELT: models are SELECT statements, `ref()` turns them into a DAG, and dbt sends the resulting SQL to the warehouse, which does all the work. Loading the raw data is another tool's job. The tempting first option is what ingestion tools such as Fivetran or Airbyte do."
+    },
+    {
+      "q": "A label is a payment at 10 October 14:00. Which feature row may it use?",
+      "options": [
+        "asOf 13 October 00:00, computedAt 13 October 02:00: the most up-to-date value",
+        "asOf 10 October 00:00, computedAt 14 October 02:00: a correction of that day, written later",
+        "asOf 10 October 00:00, computedAt 10 October 02:00",
+        "Any of them, as long as the card matches"
+      ],
+      "answer": 2,
+      "why": "A row is usable only if it was about the past and had already been written at the label's time. The first is about the future. The second is about the past but was written four days later, so no model could have read it at 14:00 on 10 October: the backfill leak that a created-timestamp filter catches."
+    },
+    {
+      "q": "A nightly job produces 40 million card scores. Writing them row by row goes through a pool of 20 connections at 2 ms per write. Roughly how long does the load keep the pool busy?",
+      "options": [
+        "About 4 seconds",
+        "About 67 minutes",
+        "About 22 hours",
+        "About 1 minute"
+      ],
+      "answer": 1,
+      "why": "40,000,000 / 20 connections = 2,000,000 writes each, times 2 ms = 4,000 seconds, about 67 minutes, during which live traffic shares the database. Building the store offline and bulk-loading it turns that into sequential file writes that no reader sees until the switch."
+    },
+    {
+      "q": "While a job updates 1,000,000 merchant scores in place, the authorization service reads the scores of 3 merchants for one payment. What can it see?",
+      "options": [
+        "Only last night's scores, until the job commits",
+        "Only tonight's scores, because the job started first",
+        "An error until the job finishes",
+        "A mix: some merchants with tonight's score and some with last night's, a combination no run produced"
+      ],
+      "answer": 3,
+      "why": "Each in-place update is visible as soon as it lands, so mid-load the table holds two runs at once. In the demo a sample of 1,000 merchants saw 568 new and 432 old scores. Building a new version and switching a pointer gives every reader one run or the other."
+    },
+    {
+      "q": "From lesson 11: what do an Iceberg commit and publishing a serving store's `CURRENT` file have in common?",
+      "options": [
+        "Both lock the table while the new data is written",
+        "Both write new immutable files where no reader looks, then make them visible with one atomic swap of a small pointer",
+        "Both rewrite the old files in place to save space",
+        "Both need a database to store the data itself"
+      ],
+      "answer": 1,
+      "why": "Iceberg writes data files, manifests and a metadata file first, then swaps the table's pointer with a compare-and-swap; the serving store writes a version folder first, then renames `CURRENT` over the old one. In both, readers see the old state or the new one, a crash leaves only unreferenced files, and the old version is still there to go back to.",
+      "from": "batch-11"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "ETL or ELT: where does the transform run?",
+      "back": "ETL: in a separate tier, before loading. ELT: inside the warehouse or lakehouse, with SQL, after the raw data is loaded."
+    },
+    {
+      "front": "What does dbt do, and not do?",
+      "back": "It compiles SELECT models into SQL, orders them by their `ref()` dependencies, runs them in the warehouse and tests the results. It doesn't move data in."
+    },
+    {
+      "front": "What is label leakage?",
+      "back": "Training rows that contain information from after the decision being learned, such as a chargeback caused by the labelled fraud itself."
+    },
+    {
+      "front": "The rule for a point-in-time join?",
+      "back": "For a label at time t: the newest feature row with event time <= t and write time <= t, no older than the TTL; otherwise no value."
+    },
+    {
+      "front": "Why not write batch output row by row into the live database?",
+      "back": "A round trip per row competes with live traffic, readers see a mix of two runs, and a failed job leaves half the table updated."
+    },
+    {
+      "front": "What does RocksDB's `IngestExternalFile` do with an SST file?",
+      "back": "Copies or links it in, briefly blocks writes to assign one global sequence number, flushes the memtable if ranges overlap, and puts it in the lowest level where it overlaps nothing."
+    },
+    {
+      "front": "How do you publish and roll back an immutable output?",
+      "back": "Write each run as a new version, then atomically replace one pointer (rename over `CURRENT`, an alias, a catalog row). Rollback is publishing the previous version again."
+    }
+  ],
+  "terms": [
+    {
+      "term": "ELT",
+      "plain": "Extract, load, transform: raw data is loaded first and transformed inside the warehouse, usually with SQL."
+    },
+    {
+      "term": "dbt model",
+      "plain": "One SELECT statement in a file, which dbt builds into a table or view in dependency order."
+    },
+    {
+      "term": "Label leakage",
+      "plain": "Information from after a decision reaching the training data for that decision."
+    },
+    {
+      "term": "Point-in-time join",
+      "plain": "Joining each label to the feature values that existed at the label's time, by event time and by write time."
+    },
+    {
+      "term": "Feature store",
+      "plain": "A system that keeps feature history for training (offline) and latest values for serving (online), from the same code."
+    },
+    {
+      "term": "Bulk load",
+      "plain": "Building a store's files in a batch job and handing them to the database whole, instead of writing rows one by one."
+    },
+    {
+      "term": "Atomic swap",
+      "plain": "Making a new version live by replacing one small pointer in a single step, so readers see the old version or the new one."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Explain to the fraud team's new data scientist why the model scored 98% recall offline and 62% in production, and what the training pipeline must do differently.",
+    "answer": "Each training row joins a payment, labelled fraud or not, to the card's feature \"chargebacks in the last 30 days\". The pipeline took each card's newest feature row, which was computed after the whole month. For a fraudulent payment, that row already counted the chargeback the fraud itself caused a few days later. So in training, frauds almost always came with a chargeback on file, and the rule learned to spot fraud by its own consequence. At authorization time that chargeback doesn't exist yet, so in production the rule only catches frauds on cards that already had an earlier chargeback: 62%. The fix is a point-in-time join. For each payment, take the newest feature row that was about a time at or before the payment and had actually been written by then, within a TTL. Both conditions matter: the first stops future values, the second stops corrections and backfills that were written later about earlier days. That training set shows the model exactly what it will see live, so offline and production scores match. Feast's historical retrieval with the created-timestamp filter, or an ASOF or LATERAL join with both conditions, does it, and the pipeline should count rows whose feature was written after their label and fail if there are any."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Machine learning keeps batch busy beyond training sets. Batch inference scores every merchant or card overnight and serves the results through exactly the bulk-load and swap of this lesson. Large language model data preparation is a batch pipeline too: extract text from HTML, drop low-quality and duplicate documents, tokenize, compute embeddings. Spark, Ray and purpose-built tools such as Kubeflow and Flyte run these jobs, and graph algorithms such as PageRank run as many supersteps over the whole graph (the Pregel model).\n\nHybrid stores combine the two halves of this lesson. LinkedIn's Venice accepts nightly bulk pushes of a whole new version and, between pushes, row updates from a stream, so a feature can be rebuilt from history in batch and kept fresh by streaming. Feature stores do the same with their offline and online stores; the hard part is keeping the code that fills both identical, or the model trains on one definition and serves another.\n\nThe publish-through-a-log design needs care at the consumer. A consumer that applies a run's records as they arrive exposes a partial run, exactly like the row-by-row writer; it must stage the run and only switch to it on the completion marker, much as read committed isolation hides uncommitted writes. Designing Data-Intensive Applications (2nd edition), chapter 11, covers ETL, analytics, machine learning and serving derived data as the four uses of batch output, and chapter 1 introduces data warehouses, lakes and ELT."
+  },
+  "sources": [
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapters 1 and 11",
+      "url": "https://dataintensive.net/"
+    },
+    {
+      "title": "Feast: point-in-time joins",
+      "url": "https://docs.feast.dev/getting-started/concepts/point-in-time-joins"
+    },
+    {
+      "title": "RocksDB wiki: creating and ingesting SST files",
+      "url": "https://github.com/facebook/rocksdb/wiki/Creating-and-Ingesting-SST-files"
+    },
+    {
+      "title": "Armbrust et al., Lakehouse (CIDR 2021)",
+      "url": "https://www.cidrdb.org/cidr2021/papers/cidr2021_paper17.pdf"
+    },
+    {
+      "title": "Dean and Ghemawat, MapReduce (OSDI 2004): the indexing system, section 6.1",
+      "url": "https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf"
+    }
+  ]
+}

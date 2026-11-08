@@ -1,0 +1,443 @@
+{
+  "id": "cons-06",
+  "title": "Distributed SQL: Spanner, CockroachDB and Aurora DSQL",
+  "minutes": 40,
+  "goal": "By the end you can name the four earlier ideas a distributed SQL database stacks (range sharding, a consensus group per range, two-phase commit across ranges, commit timestamps), explain how a timestamp oracle, Spanner's TrueTime with commit wait, CockroachDB's hybrid clocks with uncertainty restarts and Aurora DSQL's optimistic snapshot isolation each order transactions, and say what each one costs in latency and isolation.",
+  "warmup": {
+    "q": "Two servers' clocks may differ by up to 20 ms. A payment commits on server W with its local clock reading as the commit timestamp, and the client is told \"paid\". One millisecond later a report on server R reads the account using R's local clock as the snapshot timestamp. What can the report see?",
+    "options": [
+      "Always the payment: it committed before the report started",
+      "Possibly the old balance: if R's clock is behind W's, the snapshot timestamp can be lower than the payment's",
+      "Half of the payment, because the two servers disagree",
+      "Nothing: the read fails with a clock error"
+    ],
+    "answer": 1,
+    "why": "Snapshot reads return what committed at or below the snapshot timestamp. If W's clock is ahead, the payment's timestamp can be up to 20 ms above R's reading even though it happened first in real time, so the report misses it. Committing the two rows at one timestamp keeps the report from seeing half a payment; it doesn't make the timestamps agree with real time. That gap is what this lesson's designs close, each at a different price."
+  },
+  "sections": [
+    {
+      "h": "Distributed SQL stacks four earlier lessons",
+      "body": "Move 100 from account A-1001 to merchant account M-2001. The two rows live on different machines, and the database still runs the transfer as one ACID transaction, with no coordination code in the application. Spanner, CockroachDB, TiDB, YugabyteDB and Aurora DSQL do this for SQL, and FoundationDB for a key-value store, though not all of them mean serializable by it (the last section). Every one builds it from four ideas earlier lessons taught, and the figure stacks them.\n\nThe first is range sharding, from the Partitioning track. The table's key space is cut into ranges, and each range lives on a few machines. CockroachDB splits a range when it passes 512 MiB, so A-1001 can sit in one range and M-2001 in the next.\n\nThe second is a consensus group per range, lesson 4 of this track. Each range is copied to three or five servers by its own Raft group (Paxos in Spanner), with its own leader. A range survives the loss of a server, and its leader puts that range's writes in one order. A cluster runs thousands of these small groups, so leaders spread over every machine.\n\nThe third is two-phase commit across ranges, from the Transactions track's atomic commit lesson. The transfer writes provisional values, **intents**, into both ranges, and then one record decides commit or abort. The Transactions track's worst case was a coordinator that dies and leaves participants in doubt, holding locks. That case disappears here, because the decision record and every intent are themselves writes to Raft groups: they survive the loss of any one machine, and another server can finish the commit.\n\nThe fourth is timestamps, from the Faults, time and truth track's lessons on clocks and logical clocks. Each range keeps old versions of its rows (MVCC, from the Transactions track), and a reader takes a snapshot: everything committed at or below timestamp T. That works only if every commit carries a timestamp, and the two rows of one transfer carry the same one. On a single machine a counter does it. Across a thousand machines, who hands out the timestamps, and does a higher timestamp mean later in real time? That one question separates the designs in this lesson, and it decides whether lesson 1's strongest promise, strict serializability, holds. The Try it shows the first three layers in a real CockroachDB 26.3, and the transfer's two rows committed at one timestamp.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 316\" role=\"img\" aria-label=\"The layers of a distributed SQL transfer. Top: one SQL transaction moves 100 from A-1001 to M-2001. Partitioning puts the two rows in range 87 and range 88. Each range is a Raft group of three replicas with one leader. Two-phase commit writes intents to both ranges and one transaction record. Underneath, a commit timestamp comes from an oracle, TrueTime or a hybrid logical clock.\"><rect class=\"box-a\" x=\"16\" y=\"14\" width=\"668\" height=\"40\" rx=\"8\"/><text class=\"t-s t-a\" x=\"350.0\" y=\"38.0\" text-anchor=\"middle\">one SQL transaction: A-1001 -100, M-2001 +100</text><text class=\"t-s t-m\" x=\"16\" y=\"98\" text-anchor=\"start\">Partitioning</text><rect class=\"box\" x=\"190\" y=\"70\" width=\"230\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"305.0\" y=\"92.0\" text-anchor=\"middle\">range 87: keys below 'M'</text><text class=\"t-s t-m\" x=\"305.0\" y=\"109.0\" text-anchor=\"middle\">holds A-1001</text><rect class=\"box\" x=\"454\" y=\"70\" width=\"230\" height=\"52\" rx=\"8\"/><text class=\"t-s\" x=\"569.0\" y=\"92.0\" text-anchor=\"middle\">range 88: keys from 'M'</text><text class=\"t-s t-m\" x=\"569.0\" y=\"109.0\" text-anchor=\"middle\">holds M-2001</text><text class=\"t-s t-m\" x=\"16\" y=\"160\" text-anchor=\"start\">lesson 4: Raft</text><rect class=\"box-ok\" x=\"190\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"223.0\" y=\"160.0\" text-anchor=\"middle\">lead</text><rect class=\"box\" x=\"272\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"305.0\" y=\"160.0\" text-anchor=\"middle\">n2</text><rect class=\"box\" x=\"354\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"387.0\" y=\"160.0\" text-anchor=\"middle\">n3</text><rect class=\"box\" x=\"454\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"487.0\" y=\"160.0\" text-anchor=\"middle\">n1</text><rect class=\"box-ok\" x=\"536\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"569.0\" y=\"160.0\" text-anchor=\"middle\">lead</text><rect class=\"box\" x=\"618\" y=\"138\" width=\"66\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"651.0\" y=\"160.0\" text-anchor=\"middle\">n3</text><text class=\"t-s t-m\" x=\"16\" y=\"214\" text-anchor=\"start\">Transactions: 2PC</text><rect class=\"box\" x=\"190\" y=\"192\" width=\"494\" height=\"38\" rx=\"8\"/><text class=\"t-s\" x=\"437.0\" y=\"215.0\" text-anchor=\"middle\">intents on both ranges, one transaction record decides</text><text class=\"t-s t-m\" x=\"16\" y=\"268\" text-anchor=\"start\">Faults: clocks</text><rect class=\"box-b\" x=\"190\" y=\"248\" width=\"494\" height=\"38\" rx=\"8\"/><text class=\"t-s t-b\" x=\"437.0\" y=\"271.0\" text-anchor=\"middle\">commit timestamp: an oracle, TrueTime or a hybrid clock</text><text class=\"t-s t-m\" x=\"437\" y=\"306\" text-anchor=\"middle\">the last layer is where the designs differ</text></svg>",
+        "caption": "A distributed SQL transfer: ranges, a Raft group per range, two-phase commit, and a commit timestamp, which is where the designs differ."
+      },
+      "try": {
+        "title": "Two ranges, one commit timestamp",
+        "minutes": 6,
+        "steps": [
+          "Start a single-node CockroachDB 26.3 (about 1 GB) and a helper: `docker run -d --name sfz-crdb -m 1g cockroachdb/cockroach:v26.3.5 start-single-node --insecure --cache=128MiB --max-sql-memory=128MiB`, then `sql() { docker exec -i sfz-crdb ./cockroach sql --insecure -e \"$1\"; }`.",
+          "Create the accounts, split the table into two ranges at 'M', and list the ranges with their leaseholder and replicas.",
+          "Wait ten seconds, then run the transfer as one transaction and read each row with the hidden column `crdb_internal_mvcc_timestamp`, the timestamp its version was committed at. Predict: will the two rows, in two ranges, show the same timestamp?",
+          "Read the table as it was ten seconds ago with `AS OF SYSTEM TIME`, then stop: `docker rm -f sfz-crdb`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in any terminal",
+          "src": "sql \"CREATE TABLE accounts (id STRING PRIMARY KEY, balance INT NOT NULL);\"\nsql \"INSERT INTO accounts VALUES ('A-1001', 500), ('M-2001', 0);\"\nsql \"ALTER TABLE accounts SPLIT AT VALUES ('M');\"\nsql \"SELECT start_key, end_key, range_id, lease_holder, replicas FROM [SHOW RANGES FROM TABLE accounts WITH DETAILS];\"\nsleep 10\nsql \"BEGIN; UPDATE accounts SET balance = balance - 100 WHERE id = 'A-1001'; UPDATE accounts SET balance = balance + 100 WHERE id = 'M-2001'; COMMIT;\"\nsql \"SELECT id, balance, crdb_internal_mvcc_timestamp FROM accounts;\"\nsql \"SELECT id, balance FROM accounts AS OF SYSTEM TIME '-10s';\""
+        },
+        "expect": "```text\n      start_key      |   end_key    | range_id | lease_holder | replicas\n---------------------+--------------+----------+--------------+-----------\n  <before:/Table/84> | …/1/\"M\"      |       87 |            1 | {1}\n  …/1/\"M\"            | <after:/Max> |       88 |            1 | {1}\n\n    id   | balance |  crdb_internal_mvcc_timestamp\n---------+---------+---------------------------------\n  A-1001 |     400 | 1794118781781941837.0000000000\n  M-2001 |     100 | 1794118781781941837.0000000000\n\n    id   | balance\n---------+----------\n  A-1001 |     500\n  M-2001 |       0\n```\n\nThe split made two ranges, 87 and 88, each with a leaseholder (the replica that serves reads and leads writes) and a replica set, here just node 1. Both rows of the transfer carry the same commit timestamp although they live in different ranges: two-phase commit stamped them together. The timestamp is a hybrid logical clock value, nanoseconds of wall time before the dot and a logical counter after it. The `AS OF SYSTEM TIME` read is a snapshot from before the transfer, served from the old versions. Range ids and timestamps differ on your machine. Output trimmed: the statements' own `CREATE TABLE`, `INSERT` and `COMMIT` lines."
+      },
+      "refs": [
+        {
+          "title": "CockroachDB: Transaction layer (intents, transaction records, HLC, parallel commits)",
+          "url": "https://docs.cockroachlabs.com/docs/stable/architecture/transaction-layer",
+          "kind": "docs"
+        },
+        {
+          "title": "CockroachDB: Replication layer (one Raft group per range)",
+          "url": "https://docs.cockroachlabs.com/docs/stable/architecture/replication-layer",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "One server hands out every timestamp: TiDB and FoundationDB",
+      "body": "The simplest answer to \"who hands out timestamps?\" is one server, a **timestamp oracle**. Google's Percolator (2010) added transactions to Bigtable this way: one machine issued strictly increasing timestamps, about 2 million a second thanks to batching.\n\nTiDB copies Percolator. Its Placement Driver, the small cluster that also tracks where every range lives, hands out a 64-bit timestamp: 46 bits of physical milliseconds and an 18-bit logical counter. The counter advances when two timestamps are needed in the same millisecond, or when the clock steps backwards, so a timestamp never repeats and never goes down. A transaction asks the oracle for a start timestamp, reads the snapshot at it, locks and writes its rows across ranges with two-phase commit over TiKV's Raft groups, then asks the oracle again for a commit timestamp.\n\nBecause one server issues every number, the numbers follow real time. If transfer T1 commits before audit T2 starts, T2's start timestamp is higher than T1's commit timestamp, and T2's snapshot includes T1. DDIA calls this a linearizable ID generator, and it is lesson 2's linearizable register in another form. The payment from the warm-up can't be missed.\n\nFoundationDB does the same with a sequencer that hands out commit versions, about a million a second, and adds optimistic concurrency. A transaction reads at a read version and buffers its writes. At commit, resolvers check whether anything it read was overwritten since its read version, and abort it if so. The result is strict serializability without locks. The resolvers keep only five seconds of history in memory, so a transaction that runs longer than five seconds is rejected; FoundationDB's authors say that hitting the limit usually means a client is doing reads one at a time.\n\nThe price is the oracle itself. Every transaction makes one or two round trips to it before it can commit, and it is one leader, replicated for failover but not spread out. In one region that adds a fraction of a millisecond. With servers in two regions, a transaction far from the oracle pays a cross-region round trip, about 70 ms, for each timestamp. TiDB's default transaction mode is pessimistic, with locks taken as rows are written, and its REPEATABLE READ is snapshot isolation under a MySQL name, so it allows write skew. Spanner set out to remove the oracle altogether.",
+      "refs": [
+        {
+          "title": "TiDB: Timestamp Oracle (TSO)",
+          "url": "https://docs.pingcap.com/tidb/stable/tso",
+          "kind": "docs"
+        },
+        {
+          "title": "Zhou et al.: FoundationDB, a distributed unbundled transactional key value store (SIGMOD 2021)",
+          "url": "https://www.foundationdb.org/files/fdb-paper.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Peng and Dabek: Large-scale incremental processing using distributed transactions and notifications (Percolator, OSDI 2010)",
+          "url": "https://www.usenix.org/legacy/event/osdi10/tech/full_papers/Peng.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Spanner waits out the clock's error before it answers",
+      "body": "Spanner (Google, 2012) has no oracle. Each server stamps commits from its own clock. The Faults, time and truth track showed why that is dangerous: clocks disagree, and a reading says nothing about its own error. Spanner's fix is an API that reports the error. **TrueTime** returns an interval, `TT.now() = [earliest, latest]`, and guarantees that the true time is inside it. GPS receivers and atomic clocks in every data centre keep the interval narrow. In the 2012 paper, ε, half its width, grew in a sawtooth from about 1 to 7 ms over each 30-second poll of the time masters, so about 4 ms most of the time, with spikes when a time master or the network misbehaved. Google hasn't published newer figures; the \"generally less than 10 ms\" often quoted is the same paper's own summary.\n\nA read-write transaction takes locks, runs two-phase commit across the Paxos groups of the ranges it touched, and its coordinator picks a commit timestamp no lower than `TT.now().latest`. Then comes the rule that gives the design its name, **commit wait**: the coordinator releases no locks and tells no one about the commit until `TT.now().earliest` has passed the timestamp. Because the timestamp was picked at the top of an interval and the wait ends when the bottom reaches it, the wait is about 2ε. The stepper walks through it with ε = 10 ms.\n\nWhen the client hears \"committed\", the commit timestamp is in the past on every clock. Any transaction that starts afterwards reads at `TT.now().latest`, which is at or above the true time, so its timestamp is higher and its snapshot includes the commit. Spanner calls this external consistency; lesson 1 called it strict serializability.\n\nThe wait would hurt if it came on top of everything else, so Spanner overlaps it with the Paxos replication of the commit record. The 2012 paper measured commit wait at about 5 ms next to about 9 ms of Paxos latency, and a mean write latency of about 14 ms with one, three or five replicas. Strong reads pay a little too. A read at `TT.now().latest` may have to wait until its replicas are sure no transaction can still commit below that timestamp, which the lab models as a read that waits on an intent. Smaller ε means less waiting, which is why Google built the clock hardware in the first place.\n\nSpanner's default stays serializable. It now also offers REPEATABLE READ, which is snapshot isolation, set per client or per transaction, for workloads where reads blocking behind writes cost more than the occasional write skew.",
+      "stepper": {
+        "title": "Commit wait on a time axis, and what happens without it",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"At true time 0 the settlement server's TrueTime interval is 0 to 20 ms, so it picks commit timestamp 20.\"><text class=\"t-s\" x=\"16\" y=\"30\" text-anchor=\"start\">settle (clock 10 ms fast)</text><text class=\"t-s\" x=\"16\" y=\"120\" text-anchor=\"start\">audit-0 (clock 10 ms slow)</text><line class=\"ln\" x1=\"110\" y1=\"214\" x2=\"660\" y2=\"214\"/><line class=\"ln\" x1=\"110\" y1=\"209\" x2=\"110\" y2=\"219\"/><text class=\"t-s t-m\" x=\"110\" y=\"236\" text-anchor=\"middle\">-10 ms</text><line class=\"ln\" x1=\"220\" y1=\"209\" x2=\"220\" y2=\"219\"/><text class=\"t-s t-m\" x=\"220\" y=\"236\" text-anchor=\"middle\">0 ms</text><line class=\"ln\" x1=\"330\" y1=\"209\" x2=\"330\" y2=\"219\"/><text class=\"t-s t-m\" x=\"330\" y=\"236\" text-anchor=\"middle\">10 ms</text><line class=\"ln\" x1=\"440\" y1=\"209\" x2=\"440\" y2=\"219\"/><text class=\"t-s t-m\" x=\"440\" y=\"236\" text-anchor=\"middle\">20 ms</text><line class=\"ln\" x1=\"550\" y1=\"209\" x2=\"550\" y2=\"219\"/><text class=\"t-s t-m\" x=\"550\" y=\"236\" text-anchor=\"middle\">30 ms</text><line class=\"ln\" x1=\"660\" y1=\"209\" x2=\"660\" y2=\"219\"/><text class=\"t-s t-m\" x=\"660\" y=\"236\" text-anchor=\"middle\">40 ms</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">true time</text><rect class=\"box-a\" x=\"220\" y=\"42\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"228\" y=\"62\" text-anchor=\"start\">TrueTime [0, 20]</text><line class=\"ln-d\" x1=\"440\" y1=\"36\" x2=\"440\" y2=\"205\"/><text class=\"t-s t-b\" x=\"435\" y=\"203\" text-anchor=\"end\">s = 20</text><line class=\"ln-a\" x1=\"220\" y1=\"26\" x2=\"220\" y2=\"190\"/><text class=\"t-s t-a\" x=\"220\" y=\"18\" text-anchor=\"middle\">now 0 ms</text><text class=\"t-s t-a\" x=\"16\" y=\"264\" text-anchor=\"start\">settle picks s = latest = 20: no true time now can be later</text></svg>",
+            "say": "The settlement server's clock reads 10 ms when the true time is 0: it is 10 ms fast, and it doesn't know that. It does know its error bound, ε = 10 ms, so TrueTime reports the interval **[0, 20]**: the true time is somewhere in there. Spanner's rule picks the commit timestamp at the top, **s = 20**, so s can't be earlier than the moment it was chosen."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"At 8 ms the commit record is replicated, but TrueTime's earliest is 8, still below 20, so the server waits.\"><text class=\"t-s\" x=\"16\" y=\"30\" text-anchor=\"start\">settle (clock 10 ms fast)</text><text class=\"t-s\" x=\"16\" y=\"120\" text-anchor=\"start\">audit-0 (clock 10 ms slow)</text><line class=\"ln\" x1=\"110\" y1=\"214\" x2=\"660\" y2=\"214\"/><line class=\"ln\" x1=\"110\" y1=\"209\" x2=\"110\" y2=\"219\"/><text class=\"t-s t-m\" x=\"110\" y=\"236\" text-anchor=\"middle\">-10 ms</text><line class=\"ln\" x1=\"220\" y1=\"209\" x2=\"220\" y2=\"219\"/><text class=\"t-s t-m\" x=\"220\" y=\"236\" text-anchor=\"middle\">0 ms</text><line class=\"ln\" x1=\"330\" y1=\"209\" x2=\"330\" y2=\"219\"/><text class=\"t-s t-m\" x=\"330\" y=\"236\" text-anchor=\"middle\">10 ms</text><line class=\"ln\" x1=\"440\" y1=\"209\" x2=\"440\" y2=\"219\"/><text class=\"t-s t-m\" x=\"440\" y=\"236\" text-anchor=\"middle\">20 ms</text><line class=\"ln\" x1=\"550\" y1=\"209\" x2=\"550\" y2=\"219\"/><text class=\"t-s t-m\" x=\"550\" y=\"236\" text-anchor=\"middle\">30 ms</text><line class=\"ln\" x1=\"660\" y1=\"209\" x2=\"660\" y2=\"219\"/><text class=\"t-s t-m\" x=\"660\" y=\"236\" text-anchor=\"middle\">40 ms</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">true time</text><rect class=\"box-a\" x=\"308\" y=\"42\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"316\" y=\"62\" text-anchor=\"start\">TrueTime [8, 28]</text><line class=\"ln-d\" x1=\"440\" y1=\"36\" x2=\"440\" y2=\"205\"/><text class=\"t-s t-b\" x=\"435\" y=\"203\" text-anchor=\"end\">s = 20</text><line class=\"ln-a\" x1=\"308\" y1=\"26\" x2=\"308\" y2=\"190\"/><text class=\"t-s t-a\" x=\"308\" y=\"18\" text-anchor=\"middle\">now 8 ms</text><text class=\"t-s t-a\" x=\"16\" y=\"264\" text-anchor=\"start\">decided at 8 ms, but earliest 8 &lt; s = 20: hold the locks, tell no one</text></svg>",
+            "say": "Two-phase commit runs: intents on both ranges by 4 ms, the commit record replicated through Paxos by 8 ms. The transaction is decided. But TrueTime's earliest is 8, and s is 20: some clock somewhere could still read below 20. So the server **holds the locks and tells no one**. This is commit wait."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"At 20 ms TrueTime's earliest reaches 20, so s is surely in the past. The client is told the batch is paid.\"><text class=\"t-s\" x=\"16\" y=\"30\" text-anchor=\"start\">settle (clock 10 ms fast)</text><text class=\"t-s\" x=\"16\" y=\"120\" text-anchor=\"start\">audit-0 (clock 10 ms slow)</text><line class=\"ln\" x1=\"110\" y1=\"214\" x2=\"660\" y2=\"214\"/><line class=\"ln\" x1=\"110\" y1=\"209\" x2=\"110\" y2=\"219\"/><text class=\"t-s t-m\" x=\"110\" y=\"236\" text-anchor=\"middle\">-10 ms</text><line class=\"ln\" x1=\"220\" y1=\"209\" x2=\"220\" y2=\"219\"/><text class=\"t-s t-m\" x=\"220\" y=\"236\" text-anchor=\"middle\">0 ms</text><line class=\"ln\" x1=\"330\" y1=\"209\" x2=\"330\" y2=\"219\"/><text class=\"t-s t-m\" x=\"330\" y=\"236\" text-anchor=\"middle\">10 ms</text><line class=\"ln\" x1=\"440\" y1=\"209\" x2=\"440\" y2=\"219\"/><text class=\"t-s t-m\" x=\"440\" y=\"236\" text-anchor=\"middle\">20 ms</text><line class=\"ln\" x1=\"550\" y1=\"209\" x2=\"550\" y2=\"219\"/><text class=\"t-s t-m\" x=\"550\" y=\"236\" text-anchor=\"middle\">30 ms</text><line class=\"ln\" x1=\"660\" y1=\"209\" x2=\"660\" y2=\"219\"/><text class=\"t-s t-m\" x=\"660\" y=\"236\" text-anchor=\"middle\">40 ms</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">true time</text><rect class=\"box-a\" x=\"440\" y=\"42\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"448\" y=\"62\" text-anchor=\"start\">TrueTime [20, 40]</text><line class=\"ln-d\" x1=\"440\" y1=\"36\" x2=\"440\" y2=\"205\"/><text class=\"t-s t-b\" x=\"435\" y=\"203\" text-anchor=\"end\">s = 20</text><line class=\"ln-a\" x1=\"440\" y1=\"26\" x2=\"440\" y2=\"190\"/><text class=\"t-s t-a\" x=\"440\" y=\"18\" text-anchor=\"middle\">now 20 ms</text><text class=\"t-s t-a\" x=\"16\" y=\"264\" text-anchor=\"start\">earliest 20 = s: release the locks, tell the client \"paid\"</text></svg>",
+            "say": "At true time 20, TrueTime reports [20, 40]. Its earliest has reached s, so **s is now in the past on every clock in the system**. The server releases its locks and tells the client that batch 1 is paid. The wait took 2ε = 20 ms from the moment s was picked, and 8 of those ms overlapped the replication it had to do anyway."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"At 21 ms an auditor whose clock is 10 ms slow starts a read. Its TrueTime interval is 1 to 21; it reads at 21, which is above 20, so it sees the batch.\"><text class=\"t-s\" x=\"16\" y=\"30\" text-anchor=\"start\">settle (clock 10 ms fast)</text><text class=\"t-s\" x=\"16\" y=\"120\" text-anchor=\"start\">audit-0 (clock 10 ms slow)</text><line class=\"ln\" x1=\"110\" y1=\"214\" x2=\"660\" y2=\"214\"/><line class=\"ln\" x1=\"110\" y1=\"209\" x2=\"110\" y2=\"219\"/><text class=\"t-s t-m\" x=\"110\" y=\"236\" text-anchor=\"middle\">-10 ms</text><line class=\"ln\" x1=\"220\" y1=\"209\" x2=\"220\" y2=\"219\"/><text class=\"t-s t-m\" x=\"220\" y=\"236\" text-anchor=\"middle\">0 ms</text><line class=\"ln\" x1=\"330\" y1=\"209\" x2=\"330\" y2=\"219\"/><text class=\"t-s t-m\" x=\"330\" y=\"236\" text-anchor=\"middle\">10 ms</text><line class=\"ln\" x1=\"440\" y1=\"209\" x2=\"440\" y2=\"219\"/><text class=\"t-s t-m\" x=\"440\" y=\"236\" text-anchor=\"middle\">20 ms</text><line class=\"ln\" x1=\"550\" y1=\"209\" x2=\"550\" y2=\"219\"/><text class=\"t-s t-m\" x=\"550\" y=\"236\" text-anchor=\"middle\">30 ms</text><line class=\"ln\" x1=\"660\" y1=\"209\" x2=\"660\" y2=\"219\"/><text class=\"t-s t-m\" x=\"660\" y=\"236\" text-anchor=\"middle\">40 ms</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">true time</text><rect class=\"box-a\" x=\"440\" y=\"42\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"652\" y=\"62\" text-anchor=\"end\">committed at 20</text><rect class=\"box-ok\" x=\"231\" y=\"132\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"239\" y=\"152\" text-anchor=\"start\">TrueTime [1, 21]</text><line class=\"ln-d\" x1=\"440\" y1=\"36\" x2=\"440\" y2=\"205\"/><text class=\"t-s t-b\" x=\"435\" y=\"203\" text-anchor=\"end\">s = 20</text><line class=\"ln-a\" x1=\"451\" y1=\"26\" x2=\"451\" y2=\"190\"/><text class=\"t-s t-a\" x=\"451\" y=\"18\" text-anchor=\"middle\">now 21 ms</text><text class=\"t-s t-a\" x=\"16\" y=\"264\" text-anchor=\"start\">settle committed batch 1 at s = 20 and answered at 20 ms</text><text class=\"t-s t-ok\" x=\"16\" y=\"286\" text-anchor=\"start\">audit-0 reads at its latest, 21, above 20: it sees batch 1</text></svg>",
+            "say": "One millisecond later an auditor starts on a server whose clock is 10 ms slow. Its TrueTime says [1, 21], and a strong read uses the top, **21**. Since the commit was announced only once s = 20 had passed, any read that starts afterwards picks a timestamp above 20. **The auditor sees batch 1**: external consistency, lesson 1's strict serializability."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Without commit wait: the settlement server commits at its clock reading, 10, and answers at 8 ms. At 9 ms the slow auditor reads at its clock reading, -1, below 10, and misses the batch.\"><text class=\"t-s\" x=\"16\" y=\"30\" text-anchor=\"start\">settle (clock 10 ms fast)</text><text class=\"t-s\" x=\"16\" y=\"120\" text-anchor=\"start\">audit-0 (clock 10 ms slow)</text><line class=\"ln\" x1=\"110\" y1=\"214\" x2=\"660\" y2=\"214\"/><line class=\"ln\" x1=\"110\" y1=\"209\" x2=\"110\" y2=\"219\"/><text class=\"t-s t-m\" x=\"110\" y=\"236\" text-anchor=\"middle\">-10 ms</text><line class=\"ln\" x1=\"220\" y1=\"209\" x2=\"220\" y2=\"219\"/><text class=\"t-s t-m\" x=\"220\" y=\"236\" text-anchor=\"middle\">0 ms</text><line class=\"ln\" x1=\"330\" y1=\"209\" x2=\"330\" y2=\"219\"/><text class=\"t-s t-m\" x=\"330\" y=\"236\" text-anchor=\"middle\">10 ms</text><line class=\"ln\" x1=\"440\" y1=\"209\" x2=\"440\" y2=\"219\"/><text class=\"t-s t-m\" x=\"440\" y=\"236\" text-anchor=\"middle\">20 ms</text><line class=\"ln\" x1=\"550\" y1=\"209\" x2=\"550\" y2=\"219\"/><text class=\"t-s t-m\" x=\"550\" y=\"236\" text-anchor=\"middle\">30 ms</text><line class=\"ln\" x1=\"660\" y1=\"209\" x2=\"660\" y2=\"219\"/><text class=\"t-s t-m\" x=\"660\" y=\"236\" text-anchor=\"middle\">40 ms</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">true time</text><rect class=\"box-bad\" x=\"220\" y=\"42\" width=\"88\" height=\"30\" rx=\"8\"/><line class=\"ln-bad\" x1=\"209\" y1=\"128\" x2=\"209\" y2=\"166\"/><text class=\"t-s t-bad\" x=\"215\" y=\"152\" text-anchor=\"start\">reads at -1</text><line class=\"ln-d\" x1=\"330\" y1=\"36\" x2=\"330\" y2=\"205\"/><text class=\"t-s t-b\" x=\"325\" y=\"203\" text-anchor=\"end\">s = 10</text><line class=\"ln-a\" x1=\"319\" y1=\"26\" x2=\"319\" y2=\"190\"/><text class=\"t-s t-a\" x=\"319\" y=\"18\" text-anchor=\"middle\">now 9 ms</text><text class=\"t-s t-bad\" x=\"16\" y=\"264\" text-anchor=\"start\">settle trusts its clock: s = 10, answered at 8 ms (the red bar)</text><text class=\"t-s t-bad\" x=\"16\" y=\"286\" text-anchor=\"start\">audit-0 at 9 ms trusts its clock: reads at -1, below 10, misses batch 1</text></svg>",
+            "say": "Now the same two servers **trusting their clocks**. The settlement server commits at what its clock read when it started, s = 10, and answers at 8 ms. At 9 ms the auditor reads at what its clock says, -1. The batch was paid before the audit began, and the audit doesn't see it: a stale read, caused only by 20 ms of disagreement between two clocks. The lab's `trust` scenario prints this run."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch commit wait, then trust the clocks",
+        "minutes": 4,
+        "steps": [
+          "`UncertaintyDemo.kt` runs one settlement transaction across two ranges on a server whose clock is 10 ms fast, then starts one audit 1 ms after the client was told, on a server whose clock is 10 ms slow. No Docker needed.",
+          "Run `commitwait` and find when the client is told, and the timestamp the audit reads at.",
+          "Predict what the audit sees when the same servers trust their clocks, then run `trust`. Try `commitwait 3` too: does a 3 ms bound add any wait to an 8 ms commit?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='commitwait' --console=plain -q\n./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='trust' --console=plain -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='commitwait' --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l06/demo/UncertaintyDemo.kt"
+        },
+        "expect": "```text\nCOMMIT_WAIT, clocks within 10 ms of true time: settle runs 10 ms ahead, audit-0 10 ms behind\nt=    0  settle   batch 1: commit timestamp 20 (its clock reads 10)\nt=    4  settle   intents for batch 1 written to payouts and ledger at 20\nt=    8  settle   commit record replicated: batch 1 is decided\nt=   20  settle   commit wait over: TrueTime earliest is now 20, so 20 has surely passed\nt=   20  settle   client told: batch 1 is paid (20 ms)\nt=   21  audit-0  audit starts: read timestamp 21 (clock 11)\nt=   23  audit-0  reads payouts = 1, ledger = 1\nfresh: the audit sees batch 1 (0 restart(s), waited 0 ms)\n```\n\n```text\nTRUST_CLOCK, clocks within 10 ms of true time: settle runs 10 ms ahead, audit-0 10 ms behind\nt=    0  settle   batch 1: commit timestamp 10 (its clock reads 10)\nt=    4  settle   intents for batch 1 written to payouts and ledger at 10\nt=    8  settle   commit record replicated: batch 1 is decided\nt=    8  settle   client told: batch 1 is paid (8 ms)\nt=    9  audit-0  audit starts: read timestamp -1 (clock -1)\nt=   11  audit-0  reads payouts = 0, ledger = 0\nSTALE: batch 1 was acknowledged before this audit began, and the audit missed it\n```\n\nWith commit wait the transaction was decided at 8 ms but announced at 20 ms, 2ε after it picked s = 20, and the audit's timestamp, 21, came out above it. Trusting the clocks answered 12 ms sooner and the audit missed a batch that was already paid, though it still saw both ranges agree. With `commitwait 3`, 2ε is 6 ms, less than the 8 ms the commit needs anyway, so the client is told at 8 ms: the wait hides entirely behind replication."
+      },
+      "refs": [
+        {
+          "title": "Corbett et al.: Spanner, Google's globally-distributed database (OSDI 2012)",
+          "url": "https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett",
+          "kind": "read"
+        },
+        {
+          "title": "Spanner: TrueTime and external consistency",
+          "url": "https://docs.cloud.google.com/spanner/docs/true-time-external-consistency",
+          "kind": "docs"
+        },
+        {
+          "title": "Spanner: Use repeatable read isolation",
+          "url": "https://docs.cloud.google.com/spanner/docs/use-repeatable-read-isolation",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "CockroachDB moves the uncertainty from writers to readers",
+      "body": "CockroachDB runs on ordinary servers with NTP and no special clocks, so a 2ε commit wait on every write would be large. It takes two ideas instead.\n\nThe first is a **hybrid logical clock**, from the Faults, time and truth track's logical clocks lesson. A node's timestamp is its wall time plus a logical counter, and a node that receives a higher timestamp in a message moves its own clock up to it. Causally related events therefore always get increasing timestamps, even between nodes whose clocks disagree. The Try it in the first section showed one: wall nanoseconds, a dot, then the counter.\n\nThe second is a promised bound on clock disagreement, the **max offset**, 500 ms by default (Cockroach Labs suggests 250 ms for new multi-region clusters). The bound is enforced: a node whose clock is off from at least half of the other nodes by 80% of the max offset shuts itself down rather than serve wrong answers.\n\nWriters don't wait at all. A read at timestamp T knows that any value with a timestamp above T + max offset was written after it began, whatever the clocks say. A value between T and T + max offset is in the read's **uncertainty interval**: it may have committed before the read started, on a node whose clock runs ahead. The read can't skip it, so it moves its own timestamp up past that value. If its earlier reads are still valid at the new timestamp, it carries on; otherwise the transaction restarts with a `ReadWithinUncertaintyIntervalError`. The top of the interval doesn't move with the timestamp, so restarts must end. The cost lands only on reads of recently written keys, and only on those within the max offset of a write, instead of on every write.\n\nWrites are intents with a transaction record, as in section 1. **Parallel commits** set the record to STAGING while the intents are still being replicated; the transaction counts as committed once every intent has reached consensus, so commit takes one round of consensus instead of two, and the intents are cleaned up afterwards.\n\nThe guarantee is serializable by default, though not strict serializable: CockroachDB's docs say clock skew beyond the max offset can break single-key linearizability between causally dependent transactions. READ COMMITTED is also available, with a fresh snapshot per statement, no read refresh and no serialization retries, at the price of lost updates and write skew. YugabyteDB works the same way: hybrid time, a 500 ms default bound that stops servers beyond it, and an option to take the bound from AWS's ClockBound daemon instead, which on AWS is typically well under a millisecond.",
+      "try": {
+        "title": "Restart above a value you can't place",
+        "minutes": 4,
+        "steps": [
+          "Run the `restart` scenario: the same two servers, the same transaction and audit as the last Try it, with CockroachDB's policy: the writer commits at its clock, and the reader's window reaches 2ε above its own clock.",
+          "Find the read timestamp, the top of its window and the timestamp it restarts at. How long did the client wait for its commit this time, and how long the audit?",
+          "Run `restart 1`: with clocks within 1 ms, is the batch inside the window?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='restart' --console=plain -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='restart' --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l06/demo/UncertaintyDemo.kt"
+        },
+        "expect": "```text\nRESTART, clocks within 10 ms of true time: settle runs 10 ms ahead, audit-0 10 ms behind\nt=    0  settle   batch 1: commit timestamp 10 (its clock reads 10)\nt=    4  settle   intents for batch 1 written to payouts and ledger at 10\nt=    8  settle   commit record replicated: batch 1 is decided\nt=    8  settle   client told: batch 1 is paid (8 ms)\nt=    9  audit-0  audit starts: read timestamp -1 (clock -1), uncertain up to 19\nt=   11  audit-0  finds a version it can't place: restarts at 10\nt=   13  audit-0  reads payouts = 1, ledger = 1\nfresh: the audit sees batch 1 (1 restart(s), waited 0 ms)\n```\n\nThe writer answered at 8 ms, as fast as trusting the clocks. The audit read at -1, but its window reached 19 (2ε above its clock, the most two clocks can disagree), and the batch's timestamp 10 fell inside it. So it restarted at 10 and saw the batch: one extra round trip, 4 ms in all instead of 2. With `restart 1` the window is 2 ms wide and the clocks barely disagree, so the batch's timestamp is already below the read timestamp: no restart."
+      },
+      "refs": [
+        {
+          "title": "CockroachDB: Operational FAQs (clock synchronization and max offset)",
+          "url": "https://docs.cockroachlabs.com/docs/stable/operational-faqs",
+          "kind": "docs"
+        },
+        {
+          "title": "CockroachDB: Read Committed transactions",
+          "url": "https://docs.cockroachlabs.com/docs/stable/read-committed",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Aurora DSQL coordinates once at commit, and what each design costs",
+      "body": "Aurora DSQL (AWS, generally available since May 2025) makes a different trade: **optimistic concurrency at snapshot isolation only**. A transaction reads at its start time from multi-version storage, with no locks and no coordination; storage waits until it has applied every commit at or below that time. Writes stay in the query processor until COMMIT. Then an adjudicator checks whether another transaction wrote the same keys since this one started. If one did, the later one fails with SQLSTATE 40001 and code OC000, and the application retries. The commit is final once DSQL's journal stores it. That is one coordination step per transaction, at commit, and no deadlocks, since nothing waits on a lock; `SELECT ... FOR UPDATE` simply counts as a write when the adjudicator checks.\n\nThe limits come with the design. Snapshot isolation is PostgreSQL's REPEATABLE READ, so write skew is possible: two doctors can still both go off call. A transaction may change at most 3,000 rows and 10 MiB and may run at most 5 minutes. And a hot key, such as a merchant's balance row that every payment updates, turns into a retry loop, because every writer but one fails at commit.\n\nSo \"distributed SQL\" doesn't mean \"serializable\". Spanner and CockroachDB default to serializable and now offer weaker levels; TiDB and YugabyteDB default to snapshot isolation; Aurora DSQL offers nothing else. Read the isolation level in the docs, not the marketing.\n\nHere is where each design charges for the same transfer, with a consensus round inside one region of about 1 to 2 ms:\n\n| System | Commit timestamp from | A write pays | A read pays | Default isolation |\n|---|---|---|---|---|\n| TiDB | an oracle (the Placement Driver) | two oracle trips, 2PC over Raft | one oracle trip | snapshot (RR), pessimistic |\n| FoundationDB | a sequencer | a version, a resolver check | a read version | strict serializable (OCC) |\n| Spanner | TrueTime | commit wait of about 2ε, overlapped with Paxos | may wait for safe time | serializable (external consistency) |\n| CockroachDB | hybrid clock, max offset | one consensus round (parallel commits) | a restart if a value is uncertain | serializable |\n| Aurora DSQL | adjudicators at commit | one adjudication, one journal write | nothing extra | snapshot only |\n\nAll of them pay a consensus round per write and some coordination per transaction, where one PostgreSQL primary pays an fsync. You buy that for data that outgrows a machine, or for a database that survives losing a region. The Try it measures the clock part on its own.",
+      "try": {
+        "title": "Price the clock bound",
+        "minutes": 4,
+        "steps": [
+          "Run the `sweep` scenario: ten simulated seconds of traffic (one settlement job, four auditors on servers whose clocks are spread across the bound) for each policy and bound ε. It takes a few seconds.",
+          "Before reading the table, predict how the write time grows with ε under commit wait, and which column grows under restarts.",
+          "Find where trusting the clocks starts to give stale audits, and where commit wait stops hiding behind the 8 ms commit."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='sweep' --console=plain -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l06.demo.UncertaintyDemoKt -Pargs='sweep' --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l06/demo/UncertaintyDemo.kt"
+        },
+        "expect": "```text\n10 s of traffic: one settlement job, 4 auditors. Per policy and clock bound (epsilon, ms):\npolicy        eps   stale/1000   restarts/1000   write ms   audit ms\nTRUST_CLOCK     0          0.0             0.0        8.0        3.2\nTRUST_CLOCK     1          0.0             0.0        8.0        3.2\nTRUST_CLOCK     5         16.6             0.0        8.0        2.4\nTRUST_CLOCK    10        283.8             0.0        8.0        2.3\nTRUST_CLOCK    25        657.8             0.0        8.0        2.2\nTRUST_CLOCK    50        767.7             0.0        8.0        2.2\nTRUST_CLOCK   100        767.7             0.0        8.0        2.2\nTRUST_CLOCK   250        767.7             0.0        8.0        2.2\nCOMMIT_WAIT     0          0.0             0.0        8.0        3.2\nCOMMIT_WAIT     1          0.0             0.0        8.0        3.2\nCOMMIT_WAIT     5          0.0             0.0       10.0        2.8\nCOMMIT_WAIT    10          0.0             0.0       20.0        4.5\nCOMMIT_WAIT    25          0.0             0.0       50.0        7.8\nCOMMIT_WAIT    50          0.0             0.0      100.0       10.0\nCOMMIT_WAIT   100          0.0             0.0      200.0       11.6\nCOMMIT_WAIT   250          0.0             0.0      500.0       12.7\nRESTART         0          0.0             0.0        8.0        3.2\nRESTART         1          0.0             0.0        8.0        3.2\nRESTART         5          0.0           270.2        8.0        3.8\nRESTART        10          0.0           565.4        8.0        4.6\nRESTART        25          0.0           792.3        8.0        5.2\nRESTART        50          0.0           821.7        8.0        5.3\nRESTART       100          0.0           821.7        8.0        5.3\nRESTART       250          0.0           821.7        8.0        5.3\n```\n\nCommit wait costs every write max(8, 2ε) ms, and audits slow down too, because they wait on intents that commit wait holds back. Restarts cost writes nothing and add about one round trip to the audits that meet a fresh value. Here that is most audits, because every auditor reads the one key the job rewrites every 10 to 20 ms: the worst case, where a real table spreads its reads over many keys. Trusting the clocks is the fastest and, from ε = 5 ms up, wrong more often than you would ship. The run is seeded, so these numbers are exact."
+      },
+      "refs": [
+        {
+          "title": "Aurora DSQL: Concurrency control",
+          "url": "https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-concurrency-control.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Aurora DSQL: Cluster quotas and database limits",
+          "url": "https://docs.aws.amazon.com/aurora-dsql/latest/userguide/CHAP_quotas.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Brooker: DSQL Vignette, Transactions and Durability",
+          "url": "https://brooker.co.za/blog/2024/12/05/inside-dsql-writes.html",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of three bank branches in different time zones, each stamping deposit slips with its own wall clock. A timestamp oracle is a head office that issues every slip number by phone: always in order, and every branch waits on the line. Spanner gives each branch a clock certified to within a few seconds and makes the clerk hold every slip until that many seconds have passed, so no later slip anywhere can carry a smaller stamp. CockroachDB lets clerks stamp at once and makes an auditor who finds a slip stamped just after the start of the audit start over, counting it in. The analogy breaks on scale: real clocks drift by milliseconds, not seconds, and the waiting and restarting happen thousands of times a second, which is why a few milliseconds of clock error turn into a visible cost.",
+  "in_your_world": "Your payments database is most likely one Oracle or PostgreSQL primary with a standby, and for a ledger that fits on one machine that is still the cheapest way to get serializable, linearizable writes: one fsync and no clocks to trust. Distributed SQL earns its cost when the ledger outgrows the machine or must keep taking payments when a region is lost. If you move, three habits carry over from this lesson. Retry on SQLSTATE 40001, because CockroachDB's restarts and DSQL's commit-time conflicts both surface there, and make the retried transaction idempotent with the same keys you send the card issuer. Check the isolation level you actually get: DSQL and YugabyteDB's defaults are snapshot isolation, not the serializable your Oracle code may assume. And keep hot rows such as a merchant's running balance out of the hot path, because optimistic systems turn them into retry storms.",
+  "mistake": "The common mistake is assuming \"distributed SQL\" means \"serializable and always up to date\". Teams port code that relies on serializable isolation to a system whose default is snapshot isolation (Aurora DSQL, YugabyteDB, TiDB's REPEATABLE READ) and get write skew they never saw before, or they run CockroachDB with clocks they never monitor and assume real-time order. It happens because the SQL looks the same and the product pages say ACID. The fix is to read the isolation level and the clock assumptions in the docs, set the level explicitly per transaction, monitor clock offset (CockroachDB and YugabyteDB will stop a node that drifts, which is an outage you should see coming), and handle retries with SQLSTATE 40001 in one place.",
+  "compare": {
+    "title": "One transfer's commit path in Spanner and in CockroachDB",
+    "a": {
+      "label": "Spanner",
+      "lang": "text",
+      "title": "TrueTime and commit wait",
+      "src": "1  lock A-1001 and M-2001 (two-phase locking)\n2  prepare in both Paxos groups\n3  s = TT.now().latest\n4  replicate the commit record   (Paxos)\n5  wait until TT.now().earliest > s\n   (about 2 x epsilon, overlapped with 4)\n6  release locks, tell the client\n\nreaders: read at TT.now().latest,\n         may wait for safe time"
+    },
+    "b": {
+      "label": "CockroachDB",
+      "lang": "text",
+      "title": "hybrid clock and uncertainty",
+      "src": "1  ts = HLC.now() at the gateway node\n2  write intents in both Raft groups\n   and set the record to STAGING\n   (parallel commits: one round)\n3  tell the client once all are replicated\n4  resolve the intents afterwards\n\nreaders: value in (T, T + max offset]?\n         move T above it, refresh\n         or restart"
+    },
+    "note": "Both make a transaction's timestamp agree with real time, and both depend on a bound on clock error. Spanner makes every writer wait out its bound, which is small because of special hardware, so readers never doubt a timestamp. CockroachDB's bound is large (500 ms by default) because it runs on ordinary clocks, so making writers wait would be too slow; it lets readers find the doubtful values and pay only when they hit one. Which costs less depends on the clock and on how often reads touch freshly written keys."
+  },
+  "worked": {
+    "title": "Size the clock tax for three kinds of clock",
+    "steps": [
+      {
+        "say": "Write the two costs as formulas. With every clock within ε of true time, two clocks differ by up to 2ε. Commit wait adds what the wait doesn't hide behind replication; an uncertainty window catches values written up to 2ε after a read's clock.",
+        "code": "commitWait(eps, replicationMs) = max(0, 2 * eps - replicationMs)\nwindowMs(eps)                  = 2 * eps   // CockroachDB: --max-offset",
+        "lang": "text"
+      },
+      {
+        "say": "AWS's Time Sync Service with the Nitro hardware clock reports error bounds under 40 µs. The wait vanishes behind a 1 ms consensus round, and the window is tiny.",
+        "code": "eps = 0.04 ms, replication 1 ms\ncommit wait  = max(0, 0.08 - 1) = 0 ms\nwindow       = 0.08 ms",
+        "lang": "text"
+      },
+      {
+        "say": "Spanner's 2012 numbers: ε about 4 ms (peaks near 7), Paxos about 9 ms. The formula says the wait could hide entirely, yet the paper's one-replica benchmark took 14.4 ms per write with commit wait and 9.4 ms without: about 5 ms added. Overlap hides part of the wait, not all of it, so treat the formula as a lower bound.",
+        "code": "eps = 4 ms (peaks 7), replication about 9 ms\nformula: max(0, 8 - 9)  = 0 ms\nmeasured: 14.4 - 9.4    = about 5 ms",
+        "lang": "text"
+      },
+      {
+        "say": "Public internet NTP, tens of ms of error. Commit wait would add most of a 100 ms window to every write, so this is CockroachDB's territory: no wait, and reads of keys written in the last few hundred ms may restart.",
+        "code": "eps = 50 ms, replication 2 ms\ncommit wait  = max(0, 100 - 2) = 98 ms per write\nwindow       = 100 ms (CockroachDB default max offset: 500 ms)",
+        "lang": "text"
+      },
+      {
+        "say": "The lesson in code: the bound, not the clock reading, sets the price. A Kotlin check you could put in a startup probe, using the same numbers.",
+        "code": "fun commitWaitMs(epsMs: Double, replicationMs: Double) = maxOf(0.0, 2 * epsMs - replicationMs)\n\nlistOf(0.04, 4.0, 50.0).forEach { eps ->\n    println(\"eps $eps ms -> wait ${commitWaitMs(eps, 2.0)} ms, window ${2 * eps} ms\")\n}\n// eps 0.04 ms -> wait 0.0 ms, window 0.08 ms\n// eps 4.0 ms -> wait 6.0 ms, window 8.0 ms\n// eps 50.0 ms -> wait 98.0 ms, window 100.0 ms",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Commit timestamps on clocks that disagree",
+    "minutes": 20,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/cons/l06/Mvcc.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l06/Transactions.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l06/Clocks.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l06/Sim.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.cons.l06.*'",
+    "steps": [
+      "Read `Clocks.kt` (a clock with an offset it doesn't know, and a TrueTime interval around it) and the provided half of `Transactions.kt`: `settle` runs the two-range transaction, and `checkedAudit` marks an audit stale or fractured. Processes are plain Kotlin that call `sim.sleep`; virtual time makes ten seconds of traffic run in milliseconds. Run the tests once: all 14 fail.",
+      "Write `Range.read` in `Mvcc.kt`: an intent at or below the window's top blocks, a committed version inside the window is uncertain, otherwise return the snapshot value. The three `RangeTest` tests pass.",
+      "Write `commitTimestamp` and `commitWait`: the clock, or TrueTime's latest followed by a wait until TrueTime's earliest reaches the timestamp. The commit-wait test passes with exactly 20 ms.",
+      "Write `audit`: pick the read timestamp and window for the policy, then loop: one round trip, read both ranges, wait 1 ms on an intent, restart above an uncertain value. The remaining tests pass, including a property test over hundreds of seeds and bounds: commit wait and restarts never give a stale or fractured audit."
+    ],
+    "hints": [
+      "In `Range.read`, check intents before uncertainty: an intent you skip could commit at a timestamp below yours a moment later, and a reader that ignores it can see one range's half of a transfer and not the other's.",
+      "For RESTART the window is `readTs + 2 * epsilonMs`, because the writer's clock may be ε ahead of true time while yours is ε behind.",
+      "When you restart, move `readTs` up to the uncertain timestamp but leave the window's top where it was. A window that moved with the read could find a new uncertain value on every attempt.",
+      "A wait on an intent sleeps 1 ms with no new round trip; a restart costs `rttMs`. The exact-latency tests depend on that difference."
+    ],
+    "done_when": "All 14 tests in `sfz.cons.l06` pass."
+  },
+  "drill": {
+    "title": "Write the read rule from memory",
+    "minutes": 4,
+    "prompt": "Close the lab. Write `read(key, readTs, limit)` for one MVCC range: block on an intent at or below the limit, report the highest committed timestamp in (readTs, limit] as uncertain, and otherwise return the newest committed version at or below readTs.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun read(key: String, readTs: Long, limit: Long): ReadResult {\n    val all = versionsOf(key)\n    all.firstOrNull { !it.committed && it.ts <= limit }\n        ?.let { return Blocked(it.txn!!) }                 // may commit below us: wait\n    all.filter { it.committed && it.ts > readTs && it.ts <= limit }\n        .maxOfOrNull { it.ts }\n        ?.let { return Uncertain(it) }                     // can't tell before from after\n    val v = all.filter { it.committed && it.ts <= readTs }.maxBy { it.ts }\n    return Value(v.value, v.ts)                            // the snapshot at readTs\n}"
+    }
+  },
+  "recap": [
+    "Distributed SQL stacks range sharding, a Raft or Paxos group per range, two-phase commit across ranges with intents and a replicated transaction record, and MVCC commit timestamps.",
+    "The timestamps decide the guarantee. A timestamp oracle (Percolator, TiDB's Placement Driver, FoundationDB's sequencer) follows real time but costs a round trip to one leader per transaction.",
+    "Spanner's TrueTime reports [earliest, latest]; a transaction commits at latest and waits about 2ε until earliest passes it, overlapped with Paxos. That buys external consistency (strict serializability).",
+    "CockroachDB uses hybrid clocks and a max offset (500 ms default) and lets readers restart above values in their uncertainty window; parallel commits make a commit one consensus round. Serializable, not strictly.",
+    "Aurora DSQL is optimistic snapshot isolation with one adjudication at commit, 40001 on conflict and limits of 3,000 rows, 10 MiB and 5 minutes. Distributed SQL doesn't mean serializable: check the level."
+  ],
+  "quiz": [
+    {
+      "q": "A distributed SQL transfer has written intents on two ranges and its transaction record says COMMITTED, but the intent on the second range hasn't been resolved yet. A reader whose timestamp is above the commit timestamp reaches that intent. What must it do?",
+      "options": [
+        "Skip it and read the older committed version",
+        "Find out the transaction's outcome (wait for, or look up, its record) and then read the committed value",
+        "Abort, because intents mean the data is corrupt",
+        "Read the intent's value without checking anything"
+      ],
+      "answer": 1,
+      "why": "The intent belongs to a committed transaction whose timestamp is below the reader's, so the reader must see it. Skipping it would show the first range's half of the transfer and not this one's, a fractured read. The transaction record is the single place that decides, which is why reads consult it (or wait) rather than guess from the intent."
+    },
+    {
+      "q": "Spanner's TrueTime reports ε = 4 ms and the Paxos round for the commit record takes 9 ms. Roughly how much does commit wait add to a write, and why?",
+      "options": [
+        "About 8 ms on top of the 9 ms, since 2ε is always added",
+        "Nothing at all, because TrueTime uses atomic clocks",
+        "Little or none of the 2ε = 8 ms, because the wait runs while the commit record replicates; the paper measured about 5 ms of commit wait with ε peaking at 7 ms",
+        "Exactly ε = 4 ms"
+      ],
+      "answer": 2,
+      "why": "The wait lasts until TrueTime's earliest passes the timestamp, about 2ε after it was picked, and Spanner overlaps it with Paxos communication, so only the part longer than the replication shows. Atomic clocks make ε small; they don't make it zero, and the rule still waits."
+    },
+    {
+      "q": "CockroachDB runs with the default 500 ms max offset. A dashboard query reads a row that another node updated 200 ms ago (by that node's clock). What can happen?",
+      "options": [
+        "The value is inside the read's uncertainty interval, so the read moves its timestamp above it and may restart",
+        "Nothing: the value is 200 ms old, so it is clearly in the past",
+        "The query blocks for 500 ms of commit wait",
+        "The node shuts itself down for clock skew"
+      ],
+      "answer": 0,
+      "why": "Any value with a timestamp between the read's timestamp and 500 ms above it may have committed before the read began on a node with a faster clock, so the read can't place it. CockroachDB moves the read's timestamp up and continues if its earlier reads still hold, or restarts. There is no commit wait, and a node stops itself only when its own clock is off by 80% of the max offset from most others."
+    },
+    {
+      "q": "From lesson 1: CockroachDB defaults to SERIALIZABLE, Spanner promises external consistency. What does Spanner promise that plain serializability doesn't?",
+      "options": [
+        "That transactions never abort",
+        "That the serial order agrees with real time: a transaction that starts after another committed sees its effects (strict serializability)",
+        "That reads never block",
+        "That write skew is impossible"
+      ],
+      "answer": 1,
+      "why": "Serializability only says the result equals some serial order, which may put a later transaction first, so a read can be stale. External consistency adds real-time order, which is lesson 1's strict serializability. Both forbid write skew; neither promises no aborts or no blocking.",
+      "from": "cons-01"
+    },
+    {
+      "q": "A team moves its fee-allocation job to Aurora DSQL. Two transactions each read the merchant's two fee caps and lower one of them, so that the sum stays above a floor. Both commit, and the sum ends below the floor. Why?",
+      "options": [
+        "DSQL lost one of the writes",
+        "The adjudicator failed",
+        "DSQL runs snapshot isolation only: the transactions wrote different rows, so neither conflicts at commit, and write skew is allowed; materialize the conflict (both write one shared row) or use SELECT ... FOR UPDATE on the rows read",
+        "The 3,000-row limit was exceeded"
+      ],
+      "answer": 2,
+      "why": "Snapshot isolation checks only write-write conflicts. Each transaction read both caps and wrote a different one, so the adjudicator saw no overlap: the Transactions track's write skew. In DSQL, `SELECT ... FOR UPDATE` is adjudicated as a write, so reading both caps that way makes the second commit fail with 40001 instead."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Which four earlier ideas does a distributed SQL database stack?",
+      "back": "Range sharding, a consensus group per range, two-phase commit across ranges (intents plus a replicated transaction record), and MVCC commit timestamps."
+    },
+    {
+      "front": "What is a timestamp oracle, and what does it cost?",
+      "back": "One server (Percolator, TiDB's Placement Driver) that hands out increasing timestamps, so they follow real time. Every transaction makes a round trip to that one leader."
+    },
+    {
+      "front": "What does TrueTime's TT.now() return?",
+      "back": "An interval [earliest, latest] that contains the true time. ε is half its width: about 1 to 7 ms in the 2012 paper."
+    },
+    {
+      "front": "What is commit wait?",
+      "back": "Spanner commits at TT.now().latest and tells no one until TT.now().earliest has passed that timestamp, about 2ε, overlapped with Paxos."
+    },
+    {
+      "front": "What is CockroachDB's uncertainty interval?",
+      "back": "From a read's timestamp up to that timestamp plus the max offset (500 ms default). A value inside it can't be placed, so the read moves above it or restarts."
+    },
+    {
+      "front": "What isolation does Aurora DSQL offer?",
+      "back": "Snapshot isolation only (PostgreSQL's REPEATABLE READ), optimistic, checked at commit: a conflict returns 40001 with OC000."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Distributed SQL",
+      "plain": "A SQL database whose tables are split into ranges on many machines, with transactions that span them."
+    },
+    {
+      "term": "Intent",
+      "plain": "A provisional value a transaction writes before it commits; it also acts as a lock."
+    },
+    {
+      "term": "Timestamp oracle",
+      "plain": "One server that hands out strictly increasing timestamps to every transaction."
+    },
+    {
+      "term": "TrueTime",
+      "plain": "Spanner's clock API: an interval [earliest, latest] guaranteed to contain the true time."
+    },
+    {
+      "term": "Commit wait",
+      "plain": "Holding a commit's announcement until its timestamp is surely in the past on every clock."
+    },
+    {
+      "term": "Uncertainty interval",
+      "plain": "The timestamps just above a read's own that may belong to writes made before the read began."
+    },
+    {
+      "term": "Parallel commits",
+      "plain": "CockroachDB's commit that marks the transaction record STAGING while the intents replicate, so commit takes one consensus round."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Explain why a distributed SQL database can't just stamp each commit with the local clock of the server that coordinates it, and two ways real systems avoid the problem.",
+    "answer": "A snapshot read returns everything committed at or below its timestamp. If each server uses its own clock and clocks disagree, a payment committed on a server whose clock runs fast can carry a timestamp above that of a report started later on a server whose clock runs slow, so the report misses a payment that was already confirmed: a stale read, even though each transaction was atomic. Spanner avoids it with TrueTime, which reports an interval that surely contains the true time: it commits at the top of the interval and waits, about twice the clock error, until the bottom has passed that timestamp before telling anyone, so every later transaction gets a higher timestamp. CockroachDB avoids it without special clocks: it promises a maximum offset between clocks, kills nodes that exceed it, and makes a reader that meets a value just above its own timestamp, within that offset, move its timestamp up or restart. A third way is a single timestamp oracle, as in TiDB, at the price of a round trip to one server."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Percolator's cleanup.** Percolator commits by rewriting one primary lock; secondary locks point at it. A reader that finds a lock left by a crashed client checks the primary and rolls the transaction forward or back. That lazy cleanup could delay commits by tens of seconds: fine for building a search index, which was its job, and far too slow for a payment.\n\n**Deterministic databases.** Calvin (2012) agrees on the order of whole transactions first, through a replicated log, and then every replica runs them in that order with no two-phase commit at all, at the price of declaring a transaction's reads and writes up front. FaunaDB built on the idea, and Cassandra 6.0's Accord, still alpha, orders multi-partition transactions without a leader.\n\n**Better clocks for everyone.** AWS's Time Sync Service gives EC2 instances an error bound under 100 µs over NTP and under 40 µs through the Nitro hardware clock, and its ClockBound daemon reports [earliest, latest] like TrueTime. YugabyteDB can use it. As cloud clocks improve, commit wait and uncertainty windows shrink toward the cost of a consensus round, and the designs in this lesson converge.\n\n**Reading further.** Designing Data-Intensive Applications, 2nd edition, covers distributed transactions in chapter 8 and timestamps, linearizable ID generators and consensus in chapter 10."
+  },
+  "sources": [
+    {
+      "title": "Corbett et al.: Spanner, Google's globally-distributed database (OSDI 2012)",
+      "url": "https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett"
+    },
+    {
+      "title": "CockroachDB: Transaction layer",
+      "url": "https://docs.cockroachlabs.com/docs/stable/architecture/transaction-layer"
+    },
+    {
+      "title": "Aurora DSQL: Concurrency control",
+      "url": "https://docs.aws.amazon.com/aurora-dsql/latest/userguide/working-with-concurrency-control.html"
+    },
+    {
+      "title": "TiDB: Timestamp Oracle (TSO)",
+      "url": "https://docs.pingcap.com/tidb/stable/tso"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapters 8 and 10",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

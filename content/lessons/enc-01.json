@@ -1,0 +1,381 @@
+{
+  "id": "enc-01",
+  "title": "From objects to bytes: JSON, binary formats and serializers",
+  "minutes": 40,
+  "goal": "By the end you can explain why an object has to become self-contained bytes before it leaves a process, show why Java deserialization of untrusted bytes runs code and how a JEP 290 filter stops it, predict which JSON readers corrupt a 64-bit ID, and compare one record's size in JSON, CBOR, MessagePack, BSON and Java serialization.",
+  "warmup": {
+    "q": "A service sends `{\"paymentId\": 1849204436731904017}` to a dashboard written in TypeScript, which reads it with `JSON.parse`. What does the dashboard get?",
+    "options": [
+      "Exactly 1849204436731904017: JSON numbers are 64-bit integers",
+      "An error, because the number is too large for JSON",
+      "1849204436731904000, with no error",
+      "The string \"1849204436731904017\", because large numbers are kept as text"
+    ],
+    "answer": 2,
+    "why": "`JSON.parse` stores every number as a double, which holds 53 bits of digits. Near 1.8 x 10^18, doubles are 256 apart, so the ID rounds to the nearest one, 1849204436731904000, silently. JSON itself sets no size for numbers, which is why the first option is tempting and wrong: the reader decides, and many readers use doubles. Section 3 shows the fix."
+  },
+  "sections": [
+    {
+      "h": "An object in memory is a web of addresses",
+      "body": "Your payment service holds an authorization as a Kotlin object:\n\n```kotlin\ndata class Authorization(\n    val paymentId: Long,     // 1849204436731904017, from an id generator\n    val merchant: String,    // \"Fern Bakery\"\n    val amountMinor: Long,   // 4000 means 40.00 EUR\n    val currency: String,    // \"EUR\"\n    val tags: List<String>,  // [\"card\", \"3ds\"]\n)\n```\n\nIn the JVM's heap this is not one block of data. The `Authorization` object holds the two `Long` values itself, but `merchant`, `currency` and `tags` are **references**: addresses of other objects elsewhere in the heap. The string \"Fern Bakery\" is its own object, which points at a byte array that holds the characters. The list is an object that points at an array, which points at two more strings. That is eleven small objects, tied together by addresses.\n\nThose addresses mean something only inside this one process, and only until the garbage collector moves the objects, which G1 and ZGC do all the time. Copy the raw heap bytes to another JVM and `merchant` points at whatever sits at that address over there. A Python fraud model can't use them at all.\n\nSo whenever data leaves a process, something has to turn the object graph into a self-contained run of bytes: every value written out, plus enough structure (lengths, types, maybe names) for a reader to rebuild it without your heap. That is **encoding**, also called serialization or marshalling. Turning bytes back into objects is decoding (deserialization, parsing, unmarshalling). This track says \"encoding\", because the Transactions track uses \"serializable\" for an isolation level.\n\nIt happens far more often than it looks. A Kafka producer encodes every value before it sends it, and the broker stores only bytes. Redis stores every value as a byte string (the Caching track's lesson on core data types). The JDBC driver from the SQL track's lesson on SQL from the JVM encodes each parameter into PostgreSQL's wire protocol. A REST call encodes a JSON body. Temporal encodes every activity's input and result into the workflow's history.\n\nKeep one picture for this whole track: **a boundary with bytes crossing it**. On one side are a program's objects. On the other are bytes that some other program will read: another service, another language, or your own service three releases from now. Every format answers four questions about those bytes:\n\n- Can a program in another language read them?\n- How many bytes do they take, and how fast are they to write and read?\n- What happens when the record's shape changes? (Lesson 2 of this track.)\n- Is decoding safe when the bytes come from someone you don't trust?\n\nThis lesson puts the authorization above through Java serialization, JSON and three binary JSON formats, and measures each. The lab reproduces every number.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 720 280\" role=\"img\" aria-label=\"An Authorization object in the heap points at separate String and List objects by address. Encoding writes every value into one self-contained run of 116 bytes with no addresses in it.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">in the heap of one JVM</text><text class=\"t-s t-m\" x=\"526\" y=\"22\" text-anchor=\"start\">on the wire, for anyone</text><rect class=\"box-a\" x=\"16\" y=\"36\" width=\"270\" height=\"168\" rx=\"8\"/><text class=\"t\" x=\"30\" y=\"60\" text-anchor=\"start\">Authorization @7f3a1040</text><text class=\"t-s t-code\" x=\"30\" y=\"88\" text-anchor=\"start\">paymentId   1849204436731904017</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">merchant    @7f3a2210</text><text class=\"t-s t-code\" x=\"30\" y=\"136\" text-anchor=\"start\">amountMinor 4000</text><text class=\"t-s t-code\" x=\"30\" y=\"160\" text-anchor=\"start\">currency    @7f3a2280</text><text class=\"t-s t-code\" x=\"30\" y=\"184\" text-anchor=\"start\">tags        @7f3a2300</text><rect class=\"box\" x=\"326\" y=\"64\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"401\" y=\"84\" text-anchor=\"middle\">String @7f3a2210</text><text class=\"t-s t-code\" x=\"401\" y=\"102\" text-anchor=\"middle\">Fern Bakery</text><rect class=\"box\" x=\"326\" y=\"124\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"401\" y=\"144\" text-anchor=\"middle\">String @7f3a2280</text><text class=\"t-s t-code\" x=\"401\" y=\"162\" text-anchor=\"middle\">EUR</text><rect class=\"box\" x=\"326\" y=\"184\" width=\"150\" height=\"48\" rx=\"8\"/><text class=\"t-s\" x=\"401\" y=\"204\" text-anchor=\"middle\">List @7f3a2300</text><text class=\"t-s t-code\" x=\"401\" y=\"222\" text-anchor=\"middle\">card, 3ds</text><line class=\"ln\" x1=\"288\" y1=\"108\" x2=\"324\" y2=\"90\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"288\" y1=\"156\" x2=\"324\" y2=\"148\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"288\" y1=\"180\" x2=\"324\" y2=\"206\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"503\" y=\"122\" text-anchor=\"middle\">encode</text><line class=\"ln-a\" x1=\"484\" y1=\"134\" x2=\"522\" y2=\"134\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"526\" y=\"36\" width=\"178\" height=\"196\" rx=\"8\"/><text class=\"t-s t-code\" x=\"540\" y=\"60\" text-anchor=\"start\">7b 22 70 61 79 6d</text><text class=\"t-s t-code\" x=\"540\" y=\"82\" text-anchor=\"start\">65 6e 74 49 64 22</text><text class=\"t-s t-code\" x=\"540\" y=\"104\" text-anchor=\"start\">3a 31 38 34 39 32</text><text class=\"t-s t-code\" x=\"540\" y=\"126\" text-anchor=\"start\">30 34 34 33 36 37</text><text class=\"t-s t-code\" x=\"540\" y=\"148\" text-anchor=\"start\">33 31 39 30 34 30</text><text class=\"t-s t-code\" x=\"540\" y=\"170\" text-anchor=\"start\">31 37 2c 22 6d 65</text><text class=\"t-s t-m\" x=\"540\" y=\"196\" text-anchor=\"start\">... 116 bytes in all</text><text class=\"t-s t-a\" x=\"540\" y=\"218\" text-anchor=\"start\">no addresses</text><text class=\"t-s t-m\" x=\"16\" y=\"236\" text-anchor=\"start\">about a dozen objects, joined by addresses</text><text class=\"t-s t-m\" x=\"16\" y=\"262\" text-anchor=\"start\">an address means nothing in another process, or after the GC moves the object</text></svg>",
+        "caption": "In the heap, the authorization is about a dozen objects joined by addresses. Encoding writes the values themselves into one run of bytes that any process can read."
+      },
+      "refs": [
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition (chapter 5)",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Java serialization is one line to write, and it runs code when it reads",
+      "body": "The JDK has had an encoder since Java 1.1. Mark the class `Serializable` and write the object to an `ObjectOutputStream`:\n\n```kotlin\nval out = ByteArrayOutputStream()\nObjectOutputStream(out).use { it.writeObject(auth) }   // 309 bytes for our authorization\nval back = ObjectInputStream(ByteArrayInputStream(out.toByteArray())).use { it.readObject() } as Authorization\n```\n\nIt works on the first try, which is why so much Java used it: RMI, JMX, JMS `ObjectMessage`, HTTP session replication, caches that stored objects. Python has `pickle` and Ruby has `Marshal` for the same reason. Look at what it wrote, though. The stream starts with `ac ed 00 05`, a magic number and format version 5. Then comes the full class name, `sfz.enc.l01.demo.Authorization`, a version number for the class (its `serialVersionUID`), the name and type of every field, and only then the values. The JSON for the same record, in the next section, takes 116 bytes.\n\nSize is the small problem. The format belongs to Java, so the Python fraud model can't read it. And when the class changes, old bytes may stop decoding: a different `serialVersionUID` gives `InvalidClassException: local class incompatible`.\n\nThe big problem is what decoding does. `readObject()` reads a class name from the bytes, loads that class, creates an instance without running its constructor, fills the fields from the bytes, and calls the class's own `readObject` method if it has one. So **the bytes choose which class gets created**, and your code says what it expected only afterwards, in the cast. The stepper below walks through it.\n\nAnyone who can send you serialized bytes can therefore run the `readObject` of any serializable class on your classpath, with field values they picked. Your own classes don't need to be dangerous, because the JDK and every library jar add classes of their own. Chris Frohoff and Gabriel Lawrence presented chains of such classes, called gadget chains, at AppSecCali 2015, with ysoserial, a tool that builds them. The best known goes through Apache Commons Collections: a JDK class's `readObject` touches a map, the map is a `LazyMap` that calls a \"transformer\" to make missing values, and `InvokerTransformer` calls any method by name through reflection, ending in `Runtime.exec`. In November 2015, Stephen Breen of Foxglove Security published working exploits for WebLogic, WebSphere, JBoss, Jenkins and OpenNMS, which all deserialized network input. The WebLogic one is CVE-2015-4852. In 2018 Mark Reinhold, then Oracle's chief architect for the Java platform, called serialization a \"horrible mistake\" and estimated that at least a third of Java's vulnerabilities had involved it.\n\nCommons Collections then stopped deserializing `InvokerTransformer`, and new gadgets turned up in other libraries. The real bug is decoding untrusted bytes into whatever class they name. The gadget is just whatever happens to be on the classpath.\n\nJDK 9 added a way to say no first: **JEP 290** serialization filters. The stream asks a filter about every class and array before it creates anything, and the filter answers ALLOWED, REJECTED or UNDECIDED. You can write one as a pattern:\n\n```text\nmaxdepth=5;sfz.enc.l01.Authorization;java.util.ArrayList;java.lang.String;!*\n```\n\nAn exact class name allows that class, and `!*` rejects everything else. Limits such as `maxdepth`, `maxrefs`, `maxbytes` and `maxarray` reject graphs built to burn memory or CPU. Set a filter per stream with `setObjectInputFilter`, or for the whole JVM with `-Djdk.serialFilter=...`. JDK 17 added filter factories that pick a filter per stream (JEP 415). Write an allow-list, never a block-list: the next gadget is one that nobody has listed yet. Better still, accept no Java serialization from outside the process. The formats in the rest of this track decode into plain values, never into a class the sender chose.",
+      "stepper": {
+        "title": "What readObject does with bytes it didn't expect",
+        "intro": "Bytes arrive that name `AuditHook`, a harmless class with a `readObject` method. Your code expects an `Authorization`.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. your code calls readObject() on the stream\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box-a\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s t-m\" x=\"210\" y=\"160\" text-anchor=\"middle\">none set</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s\" x=\"350\" y=\"218\" text-anchor=\"middle\">your code calls readObject() on the stream</text></svg>",
+            "say": "Your service reads a request from a socket with `ObjectInputStream(socket.getInputStream()).readObject() as Authorization`. The sender wrote the bytes. They start with `ac ed 00 05` like any serialized object, and nothing so far has looked at what's inside."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. the bytes name the class: sfz.enc.l01.demo.AuditHook\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box-a\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s t-m\" x=\"210\" y=\"160\" text-anchor=\"middle\">none set</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s t-a\" x=\"350\" y=\"218\" text-anchor=\"middle\">the bytes name the class: sfz.enc.l01.demo.AuditHook</text></svg>",
+            "say": "**The bytes choose the class.** The stream reads a class name and a `serialVersionUID` from the bytes. Your expected type, `Authorization`, appears nowhere in this decision: it is only in the cast at the end of the line."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. any Serializable class on the classpath will do\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s t-m\" x=\"210\" y=\"160\" text-anchor=\"middle\">none set</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s t-a\" x=\"350\" y=\"218\" text-anchor=\"middle\">any Serializable class on the classpath will do</text></svg>",
+            "say": "The stream loads that class. With no filter, any class that implements `Serializable` qualifies: your own code, the JDK, and every jar your service depends on. Every exception class is one, because `Throwable` implements `Serializable`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. AuditHook.readObject runs, with fields the sender chose\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s t-m\" x=\"210\" y=\"160\" text-anchor=\"middle\">none set</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s t-bad\" x=\"350\" y=\"218\" text-anchor=\"middle\">AuditHook.readObject runs, with fields the sender chose</text></svg>",
+            "say": "The stream creates the object without running its constructor, fills its fields from the bytes and calls its private `readObject` method. **This is where code runs.** In a gadget chain, that `readObject` calls methods on its fields, those call others, and the last one in the 2015 Commons Collections chain called `Runtime.exec` through reflection."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. ClassCastException, after the code already ran\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s t-m\" x=\"210\" y=\"160\" text-anchor=\"middle\">none set</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s t-bad\" x=\"350\" y=\"218\" text-anchor=\"middle\">ClassCastException, after the code already ran</text></svg>",
+            "say": "`readObject()` returns an `AuditHook`, and now the cast fails with `ClassCastException`. Your error handler logs a bad request. Whatever step 3 did has already happened, so the type check came too late to protect anything."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 240\" role=\"img\" aria-label=\"ObjectInputStream reads a class name from the bytes, loads the class, creates the object and runs its readObject method, and only then does your cast check the type. InvalidClassException: filter status: REJECTED\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"8\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"173\" y=\"42\" text-anchor=\"middle\">bytes from the network</text><text class=\"t-s t-code\" x=\"173\" y=\"64\" text-anchor=\"middle\">ac ed 00 05 73 72 ... AuditHook</text><rect class=\"box\" x=\"362\" y=\"20\" width=\"330\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"527\" y=\"42\" text-anchor=\"middle\">your code</text><text class=\"t-s t-code\" x=\"527\" y=\"64\" text-anchor=\"middle\">readObject() as Authorization</text><rect class=\"box\" x=\"8\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"69\" y=\"140\" text-anchor=\"middle\">1. read the</text><text class=\"t-s\" x=\"69\" y=\"160\" text-anchor=\"middle\">class name</text><line class=\"ln\" x1=\"131\" y1=\"146\" x2=\"147\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"149\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s\" x=\"210\" y=\"140\" text-anchor=\"middle\">filter</text><text class=\"t-s\" x=\"210\" y=\"160\" text-anchor=\"middle\">REJECTED</text><line class=\"ln\" x1=\"272\" y1=\"146\" x2=\"288\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"290\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"351\" y=\"140\" text-anchor=\"middle\">2. load that</text><text class=\"t-s t-m\" x=\"351\" y=\"160\" text-anchor=\"middle\">class</text><line class=\"ln\" x1=\"413\" y1=\"146\" x2=\"429\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"431\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"492\" y=\"140\" text-anchor=\"middle\">3. create it,</text><text class=\"t-s t-m\" x=\"492\" y=\"160\" text-anchor=\"middle\">run readObject</text><line class=\"ln\" x1=\"554\" y1=\"146\" x2=\"570\" y2=\"146\" marker-end=\"url(#arr)\"/><rect class=\"box-dim\" x=\"572\" y=\"116\" width=\"122\" height=\"60\" rx=\"8\"/><text class=\"t-s t-m\" x=\"633\" y=\"140\" text-anchor=\"middle\">4. cast to</text><text class=\"t-s t-m\" x=\"633\" y=\"160\" text-anchor=\"middle\">Authorization</text><text class=\"t-s t-ok\" x=\"350\" y=\"218\" text-anchor=\"middle\">InvalidClassException: filter status: REJECTED</text></svg>",
+            "say": "With a JEP 290 filter on the stream, the filter is asked about `AuditHook` before any object exists. It isn't on the allow-list, so the answer is REJECTED and `readObject` throws `InvalidClassException`. No object was created and no `readObject` ran."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch readObject run code before the cast",
+        "minutes": 4,
+        "steps": [
+          "Open `SerializationDemo.kt`. `AuditHook` is a harmless class whose `readObject` prints a line. The demo serializes one, then decodes the bytes expecting an `Authorization`, first with no filter and then with an allow-list filter.",
+          "Predict before you run it: in step 2, which line prints first, the `readObject` line or the `ClassCastException`?",
+          "Run it from the `labs` folder with the command below.",
+          "In the filter pattern, replace `sfz.enc.l01.demo.Authorization` with `sfz.enc.l01.demo.*` and run it again. Why does `AuditHook` get through now? Put the exact name back afterwards."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SerializationDemo.kt (the decoding part)",
+          "src": "// bytes from \"a client\": they name AuditHook, not Authorization\nval hostile = serialize(AuditHook(\"chosen by whoever wrote the bytes\"))\n\n// no filter: readObject runs AuditHook's code, then the cast fails\ntry {\n    ObjectInputStream(ByteArrayInputStream(hostile)).use { it.readObject() } as Authorization\n} catch (e: ClassCastException) {\n    println(\"  ClassCastException, but only after readObject had run\")\n}\n\n// an allow-list: exact names, a depth limit, and !* for everything else\nval filter = ObjectInputFilter.Config.createFilter(\n    \"maxdepth=5;sfz.enc.l01.demo.Authorization;java.util.Arrays\\$ArrayList;java.lang.String;!*\"\n)\ntry {\n    ObjectInputStream(ByteArrayInputStream(hostile)).use {\n        it.setObjectInputFilter(filter)\n        it.readObject() as Authorization\n    }\n} catch (e: InvalidClassException) {\n    println(\"  ${e.javaClass.simpleName}: ${e.message}\")\n} catch (e: ClassCastException) {\n    println(\"  the filter let AuditHook through: ClassCastException after readObject ran\")\n}",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l01/demo/SerializationDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l01.demo.SerializationDemoKt -q"
+        },
+        "expect": "```text\n1. An Authorization takes 309 bytes. The first four: ac ed 00 05\n   The bytes name the class: true\n2. Decode them expecting an Authorization, with no filter:\n  AuditHook.readObject ran, note = 'chosen by whoever wrote the bytes'\n  ClassCastException, but only after readObject had run\n3. The same bytes with a JEP 290 allow-list filter:\n  InvalidClassException: filter status: REJECTED\n   A real Authorization still passes: true\n```\nThe `readObject` line prints before the exception: the code ran while the stream was still decoding, and the cast found out afterwards. With the package pattern, part 3 prints `AuditHook.readObject ran` again, then `the filter let AuditHook through`: `AuditHook` sits in the allowed package, so the filter says yes and the code runs. Allow exact classes."
+      },
+      "refs": [
+        {
+          "title": "JEP 290: Filter Incoming Serialization Data",
+          "url": "https://openjdk.org/jeps/290",
+          "kind": "docs"
+        },
+        {
+          "title": "PCWorld (2015): Java applications vulnerable to a nine-month-old remote code execution exploit",
+          "url": "https://www.pcworld.com/article/424388/thousands-of-java-applications-vulnerable-to-nine-month-old-remote-code-execution-exploit.html",
+          "kind": "read"
+        },
+        {
+          "title": "InfoWorld (2018): Oracle plans to dump risky Java serialization",
+          "url": "https://www.infoworld.com/article/3275924/oracle-plans-to-dump-risky-java-serialization.html",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "JSON goes everywhere, and rounds every ID above 2^53",
+      "body": "Text formats fix the language problem. Every language can read JSON, you can read the bytes in a log, and a JSON parser builds plain maps, lists, strings and numbers. Here is the authorization, 116 bytes:\n\n```json\n{\"paymentId\":1849204436731904017,\"merchant\":\"Fern Bakery\",\"amountMinor\":4000,\"currency\":\"EUR\",\"tags\":[\"card\",\"3ds\"]}\n```\n\nNow a support dashboard written in TypeScript reads it. `JSON.parse` turns every number into a JavaScript number, which is an IEEE 754 double: 64 bits, of which 53 hold the digits. Every integer up to 2^53 (9,007,199,254,740,992) fits exactly. Above that the doubles are 2 apart, then 4 apart, and near our ID 256 apart, so the parser rounds to the nearest one it can hold:\n\n```text\n9007199254740993 -> as a double -> 9007199254740992\n1849204436731904017 -> as a double -> 1849204436731904000\n```\n\nThere's no error and no warning. The dashboard shows a payment ending in 4000, and a refund for that ID finds nothing, or someone else's payment. JSON's standard, RFC 8259, sets no precision for numbers and warns that only integers from -(2^53 - 1) to 2^53 - 1 work everywhere. IDs from 64-bit generators are far above that. Twitter's API ran into this with tweet IDs and added a second field, `id_str`, with the same ID as a string. Protobuf's JSON mapping writes every 64-bit integer as a string for the same reason. Do the same: send 64-bit IDs as strings whenever a browser or another language may read them. Jackson reads `\"1849204436731904017\"` into a `Long` without any extra setting.\n\nNumbers are only the first gap in JSON and its text cousins:\n\n- JSON tells strings from numbers, but not integers from floats: is `40.0` an exact amount or a double? CSV and XML can't even tell a number from a string of digits without a schema somewhere else.\n- JSON and XML have no type for raw bytes. A signature or a PDF goes as Base64, which turns every 3 bytes into 4 characters, so a 3 KB signature becomes 4 KB.\n- CSV has no types at all, and its quoting rules vary: RFC 4180 describes one set, and plenty of tools don't follow it.\n- XML is verbose: every value sits between an opening and a closing tag.\n\nThe biggest gap is the schema. Nothing in a JSON document says which fields must be there, what type they have or what they mean, so each consumer writes its own guess into its code. **JSON Schema** (current version 2020-12) writes the guess down: types, required fields, and checks such as `\"minimum\": 1`. OpenAPI describes request and response bodies with it, and schema registries store it. One trap: a JSON Schema accepts any property it doesn't mention unless it says `\"additionalProperties\": false`. So an open schema mostly lists what is forbidden, which matters as soon as you try to change one (lesson 2).",
+      "try": {
+        "title": "Round a 64-bit ID through a double",
+        "minutes": 3,
+        "steps": [
+          "Run `BigIdDemo` from the `labs` folder (command below). It reads one JSON document twice, once as a `Long` and once as a double, then prints what happens to the integers around 2^53.",
+          "Predict: which of 2^53 - 1, 2^53, 2^53 + 1 and 2^53 + 2 come back changed?",
+          "If you have Node.js, check the same thing in JavaScript: `node -e 'console.log(JSON.parse(\"{\\\"id\\\": 1849204436731904017}\").id)'`. A browser console gives the same answer for `JSON.parse('{\"id\": 1849204436731904017}').id`."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "BigIdDemo.kt",
+          "src": "val mapper = jacksonObjectMapper()\nval json = \"\"\"{\"paymentId\":1849204436731904017,\"amountMinor\":4000}\"\"\"\nval node = mapper.readTree(json).get(\"paymentId\")\nprintln(\"read as a Long:    ${node.longValue()}\")\n// a double has 53 bits for the digits; JavaScript's JSON.parse does exactly this\nprintln(\"read as a double:  ${BigDecimal(node.asDouble()).toPlainString()}\")\n\nval twoTo53 = 1L shl 53\nfor (id in listOf(twoTo53 - 1, twoTo53, twoTo53 + 1, twoTo53 + 2)) {\n    println(\"%d -> as a double -> %s\".format(id, BigDecimal(id.toDouble()).toPlainString()))\n}",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l01/demo/BigIdDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l01.demo.BigIdDemoKt -q"
+        },
+        "expect": "```text\nsent:              {\"paymentId\":1849204436731904017,\"amountMinor\":4000}\nread as a Long:    1849204436731904017\nread as a double:  1849204436731904000\n9007199254740991 -> as a double -> 9007199254740991\n9007199254740992 -> as a double -> 9007199254740992\n9007199254740993 -> as a double -> 9007199254740992\n9007199254740994 -> as a double -> 9007199254740994\nas a string:       1849204436731904017\n```\nOnly 2^53 + 1 changes: above 2^53 a double can hold only even integers, so it lands on 2^53. 2^53 itself survives but isn't safe, because a reader can't tell whether you sent 2^53 or 2^53 + 1. Node prints `1849204436731904000`."
+      },
+      "refs": [
+        {
+          "title": "RFC 8259, section 6: Numbers",
+          "url": "https://www.rfc-editor.org/rfc/rfc8259#section-6",
+          "kind": "docs"
+        },
+        {
+          "title": "Protobuf: ProtoJSON format (64-bit integers as strings)",
+          "url": "https://protobuf.dev/programming-guides/json/",
+          "kind": "docs"
+        },
+        {
+          "title": "JSON Schema specification (2020-12)",
+          "url": "https://json-schema.org/specification",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Binary JSON packs the values and keeps the names",
+      "body": "If JSON is too big, the obvious next step is the same data in binary: real integer, float and byte-string types, and lengths instead of quotes and escapes. MessagePack, CBOR (the IETF standard, RFC 8949) and BSON (MongoDB's storage format) all do that. Here is the MessagePack encoding of the authorization, 84 bytes, one value per line:\n\n```text\n85                               map with 5 entries\na9 70 61 79 6d 65 6e 74 49 64    string of 9 bytes: \"paymentId\"\ncf 19 a9 b1 a3 40 7b 40 11       unsigned 64-bit integer: 1849204436731904017\na8 6d 65 72 63 68 61 6e 74       string of 8 bytes: \"merchant\"\nab 46 65 72 6e 20 42 ...         string of 11 bytes: \"Fern Bakery\"\nab 61 6d 6f 75 6e 74 4d ...      string of 11 bytes: \"amountMinor\"\ncd 0f a0                         unsigned 16-bit integer: 4000\n...                              \"currency\", \"EUR\", \"tags\", 92 (array of 2), \"card\", \"3ds\"\n```\n\nEvery value starts with a type byte, and small values fold their length into it: `0x85` is a map (`0x80`) with 5 entries, and `0xa9` is a string (`0xa0`) of 9 bytes. The ID takes 9 bytes instead of 19 digits, and it arrives as an integer, so no reader turns it into a double. But look at what's left: `paymentId`, `merchant`, `amountMinor`, `currency` and `tags`, spelled out in full. MessagePack has no schema, so every record carries every field name. Here the names take 45 of the 84 bytes.\n\nThe same record in each format (the lab measures all but BSON):\n\n| Encoding | Bytes | Field names in every record |\n|---|---|---|\n| JSON | 116 | yes |\n| BSON | 123 | yes |\n| CBOR, as Jackson writes it | 85 | yes |\n| MessagePack | 84 | yes |\n| Java serialization | 309 | yes, plus the class name |\n| The five values as a MessagePack array | 39 | no |\n\nBSON comes out bigger than the JSON. It is built for a database that has to skip through documents quickly: every document and string carries a 4-byte length, every field name ends with a zero byte, an array is stored as a document with the keys \"0\" and \"1\", and each 64-bit integer takes 8 bytes. CBOR and MessagePack land one byte apart. Jackson starts each CBOR map with an open length (`bf`) and ends it with a break byte (`ff`), and that's the extra byte.\n\nThe last row matters most. The same five values, written as an array in a fixed order, take 39 bytes. The names were more than half the record. But an array of five values means something only if the writer and the reader agreed on the order and types beforehand, and that agreement is a schema. Lesson 2 of this track puts one under the bytes: Protobuf replaces each name with a small number, and Avro drops even that. Binary JSON is a fair choice where you would use JSON anyway and want real types and no Base64 (WebAuthn, for example, uses CBOR). For records stored by the billion, it saves too little to be worth losing readable JSON.",
+      "try": {
+        "title": "Measure one record five ways",
+        "minutes": 3,
+        "steps": [
+          "Run `SizesDemo` from the `labs` folder. It encodes the authorization as JSON, CBOR, MessagePack and Java serialization, then encodes just the five values as an array.",
+          "Find the field names in the MessagePack hex: `70 61 79 6d 65 6e 74 49 64` is `paymentId`.",
+          "Change `tags` to ten tags and run it again. Which encoding grows the least per tag, and why?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SizesDemo.kt (the measuring part)",
+          "src": "val auth = Authorization(1849204436731904017, \"Fern Bakery\", 4000, \"EUR\", listOf(\"card\", \"3ds\"))\nshow(\"JSON\", json.writeValueAsBytes(auth))\nshow(\"CBOR\", cbor.writeValueAsBytes(auth))\nshow(\"MessagePack\", msgpack.writeValueAsBytes(auth))\nshow(\"Java serialization\", ByteArrayOutputStream().also { ObjectOutputStream(it).use { o -> o.writeObject(auth) } }.toByteArray())\n\n// the same five values with no field names, as an array\nval values = listOf(auth.paymentId, auth.merchant, auth.amountMinor, auth.currency, auth.tags)\nshow(\"JSON, no names\", json.writeValueAsBytes(values))\nshow(\"MessagePack, no names\", msgpack.writeValueAsBytes(values))",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l01/demo/SizesDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l01.demo.SizesDemoKt -q"
+        },
+        "expect": "```text\nJSON                    116 bytes   7b 22 70 61 79 6d 65 6e 74 49 64 22 3a 31 38 34 ...\nCBOR                     85 bytes   bf 69 70 61 79 6d 65 6e 74 49 64 1b 19 a9 b1 a3 ...\nMessagePack              84 bytes   85 a9 70 61 79 6d 65 6e 74 49 64 cf 19 a9 b1 a3 ...\nJava serialization      309 bytes   ac ed 00 05 73 72 00 1e 73 66 7a 2e 65 6e 63 2e ...\n\nJSON, no names           61 bytes   5b 31 38 34 39 32 30 34 34 33 36 37 33 31 39 30 ...\nMessagePack, no names    39 bytes   95 cf 19 a9 b1 a3 40 7b 40 11 ab 46 65 72 6e 20 ...\n```\n(the first line of the output, the JSON text, is trimmed). On JDK 24 or newer, msgpack-core also prints a `WARNING` about `sun.misc.Unsafe`; it is harmless. With ten tags, every format grows by about the same few bytes per tag, because a tag is a value, not a field name: names cost once per field, not once per element."
+      },
+      "refs": [
+        {
+          "title": "MessagePack specification",
+          "url": "https://github.com/msgpack/msgpack/blob/master/spec.md",
+          "kind": "docs"
+        },
+        {
+          "title": "RFC 8949: Concise Binary Object Representation (CBOR)",
+          "url": "https://www.rfc-editor.org/rfc/rfc8949",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Your desk is the heap. A sticky note on it says \"passport: second drawer\", and that note is a reference. You can't post the note to a friend abroad, because their desk has no second drawer with your passport in it. You post the passport, in a box with a packing list. JSON writes the full name on every item in the box; a schema format, next lesson, numbers the items and sends one packing list for all boxes. Java deserialization is a box that arrives with \"plug me in on arrival\" written on it, and you plug it in before you check whether it is the box you ordered. The analogy breaks on size: a real box costs the same whether the label says \"passport\" or \"item 1\", while in bytes the labels were more than half the record.",
+  "in_your_world": "Every boundary in your payment services is an encoding choice, even where nobody chose. Quarkus REST endpoints and the card-issuer API exchange JSON through Jackson, so check how each one sends 64-bit IDs: an Oracle `NUMBER(19)` primary key or a generated payment ID travels safely to another JVM and silently loses digits in any TypeScript back-office tool. Make those fields strings at the API edge. Kafka values are whatever bytes your serializer writes. Temporal's default data converter writes activity inputs and results as JSON in the workflow history, so the same rule applies there. And search for `ObjectInputStream`, JMS `ObjectMessage` and \"Java serialization\" settings in caches and session stores: any of them that reads bytes another system can write needs an allow-list filter, or a different format.",
+  "mistake": "Believing JSON is safe to decode because it is \"just data\". It is, until you let the JSON name a class. Jackson's polymorphic typing (`enableDefaultTyping()`, or `@JsonTypeInfo(use = JsonTypeInfo.Id.CLASS)` on a field typed `Object`) writes the class name into the JSON and creates that class when it reads, which is Java serialization's bug again, and jackson-databind spent years patching gadget classes reported against it. People turn it on to round-trip a `Map<String, Any>` of mixed types without writing a schema. The fix is to never let input pick an arbitrary class: use concrete types, or declare the allowed subtypes with `@JsonSubTypes` and a logical type name, or a `PolymorphicTypeValidator` that allow-lists base types.",
+  "worked": {
+    "title": "Put an allow-list filter on a legacy endpoint that must keep accepting serialized objects",
+    "steps": [
+      {
+        "say": "A settlement adapter still receives Java-serialized `Authorization` objects from an old system, and you can't change the sender this quarter. First find out which classes a real message contains. Install a filter that logs every class it is asked about and answers UNDECIDED, so nothing changes yet, and decode one captured message. (Strings are never passed to a filter, so they don't show up.)",
+        "code": "// subgoal: see what a genuine message contains\ninput.setObjectInputFilter { info ->\n    println(\"asked: ${info.serialClass()} depth=${info.depth()} array=${info.arrayLength()}\")\n    ObjectInputFilter.Status.UNDECIDED\n}\ninput.readObject()\n// asked: null depth=1 array=-1                        (no class: only the limits are checked)\n// asked: class sfz.enc.l01.Authorization depth=1 array=-1\n// asked: class java.util.ArrayList depth=2 array=-1\n// asked: class [Ljava.lang.Object; depth=2 array=2",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Turn that list into a pattern. Put the limits first, name each class exactly, and end with `!*`. The `Object[]` line is `ArrayList` checking the array it is about to allocate; an array is matched by its element type, so allow `java.lang.Object`. Size `maxdepth` and `maxbytes` from real messages with room to spare.",
+        "code": "// subgoal: an allow-list, never a block-list\nval filter = ObjectInputFilter.Config.createFilter(\n    \"maxdepth=5;maxbytes=4096;sfz.enc.l01.Authorization;java.util.ArrayList;\" +\n        \"java.util.Arrays\\$ArrayList;java.lang.String;java.lang.Object;!*\"\n)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Install it on the stream that reads network input, before the first `readObject`. A process-wide `-Djdk.serialFilter` would also work, but it applies to every stream in the JVM, including ones your libraries open for their own reasons.",
+        "code": "// subgoal: filter exactly the untrusted stream\nfun readAuthorization(bytes: ByteArray): Authorization =\n    ObjectInputStream(ByteArrayInputStream(bytes)).use { input ->\n        input.setObjectInputFilter(filter)\n        input.readObject() as Authorization\n    }",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Prove it with a test: serialize an unlisted class whose `readObject` counts calls, decode it, and expect `InvalidClassException` with the counter still at zero. The lab's `Tripwire` test does exactly this. Then put a ticket on the board to replace the format: the filter limits the damage, and JSON or Protobuf removes the cause.",
+        "code": "// subgoal: rejected before any code ran\nassertThatThrownBy { readAuthorization(serialize(Tripwire(\"x\"))) }\n    .isInstanceOf(InvalidClassException::class.java)\n    .hasMessageContaining(\"REJECTED\")\nassertThat(Tripwire.fired.get()).isZero()",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Measure one record four ways, catch the 2^53 bug, and filter a deserializer",
+    "minutes": 15,
+    "files": [
+      "labs/flow/src/main/kotlin/sfz/enc/l01/Formats.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l01/JsonIds.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l01/SafeDeserializer.kt"
+    ],
+    "run": "./gradlew :flow:test --tests 'sfz.enc.l01.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 16 fail with `NotImplementedError`. No Docker is needed: everything runs in the JVM.",
+      "In `Formats.kt`, write `encode`: one branch per format, three of them a single `writeValueAsBytes` call and one an `ObjectOutputStream`. Then write `positional`, the five values in declaration order. The five `FormatsTest` tests check the exact sizes from the lesson: 116, 85, 84, about 300, and 61 and 39 without names.",
+      "In `JsonIds.kt`, write `isSafe`, `changedByDouble` and `countChanged`. Then `toJson`, which writes `paymentId` as a string, and `fromJson`, which must read both the new string form and the old number form.",
+      "In `SafeDeserializer.kt`, write `readAuthorization` with a JEP 290 allow-list filter. The tests send it a `Tripwire`, a class whose `readObject` counts its calls, and a graph nested ten levels deep.",
+      "Run the tests until all 16 pass."
+    ],
+    "hints": [
+      "`ObjectOutputStream(out).use { it.writeObject(value) }`, then `out.toByteArray()`. Close the stream before you take the bytes, or the last block may still sit in its buffer.",
+      "Compare without rounding: `BigDecimal(id.toDouble()).compareTo(BigDecimal(id)) != 0`. `id.toDouble().toLong() != id` looks right, but it clamps values near `Long.MAX_VALUE`.",
+      "`Formats.json.valueToTree<ObjectNode>(a)` gives you a tree you can change with `put(\"paymentId\", a.paymentId.toString())` before you write it.",
+      "If the Jackson test fails with `REJECTED`, your filter is missing `java.lang.Object`: `ArrayList` checks an `Object[]` before it fills itself, and arrays are checked by their element type."
+    ],
+    "done_when": "All 16 tests in `FormatsTest`, `JsonIdsTest` and `SafeDeserializerTest` pass."
+  },
+  "drill": {
+    "title": "Write the safe decoder from memory",
+    "minutes": 4,
+    "prompt": "Close the lesson. Write `readAuthorization(bytes: ByteArray): Authorization`, which decodes Java-serialized bytes but accepts only `Authorization`, `ArrayList`, `String` and `Object` arrays, at most 5 levels deep. Then check: did you set the filter before `readObject`, and does your pattern end with `!*`?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun readAuthorization(bytes: ByteArray): Authorization {\n    val filter = ObjectInputFilter.Config.createFilter(\n        \"maxdepth=5;sfz.enc.l01.Authorization;java.util.ArrayList;java.lang.String;java.lang.Object;!*\"\n    )\n    return ObjectInputStream(ByteArrayInputStream(bytes)).use { input ->\n        input.setObjectInputFilter(filter)   // before the first readObject\n        input.readObject() as Authorization  // the cast is a type check, not a defence\n    }\n}"
+    }
+  },
+  "recap": [
+    "Objects in memory point at each other by address, and addresses mean nothing outside the process, so data that leaves it must be encoded into self-contained bytes.",
+    "Java serialization lets the bytes choose which class to create and runs its `readObject` before your cast. Decoding untrusted bytes this way has led to remote code execution; a JEP 290 allow-list filter rejects classes before they exist.",
+    "Many JSON readers keep numbers as doubles, so integers above 2^53 change silently. Send 64-bit IDs as strings.",
+    "JSON, XML and CSV also lack binary data (Base64 adds a third) and, without JSON Schema, any written contract.",
+    "MessagePack and CBOR shrink the values but keep every field name: 84 and 85 bytes against 116 for JSON, while the bare values take 39. BSON is bigger than JSON."
+  ],
+  "quiz": [
+    {
+      "q": "A service reads `ObjectInputStream(socket.getInputStream()).readObject() as PaymentCommand`. A reviewer says it's safe because anything that isn't a `PaymentCommand` throws `ClassCastException`. What's wrong with that argument?",
+      "options": [
+        "Nothing: the cast rejects every other class before it is used",
+        "The cast runs after `readObject` has already created the class the bytes named and run its `readObject` code",
+        "The cast is skipped when assertions are disabled in production",
+        "`ClassCastException` is only thrown for classes from other packages"
+      ],
+      "answer": 1,
+      "why": "Decoding happens inside `readObject()`: it loads the class named in the bytes, creates it and runs its `readObject` method. The cast checks the result afterwards, when any gadget chain has already run. A JEP 290 filter is the check that comes first."
+    },
+    {
+      "q": "You must keep accepting Java-serialized messages for a while. Which filter is the better choice?",
+      "options": [
+        "`!org.apache.commons.collections.functors.*` to block the known gadget package",
+        "`sfz.payments.**` to allow your own packages and nothing else",
+        "`maxdepth=10;sfz.payments.PaymentCommand;java.util.ArrayList;java.lang.String;java.lang.Object;!*`",
+        "No filter, but upgrade Commons Collections to a version without the gadget"
+      ],
+      "answer": 2,
+      "why": "Name exactly the classes a genuine message contains, cap the depth, and reject everything else with `!*`. A block-list misses the next gadget, and upgrading one library leaves gadgets in others. Allowing whole packages with `**` lets in every serializable class in them, which is how the lab's `Tripwire` gets through."
+    },
+    {
+      "q": "Your API returns `{\"refundId\": 9007199254740993}` and a JavaScript client echoes the value back to cancel the refund. Which ID does your service receive?",
+      "options": [
+        "9007199254740992",
+        "9007199254740993",
+        "9007199254740994",
+        "None: `JSON.parse` throws on numbers above 2^53"
+      ],
+      "answer": 0,
+      "why": "Above 2^53, doubles are 2 apart, so the odd number 2^53 + 1 rounds to 2^53, 9007199254740992, without an error. The client then cancels a different refund ID. Sending the ID as a string avoids this."
+    },
+    {
+      "q": "MessagePack encodes the lesson's authorization in 84 bytes, against 116 for JSON. Where do most of the 84 bytes go?",
+      "options": [
+        "Type bytes in front of every value",
+        "Padding to align integers to 8 bytes",
+        "A schema header MessagePack adds to each message",
+        "The field names, which travel in every record"
+      ],
+      "answer": 3,
+      "why": "MessagePack has no schema, so `paymentId`, `merchant` and the rest go into every record: 45 of the 84 bytes. Type bytes are one per value and MessagePack adds no padding or header. The five values alone, as an array, take 39 bytes."
+    },
+    {
+      "q": "Your team validates incoming webhooks with this JSON Schema: `{\"type\": \"object\", \"required\": [\"paymentId\", \"amountMinor\"]}`. A partner starts sending an extra field, `\"riskScore\": 87`. What happens?",
+      "options": [
+        "Validation fails, because `riskScore` isn't in the schema",
+        "Validation fails only if `riskScore` is a number",
+        "Validation passes, and your code must decide what to do with the extra field",
+        "The validator strips `riskScore` before your code sees it"
+      ],
+      "answer": 2,
+      "why": "JSON Schema's content model is open by default: properties the schema doesn't mention are allowed unless it says `\"additionalProperties\": false`. Validators check; they don't strip fields. Assuming a schema lists what's allowed is the common misreading."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Why can't you send an object's heap bytes to another process?",
+      "back": "References inside it are addresses that only mean something in this process, and only until the GC moves the objects. Encoding writes the values themselves."
+    },
+    {
+      "front": "What does `ObjectInputStream.readObject()` do before your cast runs?",
+      "back": "It reads a class name from the bytes, loads that class, creates an instance and runs its `readObject` method. The bytes choose the class."
+    },
+    {
+      "front": "What is a gadget chain?",
+      "back": "A chain of ordinary serializable classes already on the classpath whose `readObject` and related methods, called in sequence, end in something dangerous such as `Runtime.exec`."
+    },
+    {
+      "front": "What does a JEP 290 filter pattern `maxdepth=5;com.acme.Order;!*` do?",
+      "back": "Rejects graphs deeper than 5, allows the class `com.acme.Order`, and rejects every other class before any object is created."
+    },
+    {
+      "front": "Which integers survive any JSON parser exactly?",
+      "back": "Those from -(2^53 - 1) to 2^53 - 1. Above that, parsers that use doubles round silently. Send larger IDs as strings."
+    },
+    {
+      "front": "How much bigger does Base64 make binary data?",
+      "back": "4/3, about 33% more: every 3 bytes become 4 characters."
+    },
+    {
+      "front": "Why is BSON often bigger than the same JSON?",
+      "back": "It adds a 4-byte length to every document and string, a zero byte after each name, numeric keys for array items, and 8 bytes per 64-bit integer, so a database can skip through it fast."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Encoding",
+      "plain": "Turning in-memory objects into a self-contained sequence of bytes. Also called serialization or marshalling. Decoding is the reverse."
+    },
+    {
+      "term": "Gadget chain",
+      "plain": "Existing classes on the classpath that, chained through deserialization, do something the attacker wants."
+    },
+    {
+      "term": "JEP 290 filter",
+      "plain": "An `ObjectInputFilter` the stream asks about each class and array before it creates it; it answers ALLOWED, REJECTED or UNDECIDED."
+    },
+    {
+      "term": "IEEE 754 double",
+      "plain": "The 64-bit floating-point number many JSON readers use. It holds 53 bits of digits, so larger integers get rounded."
+    },
+    {
+      "term": "JSON Schema",
+      "plain": "A JSON document that describes valid JSON: types, required fields, value checks. Open to extra properties by default."
+    },
+    {
+      "term": "Binary JSON",
+      "plain": "Formats such as MessagePack, CBOR and BSON that encode JSON's data model in binary with real types. They carry field names in every record."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague says: \"Our socket handler uses ObjectInputStream, but none of our classes have a readObject method, so there's nothing to exploit.\" Explain why that's wrong and what you would do.",
+    "answer": "The bytes choose the class, not our code. `readObject()` will create any serializable class on the classpath that the bytes name, and that includes the JDK and every library we ship, not just our classes. Some of those have `readObject` methods that call other methods on their fields, and attackers chain them (gadget chains, like the Commons Collections one behind CVE-2015-4852) until something runs a command. Our cast to the expected type happens only after all of that. So I'd put a JEP 290 allow-list filter on that stream, naming exactly the classes a real message contains, with a depth limit and `!*` at the end, and plan to replace Java serialization with JSON or Protobuf, which decode into plain values."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Designing Data-Intensive Applications (2nd edition, chapter 5) frames this lesson's material as the first half of a larger question: once data is bytes, how do the programs that write it and the programs that read it change without breaking each other? Lesson 2 of this track takes that up.\n\nThree directions this lesson skipped:\n\n- **Zero-copy formats.** FlatBuffers and Cap'n Proto lay data out in memory exactly as it goes on the wire, with offsets instead of addresses, so a reader uses the bytes in place with no decoding step. Apache Arrow does the same for columns of data, which is why analytics engines can hand a table to each other without copying it.\n- **Records and serialization.** Java records deserialize through their canonical constructor, so the checks in that constructor run on decoded data, which plain classes skip. Brian Goetz's 2019 OpenJDK note \"Towards Better Serialization\" argues for that direction.\n- **Text is still the default between organizations.** Card networks, banks and partners keep exchanging JSON, XML (ISO 20022 payment messages are XML) and even CSV settlement files, because agreeing on anything across companies costs more than the extra bytes do. Inside your own systems you get to choose."
+  },
+  "sources": [
+    {
+      "title": "JEP 290: Filter Incoming Serialization Data",
+      "url": "https://openjdk.org/jeps/290"
+    },
+    {
+      "title": "RFC 8259: The JavaScript Object Notation (JSON) Data Interchange Format",
+      "url": "https://www.rfc-editor.org/rfc/rfc8259"
+    },
+    {
+      "title": "MessagePack specification",
+      "url": "https://github.com/msgpack/msgpack/blob/master/spec.md"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 5",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

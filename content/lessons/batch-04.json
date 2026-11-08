@@ -1,0 +1,417 @@
+{
+  "id": "batch-04",
+  "title": "Hive: SQL on files, partitions and the metastore",
+  "minutes": 40,
+  "goal": "By the end you can explain what a catalog adds to a folder of files, lay out a table as Hive-style `dt=` directories, explain how the metastore turns a filter on `dt` into a short list of directories, and spot the cases where pruning silently stops working.",
+  "warmup": {
+    "q": "A payments table is stored as one directory per day, `payments/dt=2026-11-01/` to `payments/dt=2026-11-30/`. A query filters `WHERE created_at >= '2026-11-29'`. How many day directories does the engine read?",
+    "options": [
+      "2, because `created_at` and `dt` hold the same dates",
+      "All 30, because the filter isn't on the partition column",
+      "None, because `created_at` isn't stored in the files",
+      "Only the newest one"
+    ],
+    "answer": 1,
+    "why": "The engine skips directories by matching the filter against the `dt` values in their names. It has no way to know that `created_at` and `dt` agree, so it opens every file and filters rows inside them. Same answer, thirty times the reading. Adding `dt >= '2026-11-29'` to the query fixes it."
+  },
+  "sections": [
+    {
+      "h": "A Hive table is a directory plus a schema stored somewhere else",
+      "body": "Lesson 3 left you writing a map function and a reduce function for every question. This lesson adds the layer that let people skip that: a catalog that gives a folder of files a name and a schema, so that SQL can run over it, and a directory layout that lets a query skip most of the files. Facebook's Hive paper (2009) starts from exactly that spot. The data sat as files on HDFS, the replicated file system from lesson 3. Every question about it needed a custom MapReduce program, which the paper calls low level and hard to maintain and reuse. The analysts knew SQL. So ask what it would take to run this against a folder of files:\n\n```sql\nSELECT status, count(*) FROM payments GROUP BY status;\n```\n\nSQL needs facts that a folder doesn't have. It needs a name for the data, `payments`. It needs the columns and their types, called the schema, so that `status` means something. And it needs to know where the files are and how to read them: CSV, Parquet (the column-by-column format from lesson 1), or something else.\n\nVersion 1: put all of that into every query. DuckDB, the single-machine engine from lesson 1, lets you do exactly that:\n\n```sql\nSELECT status, count(*)\nFROM read_parquet('/lake/payments/*.parquet')   -- where the files are, and their format\nGROUP BY status;\n```\n\nThat works for one person. It breaks when fifty analysts each copy the path, the format and the column types into their own queries. Move the folder and every query breaks, and nobody can tell which folders are tables.\n\nVersion 2: write the description down once, in a shared place, under a name. That is what Hive did. Facebook described it in 2009: analysts wrote SQL (in a dialect called HiveQL), and Hive compiled each query into MapReduce jobs. Facebook's warehouse already held several thousand Hive tables and over 700 TB. A Hive table is two things kept apart. The files sit in one directory per table. The description (schema, file format, the directory's location) sits in a separate database called the **metastore**. A query joins the two when it runs. Keep this picture for the whole lesson: a name in the metastore that points at a directory full of files. The figure below draws it.\n\nKeeping the two apart has a consequence. Oracle checks every row against the table definition when you insert it: a string like `'12.50 EUR'` in a `NUMBER` column fails right there. Hive checks nothing on the way in. Any job that drops a file into the directory has added rows, without an `INSERT`. A file with the wrong types lands without complaint, and the error shows up later, when a query reads it. This is **schema on read**. It made loading data trivial, and it moved the cost of bad data to whoever reads it.\n\nHive also has two kinds of table. It owns the files of a managed table, so `DROP TABLE` deletes them. It only points at the files of an external table, so `DROP TABLE` deletes the description and leaves the files. Data lakes, shared folders of files that many tools read, mostly use external tables.\n\nHive the engine is legacy now. The project declared its 1.x, 2.x and 3.x lines end of life in 2024, and Hive 4.2.1 came out in August 2026, needing JDK 21. Its ideas are everywhere, though. Spark, Trino and DuckDB all read Hive-style tables, and the metastore is still a common catalog, the general name for a service that maps table names to their descriptions. This lesson's demos use DuckDB and Spark's built-in catalog, so you need no Hive install.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"A Hive table: the query names a table, the metastore maps the name to a schema, a format and a location, and the location holds the files\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"300\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"170\" y=\"43.5\" text-anchor=\"middle\">SELECT status, count(*)</text><text class=\"t-s t-code\" x=\"170\" y=\"59.5\" text-anchor=\"middle\">FROM payments GROUP BY status</text><rect class=\"box-b\" x=\"380\" y=\"20\" width=\"280\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"520\" y=\"52.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"520\" y=\"68.5\" text-anchor=\"middle\">payments: 8 columns</text><text class=\"t-s\" x=\"520\" y=\"84.5\" text-anchor=\"middle\">format: Parquet</text><text class=\"t-s\" x=\"520\" y=\"100.5\" text-anchor=\"middle\">location: s3://lake/payments/</text><line class=\"ln\" x1=\"320\" y1=\"48\" x2=\"378\" y2=\"48\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"349\" y=\"40\" text-anchor=\"middle\">1</text><text class=\"t-s t-m\" x=\"20\" y=\"170\" text-anchor=\"start\">s3://lake/payments/</text><rect class=\"box\" x=\"20\" y=\"180\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"201.5\" text-anchor=\"middle\">part-00000.parquet</text><rect class=\"box\" x=\"180\" y=\"180\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"255\" y=\"201.5\" text-anchor=\"middle\">part-00001.parquet</text><rect class=\"box\" x=\"340\" y=\"180\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"415\" y=\"201.5\" text-anchor=\"middle\">part-00002.parquet</text><rect class=\"box\" x=\"500\" y=\"180\" width=\"150\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"575\" y=\"201.5\" text-anchor=\"middle\">part-00003.parquet</text><line class=\"ln-d\" x1=\"520\" y1=\"124\" x2=\"520\" y2=\"176\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"530\" y=\"152\" text-anchor=\"start\">2</text><line class=\"ln\" x1=\"170\" y1=\"76\" x2=\"170\" y2=\"176\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"180\" y=\"130\" text-anchor=\"start\">3: read the files</text><text class=\"t-s t-m\" x=\"340\" y=\"242\" text-anchor=\"middle\">the name and schema live in one place, the bytes in another</text></svg>",
+        "caption": "A Hive table: (1) the engine looks up the name in the metastore, (2) which knows the schema, format and directory, and (3) the engine reads the files it finds there."
+      },
+      "try": {
+        "title": "Add rows by copying files",
+        "minutes": 3,
+        "steps": [
+          "From the `labs` folder, run `SchemaOnReadDemo`. It treats a directory as a table through a DuckDB view (a saved query with a name) over `*.parquet`.",
+          "Watch the row count after the third file lands. Nobody ran `INSERT`.",
+          "Predict before you read the last line: the fourth file was written without an error. What happens to the next query?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SchemaOnReadDemo.kt",
+          "src": "package sfz.batch.l04.demo\n\nimport java.io.File\nimport java.sql.Connection\nimport java.sql.DriverManager\n\n/**\n * A \"table\" that is only a directory of files plus a schema. Adding a file adds rows, and a bad\n * file is only noticed when a query reads it.\n */\nfun main() {\n    val dir = File(\"build/l03/raw/payments\").apply { deleteRecursively(); mkdirs() }\n    DriverManager.getConnection(\"jdbc:duckdb:\").use { c ->\n        // two batches land as files; nobody runs INSERT\n        batch(c, File(dir, \"batch-1.parquet\"), from = 0)\n        batch(c, File(dir, \"batch-2.parquet\"), from = 1_000)\n        c.run(\"CREATE VIEW payments AS SELECT * FROM read_parquet('${dir.absolutePath}/*.parquet')\")\n        println(\"2 files:  \" + c.query(\"SELECT count(*), sum(amount_cents) FROM payments\"))\n\n        batch(c, File(dir, \"batch-3.parquet\"), from = 2_000)\n        println(\"3 files:  \" + c.query(\"SELECT count(*), sum(amount_cents) FROM payments\"))\n\n        // an upstream job changes amount_cents to text like '12.50 EUR'; writing the file works fine\n        c.run(\"COPY (SELECT 3000 AS payment_id, '12.50 EUR' AS amount_cents) TO '${File(dir, \"batch-4.parquet\").absolutePath}' (FORMAT parquet)\")\n        println(\"4 files:  \" + runCatching { c.query(\"SELECT count(*), sum(amount_cents) FROM payments\") }\n            .getOrElse { \"query failed: \" + it.message!!.lineSequence().first() })\n    }\n}\n\nprivate fun batch(c: Connection, file: File, from: Int) =\n    c.run(\"COPY (SELECT i AS payment_id, (i % 997) * 100 AS amount_cents FROM range($from, ${from + 1_000}) t(i)) TO '${file.absolutePath}' (FORMAT parquet)\")\n\nprivate fun Connection.run(sql: String) = createStatement().use { it.execute(sql) }\n\nprivate fun Connection.query(sql: String): String = createStatement().use { s ->\n    s.executeQuery(sql).use { rs -> rs.next(); (1..rs.metaData.columnCount).joinToString(\", \") { \"${rs.metaData.getColumnLabel(it)} = ${rs.getString(it)}\" } }\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l04.demo.SchemaOnReadDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l04/demo/SchemaOnReadDemo.kt"
+        },
+        "expect": "```text\n2 files:  count_star() = 2000, sum(amount_cents) = 99302700\n3 files:  count_star() = 3000, sum(amount_cents) = 148955400\n4 files:  query failed: Conversion Error: Error while reading file \"/.../bigdata/build/l03/raw/payments/batch-4.parquet\": failed to cast column \"amount_cents\" from type VARCHAR to BIGINT: : Could not convert string '12.50 EUR' to INT64\n```\n\n(The path is trimmed.) The third file added 1,000 rows by existing. The fourth file was accepted when it was written, and the error appears only when a query reads it. Every query that touches `amount_cents` now fails, not just the bad rows, until someone finds and removes that file."
+      },
+      "refs": [
+        {
+          "title": "Hive: A Warehousing Solution Over a Map-Reduce Framework (Thusoo et al., VLDB 2009)",
+          "url": "https://www.vldb.org/pvldb/vol2/vldb09-938.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Managed vs. external tables (Apache Hive docs)",
+          "url": "https://hive.apache.org/docs/latest/language/managed-vs--external-tables/",
+          "kind": "docs"
+        },
+        {
+          "title": "Apache Hive downloads and release status",
+          "url": "https://hive.apache.org/general/downloads/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Partitions are directories named key=value",
+      "body": "A payments table grows by one day of data every day, and most questions are about recent days: yesterday's settlements, last week's declines. With one directory for the whole table, every query reads every file. After three years, a question about yesterday reads 1,095 days of data to use one of them.\n\nThe fix is to split the table's directory into subdirectories, one per day, and name each one after its value:\n\n```text\npayments/\n  dt=2026-11-01/\n    part-00000-....snappy.parquet\n    part-00001-....snappy.parquet\n  dt=2026-11-02/\n    part-00000-....snappy.parquet\n  ...\n```\n\nEach subdirectory is a **partition** of the table, and `dt` is the partition column. The name holds both the column and the value, `dt=2026-11-02`, so any reader can rebuild the column from the path alone. In fact the value lives only in the path. When Spark writes with `partitionBy(\"dt\")`, it removes the `dt` column from the rows and puts the value into the directory name instead. When an engine reads the table, it turns `dt=2026-11-02` back into a column. Spark calls this partition discovery, and DuckDB calls it `hive_partitioning`.\n\nThe payoff is **partition pruning**. A query with `WHERE dt = '2026-11-03'` skips every other directory without opening a single file. With three years of days in the table, that query reads one day out of about a thousand. It is lesson 3's data locality pushed one step further: rather than moving the code to the data, don't go near data you don't need.\n\nPruning works only on the partition column itself. A filter on `created_at` may cover exactly the same day, but the engine can't know that from the directory names, so it opens every file. (It can still skip parts of each file using statistics; that's lesson 5.) Iceberg, a table format covered in lesson 11, removes this trap with hidden partitioning.\n\nSo pick partition columns that queries filter on and that have few distinct values. Day is the classic choice: three years is about a thousand directories. Partition by `merchant_id` as well, with 500,000 merchants, and you get 500 million directories, most holding one tiny file.",
+      "try": {
+        "title": "Make DuckDB skip six days",
+        "minutes": 4,
+        "steps": [
+          "Run `PartitionPruningDemo`. Spark writes a week of payments with `partitionBy(\"dt\")`, then DuckDB plans two queries for the same day.",
+          "Look at the file paths it prints: where is `dt`?",
+          "Predict before the last two lines: how many files does each query open?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "PartitionPruningDemo.kt",
+          "src": "package sfz.batch.l04.demo\n\nimport org.apache.spark.sql.SaveMode\nimport java.io.File\nimport java.sql.DriverManager\n\n/**\n * Spark writes a week of payments as a Hive-style table, one directory per day.\n * Then DuckDB plans two queries for the same day and says how many files each would open.\n */\nfun main() {\n    val lake = File(\"build/l03/lake\")\n    val spark = demoSpark()\n    demoPayments(spark).write().mode(SaveMode.Overwrite).partitionBy(\"dt\").parquet(lake.absolutePath)\n    spark.stop()\n\n    val files = dataFiles(lake)\n    println(\"%d files in %d directories, for example:\".format(files.size, lake.listFiles { f -> f.isDirectory }!!.size))\n    files.take(3).forEach { println(\"  $it\") }\n\n    val scan = \"read_parquet('${lake.absolutePath}/**/*.parquet', hive_partitioning = true)\"\n    DriverManager.getConnection(\"jdbc:duckdb:\").use { c ->\n        for (where in listOf(\"dt = '2026-11-03'\", \"created_at::DATE = DATE '2026-11-03'\")) {\n            val sql = \"SELECT sum(amount_cents) FROM $scan WHERE $where\"\n            val plan = c.createStatement().use { s -> s.executeQuery(\"EXPLAIN $sql\").use { rs -> rs.next(); rs.getString(2) } }\n            // DuckDB prints \"Scanning Files: n/total\" only when it can skip files by their path\n            val scanning = Regex(\"\"\"Scanning Files: (\\d+/\\d+)\"\"\").find(plan)?.groupValues?.get(1) ?: \"all ${files.size}\"\n            println(\"WHERE %-38s -> opens %s files\".format(where, scanning))\n        }\n    }\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l04.demo.PartitionPruningDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l04/demo/PartitionPruningDemo.kt"
+        },
+        "expect": "```text\n8 files in 7 directories, for example:\n  dt=2026-11-01/part-00000-509cf1d0-d6f7-4a94-8825-5bd91afbb939.c000.snappy.parquet\n  dt=2026-11-02/part-00000-509cf1d0-d6f7-4a94-8825-5bd91afbb939.c000.snappy.parquet\n  dt=2026-11-03/part-00000-509cf1d0-d6f7-4a94-8825-5bd91afbb939.c000.snappy.parquet\nWHERE dt = '2026-11-03'                      -> opens 1/8 files\nWHERE created_at::DATE = DATE '2026-11-03'   -> opens all 8 files\n```\n\nThe file name changes every run. One day has two files because its rows came from both of Spark's two tasks. The `dt` filter opens one file. The `created_at` filter returns the same total and opens all eight. DuckDB prints a `Scanning Files` line only when it can skip files by their path, so a missing line means it reads them all."
+      },
+      "refs": [
+        {
+          "title": "Partition discovery (Spark Parquet docs)",
+          "url": "https://spark.apache.org/docs/latest/sql-data-sources-parquet.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Hive partitioning (DuckDB 2.0 docs)",
+          "url": "https://duckdb.org/docs/2.0/data/partitioning/hive_partitioning.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "The metastore turns a table name into a list of directories",
+      "body": "Pruning needs a list of the partitions that exist. The engine could build it by listing the table's directory before every query. On a laptop that takes microseconds. On S3, the object store from lesson 3, a listing returns at most 1,000 names per request. A table with 30,000 day and hour directories costs 30 requests, one after another, before any data is read. Hive's answer was to keep the partition list in the metastore, next to the schema.\n\nThe Hive Metastore (HMS) is a service with a relational database behind it. Clients talk to it over Thrift, a remote procedure call protocol similar to gRPC, on port 9083 by default. The database is Derby for quick tests, and MySQL, MariaDB, Postgres, Oracle or SQL Server in real use. For every table it stores the columns and types, the file format, the location, and one entry per partition with that partition's directory. Since Hive 3.0 it can also run on its own, without the rest of Hive, for engines such as Spark and Trino that only need the catalog.\n\nPlanning a query on a partitioned table then goes like this. The engine asks the metastore for the table and gets the schema and location. It passes the filter on the partition column along, and the metastore returns only the matching partitions, straight from its own database tables. Then the engine lists the files in those directories and reads them. The stepper below walks through it.\n\nNotice where the truth now lives: in the metastore's partition list, not in the directories. A job that writes `dt=2026-11-08/` straight to storage has written data that no query will find, because the metastore has no entry for it. The data looks lost until someone runs one of these:\n\n```sql\nALTER TABLE payments ADD PARTITION (dt = '2026-11-08');   -- register one directory\nMSCK REPAIR TABLE payments;                                -- list the location, add every missing one\n```\n\n`MSCK REPAIR TABLE` lists the whole table location, which is slow for a big table on S3, so pipelines usually add each partition right after they write it. Spark supports both statements. Its built-in catalog acts like a metastore even without Hive: a table created over existing directories starts with zero partitions.",
+      "stepper": {
+        "title": "A query pruned by the metastore",
+        "intro": "Follow one query from table name to files. Watch which directories light up.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A query for one day arrives at the engine, which only knows the table name\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-03'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">engine</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">Spark, Trino or Hive</text><rect class=\"box\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"81.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s t-m\" x=\"540\" y=\"97.5\" text-anchor=\"middle\">MySQL or Postgres behind it</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">the engine knows a table name, not where its files are</text></svg>",
+            "say": "A query for one day's total arrives. The engine (Spark, Trino, Hive) knows the name `payments` and nothing else: not the columns, not the format, not where the files are."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The engine asks the metastore for the table and gets schema, format, location and partition column\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-03'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">engine</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">Spark, Trino or Hive</text><rect class=\"box-a\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"57.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"540\" y=\"73.5\" text-anchor=\"middle\">table payments</text><text class=\"t-s\" x=\"540\" y=\"89.5\" text-anchor=\"middle\">columns and types</text><text class=\"t-s\" x=\"540\" y=\"105.5\" text-anchor=\"middle\">Parquet, partitioned by dt</text><text class=\"t-s t-code\" x=\"540\" y=\"121.5\" text-anchor=\"middle\">s3://lake/payments/</text><line class=\"ln-a\" x1=\"352\" y1=\"116\" x2=\"418\" y2=\"116\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"418\" y1=\"138\" x2=\"352\" y2=\"138\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">the metastore holds the schema, format, location and partition list</text></svg>",
+            "say": "The engine asks the metastore for the table. Back come the columns and types, the file format, the location, and the fact that the table is partitioned by `dt`. The engine can now check the query: `amount_cents` exists, `dt` is a partition column."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The metastore answers the partition filter itself and returns one partition out of seven\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-03'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">engine</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">Spark, Trino or Hive</text><rect class=\"box-a\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"57.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"540\" y=\"73.5\" text-anchor=\"middle\">7 partitions stored</text><text class=\"t-s\" x=\"540\" y=\"89.5\" text-anchor=\"middle\">filter: dt = 2026-11-03</text><text class=\"t-s t-a\" x=\"540\" y=\"105.5\" text-anchor=\"middle\">match: 1 partition</text><text class=\"t-s t-code\" x=\"540\" y=\"121.5\" text-anchor=\"middle\">.../dt=2026-11-03/</text><line class=\"ln-a\" x1=\"352\" y1=\"116\" x2=\"418\" y2=\"116\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"418\" y1=\"138\" x2=\"352\" y2=\"138\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box-a\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">the filter on dt is answered from metadata, before any file is touched</text></svg>",
+            "say": "The engine sends the filter on `dt` along with its request for partitions. The metastore answers it from its own tables, one row per partition, and returns a single partition with its directory. No file has been opened yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The engine lists only the one matching directory and finds four files; the other six days are never touched\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-03'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">engine</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">Spark, Trino or Hive</text><rect class=\"box\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"81.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"540\" y=\"97.5\" text-anchor=\"middle\">7 partitions stored</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box-dim\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box-dim\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box-a\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box-dim\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box-dim\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box-dim\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box-dim\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><line class=\"ln-a\" x1=\"185\" y1=\"156\" x2=\"216\" y2=\"212\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"216\" y=\"274\" text-anchor=\"middle\">4 files</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">one directory listed, six days never touched</text></svg>",
+            "say": "The engine lists the files in that one directory: four Parquet files. The other six days are never listed and never read. This is **partition pruning**, and it happened before the engine read a byte of data."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The engine reads the four files of one day and returns the total\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-03'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">result</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">one day's total from 4 files</text><rect class=\"box\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"81.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"540\" y=\"97.5\" text-anchor=\"middle\">7 partitions stored</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box-dim\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box-dim\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box-a\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box-dim\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box-dim\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box-dim\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box-dim\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><line class=\"ln-a\" x1=\"185\" y1=\"156\" x2=\"216\" y2=\"212\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"216\" y=\"274\" text-anchor=\"middle\">4 files</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">a week of data, a seventh of it read</text></svg>",
+            "say": "The engine reads the four files and sums `amount_cents`. A query over one day of a week-long table read one seventh of it. On a table with three years of days, it reads one day out of about a thousand."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A late job wrote dt=2026-11-08 straight to storage; the metastore has no row for it, so a query for that day returns nothing\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-08'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">result</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">0 rows</text><rect class=\"box-bad\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"65.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s\" x=\"540\" y=\"81.5\" text-anchor=\"middle\">7 partitions stored</text><text class=\"t-s\" x=\"540\" y=\"97.5\" text-anchor=\"middle\">filter: dt = 2026-11-08</text><text class=\"t-s t-bad\" x=\"540\" y=\"113.5\" text-anchor=\"middle\">match: none</text><line class=\"ln-a\" x1=\"352\" y1=\"116\" x2=\"418\" y2=\"116\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"418\" y1=\"138\" x2=\"352\" y2=\"138\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><rect class=\"box-b\" x=\"580\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"616\" y=\"237.5\" text-anchor=\"middle\">11-08</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">the directory exists, but only the metastore's list counts</text></svg>",
+            "say": "A late job writes `dt=2026-11-08/` straight to S3 and never tells the metastore. A query for that day asks the metastore, gets no partitions back, and returns **zero rows**. The files are right there. Nothing looks broken, the data just seems to be missing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"MSCK REPAIR TABLE lists the table's location, finds the new directory and adds it as an eighth partition\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"16\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t-s t-code\" x=\"185\" y=\"39.5\" text-anchor=\"middle\">SELECT sum(amount_cents) FROM payments</text><text class=\"t-s t-code\" x=\"185\" y=\"55.5\" text-anchor=\"middle\">WHERE dt = '2026-11-08'</text><line class=\"ln\" x1=\"185\" y1=\"72\" x2=\"185\" y2=\"96\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"20\" y=\"98\" width=\"330\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"185\" y=\"122.5\" text-anchor=\"middle\">result</text><text class=\"t-s\" x=\"185\" y=\"138.5\" text-anchor=\"middle\">the late day's total</text><rect class=\"box-ok\" x=\"420\" y=\"16\" width=\"240\" height=\"138\" rx=\"8\"/><text class=\"t\" x=\"540\" y=\"65.5\" text-anchor=\"middle\">metastore</text><text class=\"t-s t-code\" x=\"540\" y=\"81.5\" text-anchor=\"middle\">MSCK REPAIR TABLE</text><text class=\"t-s\" x=\"540\" y=\"97.5\" text-anchor=\"middle\">found dt=2026-11-08</text><text class=\"t-s t-ok\" x=\"540\" y=\"113.5\" text-anchor=\"middle\">8 partitions stored</text><line class=\"ln-a\" x1=\"352\" y1=\"116\" x2=\"418\" y2=\"116\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"418\" y1=\"138\" x2=\"352\" y2=\"138\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">s3://lake/payments/dt=2026-...</text><rect class=\"box\" x=\"20\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"56\" y=\"237.5\" text-anchor=\"middle\">11-01</text><rect class=\"box\" x=\"100\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"136\" y=\"237.5\" text-anchor=\"middle\">11-02</text><rect class=\"box\" x=\"180\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"216\" y=\"237.5\" text-anchor=\"middle\">11-03</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"296\" y=\"237.5\" text-anchor=\"middle\">11-04</text><rect class=\"box\" x=\"340\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"376\" y=\"237.5\" text-anchor=\"middle\">11-05</text><rect class=\"box\" x=\"420\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"456\" y=\"237.5\" text-anchor=\"middle\">11-06</text><rect class=\"box\" x=\"500\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"536\" y=\"237.5\" text-anchor=\"middle\">11-07</text><rect class=\"box-ok\" x=\"580\" y=\"214\" width=\"72\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"616\" y=\"237.5\" text-anchor=\"middle\">11-08</text><text class=\"t-s t-m\" x=\"340\" y=\"314\" text-anchor=\"middle\">MSCK REPAIR TABLE or ALTER TABLE ADD PARTITION syncs the list</text></svg>",
+            "say": "`MSCK REPAIR TABLE payments` lists the table's location, finds the directory the metastore doesn't know, and adds it. `ALTER TABLE payments ADD PARTITION (dt = '2026-11-08')` does the same for one directory without listing everything. Now the query finds the day."
+          }
+        ]
+      },
+      "try": {
+        "title": "Lose a day and find it again",
+        "minutes": 4,
+        "steps": [
+          "Run `MetastoreDemo`. It registers the lake from the previous Try it as a table in Spark's catalog, which plays the metastore.",
+          "Read the first two lines. The files were there the whole time. What changed between them?",
+          "Read the 2026-11-08 lines, then the last line. How did Spark know which files to open?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "MetastoreDemo.kt",
+          "src": "package sfz.batch.l04.demo\n\nimport org.apache.spark.sql.SaveMode\nimport org.apache.spark.sql.functions.col\nimport java.io.File\n\n/**\n * Registers the lake from PartitionPruningDemo as a table in Spark's catalog, which plays the Hive\n * metastore here, and shows that the catalog's partition list and the directories can disagree.\n */\nfun main() {\n    val lake = File(\"build/l03/lake\")\n    val spark = demoSpark()\n    File(lake, \"dt=2026-11-08\").deleteRecursively()                  // left over from an earlier run\n    if (!File(lake, \"_SUCCESS\").exists()) {\n        demoPayments(spark).write().mode(SaveMode.Overwrite).partitionBy(\"dt\").parquet(lake.absolutePath)\n    }\n    fun show(label: String, sql: String) = println(\"%-34s %s\".format(label, spark.sql(sql).collectAsList().joinToString(\" \") { it.mkString(\",\") }))\n\n    // 1. register the existing directory as an external table: schema and location go into the catalog\n    spark.sql(\"\"\"\n        CREATE TABLE payments (payment_id BIGINT, merchant_id INT, card_country STRING,\n                               amount_cents BIGINT, created_at TIMESTAMP, dt STRING)\n        USING parquet PARTITIONED BY (dt) LOCATION '${lake.absolutePath}'\"\"\")\n    show(\"rows right after CREATE TABLE:\", \"SELECT count(*) FROM payments\")\n\n    // 2. the catalog has no partitions yet; MSCK REPAIR walks the directory and adds them\n    spark.sql(\"MSCK REPAIR TABLE payments\")\n    show(\"rows after MSCK REPAIR TABLE:\", \"SELECT count(*) FROM payments\")\n    println(\"%-34s %d\".format(\"partitions the catalog knows:\", spark.sql(\"SHOW PARTITIONS payments\").count()))\n\n    // 3. a late job writes 2026-11-08 straight into the directory, without telling the catalog\n    demoPayments(spark, days = 1, firstEpochSecond = 1_794_096_000L).drop(\"dt\")\n        .write().mode(SaveMode.Overwrite).parquet(File(lake, \"dt=2026-11-08\").absolutePath)\n    show(\"rows for 2026-11-08, before:\", \"SELECT count(*) FROM payments WHERE dt = '2026-11-08'\")\n    spark.sql(\"ALTER TABLE payments ADD PARTITION (dt = '2026-11-08')\")\n    show(\"rows for 2026-11-08, after ADD:\", \"SELECT count(*) FROM payments WHERE dt = '2026-11-08'\")\n\n    // 4. a filter on dt is answered by the catalog first: only one day's files get opened\n    val oneDay = spark.table(\"payments\").where(col(\"dt\").equalTo(\"2026-11-03\"))\n    println(\"files opened for dt = 2026-11-03:   %d of %d\".format(oneDay.inputFiles().size, dataFiles(lake).size))\n    spark.stop()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l04.demo.MetastoreDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l04/demo/MetastoreDemo.kt"
+        },
+        "expect": "```text\nrows right after CREATE TABLE:     0\nrows after MSCK REPAIR TABLE:      70000\npartitions the catalog knows:      7\nrows for 2026-11-08, before:       0\nrows for 2026-11-08, after ADD:    10000\nfiles opened for dt = 2026-11-03:   1 of 10\n```\n\nThe new table saw no rows until the repair registered its seven partitions. The late day stayed invisible until `ADD PARTITION`. The last line comes from `inputFiles()`, the list of files Spark's scan will open after it asked the catalog which partitions match: 1 of the 10 files now in the lake."
+      },
+      "refs": [
+        {
+          "title": "Metastore 3.0 administration (Apache Hive docs)",
+          "url": "https://hive.apache.org/docs/latest/admin/adminmanual-metastore-3-0-administration/",
+          "kind": "docs"
+        },
+        {
+          "title": "REPAIR TABLE (Spark SQL reference)",
+          "url": "https://spark.apache.org/docs/latest/sql-ref-syntax-ddl-repair-table.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Where the Hive model breaks",
+      "body": "Hive tables are built from files and directories, and the cracks are in exactly those places.\n\nA write is not atomic, meaning readers can see it half done. A job that writes a day as 200 files doesn't publish them in one step. Depending on how the job commits its output, they appear task by task or file by file, and a query that lists the directory in between sees part of the day. On S3 there is no rename to fall back on (lesson 3), so every file appears on its own. `INSERT OVERWRITE`, Hive's statement for replacing a partition's contents, is worse: it removes the old files and then moves the new ones in, so a reader at the wrong moment sees nothing. Two jobs writing the same partition can mix their files. The metastore can't help, because it tracks directories, not files.\n\nListing stays slow, even with the metastore. The metastore knows which directories to read, but not the files inside them, so the engine still lists each directory it reads. With 1,000 names per request, a partition that holds 50,000 files takes 50 requests, one after another, before the first byte of data arrives.\n\nSmall files cost more than their bytes. Every file means an open, a read of its footer (the index Parquet keeps at the end of each file), and on S3 a request with its own latency. A streaming job that writes a file into its partition every minute turns one day into 1,440 files. The demo below shows the effect on your own SSD, where opening a file is cheap. On S3 the gap is wider.\n\nThese are the problems that Iceberg and Delta Lake were built to solve. Both are table formats: a set of metadata files, stored next to the data, that list every data file of the table (lessons 11 and 12). Because the table lists its files, nobody lists directories. A write becomes visible in one atomic step, when a new snapshot replaces the old one. (A snapshot is a complete list of the table's files at one moment.) Readers see all of a write or none of it. And you can partition by `days(created_at)` without a separate `dt` column. The metastore lives on in that world too: Iceberg can use it as its catalog, and Hive's own docs describe an Iceberg REST catalog backed by the metastore. New builds lean toward REST catalogs, catalogs that speak a standard HTTP API, which lesson 12 covers.",
+      "try": {
+        "title": "Store the same week as 7 files and as 350",
+        "minutes": 3,
+        "steps": [
+          "Run `SmallFilesDemo`. It writes the same 70,000 payments twice: one file per day, then 50 files per day.",
+          "Predict: the data is identical. How much slower is the second layout to query?",
+          "Compare the sizes too. Why is the many-files copy bigger?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SmallFilesDemo.kt",
+          "src": "package sfz.batch.l04.demo\n\nimport java.io.File\nimport java.sql.Connection\nimport java.sql.DriverManager\n\n/** The same week of payments stored as 7 files and as 350 small ones, then queried the same way. */\nfun main() {\n    DriverManager.getConnection(\"jdbc:duckdb:\").use { c ->\n        // 70,000 payments, 10,000 a day for 7 days\n        c.run(\"\"\"CREATE TABLE payments AS\n                 SELECT i AS payment_id, (hash(i) % 250000 + 100)::BIGINT AS amount_cents,\n                        DATE '2026-11-01' + (i // 10000)::INTEGER AS dt\n                 FROM range(70000) t(i)\"\"\")\n        val few = fresh(\"build/l03/few-files\")\n        val many = fresh(\"build/l03/many-files\")\n        for (day in 0 until 7) {\n            val dt = \"2026-11-0${day + 1}\"\n            // one file per day, as a daily batch job would write it\n            c.copy(\"SELECT payment_id, amount_cents FROM payments WHERE dt = DATE '$dt'\", File(few, \"dt=$dt/part-0.parquet\"))\n            // 50 files per day, as a job with 50 tasks (or a stream writing every half hour) would\n            for (part in 0 until 50) {\n                c.copy(\"SELECT payment_id, amount_cents FROM payments WHERE dt = DATE '$dt' AND payment_id % 50 = $part\",\n                    File(many, \"dt=$dt/part-$part.parquet\"))\n            }\n        }\n        for (root in listOf(few, many)) {\n            val sql = \"SELECT dt, sum(amount_cents) FROM read_parquet('${root.absolutePath}/**/*.parquet') GROUP BY dt\"\n            val best = (1..5).minOf {\n                val t0 = System.nanoTime()\n                c.createStatement().use { s -> s.executeQuery(sql).use { rs -> while (rs.next()) Unit } }\n                (System.nanoTime() - t0) / 1e6\n            }\n            val files = root.walkTopDown().filter { it.name.endsWith(\".parquet\") }.toList()\n            println(\"%-10s %4d files, %4.1f MB, query %5.1f ms\".format(root.name, files.size, files.sumOf { it.length() } / 1e6, best))\n        }\n    }\n}\n\nprivate fun fresh(path: String) = File(path).apply { deleteRecursively(); mkdirs() }\n\nprivate fun Connection.run(sql: String) = createStatement().use { it.execute(sql) }\n\nprivate fun Connection.copy(select: String, file: File) {\n    file.parentFile.mkdirs()\n    run(\"COPY ($select) TO '${file.absolutePath}' (FORMAT parquet)\")\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l04.demo.SmallFilesDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l04/demo/SmallFilesDemo.kt"
+        },
+        "expect": "```text\nfew-files     7 files,  0.6 MB, query   1.6 ms\nmany-files  350 files,  0.8 MB, query  18.3 ms\n```\n\nThe times vary a little between runs (19.9 ms on a second run here), but the many-files layout is always about ten times slower for the same rows. It is also bigger, because every Parquet file repeats its own footer and schema, and smaller files compress worse. Here each extra file costs a local open; on S3 each one is another request."
+      },
+      "refs": [
+        {
+          "title": "ListObjectsV2 (Amazon S3 API reference)",
+          "url": "https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A Hive table works like a library with a card catalog. The catalog (the metastore) says which shelf holds which year's books (the partitions). A librarian looks up the card before walking to a shelf, so a question about 2024 never visits the 2019 shelf. If someone shelves a new year of books without writing a card, nobody finds them until a librarian walks every shelf and writes the missing cards (`MSCK REPAIR TABLE`). The analogy breaks at the cards: a library catalog lists every book, while the metastore only lists shelves. It can't tell you that a shelf is half full because someone is still putting books on it.",
+  "in_your_world": "Settlement exports often end up in exactly this shape. A nightly job writes `settlements/dt=2026-11-07/` to S3, and finance reads it with Athena (AWS's hosted SQL engine) or Trino, through Glue (AWS's catalog service, which Hive-compatible engines can use in place of a metastore) or a Hive metastore. Two things from this lesson bite there. The job that writes the directory has to register the partition, or the dashboard shows an empty day until someone notices. And a re-run of the job for a day replaces files while a dashboard may be reading them. The Hive-era fix is to write the re-run to a new directory, then point the partition at it in one metastore call: `ALTER TABLE settlements PARTITION (dt = '2026-11-07') SET LOCATION '...'`. Readers then see either the old day or the new one, never half of each.",
+  "mistake": "The common mistake is filtering on the timestamp instead of the partition column. `WHERE created_at >= '2026-11-01'` reads like the right filter and returns the right rows, so nobody notices that the engine opened every file in the table. The plan tells you. In Spark, `PartitionFilters: []` on the `FileScan` line means no pruning. In DuckDB, a missing `Scanning Files: n/m` line means the same. Put the partition column in the `WHERE` clause too (`dt >= '2026-11-01' AND created_at >= ...`), or move to a table format with hidden partitioning.",
+  "compare": {
+    "title": "The same daily-partitioned table in Oracle and in Hive",
+    "a": {
+      "label": "Oracle: schema on write",
+      "lang": "sql",
+      "src": "CREATE TABLE payments (\n  payment_id   NUMBER(19) PRIMARY KEY,\n  amount_cents NUMBER(19) NOT NULL,\n  created_at   TIMESTAMP  NOT NULL\n)\nPARTITION BY RANGE (created_at) INTERVAL (NUMTODSINTERVAL(1, 'DAY'))\n  (PARTITION p0 VALUES LESS THAN (TIMESTAMP '2026-11-01 00:00:00'));\n\nINSERT INTO payments VALUES (3000, '12.50 EUR', SYSTIMESTAMP);\n-- rejected at INSERT time with ORA-01722: the bad row never lands"
+    },
+    "b": {
+      "label": "Hive: schema on read",
+      "lang": "sql",
+      "src": "CREATE EXTERNAL TABLE payments (\n  payment_id   BIGINT,\n  amount_cents BIGINT,\n  created_at   TIMESTAMP\n)\nPARTITIONED BY (dt STRING)\nSTORED AS PARQUET\nLOCATION 's3a://lake/payments/';\n\n-- a job copies batch-4.parquet into s3a://lake/payments/dt=2026-11-08/; nothing checks it\nALTER TABLE payments ADD PARTITION (dt = '2026-11-08');\nSELECT sum(amount_cents) FROM payments WHERE dt = '2026-11-08';\n-- only now does a reader hit the file whose amount_cents is a string"
+    },
+    "note": "Both tables are partitioned by day and both prune. The difference is who owns the files. Oracle writes its own data files, checks every row on the way in, and knows which rows each partition holds, so the partition key can be `created_at` itself and a filter on `created_at` prunes. Hive owns only the description. Files arrive from anywhere, the partition key is a separate `dt` column that lives in the path, and a bad file is found by the first query that reads it."
+  },
+  "worked": {
+    "title": "Lay out an authorizations table for a fraud team",
+    "steps": [
+      {
+        "say": "The fraud team asks two kinds of questions: daily totals for the last week, and everything one merchant did in the last 30 days. You keep 3 years at about 4 million authorizations a day. Start by counting directories and file sizes for each candidate layout.",
+        "code": "// 1. 4,000,000 rows a day x ~40 bytes compressed = ~160 MB a day; 3 years = 1,095 days\ndt only:             1,095 directories, ~160 MB each\ndt + card_country:   1,095 x 30 = 32,850 directories, ~5 MB each\ndt + merchant_id:    1,095 x 50,000 = 54,750,000 directories, ~3 KB each",
+        "lang": "text"
+      },
+      {
+        "say": "Pick `dt` alone. The merchant question is real, but partitioning by merchant explodes the file count. Instead, sort each day's rows by merchant, so the min/max statistics inside each file let a reader skip most of it (lesson 5 shows how).",
+        "code": "// 2. one directory per day, rows sorted by merchant inside each file\nauthorizations\n    .repartition(col(\"dt\"))                              // all rows of a day in one task: one file per day\n    .sortWithinPartitions(\"dt\", \"merchant_id\", \"created_at\")   // dt first, as the writer needs\n    .write().mode(SaveMode.Overwrite)\n    .partitionBy(\"dt\")\n    .parquet(\"s3a://lake/authorizations/\")",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Register the table once. After that, the writing job adds its own partition right after each daily write, so you never depend on a slow repair over S3.",
+        "code": "-- 3. once\nCREATE TABLE authorizations (\n  auth_id BIGINT, merchant_id INT, card_id BIGINT, amount_cents BIGINT, created_at TIMESTAMP, dt STRING)\nUSING parquet PARTITIONED BY (dt) LOCATION 's3a://lake/authorizations/';\n\n-- after each daily write, from the same job\nALTER TABLE authorizations ADD IF NOT EXISTS PARTITION (dt = '2026-11-07');",
+        "lang": "sql"
+      },
+      {
+        "say": "Query with the partition column in the filter, and keep the merchant filter for the reader to use inside the files. Check the plan once: `PartitionFilters` should list the `dt` range.",
+        "code": "-- 4. dt prunes directories; merchant_id prunes inside files\nSELECT count(*), sum(amount_cents)\nFROM authorizations\nWHERE dt BETWEEN '2026-10-09' AND '2026-11-07'\n  AND merchant_id = 4711;",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A Hive-style payments lake, read two ways",
+    "minutes": 15,
+    "needs": [
+      "JDK 21"
+    ],
+    "files": [
+      "labs/bigdata/src/main/kotlin/sfz/batch/l04/PaymentsLake.kt"
+    ],
+    "run": "./gradlew :bigdata:test --tests 'sfz.batch.l04.*'",
+    "steps": [
+      "Run the tests. All five fail at `writeByDay`, because every test needs the lake first.",
+      "Write `writeByDay` with `partitionBy(\"dt\")`. The first test checks the directory names, then reads one file on its own to prove `dt` isn't inside it.",
+      "Write `registerTable`: a `CREATE TABLE` with the column list from the KDoc, `USING parquet PARTITIONED BY (dt) LOCATION '...'`, then a call to `refreshPartitions`.",
+      "Write `refreshPartitions`. Its test writes a late day straight to disk, checks that the table can't see it, calls your function, and checks again.",
+      "Write `dailyTotal`. The test calls `inputFiles()` on your query and expects only that day's files.",
+      "Write `dailyTotalSql` for DuckDB. The test runs `EXPLAIN` on your SQL and reads the `Scanning Files: n/m` line. Run all five tests until they pass."
+    ],
+    "hints": [
+      "`payments.write().mode(SaveMode.Overwrite).partitionBy(\"dt\").parquet(root)` is the whole of `writeByDay`.",
+      "A table created over existing directories starts with no partitions. `MSCK REPAIR TABLE name` adds them; Spark also accepts `REPAIR TABLE name`.",
+      "`spark.table(table).where(col(\"dt\").equalTo(dt)).agg(sum(\"amount_cents\"))`. A filter on `to_date(col(\"created_at\"))` gives the right total and fails the file test.",
+      "In DuckDB, `read_parquet('<root>/**/*.parquet', hive_partitioning = true)` turns `dt=...` into a column. DuckDB reads it as a `DATE`, and `WHERE dt = '2026-11-05'` still works."
+    ],
+    "done_when": "All five tests in `PaymentsLakeTest` pass."
+  },
+  "drill": {
+    "title": "Register a lake, then skip the catalog",
+    "minutes": 4,
+    "prompt": "From memory, write the Spark SQL that turns an existing `dt=` directory tree of Parquet payments into a queryable table, and the statement that registers one new day later. Then write the DuckDB query that answers \"total for one day\" from the same files with no catalog at all.",
+    "answer": {
+      "lang": "sql",
+      "src": "-- Spark: the catalog owns the schema and the partition list\nCREATE TABLE payments (payment_id BIGINT, amount_cents BIGINT, created_at TIMESTAMP, dt STRING)\nUSING parquet PARTITIONED BY (dt) LOCATION '/data/lake/payments';\nMSCK REPAIR TABLE payments;                                   -- learn the days already on disk\nALTER TABLE payments ADD PARTITION (dt = '2026-11-08');       -- later: one new day\n\n-- DuckDB: no catalog, the paths are the partition list\nSELECT sum(amount_cents)\nFROM read_parquet('/data/lake/payments/**/*.parquet', hive_partitioning = true)\nWHERE dt = '2026-11-08';"
+    }
+  },
+  "recap": [
+    "A Hive table is a directory of files plus a description (schema, format, location) kept in the metastore. Files are checked only when a query reads them: schema on read.",
+    "Partitions are subdirectories named `key=value`. The value lives in the path, and a filter on the partition column lets an engine skip whole directories.",
+    "Pruning works only on the partition column. A filter on `created_at` opens every file of a `dt`-partitioned table.",
+    "The metastore's partition list is the truth. A directory written behind its back stays invisible until `ALTER TABLE ... ADD PARTITION` or `MSCK REPAIR TABLE`.",
+    "The model breaks at the file level: writes aren't atomic, listing is slow on object storage, and small files cost more than their bytes. Iceberg and Delta fix exactly these."
+  ],
+  "quiz": [
+    {
+      "q": "A table is partitioned by `dt` and holds 90 days. Which query opens files in only one day's directory?",
+      "options": [
+        "`WHERE created_at >= '2026-11-03' AND created_at < '2026-11-04'`",
+        "`WHERE dt = '2026-11-03'`",
+        "`WHERE to_date(created_at) = '2026-11-03'`",
+        "`WHERE amount_cents > 0 ORDER BY dt LIMIT 10`"
+      ],
+      "answer": 1,
+      "why": "Only a filter on the partition column itself can be matched against directory names. The two `created_at` filters select the same rows but force a read of every file. Ordering by `dt` doesn't filter anything."
+    },
+    {
+      "q": "A job wrote `dt=2026-11-08/` into a table's location an hour ago. A dashboard query for that day returns zero rows, and the files are there. What is the likely cause?",
+      "options": [
+        "The metastore has no partition for 2026-11-08, so the engine never lists that directory",
+        "The files are still being compressed",
+        "Parquet files need an index before they can be read",
+        "The dashboard cached yesterday's result"
+      ],
+      "answer": 0,
+      "why": "The engine asks the metastore which partitions match, and only lists the directories it gets back. A directory written without `ADD PARTITION` (or a later `MSCK REPAIR TABLE`) doesn't exist as far as queries are concerned. A cached result would show yesterday's numbers, not zero rows for a new day."
+    },
+    {
+      "q": "Someone runs `DROP TABLE payments` on an external Hive table. What happens to its files?",
+      "options": [
+        "They are deleted",
+        "They move to a trash folder for a while",
+        "They stay; only the metadata is removed",
+        "They are rewritten into the warehouse directory"
+      ],
+      "answer": 2,
+      "why": "External means Hive doesn't own the data. Dropping the table deletes its description from the metastore and leaves the files alone. Deleting (or moving to trash) is what happens to a managed table."
+    },
+    {
+      "q": "A streaming job writes a small file into each hourly partition every 30 seconds. A month later queries are slow, though the table holds only 20 GB. Why?",
+      "options": [
+        "20 GB is too much for Parquet",
+        "The metastore can't store more than 1,000 partitions",
+        "Hourly partitions turn off pruning",
+        "There are about 86,000 tiny files, and each one costs a listing entry, an open and a footer read"
+      ],
+      "answer": 3,
+      "why": "120 files an hour for 720 hours is 86,400 files of about 230 KB each. The per-file costs dominate, especially on S3 where each file is a request. Compacting each hour into a few large files fixes it. Pruning still works on hourly partitions; it just can't help a query that needs many of them."
+    },
+    {
+      "q": "From the previous lesson: a MapReduce job writes its output with 50 reducers. How many data files does it put in its output directory?",
+      "options": [
+        "1",
+        "50",
+        "One per map task",
+        "One per distinct key"
+      ],
+      "answer": 1,
+      "why": "Each reducer writes one output file, `part-00000` to `part-00049`. That is also why Hive tables filled by MapReduce jobs got one file per reducer per partition. The number of tasks that write a table decides how many files it ends up with.",
+      "from": "batch-03"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Where does the value of a Hive partition column live?",
+      "back": "In the directory name, like `dt=2026-11-03/`. Spark's `partitionBy` removes the column from the files it writes."
+    },
+    {
+      "front": "What does the Hive Metastore store for a table?",
+      "back": "Columns and types, file format, location, and one entry per partition with its directory. It is a Thrift service (port 9083) in front of a relational database."
+    },
+    {
+      "front": "A new `dt=` directory appears in storage, but queries can't see it. Why, and what fixes it?",
+      "back": "The metastore has no partition for it. Run `ALTER TABLE ... ADD PARTITION` for that day, or `MSCK REPAIR TABLE` to add every missing one."
+    },
+    {
+      "front": "Managed vs external table: what does DROP TABLE delete?",
+      "back": "Managed: the metadata and the files. External: only the metadata; the files stay."
+    },
+    {
+      "front": "What does \"schema on read\" mean?",
+      "back": "Files aren't checked when they land. Their types are checked against the table's schema only when a query reads them."
+    },
+    {
+      "front": "Why does a filter on `created_at` not prune a table partitioned by `dt`?",
+      "back": "Engines prune by matching filters against directory names. They can't know `created_at` and `dt` agree, so they open every file."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Schema on read",
+      "plain": "Checking data against the table's schema when it is read, not when it is written."
+    },
+    {
+      "term": "Hive-style partition",
+      "plain": "A subdirectory named `column=value` that holds the rows with that value."
+    },
+    {
+      "term": "Partition pruning",
+      "plain": "Skipping whole partitions (directories) that can't match a query's filter, before reading any file."
+    },
+    {
+      "term": "Hive Metastore (HMS)",
+      "plain": "A service over a relational database that stores table schemas, locations and partition lists for Hive, Spark and Trino."
+    },
+    {
+      "term": "External table",
+      "plain": "A table whose files the catalog doesn't own: dropping it removes only the metadata."
+    },
+    {
+      "term": "MSCK REPAIR TABLE",
+      "plain": "A command that lists a table's location and adds partitions found on storage but missing from the metastore."
+    },
+    {
+      "term": "Small files problem",
+      "plain": "Slow reads caused by many tiny files, because each file has fixed costs to list, open and parse."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A data engineer asks why a move to Iceberg is worth it, since \"Hive partitions already prune\". Explain what Hive-style partitioning does well and two problems it can't fix.",
+    "answer": "Hive-style partitioning does one thing well. If a query filters on the partition column, the engine asks the metastore for the matching partitions and lists only those directories. A one-day query on a three-year table reads a thousandth of it. Two problems are out of its reach because the metastore tracks directories, not files. First, writes aren't atomic: a job adds files one by one, so a reader can see half a write, and an overwrite can show an empty partition. Second, the engine has to list directories to find files, which is slow on S3 with 1,000 keys per request, and it gets worse as small files pile up. There's also a usability trap: pruning only works on the separate `dt` column, so a filter on `created_at` silently reads everything. Iceberg keeps its own list of every file, commits a snapshot atomically, and partitions by a transform of `created_at` itself."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Hive had a second layout trick besides partitions: **buckets**. Inside each partition, rows can be spread across a fixed number of files by a hash of a column, so bucket 7 of `card_id` always holds the same cards. The Hive paper describes it: each bucket is one file in the partition directory.\n\nBucketing is a shuffle paid for at write time. Lesson 3's partitioner sends each key to reducer `hash(key) mod R`; bucketing does the same with `R` buckets and keeps the result on disk. Say two tables are bucketed on the same key into the same number of buckets. A join can then match bucket 7 of one with bucket 7 of the other, and no rows have to move across the network.\n\nSpark offers this for its own tables with `bucketBy(n, column)` together with `saveAsTable`. The modern version lives in table formats. Spark's tuning guide describes a storage-partitioned join that uses the partition layout of a table format such as Iceberg. When it applies there is no `Exchange` (Spark's name for a shuffle) before the join at all. The catch is the same in every era: both sides must agree on the key and the bucket count, and a bucket layout that matches today's join rarely matches next year's."
+  },
+  "sources": [
+    {
+      "title": "Hive: A Warehousing Solution Over a Map-Reduce Framework (Thusoo et al., VLDB 2009)",
+      "url": "https://www.vldb.org/pvldb/vol2/vldb09-938.pdf"
+    },
+    {
+      "title": "Hive Data Definition Language: partitions and MSCK REPAIR TABLE",
+      "url": "https://hive.apache.org/docs/latest/language/languagemanual-ddl/"
+    },
+    {
+      "title": "Metastore 3.0 administration (Apache Hive docs)",
+      "url": "https://hive.apache.org/docs/latest/admin/adminmanual-metastore-3-0-administration/"
+    },
+    {
+      "title": "Hive partitioning (DuckDB 2.0 docs)",
+      "url": "https://duckdb.org/docs/2.0/data/partitioning/hive_partitioning.html"
+    },
+    {
+      "title": "Spark SQL performance tuning: storage-partitioned join",
+      "url": "https://spark.apache.org/docs/latest/sql-performance-tuning.html"
+    }
+  ]
+}

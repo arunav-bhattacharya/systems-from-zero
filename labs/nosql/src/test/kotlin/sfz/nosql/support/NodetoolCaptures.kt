@@ -2,7 +2,7 @@ package sfz.nosql.support
 
 /**
  * Reads `nodetool` output captured from the three-node cluster (env/cassandra-cluster.yml) and kept
- * as test resources, so the lessons on Cassandra's ring (nosql-13, nosql-14) can check their models
+ * as test resources, so the lessons on Cassandra's ring (shard-05, shard-06) can check their models
  * against what a real cluster printed. Lines starting with `#` are comments added when capturing.
  */
 object NodetoolCaptures {

@@ -6,6 +6,11 @@
   const L = C.lessons;
   const T = Object.fromEntries(C.tracks.map((t, i) => [t.id, Object.assign(t, { idx: i + 1 })]));
   const ORDER = C.order;
+  // Parts group tracks ("Part II · Data on one machine"); redirects map old lesson and track ids to new ones
+  const PARTS = C.parts || [];
+  const PART = Object.fromEntries(PARTS.map((p, i) => [p.id, Object.assign(p, { idx: i + 1 })]));
+  const REDIR = C.redirects || {};
+  const roman = (n) => ["", "I", "II", "III", "IV", "V", "VI", "VII", "VIII"][n] || String(n);
   const $ = (s, r = document) => r.querySelector(s);
   const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -17,6 +22,31 @@
   let S = blank();
   try { S = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) { /* private window or blocked storage */ }
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ } };
+
+  /* When lessons move to new ids, carry progress, quiz scores, notes and review cards across once. */
+  function migrateIds() {
+    const sig = Object.keys(REDIR).length;
+    if (!sig || S.migrated === sig) return;
+    const lid = (id) => REDIR[id] || id;
+    for (const k of ["done", "undone", "quiz", "explain"]) {
+      const out = {};
+      for (const [id, v] of Object.entries(S[k] || {})) { const n = lid(id); if (out[n] == null || (k !== "explain" && v > out[n])) out[n] = v; }
+      S[k] = out;
+    }
+    const tq = {};
+    for (const [tid, v] of Object.entries(S.tquiz || {})) { const n = (REDIR["track-" + tid] || "track-" + tid).slice(6); tq[n] = Math.max(tq[n] || 0, v); }
+    S.tquiz = tq;
+    const cards = {};
+    for (const [id, c] of Object.entries(S.cards || {})) {
+      const [key, k] = id.split(":");
+      const nk = REDIR[key] || (REDIR["track-" + key] ? REDIR["track-" + key].slice(6) : key);
+      cards[`${nk}:${k}`] = c;
+    }
+    S.cards = cards;
+    S.migrated = sig;
+    save();
+  }
+  migrateIds();
 
   /* ---------------- moving progress between devices ----------------
      Progress lives in this browser. The Plan page copies it out as text and imports it on another
@@ -211,10 +241,12 @@
     </div>
     <div class="navsec"><span class="label">Tracks · ${doneCount()} of ${ORDER.length} lessons done</span>
     <input class="field filter" id="lesson-filter" type="search" placeholder="Find a lesson" aria-label="Find a lesson" value="${esc(filterText)}"></div>`;
+    let lastPart = null;
     for (const t of C.tracks) {
       const open = filterText ? true : S.open[t.id] ?? (t.id === curTrack || (!curTrack && t.id === nxTrack));
       const shown = t.lessons.filter((id) => !filterText || L[id].title.toLowerCase().includes(filterText.toLowerCase()));
       if (filterText && !shown.length) continue;
+      if (PART[t.part] && t.part !== lastPart) { lastPart = t.part; h += `<div class="partsec"><span class="label">Part ${roman(PART[t.part].idx)} · ${esc(PART[t.part].title)}</span></div>`; }
       h += `<div class="trk" style="--trk: var(--c${t.idx})"><button data-act="toggle-track" data-id="${t.id}" aria-expanded="${open}">
           <span class="tn">${pad(t.idx)}</span><span class="tt">${esc(t.title)}</span><span></span>${cells(t.lessons)}</button>
         ${open ? `<ul><li><button data-go="track-${t.id}" class="${cur === "track-" + t.id ? "on" : ""}"><span class="cell" style="visibility:hidden"></span>Track overview</button></li>
@@ -227,7 +259,11 @@
   let filterText = "";
 
   /* ---------------- router ---------------- */
-  const route = () => (location.hash.slice(1) || "home");
+  const route = () => {
+    const h = location.hash.slice(1) || "home";
+    if (REDIR[h]) { history.replaceState(null, "", "#" + REDIR[h]); return REDIR[h]; }
+    return h;
+  };
   function render(keepScroll) {
     const cur = route();
     const y = scrollY;
@@ -305,14 +341,16 @@
     </section>
 
     <div class="sechead"><h2>Tracks</h2><span class="label">Do them in order, or jump to the one you need</span></div>
+    ${(PARTS.length ? PARTS.map((p) => ({ p, ts: C.tracks.filter((t) => t.part === p.id) })) : [{ p: null, ts: C.tracks }]).map(({ p, ts }) => `
+    ${p ? `<div class="parthead"><span class="label">Part ${roman(p.idx)}</span><h3>${esc(p.title)}</h3>${p.short ? `<p class="mute">${p.short}</p>` : ""}</div>` : ""}
     <section class="tracks">
-      ${C.tracks.map((t) => `<button class="panel tcard" style="--trk: var(--c${t.idx})" data-go="track-${t.id}">
-        <span class="label">Track ${pad(t.idx)} · ${t.lessons.length} lessons · labs/${esc(t.lab)}</span>
+      ${ts.map((t) => `<button class="panel tcard" style="--trk: var(--c${t.idx})" data-go="track-${t.id}">
+        <span class="label">Track ${pad(t.idx)} · ${t.lessons.length} lessons · ${(t.labs || [t.lab]).map((m) => "labs/" + esc(m)).join(", ")}</span>
         <h3>${esc(t.title)}</h3><p>${esc(t.short)}</p>
         ${cells(t.lessons, true)}
         <span class="foot"><span>${trackDone(t)} of ${t.lessons.length} done</span><span>${t.lessons.filter((id) => L[id].ready).length < t.lessons.length ? `${t.lessons.filter((id) => L[id].ready).length} written` : ""}</span></span>
       </button>`).join("")}
-    </section>
+    </section>`).join("")}
 
     <div class="sechead"><h2>How a session works</h2></div>
     <section class="how">
@@ -786,17 +824,17 @@
           ${envs.map((e) => `<tr><td><code>${esc(e.start)}</code></td><td>${e.what}</td><td>${esc(e.tracks)}</td></tr>`).join("")}
           </tbody></table></div>
           ${cb("stop a service and delete its data", "docker compose -f env/postgres.yml down -v")}</section>` : ""}
-        <section class="block"><h2>${envs.length ? 6 : 5}. Open it in IntelliJ IDEA</h2><p>Open the <code>labs</code> folder (not the repo root) as a Gradle project. Each track is a module: ${C.tracks.map((t) => `<code>${esc(t.lab)}</code>`).join(", ")}. Each module has four source folders:</p>
+        <section class="block"><h2>${envs.length ? 6 : 5}. Open it in IntelliJ IDEA</h2><p>Open the <code>labs</code> folder (not the repo root) as a Gradle project. Each module is one toolchain, with the libraries and containers its labs need: ${[...new Set(C.tracks.flatMap((t) => t.labs || [t.lab]))].map((m) => `<code>${esc(m)}</code>`).join(", ")}. A lesson's lab lives in the module whose tools it uses, and each lesson page names it. Each module has four source folders:</p>
           <div class="tablewrap"><table><thead><tr><th>Folder</th><th>What it holds</th></tr></thead><tbody>
             <tr><td><code>src/main</code></td><td>The exercises. This is where you write code (or SQL).</td></tr>
             <tr><td><code>src/test</code></td><td>The tests that tell you when an exercise is done.</td></tr>
             <tr><td><code>src/demo</code></td><td>Small programs the Try it steps run. Edit them freely.</td></tr>
             <tr><td><code>src/solution</code></td><td>Reference answers. Same names, same packages. Peek last.</td></tr></tbody></table></div>
-          <p>Lesson <code>${esc(ORDER[0])}</code> lives in package <code>sfz.${esc(C.tracks[0].lab)}.l01</code> in every folder. The same pattern holds for every lesson.</p></section>
+          <p>Lesson <code>${esc(ORDER[0])}</code> lives in package <code>sfz.${esc(C.tracks[0].id)}.l01</code> in every folder: the track id, then the lesson number. The same pattern holds for every lesson.</p></section>
         <section class="block"><h2>${envs.length ? 7 : 6}. The three commands you'll use</h2>
-          ${cb("run one lesson's lab tests", `./gradlew :${C.tracks[0].lab}:test --tests 'sfz.${C.tracks[0].lab}.l03.*'`)}
+          ${cb("run one lesson's lab tests", `./gradlew :${C.tracks[0].lab}:test --tests 'sfz.${C.tracks[0].id}.l03.*'`)}
           ${cb("run a demo from a Try it step", "./gradlew :net:demo -Pmain=sfz.net.l06.demo.Boundaries")}
-          ${cb("check the reference answers (should always pass)", `./gradlew :${C.tracks[0].lab}:solutionTest --tests 'sfz.${C.tracks[0].lab}.l03.*'`)}
+          ${cb("check the reference answers (should always pass)", `./gradlew :${C.tracks[0].lab}:solutionTest --tests 'sfz.${C.tracks[0].id}.l03.*'`)}
           <p>In IntelliJ you can also click the green arrow next to any test or <code>main</code>. For a Kotlin file <code>Foo.kt</code> with a top-level <code>main</code>, the class name is <code>FooKt</code>.</p></section>
         <section class="block"><h2>${envs.length ? 8 : 7}. How to use the labs</h2><p>Read the failing test first. It is the spec. Then write the code, run the tests, and repeat. A stuck test fails after 60 seconds instead of hanging. The first test that starts a container pulls its image, which can take a minute; after that it starts in seconds.</p></section>
         <div class="row"><button class="btn" data-go="${ORDER[0]}">Start lesson one</button></div>

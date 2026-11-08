@@ -1,408 +1,423 @@
 {
-  "id": "sql-01",
-  "title": "The relational model, keys and NULL",
-  "minutes": 40,
-  "goal": "By the end you can name the candidate keys of a table, predict what NULL does to a comparison, a WHERE clause and a count, and write a one-table query whose time range, order and row limit are exactly right.",
-  "warmup": {
-    "q": "The `customers` table has 13 rows. Customer 1 referred 2 of them, other customers referred 6, and nobody referred the remaining 5 (their `referred_by` is NULL). How many rows does `SELECT * FROM customers WHERE referred_by <> 1` return?",
-    "options": [
-      "11",
-      "6",
-      "13",
-      "None: PostgreSQL raises an error when it compares with NULL"
-    ],
-    "answer": 1,
-    "why": "The 2 rows with `referred_by = 1` give false. The 5 NULL rows give NULL, which SQL reads as unknown, and WHERE keeps only rows where the condition is true. So only the 6 customers referred by someone else come back. Nothing raises an error: the NULL rows disappear without a word."
-  },
-  "sections": [
-    {
-      "h": "A database keeps facts in tables, and a table has no order",
-      "body": "Start with a payments service that keeps its payments in a Kotlin `List<Payment>`. It works until the process restarts and every payment is gone. So you append each payment to a file, one line of JSON per payment. The data now survives a restart, and three new problems appear. To find the payments of card 8 you read the whole file. When a second service writes to the same file, two half-written lines can interleave. And nothing stops a bug from writing a payment for card 99, which does not exist. On top of that, every new question (\"the five largest payments in March\") is new code: open the file, loop, filter, sort.\n\nA relational database such as PostgreSQL answers these problems with four parts. A **server process** owns the data files, and programs never touch the files: they connect over the network and send requests. psql, the command-line client, does this, and so does your Kotlin service through JDBC. **Tables** hold the data. A table has named, typed columns, and each **row** records one fact. **Constraints** are rules the server checks on every write, such as \"a payment's card must exist\". And **SQL** is a language where you describe the rows you want, and the server works out how to find them. Here is one fact, payment 17: card 8 paid merchant 4 the sum of 189.99, stored as 18999 cents, at 16:40 UTC on 12 March 2026.\n\n```postgresql\ncourse=# SELECT payment_id, card_id, merchant_id, amount_minor, status, created_at\ncourse-# FROM payments\ncourse-# WHERE payment_id = 17;\n payment_id | card_id | merchant_id | amount_minor |  status   |       created_at\n------------+---------+-------------+--------------+-----------+------------------------\n         17 |       8 |           4 |        18999 | succeeded | 2026-03-12 16:40:00+00\n(1 row)\n```\n\nThis lesson builds one picture that the whole track reuses: **a table is a collection of facts, keys say which fact is which and how facts point at each other, and a query filters and reshapes facts in a fixed order.**\n\nThe theory comes from E. F. Codd, who published the relational model in 1970. He called a table a **relation**: a *set* of rows that all have the same columns, where each column takes its values from one type. A set has no duplicates and no order. SQL keeps neither promise. A SQL table is a **bag**, a collection that may hold the same row twice, and a query keeps duplicate rows unless you write `DISTINCT`. `SELECT country_code FROM customers WHERE created_at < '2026-01-01'` returns US twice, because two of those five customers live in the US. `SELECT DISTINCT` returns four rows, in the order US, FR, IN, DE. That is not sorted: PostgreSQL removed the duplicates with a hash table and handed back the buckets as it found them.\n\nOrder is the bigger trap. PostgreSQL stores a table in a file made of 8 KB pages. All 13 customers fit in one page. A query with nothing better to use reads the pages from first to last (a **sequential scan**) and returns rows in the order it meets them. The docs promise only that rows come back \"in whatever order the system finds fastest to produce\". On a fresh table that looks like insertion order. It stops looking like it as soon as a row moves. And rows move: PostgreSQL never changes a row in place. An `UPDATE` writes a new version of the row, usually behind the other rows, and the next scan meets it last. (PostgreSQL keeps the old version for a while, because a query that started earlier may still be reading it. The isolation lesson explains this.) So `LIMIT 3` without `ORDER BY` means \"any three rows\", and a test that expects the three oldest customers passes until somebody updates one of them.",
-      "try": {
-        "title": "Watch a row move",
-        "minutes": 4,
-        "steps": [
-          "From the `labs` folder, start the course database: `docker compose -f env/postgres.yml up -d`. The first start loads the payments schema and its small seed in a few seconds.",
-          "Open psql on it: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Type `\\pset null '∅'` so NULLs show up as ∅ for the rest of the lesson.",
-          "Run the first `SELECT` and note the three ids. Predict: after an `UPDATE` that changes nothing, will the same query return the same three rows?",
-          "Run the rest, one statement at a time. `BEGIN` starts a transaction, a group of changes that becomes permanent only on `COMMIT`. `ROLLBACK` throws the group away, so the database stays as it was."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SELECT customer_id, full_name FROM customers LIMIT 3;\nBEGIN;\nUPDATE customers SET full_name = full_name WHERE customer_id = 1;\nSELECT customer_id, full_name FROM customers LIMIT 3;\nSELECT customer_id, full_name FROM customers ORDER BY customer_id LIMIT 3;\nROLLBACK;"
-        },
-        "expect": "The first query returns customers 1, 2 and 3. After the update the same query returns 2, 3 and 4:\n\n```postgresql\ncourse=*# SELECT customer_id, full_name FROM customers LIMIT 3;\n customer_id |  full_name\n-------------+--------------\n           2 | Ben Carter\n           3 | Chloe Martin\n           4 | Daniel Kim\n(3 rows)\n```\n\nThe update wrote a new version of customer 1 behind the other rows, so the scan reached it last. The version with `ORDER BY customer_id` returns 1, 2 and 3 both times. (The `*` in the prompt means a transaction is open.)"
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: SELECT (the ORDER BY clause)",
-          "url": "https://www.postgresql.org/docs/18/sql-select.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Keys decide when two rows are the same fact",
-      "body": "Payments 17 and 18 look alike. Same card, same merchant, same amount, two minutes apart:\n\n```postgresql\ncourse=# SELECT payment_id, card_id, merchant_id, amount_minor, created_at\ncourse-# FROM payments\ncourse-# WHERE card_id = 8 AND merchant_id = 4\ncourse-# ORDER BY payment_id;\n payment_id | card_id | merchant_id | amount_minor |       created_at\n------------+---------+-------------+--------------+------------------------\n         17 |       8 |           4 |        18999 | 2026-03-12 16:40:00+00\n         18 |       8 |           4 |        18999 | 2026-03-12 16:42:10+00\n(2 rows)\n```\n\nIs that one purchase recorded twice, or two purchases? To answer, a table needs what a Kotlin class needs for `equals`: a rule that says which row is which. Build it up in steps.\n\nFirst try: identify a payment by what it says, `(card_id, merchant_id, amount_minor)`. Payments 17 and 18 share all three, so the rule already breaks. Add `created_at` and the pair `(card_id, created_at)` is unique in the seed. That still does not make it a rule. A settlement import that writes two rows with the same timestamp is easy to imagine, and nothing would stop it. Data can prove that some columns are not unique. It can never prove that they always will be.\n\nThe vocabulary for this: a **superkey** is a set of columns whose values never repeat across rows. A **candidate key** is a superkey with nothing to spare: drop any column and it stops being unique. `(payment_id, status)` is a superkey, but `status` is spare, so the pair is not a candidate key. `payment_id` alone is one.\n\nSecond try: let the database number the rows. `payment_id` is an **identity column**: on each insert, PostgreSQL takes the next number from a counter (a sequence) and writes it into the row. A key like this, with no meaning outside the database, is a **surrogate key**. Now every row has a name. It still cannot answer the retry question. The client sends a payment, the server inserts it, and the reply is lost in a network timeout. The client retries, and the server inserts row 38 with a fresh id. The card is charged twice.\n\nThird piece: let the client name the payment. `payment_uid` is a **UUID**, a 128-bit identifier the client can generate without asking anyone, written as 32 hex digits such as `019ce2eb-5700-7011-8000-000000000011`. The client creates it once and sends it with every attempt, so a retry carries the same value. This is an **idempotency key**, and a `UNIQUE` constraint on it turns the second insert into an error. PostgreSQL enforces `UNIQUE` with a **B-tree index**, a sorted structure that maps each key to its row (think of a `TreeMap`), so the check reads a few 8 KB pages instead of the whole table.\n\n`payments` now has two candidate keys. You pick one as the **primary key**: PostgreSQL makes its columns `NOT NULL` and gives it a unique index. Protect every other candidate key with `UNIQUE`.\n\nThe file had one more problem: a payment for card 99. A **foreign key** solves it. `payments.card_id REFERENCES cards` means every `card_id` in payments must exist as a key in cards. PostgreSQL checks it on every insert or update in payments, and on every delete in cards. The figure shows the keys of the core tables. `\\d payments` lists them too (output trimmed):\n\n```postgresql\ncourse=# \\d payments\n...\nIndexes:\n    \"payments_pkey\" PRIMARY KEY, btree (payment_id)\n    \"payments_payment_uid_key\" UNIQUE CONSTRAINT, btree (payment_uid)\nForeign-key constraints:\n    \"payments_card_id_fkey\" FOREIGN KEY (card_id) REFERENCES cards(card_id)\n    \"payments_merchant_id_fkey\" FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)\n```\n\nThere is no index on `card_id` or `merchant_id`. Declaring a foreign key does not create one, in PostgreSQL or in Oracle. Lesson 11 of this track, on indexes, shows what that costs.",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Five tables and their keys. accounts points to customers and merchants, cards to accounts, payments to cards and merchants, and customers points to itself through referred_by.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"10\" y=\"40\" width=\"150\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"85.0\" y=\"66\" text-anchor=\"middle\">customers</text><text class=\"t-s t-code\" x=\"85.0\" y=\"90\" text-anchor=\"middle\">PK customer_id</text><text class=\"t-s t-code\" x=\"85.0\" y=\"112\" text-anchor=\"middle\">UNIQUE email</text><text class=\"t-s t-code\" x=\"85.0\" y=\"134\" text-anchor=\"middle\">FK referred_by</text><rect class=\"box\" x=\"180\" y=\"40\" width=\"150\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"255.0\" y=\"66\" text-anchor=\"middle\">accounts</text><text class=\"t-s t-code\" x=\"255.0\" y=\"90\" text-anchor=\"middle\">PK account_id</text><text class=\"t-s t-code\" x=\"255.0\" y=\"112\" text-anchor=\"middle\">FK customer_id</text><text class=\"t-s t-code\" x=\"255.0\" y=\"134\" text-anchor=\"middle\">FK merchant_id</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"66\" text-anchor=\"middle\">cards</text><text class=\"t-s t-code\" x=\"425.0\" y=\"90\" text-anchor=\"middle\">PK card_id</text><text class=\"t-s t-code\" x=\"425.0\" y=\"112\" text-anchor=\"middle\">FK account_id</text><rect class=\"box-a\" x=\"520\" y=\"40\" width=\"150\" height=\"134\" rx=\"8\"/><text class=\"t t-a\" x=\"595.0\" y=\"66\" text-anchor=\"middle\">payments</text><text class=\"t-s t-code\" x=\"595.0\" y=\"90\" text-anchor=\"middle\">PK payment_id</text><text class=\"t-s t-code\" x=\"595.0\" y=\"112\" text-anchor=\"middle\">UNIQUE payment_uid</text><text class=\"t-s t-code\" x=\"595.0\" y=\"134\" text-anchor=\"middle\">FK card_id</text><text class=\"t-s t-code\" x=\"595.0\" y=\"156\" text-anchor=\"middle\">FK merchant_id</text><rect class=\"box\" x=\"350\" y=\"196\" width=\"150\" height=\"68\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"222\" text-anchor=\"middle\">merchants</text><text class=\"t-s t-code\" x=\"425.0\" y=\"246\" text-anchor=\"middle\">PK merchant_id</text><line class=\"ln\" x1=\"180\" y1=\"96\" x2=\"162\" y2=\"96\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"350\" y1=\"85\" x2=\"332\" y2=\"85\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"520\" y1=\"85\" x2=\"502\" y2=\"85\" marker-end=\"url(#arr)\"/><path class=\"ln\" d=\"M 560 174 L 560 230 L 502 230\" marker-end=\"url(#arr)\" fill=\"none\"/><path class=\"ln\" d=\"M 255 152 L 255 230 L 348 230\" marker-end=\"url(#arr)\" fill=\"none\"/><path class=\"ln\" d=\"M 50 40 L 50 18 L 120 18 L 120 38\" marker-end=\"url(#arr)\" fill=\"none\"/><text class=\"t-s t-m\" x=\"85\" y=\"12\" text-anchor=\"middle\">referred_by</text></svg>",
-        "caption": "The core tables of the course schema. Each arrow is a foreign key pointing at the primary key it references."
-      },
-      "try": {
-        "title": "Break the keys on purpose",
-        "minutes": 3,
-        "steps": [
-          "Payment 17 has `payment_uid` `019ce2eb-5700-7011-8000-000000000011`. Predict what happens when a client retry sends that uid again.",
-          "Run the two inserts below. Each error names the constraint that stopped it.",
-          "Run `\\d cards` and find the foreign key that points at accounts."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "INSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019ce2eb-5700-7011-8000-000000000011', 8, 4, 18999, 'succeeded', now());\n\nINSERT INTO payments (card_id, merchant_id, amount_minor, status, created_at)\nVALUES (99, 4, 18999, 'succeeded', now());"
-        },
-        "expect": "Both inserts fail, and nothing is written:\n\n```text\nERROR:  duplicate key value violates unique constraint \"payments_payment_uid_key\"\nDETAIL:  Key (payment_uid)=(019ce2eb-5700-7011-8000-000000000011) already exists.\n\nERROR:  insert or update on table \"payments\" violates foreign key constraint \"payments_card_id_fkey\"\nDETAIL:  Key (card_id)=(99) is not present in table \"cards\".\n```\n\nThe second insert did not give a `payment_uid`, so the column default `uuidv7()` made a fresh one. That insert failed on the card, not on the uid."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Constraints",
-          "url": "https://www.postgresql.org/docs/18/ddl-constraints.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "NULL means unknown, and WHERE keeps only true",
-      "body": "Kofi Mensah signed up without a referral code. What should his `referred_by` hold? Try the obvious answers first. `0` fails at once: no customer 0 exists, so the foreign key rejects it, and if it did not, `count(referred_by)` would count Kofi as referred. A magic value such as `-1` has the same problems, and every query must remember the magic. SQL's answer is a marker that means \"no value here\": **NULL**.\n\nA marker is not a value, so how does it compare? Is NULL equal to 1? SQL does not answer false. It answers NULL again, which here means **unknown**. Logic with three answers (true, false and unknown) is called **three-valued logic**. Here are its rules, in one query (run with `\\pset null '∅'`, which makes psql print NULL as ∅):\n\n```postgresql\ncourse=# SELECT NULL = NULL AS \"null = null\", NULL <> 1 AS \"null <> 1\", NULL IS NULL AS \"is null\",\ncourse-#        NULL IS DISTINCT FROM 1 AS \"distinct from 1\", true OR NULL AS \"true or null\",\ncourse-#        false AND NULL AS \"false and null\", NOT NULL::boolean AS \"not null\";\n null = null | null <> 1 | is null | distinct from 1 | true or null | false and null | not null\n-------------+-----------+---------+-----------------+--------------+----------------+----------\n ∅           | ∅         | t       | t               | t            | f              | ∅\n(1 row)\n```\n\nRead each column as a rule. Any comparison with NULL (`=`, `<>`, `<`, `>`) is unknown, even `NULL = NULL`: two unknown numbers might or might not be equal. `IS NULL` and `IS DISTINCT FROM` never return unknown. `IS DISTINCT FROM` treats NULL as an ordinary value, so `NULL IS DISTINCT FROM 1` is true. With `OR` and `AND`, a known side can decide: `true OR unknown` is true whatever the unknown turns out to be, and `false AND unknown` is false. Every other mix with unknown stays unknown, and `NOT unknown` is still unknown.\n\nThen comes the rule that bites. **WHERE keeps a row only when its condition is true.** False and unknown both drop it. So `WHERE referred_by <> 1` drops Kofi and the four other customers nobody referred, which is not what \"not referred by customer 1\" means in English. The stepper runs that WHERE clause over six rows.\n\nThe fix depends on what you mean. `referred_by IS DISTINCT FROM 1` keeps the NULL rows. `referred_by <> 1 OR referred_by IS NULL` says the same thing in more words. If a column should never be empty, declare it `NOT NULL` and the question never comes up. The bug feels natural because Kotlin works differently: `null == null` is true in Kotlin. `IS NOT DISTINCT FROM` is the SQL spelling of Kotlin's `==`.\n\nAggregate functions, which fold many rows into one value, have NULL rules of their own. `count(*)` counts rows. `count(referred_by)` counts rows where `referred_by` is not NULL. `count(DISTINCT referred_by)` counts different non-NULL values. On the seed those are 13, 8 and 7. `sum`, `avg`, `min` and `max` skip NULLs too, and `sum` over zero rows returns NULL, not 0.",
-      "stepper": {
-        "title": "WHERE referred_by <> 1, one row at a time",
-        "intro": "Click Next to watch PostgreSQL test each row. The blue row was just decided; green rows are kept, dashed red rows are dropped.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
-            "say": "WHERE runs its condition once for each row and keeps the row only when the answer is **true**. Here are customers 1 to 6. Nobody referred customers 1 and 2, so their `referred_by` is NULL."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
-            "say": "Customer 1: `NULL <> 1` is unknown. Unknown is not true, so WHERE drops the row. PostgreSQL gives no error and no warning."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
-            "say": "Customer 2: the same. Every customer nobody referred falls out here, even though Asha (customer 1) referred neither of them."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
-            "say": "Customer 3: Asha did refer Chloe, so `1 <> 1` is false and the row goes. That one is correct."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
-            "say": "Customer 4: `2 <> 1` is true. This is the first row that survives."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box-a\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"235\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"235\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text><text class=\"t t-ok\" x=\"375\" y=\"269\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"269\" text-anchor=\"middle\">kept</text></svg>",
-            "say": "Customers 5 and 6 finish the scan: false, then true. Two of these six rows survive. On the whole table it is 6 rows of 13."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by IS DISTINCT FROM 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by IS DISTINCT FROM 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">IS DISTINCT FROM 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-ok\" x=\"375\" y=\"99\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"99\" text-anchor=\"middle\">kept</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-ok\" x=\"375\" y=\"133\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"133\" text-anchor=\"middle\">kept</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box-dim\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"235\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"235\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text><text class=\"t t-ok\" x=\"375\" y=\"269\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"269\" text-anchor=\"middle\">kept</text></svg>",
-            "say": "Now write `referred_by IS DISTINCT FROM 1`. It treats NULL as an ordinary value, and NULL is distinct from 1, so customers 1 and 2 are kept. On the whole table that is 11 rows: everyone Asha did not refer."
-          }
-        ]
-      },
-      "try": {
-        "title": "Predict five answers, then count",
-        "minutes": 5,
-        "steps": [
-          "Before you run the first query, write down t, f or ∅ for each of its five columns.",
-          "Run it and check your guesses against the rules above.",
-          "Run the two counts. The difference is the number of customers nobody referred.",
-          "Run the last query. Merchant 6 has no payments: what does `sum` return over no rows?"
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "\\pset null '∅'\nSELECT 2 > NULL                       AS a,\n       NULL OR false                  AS b,\n       NOT (NULL = 1)                 AS c,\n       NULL IS NOT DISTINCT FROM NULL AS d,\n       (NULL = 1) IS NULL             AS e;\n\nSELECT count(*) FROM customers WHERE referred_by <> 1;\nSELECT count(*) FROM customers WHERE referred_by IS DISTINCT FROM 1;\n\nSELECT sum(amount_minor), count(*) FROM payments WHERE merchant_id = 6;"
-        },
-        "expect": "```postgresql\n a | b | c | d | e\n---+---+---+---+---\n ∅ | ∅ | ∅ | t | t\n(1 row)\n```\n\n`b` is unknown because `false` cannot decide an OR. `c` is unknown because NOT of unknown is unknown. `d` is true: two NULLs are not distinct. `e` is true because the comparison itself returned NULL. The counts are 6 and 11. The last query returns `∅` for the sum and `0` for the count: `count` never returns NULL, `sum` does when it has no rows."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL 18: Comparison functions and operators (IS DISTINCT FROM)",
-          "url": "https://www.postgresql.org/docs/18/functions-comparison.html",
-          "kind": "docs"
-        },
-        {
-          "title": "PostgreSQL 18: Aggregate functions",
-          "url": "https://www.postgresql.org/docs/18/functions-aggregate.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "A SELECT runs in a different order than you write it",
-      "body": "This query fails, and the reason teaches the most useful rule in SQL:\n\n```postgresql\ncourse=# SELECT payment_id, round(amount_minor / 100.0, 2) AS amount\ncourse-# FROM payments\ncourse-# WHERE amount > 500;\nERROR:  column \"amount\" does not exist\nLINE 3: WHERE amount > 500;\n              ^\n```\n\n`amount` is defined two lines up. Why can't WHERE see it? Because the clause you write first runs late. Think of the query as a Kotlin pipeline: `payments.filter { it.amountMinor > 50000 }.map { Row(it.paymentId, it.amountMinor / 100.0) }.sortedByDescending { it.amount }.take(5)`. You cannot filter on a field that `map` creates later. SQL has the same shape, written in a different order. PostgreSQL evaluates the clauses in this logical order:\n\n1. `FROM`, including joins: which rows exist.\n2. `WHERE`: keep the rows where the condition is true.\n3. `GROUP BY`, then `HAVING`: lesson 4 of this track.\n4. The select list: compute the output columns and their aliases.\n5. `DISTINCT`: drop duplicate output rows.\n6. `ORDER BY`: sort.\n7. `LIMIT`, `OFFSET` or `FETCH FIRST`: cut.\n\nThe **planner**, the part of PostgreSQL that decides how to run a query, may do the physical work in another order, for example by reading an index instead of scanning. The result must still look as if the steps ran in this order. So an alias from step 4 is invisible in step 2 and visible in step 6: `ORDER BY amount` works. In WHERE, filter on the column itself: `WHERE amount_minor > 50000`.\n\nStep 6 has a trap: ties. Payments 17, 18 and 19 all have `amount_minor = 18999`. With `ORDER BY amount_minor DESC LIMIT 5`, any of the three may take the last places, and a different one next week. End the sort with a unique column, `ORDER BY amount_minor DESC, payment_id`, and the order is fixed. If you want every tied row, `FETCH FIRST 5 ROWS WITH TIES` (PostgreSQL 13 and later) keeps going until the tie ends.\n\nStep 4 is where `CASE` lives, SQL's version of Kotlin's `when`. The first branch whose condition is true wins, and `ELSE` catches the rest. Without an ELSE, the rest get NULL. Watch the short form: `CASE referred_by WHEN NULL THEN ...` compares with `=`, so it never matches a NULL.\n\nStep 2 is where time ranges go wrong. `created_at` is a `timestamptz`: an instant in time, stored as UTC, down to the microsecond. `BETWEEN '2026-03-01' AND '2026-03-31'` includes both ends, and its end is midnight at the start of 31 March, so it loses the whole last day. `BETWEEN '2026-03-01' AND '2026-04-01'` includes a payment made at exactly midnight on 1 April. Write every range half-open: `created_at >= '2026-03-01' AND created_at < '2026-04-01'`. It includes the first instant of March and stops just before the first instant of April, so consecutive months never overlap and never leave a gap. A date without a time zone is read in the session's `TimeZone` setting, which is UTC in the course database.",
-      "try": {
-        "title": "Lose a payment with BETWEEN",
-        "minutes": 4,
-        "steps": [
-          "Payment 22 was made half a second before midnight on 31 March. Payment 23 was made at exactly midnight on 1 April. Predict which of them each of the first two queries returns.",
-          "Run them. Then run the third query and count the rows: you asked for two.",
-          "When you are done for the day, leave psql with `\\q` and stop the database with `docker compose -f env/postgres.yml down`. Add `-v` to delete the data as well."
-        ],
-        "code": {
-          "lang": "postgresql",
-          "title": "psql, database course",
-          "src": "SELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at BETWEEN '2026-03-31' AND '2026-04-01'\nORDER BY created_at;\n\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at >= '2026-03-31' AND created_at < '2026-04-01'\nORDER BY created_at;\n\nSELECT payment_id, amount_minor FROM payments\nWHERE merchant_id = 4 AND created_at >= '2026-03-01' AND created_at < '2026-04-01'\nORDER BY amount_minor DESC\nFETCH FIRST 2 ROWS WITH TIES;"
-        },
-        "expect": "BETWEEN returns both payments, because both ends are inclusive:\n\n```postgresql\n payment_id |        created_at        | amount_minor\n------------+--------------------------+--------------\n         22 | 2026-03-31 23:59:59.5+00 |        52000\n         23 | 2026-04-01 00:00:00+00   |        99000\n(2 rows)\n```\n\nThe half-open range returns only payment 22. The last query returns four rows, not two: payment 15 (89900), then 17, 18 and 19, which tie at 18999 for second place."
-      },
-      "refs": [
-        {
-          "title": "PostgreSQL wiki: Don't Do This (BETWEEN with timestamps)",
-          "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This",
-          "kind": "read"
-        },
-        {
-          "title": "PostgreSQL 18: LIMIT and OFFSET",
-          "url": "https://www.postgresql.org/docs/18/queries-limit.html",
-          "kind": "docs"
-        }
-      ]
-    }
+ "id": "sql-01",
+ "title": "The relational model, keys and NULL",
+ "minutes": 40,
+ "goal": "By the end you can say what problem the relational model solved, name the candidate keys of a table, predict what NULL does to a comparison, a WHERE clause and a count, and write a one-table query whose time range, order and row limit are exactly right.",
+ "warmup": {
+  "q": "The `customers` table has 13 rows. Customer 1 referred 2 of them, other customers referred 6, and nobody referred the remaining 5 (their `referred_by` is NULL). How many rows does `SELECT * FROM customers WHERE referred_by <> 1` return?",
+  "options": [
+   "11",
+   "6",
+   "13",
+   "None: PostgreSQL raises an error when it compares with NULL"
   ],
-  "analogy": "A NULL is a sealed envelope. Ask whether the envelope holds the number 1 and the honest answer is \"can't tell\". Ask whether two sealed envelopes hold the same number and the answer is still \"can't tell\". WHERE lets through only the rows where the answer is a clear yes, so every envelope stays outside. `IS NULL` asks a different question, \"is this an envelope?\", and that question always has an answer. The analogy breaks when SQL groups rows: `GROUP BY`, `DISTINCT` and `ORDER BY` put all the NULLs together as if they were equal, while a `UNIQUE` constraint still treats them as different from each other.",
-  "in_your_world": "Oracle makes this lesson personal. Oracle stores an empty string as NULL, so every empty `VARCHAR2` in your Oracle data is already NULL. Move that code to PostgreSQL and it starts writing real empty strings that `WHERE note IS NULL` no longer finds. In a settlement report, `WHERE status != 'REVERSED'` skips every row whose status was never set, and the totals come out short without an error. A hand-written JPQL query `where r.reason = :reason` called with null becomes `= NULL` in SQL and matches nothing. And a Testcontainers test that reads `LIMIT 1` without `ORDER BY` can pass for months, then fail after a migration rewrites the table.",
-  "mistake": "The most common mistake is writing `<>`, `!=` or `NOT IN` against a nullable column and expecting the NULL rows to count as \"different\". It feels right because in Kotlin and Java `null != 1` is true. In SQL it is unknown, and WHERE drops the row silently, so the query runs, returns believable rows and undercounts. The fix is to decide what NULL means for that column. If it should never happen, declare the column `NOT NULL`. If the NULL rows belong in the answer, say so with `IS DISTINCT FROM` or an explicit `OR col IS NULL`. When you review SQL, stop at every negative comparison and ask which side can be NULL.",
-  "compare": {
-    "title": "Empty strings and row limits: Oracle vs PostgreSQL",
-    "a": {
-      "label": "Oracle",
-      "lang": "sql",
-      "title": "Oracle",
-      "src": "-- an empty string IS NULL in Oracle\nSELECT CASE WHEN '' IS NULL THEN 'null' ELSE 'not null' END AS empty_string\nFROM dual;                               -- 'null' (FROM dual is optional from 23ai)\n\n-- so this fails when full_name is NOT NULL\nINSERT INTO customers (customer_id, email, full_name, country_code)\nVALUES (20, 'x@example.com', '', 'US');  -- cannot insert NULL\n\n-- row limits: 12c and later; older code filters on ROWNUM\nSELECT payment_id FROM payments\nORDER BY amount_minor DESC, payment_id\nFETCH FIRST 5 ROWS ONLY;"
-    },
-    "b": {
-      "label": "PostgreSQL 18",
-      "lang": "sql",
-      "title": "PostgreSQL 18",
-      "src": "-- an empty string is a value: length 0, not NULL\nSELECT CASE WHEN '' IS NULL THEN 'null' ELSE 'not null' END AS empty_string;\n                                         -- 'not null'\n\n-- succeeds and stores a real empty string\nINSERT INTO customers (customer_id, email, full_name, country_code)\nVALUES (20, 'x@example.com', '', 'US');\n\n-- both spellings work; FETCH FIRST is the standard one\nSELECT payment_id FROM payments\nORDER BY amount_minor DESC, payment_id\nFETCH FIRST 5 ROWS ONLY;                 -- or LIMIT 5"
-    },
-    "note": "Oracle treats a zero-length character value as NULL. PostgreSQL follows the SQL standard and keeps `''` and NULL apart. Data copied from Oracle arrives with NULL wherever the application once wrote `''`, and code ported from Oracle starts writing empty strings that `IS NULL` no longer matches. Pick one meaning per column and enforce it with `NOT NULL` or `CHECK (col <> '')`. Both databases accept `FETCH FIRST n ROWS ONLY` and `WITH TIES`. `LIMIT` is PostgreSQL's own spelling. Oracle code older than 12c limits rows with `ROWNUM`, which is assigned before `ORDER BY` runs unless you sort in a subquery first."
+  "answer": 1,
+  "why": "The 2 rows with `referred_by = 1` give false. The 5 NULL rows give NULL, which SQL reads as unknown, and WHERE keeps only rows where the condition is true. So only the 6 customers referred by someone else come back. Nothing raises an error: the NULL rows disappear without a word."
+ },
+ "sections": [
+  {
+   "h": "A database keeps facts in tables, and a query says what it wants",
+   "body": "Start with a payments service that keeps its payments in a Kotlin `List<Payment>`. It works until the process restarts and every payment is gone. So you append each payment to a file, one line of JSON per payment. The data now survives a restart, and three new problems appear. To find the payments of card 8 you read the whole file. When a second service writes to the same file, two half-written lines can interleave. And nothing stops a bug from writing a payment for card 99, which does not exist. On top of that, every new question (\"the five largest payments in March\") is new code: open the file, loop, filter, sort.\n\nA relational database such as PostgreSQL answers these problems with four parts. A **server process** owns the data files, and programs never touch the files: they connect over the network and send requests. psql, the command-line client, does this, and so does your Kotlin service through JDBC. **Tables** hold the data. A table has named, typed columns, and each **row** records one fact. **Constraints** are rules the server checks on every write, such as \"a payment's card must exist\". And **SQL** is a language where you describe the rows you want, and the server works out how to find them. Here is one fact, payment 17: card 8 paid merchant 4 the sum of 189.99, stored as 18999 cents, at 16:40 UTC on 12 March 2026.\n\n```postgresql\ncourse=# SELECT payment_id, card_id, merchant_id, amount_minor, status, created_at\ncourse-# FROM payments\ncourse-# WHERE payment_id = 17;\n payment_id | card_id | merchant_id | amount_minor |  status   |       created_at\n------------+---------+-------------+--------------+-----------+------------------------\n         17 |       8 |           4 |        18999 | succeeded | 2026-03-12 16:40:00+00\n(1 row)\n```\n\nThe theory comes from E. F. Codd, who published the relational model in 1970. The databases of his day kept records in a stored order, linked by pointers, and a program found a record by walking those links. Change the order, an index or the links, and the programs broke. Codd's tables have no pointers and no order. A query says which rows it wants and the database decides how to find them, so the storage can change under a program without breaking it. That is why SQL is declarative.\n\nThis lesson builds one picture that the whole track reuses: **a table is a collection of facts, keys say which fact is which and how facts point at each other, and a query filters and reshapes facts in a fixed order.**\n\nThe rest of this track builds on that picture: schema design, joins, aggregation, subqueries, window functions, LATERAL and pagination, JSONB and upserts, and last the same server reached from Kotlin through JDBC. Three topics that live close to SQL have tracks of their own later in the course. How PostgreSQL stores rows, finds them through indexes and shows its plan with EXPLAIN is the Storage track. What happens when two sessions write at once (isolation levels, row locks, job queues) is the Transactions track. Copies of the database on other machines are the Replication track. When a lesson here touches one of them, it says what it needs in a sentence and points ahead.",
+   "refs": [
+    {
+     "title": "E. F. Codd, A Relational Model of Data for Large Shared Data Banks (1970)",
+     "url": "https://doi.org/10.1145/362384.362685",
+     "kind": "read"
+    }
+   ]
   },
-  "worked": {
-    "title": "A support query, built in the order PostgreSQL runs it",
-    "steps": [
-      {
-        "say": "Support asks: which customers joined in the first quarter of 2026, leaving out the ones Daniel (customer 4) referred, newest first? And did each one come through a referral? Start with FROM and WHERE, and write the quarter as a half-open range. Eight customers, 6 to 13, joined in that quarter.",
-        "code": "-- 1. which rows: the quarter, half-open\nSELECT customer_id, full_name, referred_by\nFROM customers\nWHERE created_at >= '2026-01-01' AND created_at < '2026-04-01';",
-        "lang": "sql"
-      },
-      {
-        "say": "Leave out Daniel's referrals. `referred_by <> 4` would also drop Grace, Ivy and Kofi, whose `referred_by` is NULL. `IS DISTINCT FROM` keeps them and drops only Hugo, customer 8.",
-        "code": "-- 2. a NULL-safe \"not referred by 4\"\n  AND referred_by IS DISTINCT FROM 4",
-        "lang": "sql"
-      },
-      {
-        "say": "Label each row with a CASE. The short form looks tidy and is wrong: `CASE referred_by WHEN NULL` compares `referred_by = NULL`, which is never true, so every row falls through to ELSE. On customers 7, 9 and 11, all organic, it returns `referred` three times. Use the searched form with `IS NULL`.",
-        "code": "-- 3. wrong: CASE referred_by WHEN NULL THEN 'organic' ELSE 'referred' END\nCASE WHEN referred_by IS NULL THEN 'organic' ELSE 'referred' END AS source",
-        "lang": "sql"
-      },
-      {
-        "say": "Put it together. The sort ends with `customer_id` so two customers who joined in the same second still come back in a fixed order. Seven rows: Hugo is the only one left out.\n\n```postgresql\n customer_id |  full_name   | referred_by |  source\n-------------+--------------+-------------+----------\n          13 | Mateo Ruiz   |           8 | referred\n          12 | Lena Novak   |           7 | referred\n          11 | Kofi Mensah  |           ∅ | organic\n          10 | Jonas Weber  |           5 | referred\n           9 | Ivy Chen     |           ∅ | organic\n           7 | Grace Lee    |           ∅ | organic\n           6 | Farid Haddad |           3 | referred\n(7 rows)\n```",
-        "code": "SELECT customer_id, full_name, referred_by,\n       CASE WHEN referred_by IS NULL THEN 'organic' ELSE 'referred' END AS source\nFROM customers\nWHERE created_at >= '2026-01-01' AND created_at < '2026-04-01'   -- half-open quarter\n  AND referred_by IS DISTINCT FROM 4                               -- keeps the NULLs\nORDER BY created_at DESC, customer_id DESC;                        -- unique last key",
-        "lang": "sql"
-      }
-    ]
-  },
-  "lab": {
-    "title": "Three one-table queries, checked against the seed",
-    "minutes": 15,
-    "needs": [
-      "Docker"
-    ],
-    "files": [
-      "labs/sql/src/main/resources/sfz/sql/l01/not_referred_by_asha.sql",
-      "labs/sql/src/main/resources/sfz/sql/l01/customer_counts.sql",
-      "labs/sql/src/main/resources/sfz/sql/l01/march_top_payments.sql"
-    ],
-    "run": "./gradlew :sql:test --tests 'sfz.sql.l01.*'",
-    "steps": [
-      "Make sure Docker is running. The tests start their own PostgreSQL 18 container with Testcontainers and load the same schema and seed as the psql database, so you can try every query in psql first.",
-      "Run the tests from the `labs` folder. All six fail. Each failure prints the rows the test expected next to the rows your query returned.",
-      "`not_referred_by_asha.sql` holds a query that looks right. Fix its WHERE clause so the customers nobody referred stay in the answer.",
-      "In `customer_counts.sql`, give each of the four columns the right kind of count. It stays one SELECT with no WHERE.",
-      "Write `march_top_payments.sql`: the five largest succeeded payments of March 2026, ties broken by `payment_id`, with a `band` column from a CASE.",
-      "Run the tests until all six pass. Each exercise has a second test that adds rows first, so a hard-coded answer fails it."
-    ],
-    "hints": [
-      "In psql, `SELECT customer_id, referred_by FROM customers ORDER BY 1;` with `\\pset null '∅'` shows exactly which rows are NULL.",
-      "`count(DISTINCT col)` skips NULLs, like `count(col)`. `count(*) - count(col)` is the number of NULLs in col.",
-      "Three payments sit on the edges of March: 13 at 00:00 on 1 March, 22 at 23:59:59.5 on 31 March and 23 at 00:00 on 1 April. Only 13 and 22 are March payments."
-    ],
-    "done_when": "All six tests in `KeysAndNullTest` pass."
-  },
-  "drill": {
-    "title": "Write the NULL rules from memory",
+  {
+   "h": "A table is a bag of rows, and it has no order",
+   "body": "Codd called a table a **relation**: a *set* of rows that all have the same columns, where each column takes its values from one type. A set has no duplicates and no order. SQL keeps neither promise. A SQL table is a **bag**, a collection that may hold the same row twice, and a query keeps duplicate rows unless you write `DISTINCT`. `SELECT country_code FROM customers WHERE created_at < '2026-01-01'` returns US twice, because two of those five customers live in the US. `SELECT DISTINCT` returns four rows, in the order US, FR, IN, DE. That is not sorted: PostgreSQL removed the duplicates with a hash table and handed back the buckets as it found them.\n\nOrder is the bigger trap. PostgreSQL stores a table in a file made of 8 KB pages. All 13 customers fit in one page. A query with nothing better to use reads the pages from first to last (a **sequential scan**) and returns rows in the order it meets them. The docs promise only that rows come back \"in whatever order the system finds fastest to produce\". On a fresh table that looks like insertion order. It stops looking like it as soon as a row moves. And rows move: PostgreSQL never changes a row in place. An `UPDATE` writes a new version of the row, usually behind the other rows, and the next scan meets it last. (PostgreSQL keeps the old version for a while, because a query that started earlier may still be reading it. The Transactions track's lesson on MVCC explains this.) So `LIMIT 3` without `ORDER BY` means \"any three rows\", and a test that expects the three oldest customers passes until somebody updates one of them.",
+   "try": {
+    "title": "Watch a row move",
     "minutes": 4,
-    "prompt": "Without looking back, write t, f or NULL next to each expression: `NULL = NULL`, `NULL <> 5`, `true AND NULL`, `true OR NULL`, `false AND NULL`, `false OR NULL`, `NOT NULL`, `NULL IS DISTINCT FROM NULL`. Then write a WHERE clause for a nullable column `fee_minor`: \"the fee is not 500, and a row with no fee counts as not 500\".",
-    "answer": {
-      "lang": "sql",
-      "src": "-- NULL = NULL                -> NULL\n-- NULL <> 5                  -> NULL\n-- true AND NULL              -> NULL\n-- true OR NULL               -> true\n-- false AND NULL             -> false\n-- false OR NULL              -> NULL\n-- NOT NULL                   -> NULL\n-- NULL IS DISTINCT FROM NULL -> false\n\nWHERE fee_minor IS DISTINCT FROM 500\n-- or, longer: WHERE fee_minor <> 500 OR fee_minor IS NULL"
+    "steps": [
+     "From the `labs` folder, start the course database: `docker compose -f env/postgres.yml up -d`. The first start loads the payments schema and its small seed in a few seconds. The server runs in a container, which the last lesson of the Operating systems track showed is an ordinary process with its own namespaces and cgroup.",
+     "Open psql on it: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Type `\\pset null '∅'` so NULLs show up as ∅ for the rest of the lesson.",
+     "Run the first `SELECT` and note the three ids. Predict: after an `UPDATE` that changes nothing, will the same query return the same three rows?",
+     "Run the rest, one statement at a time. `BEGIN` starts a transaction, a group of changes that becomes permanent only on `COMMIT`. `ROLLBACK` throws the group away, so the database stays as it was."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT customer_id, full_name FROM customers LIMIT 3;\nBEGIN;\nUPDATE customers SET full_name = full_name WHERE customer_id = 1;\nSELECT customer_id, full_name FROM customers LIMIT 3;\nSELECT customer_id, full_name FROM customers ORDER BY customer_id LIMIT 3;\nROLLBACK;"
+    },
+    "expect": "The first query returns customers 1, 2 and 3. After the update the same query returns 2, 3 and 4:\n\n```postgresql\ncourse=*# SELECT customer_id, full_name FROM customers LIMIT 3;\n customer_id |  full_name\n-------------+--------------\n           2 | Ben Carter\n           3 | Chloe Martin\n           4 | Daniel Kim\n(3 rows)\n```\n\nThe update wrote a new version of customer 1 behind the other rows, so the scan reached it last. The version with `ORDER BY customer_id` returns 1, 2 and 3 both times. (The `*` in the prompt means a transaction is open.)"
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL 18: SELECT (the ORDER BY clause)",
+     "url": "https://www.postgresql.org/docs/18/sql-select.html",
+     "kind": "docs"
     }
+   ]
   },
-  "recap": [
-    "A SQL table is a bag: duplicates stay unless a key or `DISTINCT` removes them, and rows have no order unless you write `ORDER BY`.",
-    "A candidate key is a minimal set of columns that never repeats. Make one the primary key and give every other one a `UNIQUE` constraint. Data can disprove a key, never prove one.",
-    "Any comparison with NULL is unknown, and WHERE keeps only rows that are true. Say what NULL means with `IS NULL`, `IS DISTINCT FROM` or a `NOT NULL` column.",
-    "`count(*)` counts rows, `count(col)` counts non-NULL values, `count(DISTINCT col)` counts different non-NULL values, and `sum` over no rows is NULL.",
-    "PostgreSQL evaluates FROM, WHERE, GROUP BY, HAVING, the select list, DISTINCT, ORDER BY and LIMIT in that order, so WHERE cannot see a select alias.",
-    "End every sort with a unique column, and write time ranges half-open: `>= start AND < end`."
-  ],
-  "quiz": [
-    {
-      "q": "A new nullable column `refunds.note_code` holds a code for 36 of 40 refunds; 4 have none yet. 10 refunds have `note_code = 'FR'`. How many rows does `SELECT * FROM refunds WHERE note_code <> 'FR'` return?",
-      "options": [
-        "26",
-        "30",
-        "36",
-        "40"
-      ],
-      "answer": 0,
-      "why": "30 refunds are not 'FR', but 4 of those 30 have NULL, and `NULL <> 'FR'` is unknown, so WHERE drops them. 26 remain. 30 is the answer the English question wants, and you get it with `note_code IS DISTINCT FROM 'FR'`."
+  {
+   "h": "Keys decide when two rows are the same fact",
+   "body": "Payments 17 and 18 look alike. Same card, same merchant, same amount, two minutes apart:\n\n```postgresql\ncourse=# SELECT payment_id, card_id, merchant_id, amount_minor, created_at\ncourse-# FROM payments\ncourse-# WHERE card_id = 8 AND merchant_id = 4\ncourse-# ORDER BY payment_id;\n payment_id | card_id | merchant_id | amount_minor |       created_at\n------------+---------+-------------+--------------+------------------------\n         17 |       8 |           4 |        18999 | 2026-03-12 16:40:00+00\n         18 |       8 |           4 |        18999 | 2026-03-12 16:42:10+00\n(2 rows)\n```\n\nIs that one purchase recorded twice, or two purchases? To answer, a table needs what a Kotlin class needs for `equals`: a rule that says which row is which. Build it up in steps.\n\nFirst try: identify a payment by what it says, `(card_id, merchant_id, amount_minor)`. Payments 17 and 18 share all three, so the rule already breaks. Add `created_at` and the pair `(card_id, created_at)` is unique in the seed. That still does not make it a rule. A settlement import that writes two rows with the same timestamp is easy to imagine, and nothing would stop it. Data can prove that some columns are not unique. It can never prove that they always will be.\n\nThe vocabulary for this: a **superkey** is a set of columns whose values never repeat across rows. A **candidate key** is a superkey with nothing to spare: drop any column and it stops being unique. `(payment_id, status)` is a superkey, but `status` is spare, so the pair is not a candidate key. `payment_id` alone is one.\n\nSecond try: let the database number the rows. `payment_id` is an **identity column**: on each insert, PostgreSQL takes the next number from a counter (a sequence) and writes it into the row. A key like this, with no meaning outside the database, is a **surrogate key**. Now every row has a name. It still cannot answer the retry question. The client sends a payment, the server inserts it, and the reply is lost in a network timeout. The client retries, and the server inserts row 38 with a fresh id. The card is charged twice.\n\nThird piece: let the client name the payment. `payment_uid` is a **UUID**, a 128-bit identifier the client can generate without asking anyone, written as 32 hex digits such as `019ce2eb-5700-7011-8000-000000000011`. The client creates it once and sends it with every attempt, so a retry carries the same value. This is an **idempotency key**, and a `UNIQUE` constraint on it turns the second insert into an error. PostgreSQL enforces `UNIQUE` with a **B-tree index**, a sorted structure that maps each key to its row (think of a `TreeMap`), so the check reads a few 8 KB pages instead of the whole table.\n\n`payments` now has two candidate keys. You pick one as the **primary key**: PostgreSQL makes its columns `NOT NULL` and gives it a unique index. Protect every other candidate key with `UNIQUE`.\n\nThe file had one more problem: a payment for card 99. A **foreign key** solves it. `payments.card_id REFERENCES cards` means every `card_id` in payments must exist as a key in cards. PostgreSQL checks it on every insert or update in payments, and on every delete in cards. The figure shows the keys of the core tables. `\\d payments` lists them too (output trimmed):\n\n```postgresql\ncourse=# \\d payments\n...\nIndexes:\n    \"payments_pkey\" PRIMARY KEY, btree (payment_id)\n    \"payments_payment_uid_key\" UNIQUE CONSTRAINT, btree (payment_uid)\nForeign-key constraints:\n    \"payments_card_id_fkey\" FOREIGN KEY (card_id) REFERENCES cards(card_id)\n    \"payments_merchant_id_fkey\" FOREIGN KEY (merchant_id) REFERENCES merchants(merchant_id)\n```\n\nThere is no index on `card_id` or `merchant_id`. Declaring a foreign key does not create one, in PostgreSQL or in Oracle. The Storage track's lesson on indexes and EXPLAIN shows what that costs.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Five tables and their keys. accounts points to customers and merchants, cards to accounts, payments to cards and merchants, and customers points to itself through referred_by.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"10\" y=\"40\" width=\"150\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"85.0\" y=\"66\" text-anchor=\"middle\">customers</text><text class=\"t-s t-code\" x=\"85.0\" y=\"90\" text-anchor=\"middle\">PK customer_id</text><text class=\"t-s t-code\" x=\"85.0\" y=\"112\" text-anchor=\"middle\">UNIQUE email</text><text class=\"t-s t-code\" x=\"85.0\" y=\"134\" text-anchor=\"middle\">FK referred_by</text><rect class=\"box\" x=\"180\" y=\"40\" width=\"150\" height=\"112\" rx=\"8\"/><text class=\"t\" x=\"255.0\" y=\"66\" text-anchor=\"middle\">accounts</text><text class=\"t-s t-code\" x=\"255.0\" y=\"90\" text-anchor=\"middle\">PK account_id</text><text class=\"t-s t-code\" x=\"255.0\" y=\"112\" text-anchor=\"middle\">FK customer_id</text><text class=\"t-s t-code\" x=\"255.0\" y=\"134\" text-anchor=\"middle\">FK merchant_id</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"66\" text-anchor=\"middle\">cards</text><text class=\"t-s t-code\" x=\"425.0\" y=\"90\" text-anchor=\"middle\">PK card_id</text><text class=\"t-s t-code\" x=\"425.0\" y=\"112\" text-anchor=\"middle\">FK account_id</text><rect class=\"box-a\" x=\"520\" y=\"40\" width=\"150\" height=\"134\" rx=\"8\"/><text class=\"t t-a\" x=\"595.0\" y=\"66\" text-anchor=\"middle\">payments</text><text class=\"t-s t-code\" x=\"595.0\" y=\"90\" text-anchor=\"middle\">PK payment_id</text><text class=\"t-s t-code\" x=\"595.0\" y=\"112\" text-anchor=\"middle\">UNIQUE payment_uid</text><text class=\"t-s t-code\" x=\"595.0\" y=\"134\" text-anchor=\"middle\">FK card_id</text><text class=\"t-s t-code\" x=\"595.0\" y=\"156\" text-anchor=\"middle\">FK merchant_id</text><rect class=\"box\" x=\"350\" y=\"196\" width=\"150\" height=\"68\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"222\" text-anchor=\"middle\">merchants</text><text class=\"t-s t-code\" x=\"425.0\" y=\"246\" text-anchor=\"middle\">PK merchant_id</text><line class=\"ln\" x1=\"180\" y1=\"96\" x2=\"162\" y2=\"96\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"350\" y1=\"85\" x2=\"332\" y2=\"85\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"520\" y1=\"85\" x2=\"502\" y2=\"85\" marker-end=\"url(#arr)\"/><path class=\"ln\" d=\"M 560 174 L 560 230 L 502 230\" marker-end=\"url(#arr)\" fill=\"none\"/><path class=\"ln\" d=\"M 255 152 L 255 230 L 348 230\" marker-end=\"url(#arr)\" fill=\"none\"/><path class=\"ln\" d=\"M 50 40 L 50 18 L 120 18 L 120 38\" marker-end=\"url(#arr)\" fill=\"none\"/><text class=\"t-s t-m\" x=\"85\" y=\"12\" text-anchor=\"middle\">referred_by</text></svg>",
+    "caption": "The core tables of the course schema. Each arrow is a foreign key pointing at the primary key it references."
+   },
+   "try": {
+    "title": "Break the keys on purpose",
+    "minutes": 3,
+    "steps": [
+     "Payment 17 has `payment_uid` `019ce2eb-5700-7011-8000-000000000011`. Predict what happens when a client retry sends that uid again.",
+     "Run the two inserts below. Each error names the constraint that stopped it.",
+     "Run `\\d cards` and find the foreign key that points at accounts."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "INSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019ce2eb-5700-7011-8000-000000000011', 8, 4, 18999, 'succeeded', now());\n\nINSERT INTO payments (card_id, merchant_id, amount_minor, status, created_at)\nVALUES (99, 4, 18999, 'succeeded', now());"
     },
+    "expect": "Both inserts fail, and nothing is written:\n\n```text\nERROR:  duplicate key value violates unique constraint \"payments_payment_uid_key\"\nDETAIL:  Key (payment_uid)=(019ce2eb-5700-7011-8000-000000000011) already exists.\n\nERROR:  insert or update on table \"payments\" violates foreign key constraint \"payments_card_id_fkey\"\nDETAIL:  Key (card_id)=(99) is not present in table \"cards\".\n```\n\nThe second insert did not give a `payment_uid`, so the column default `uuidv7()` made a fresh one. That insert failed on the card, not on the uid."
+   },
+   "refs": [
     {
-      "q": "In the current data, no merchant has two payments with the same `created_at`. What does that tell you about the pair `(merchant_id, created_at)`?",
-      "options": [
-        "It is a candidate key, so it could be the primary key",
-        "It is a foreign key to merchants",
-        "Only that it is unique today; it becomes a rule only if you add a UNIQUE constraint",
-        "It is a superkey but not a candidate key"
-      ],
-      "answer": 2,
-      "why": "A key is a promise about every row the table may ever hold. Current data can show that a set of columns is not unique, but it cannot show that it always will be. Until a UNIQUE constraint enforces it, the next import can break it."
-    },
-    {
-      "q": "Why does `SELECT amount_minor / 100 AS amount FROM payments ORDER BY amount` work, while the same query with `WHERE amount > 5` fails?",
-      "options": [
-        "WHERE is evaluated before the select list, and ORDER BY after it",
-        "WHERE cannot compare numeric expressions",
-        "Aliases work only in ORDER BY because of a PostgreSQL limitation that Oracle does not have",
-        "`amount` is a reserved word inside WHERE"
-      ],
-      "answer": 0,
-      "why": "The logical order is FROM, WHERE, GROUP BY, HAVING, select list, DISTINCT, ORDER BY, LIMIT. When WHERE runs, the alias has not been computed yet. Oracle has the same rule for the same reason."
-    },
-    {
-      "q": "A test runs `SELECT payment_id FROM payments WHERE card_id = 8 LIMIT 1` and expects 6, the card's oldest payment. It has passed 200 times. What is true?",
-      "options": [
-        "It will keep passing, because PostgreSQL returns rows in insertion order",
-        "It can start failing after an update to one of those rows, because without ORDER BY the order is whatever is fastest",
-        "LIMIT 1 always returns the row with the lowest primary key",
-        "It fails only on PostgreSQL 18, which changed the scan order"
-      ],
-      "answer": 1,
-      "why": "Without ORDER BY, rows come back in whatever order the plan produces. An UPDATE writes a new row version elsewhere in the table, and an index scan would change the order again. Write `ORDER BY created_at, payment_id`."
-    },
-    {
-      "q": "Table `t` has three rows with `score` 10, 20 and NULL. What does `SELECT count(*), count(score), avg(score) FROM t` return?",
-      "options": [
-        "3, 3, 10",
-        "3, 2, 15",
-        "2, 2, 15",
-        "3, 2, 10"
-      ],
-      "answer": 1,
-      "why": "`count(*)` counts all three rows. `count(score)` and `avg(score)` skip the NULL, so the average is (10 + 20) / 2 = 15. \"3, 2, 10\" is what you would get if NULL counted as zero, which it does not."
+     "title": "PostgreSQL 18: Constraints",
+     "url": "https://www.postgresql.org/docs/18/ddl-constraints.html",
+     "kind": "docs"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "What does `NULL = NULL` return in SQL?",
-      "back": "NULL, meaning unknown. Use `IS NULL`, or `IS NOT DISTINCT FROM` for NULL-safe equality."
-    },
-    {
-      "front": "Which rows does WHERE keep?",
-      "back": "Only rows whose condition is true. Rows where it is false or unknown are dropped, without any error."
-    },
-    {
-      "front": "`count(*)` vs `count(col)` vs `count(DISTINCT col)`?",
-      "back": "Rows; rows where col is not NULL; different non-NULL values of col."
-    },
-    {
-      "front": "What does `sum(x)` return over zero rows?",
-      "back": "NULL, not 0. Write `coalesce(sum(x), 0)` when you need a number."
-    },
-    {
-      "front": "Candidate key vs primary key?",
-      "back": "A candidate key is any minimal set of columns that is unique. The primary key is the one you choose. Give the others a UNIQUE constraint."
-    },
-    {
-      "front": "Why can't WHERE use an alias from the select list?",
-      "back": "WHERE is evaluated before the select list, so the alias does not exist yet. ORDER BY runs after it and can use it."
-    },
-    {
-      "front": "How do you select all of March 2026 from a timestamptz column?",
-      "back": "`created_at >= '2026-03-01' AND created_at < '2026-04-01'`. Half-open: no gap at the end, no overlap with April."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Relation",
-      "plain": "Codd's name for a table: a set of rows that all have the same named, typed columns."
-    },
-    {
-      "term": "Bag",
-      "plain": "A collection that allows duplicates. SQL tables and query results are bags unless a key or DISTINCT prevents it."
-    },
-    {
-      "term": "Candidate key",
-      "plain": "A minimal set of columns whose values never repeat. A table can have several; the primary key is one of them."
-    },
-    {
-      "term": "Surrogate key",
-      "plain": "A key with no business meaning that the database hands out, such as an identity column."
-    },
-    {
-      "term": "Foreign key",
-      "plain": "A column whose values must exist as a key in another table. The database checks it on every write."
-    },
-    {
-      "term": "Three-valued logic",
-      "plain": "Logic with true, false and unknown. Any comparison with NULL is unknown."
-    },
-    {
-      "term": "Half-open range",
-      "plain": "A range that includes its start and excludes its end: >= start AND < end."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A teammate's query `SELECT * FROM customers WHERE referred_by <> 1` is meant to list everyone customer 1 did not refer. It returns 6 rows, and they expected 11. Explain why, and how to fix it.",
-    "answer": "`referred_by` is NULL for the five customers nobody referred. Comparing NULL with 1 gives unknown, not true, and WHERE keeps only rows where the condition is true, so those five rows are dropped along with the two Asha did refer. That leaves 6. To keep the NULL rows, write `WHERE referred_by IS DISTINCT FROM 1`, which treats NULL as a value that is different from 1, or spell it out as `referred_by <> 1 OR referred_by IS NULL`. Both return 11."
+   ]
   },
-  "deeper": {
-    "minutes": 8,
-    "body": "NULL is not treated the same way everywhere in SQL, and the differences are worth knowing before they surprise you.\n\nComparisons say NULL is not equal to NULL. Grouping says the opposite: `GROUP BY referred_by` puts all five NULLs into one group, and `DISTINCT` keeps one NULL. Sorting puts NULLs together too. PostgreSQL sorts NULL as larger than every value, so it comes last in ascending order and first in descending order. Oracle does the same. `NULLS FIRST` and `NULLS LAST` override it:\n\n```postgresql\ncourse=# SELECT referred_by, count(*) FROM customers GROUP BY referred_by ORDER BY referred_by DESC LIMIT 3;\n referred_by | count\n-------------+-------\n           ∅ |     5\n           8 |     1\n           7 |     1\n(3 rows)\n```\n\nA `UNIQUE` constraint goes back to comparison rules: two NULLs are not equal, so a unique column accepts any number of NULLs. PostgreSQL 15 added `UNIQUE NULLS NOT DISTINCT`, which allows at most one:\n\n```postgresql\ncourse=# CREATE TEMP TABLE t2 (code text UNIQUE NULLS NOT DISTINCT);\nCREATE TABLE\ncourse=# INSERT INTO t2 VALUES (NULL), (NULL);\nERROR:  duplicate key value violates unique constraint \"t2_code_key\"\nDETAIL:  Key (code)=(null) already exists.\n```\n\nCodd's original 1970 model had no NULL at all. He added it later, and later still argued for two different marks: one for \"applicable but unknown\" (we don't know the customer's phone number) and one for \"inapplicable\" (this customer has no referrer, and that is a known fact). SQL has only one NULL, and its logic always treats it as \"unknown\". That is why `referred_by IS NULL` reads as \"nobody referred them\" in this schema while `referred_by <> 1` behaves as if the referrer were a secret. When a column's NULL means \"does not apply\", consider whether a real value, a separate table or a `NOT NULL` column with a default says it more clearly."
-  },
-  "sources": [
+  {
+   "h": "NULL means unknown, and WHERE keeps only true",
+   "body": "Kofi Mensah signed up without a referral code. What should his `referred_by` hold? Try the obvious answers first. `0` fails at once: no customer 0 exists, so the foreign key rejects it, and if it did not, `count(referred_by)` would count Kofi as referred. A magic value such as `-1` has the same problems, and every query must remember the magic. SQL's answer is a marker that means \"no value here\": **NULL**.\n\nA marker is not a value, so how does it compare? Is NULL equal to 1? SQL does not answer false. It answers NULL again, which here means **unknown**. Logic with three answers (true, false and unknown) is called **three-valued logic**. Here are its rules, in one query (run with `\\pset null '∅'`, which makes psql print NULL as ∅):\n\n```postgresql\ncourse=# SELECT NULL = NULL AS \"null = null\", NULL <> 1 AS \"null <> 1\", NULL IS NULL AS \"is null\",\ncourse-#        NULL IS DISTINCT FROM 1 AS \"distinct from 1\", true OR NULL AS \"true or null\",\ncourse-#        false AND NULL AS \"false and null\", NOT NULL::boolean AS \"not null\";\n null = null | null <> 1 | is null | distinct from 1 | true or null | false and null | not null\n-------------+-----------+---------+-----------------+--------------+----------------+----------\n ∅           | ∅         | t       | t               | t            | f              | ∅\n(1 row)\n```\n\nRead each column as a rule. Any comparison with NULL (`=`, `<>`, `<`, `>`) is unknown, even `NULL = NULL`: two unknown numbers might or might not be equal. `IS NULL` and `IS DISTINCT FROM` never return unknown. `IS DISTINCT FROM` treats NULL as an ordinary value, so `NULL IS DISTINCT FROM 1` is true. With `OR` and `AND`, a known side can decide: `true OR unknown` is true whatever the unknown turns out to be, and `false AND unknown` is false. Every other mix with unknown stays unknown, and `NOT unknown` is still unknown.\n\nThen comes the rule that bites. **WHERE keeps a row only when its condition is true.** False and unknown both drop it. So `WHERE referred_by <> 1` drops Kofi and the four other customers nobody referred, which is not what \"not referred by customer 1\" means in English. The stepper runs that WHERE clause over six rows.\n\nThe fix depends on what you mean. `referred_by IS DISTINCT FROM 1` keeps the NULL rows. `referred_by <> 1 OR referred_by IS NULL` says the same thing in more words. If a column should never be empty, declare it `NOT NULL` and the question never comes up. The bug feels natural because Kotlin works differently: `null == null` is true in Kotlin. `IS NOT DISTINCT FROM` is the SQL spelling of Kotlin's `==`.\n\nAggregate functions, which fold many rows into one value, have NULL rules of their own. `count(*)` counts rows. `count(referred_by)` counts rows where `referred_by` is not NULL. `count(DISTINCT referred_by)` counts different non-NULL values. On the seed those are 13, 8 and 7. `sum`, `avg`, `min` and `max` skip NULLs too, and `sum` over zero rows returns NULL, not 0.",
+   "stepper": {
+    "title": "WHERE referred_by <> 1, one row at a time",
+    "intro": "Click Next to watch PostgreSQL test each row. The blue row was just decided; green rows are kept, dashed red rows are dropped.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
+      "say": "WHERE runs its condition once for each row and keeps the row only when the answer is **true**. Here are customers 1 to 6. Nobody referred customers 1 and 2, so their `referred_by` is NULL."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
+      "say": "Customer 1: `NULL <> 1` is unknown. Unknown is not true, so WHERE drops the row. PostgreSQL gives no error and no warning."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
+      "say": "Customer 2: the same. Every customer nobody referred falls out here, even though Asha (customer 1) referred neither of them."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
+      "say": "Customer 3: Asha did refer Chloe, so `1 <> 1` is false and the row goes. That one is correct."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text></svg>",
+      "say": "Customer 4: `2 <> 1` is true. This is the first row that survives."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by &lt;&gt; 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">referred_by &lt;&gt; 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-dim\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"99\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"99\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-b\" x=\"375\" y=\"133\" text-anchor=\"middle\">unknown</text><text class=\"t t-bad\" x=\"545\" y=\"133\" text-anchor=\"middle\">dropped</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box-a\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"235\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"235\" text-anchor=\"middle\">dropped</text><rect class=\"box-a\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text><text class=\"t t-ok\" x=\"375\" y=\"269\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"269\" text-anchor=\"middle\">kept</text></svg>",
+      "say": "Customers 5 and 6 finish the scan: false, then true. Two of these six rows survive. On the whole table it is 6 rows of 13."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"The condition referred_by IS DISTINCT FROM 1 evaluated for customers 1 to 6, one row at a time\"><text class=\"t t-code\" x=\"20\" y=\"28\" text-anchor=\"start\">SELECT customer_id FROM customers WHERE referred_by IS DISTINCT FROM 1</text><text class=\"t-s t-m\" x=\"85\" y=\"62\" text-anchor=\"middle\">customer_id</text><text class=\"t-s t-m\" x=\"215\" y=\"62\" text-anchor=\"middle\">referred_by</text><text class=\"t-s t-m\" x=\"375\" y=\"62\" text-anchor=\"middle\">IS DISTINCT FROM 1</text><text class=\"t-s t-m\" x=\"545\" y=\"62\" text-anchor=\"middle\">WHERE</text><line class=\"ln-d\" x1=\"20\" y1=\"72\" x2=\"620\" y2=\"72\"/><rect class=\"box-a\" x=\"20\" y=\"80\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"99\" text-anchor=\"middle\">1</text><text class=\"t t-b\" x=\"215\" y=\"99\" text-anchor=\"middle\">NULL</text><text class=\"t t-ok\" x=\"375\" y=\"99\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"99\" text-anchor=\"middle\">kept</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"133\" text-anchor=\"middle\">2</text><text class=\"t t-b\" x=\"215\" y=\"133\" text-anchor=\"middle\">NULL</text><text class=\"t t-ok\" x=\"375\" y=\"133\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"133\" text-anchor=\"middle\">kept</text><rect class=\"box-dim\" x=\"20\" y=\"148\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"167\" text-anchor=\"middle\">3</text><text class=\"t\" x=\"215\" y=\"167\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"167\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"167\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"182\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"201\" text-anchor=\"middle\">4</text><text class=\"t\" x=\"215\" y=\"201\" text-anchor=\"middle\">2</text><text class=\"t t-ok\" x=\"375\" y=\"201\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"201\" text-anchor=\"middle\">kept</text><rect class=\"box-dim\" x=\"20\" y=\"216\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"235\" text-anchor=\"middle\">5</text><text class=\"t\" x=\"215\" y=\"235\" text-anchor=\"middle\">1</text><text class=\"t t-bad\" x=\"375\" y=\"235\" text-anchor=\"middle\">false</text><text class=\"t t-bad\" x=\"545\" y=\"235\" text-anchor=\"middle\">dropped</text><rect class=\"box-ok\" x=\"20\" y=\"250\" width=\"600\" height=\"28\" rx=\"8\"/><text class=\"t\" x=\"85\" y=\"269\" text-anchor=\"middle\">6</text><text class=\"t\" x=\"215\" y=\"269\" text-anchor=\"middle\">3</text><text class=\"t t-ok\" x=\"375\" y=\"269\" text-anchor=\"middle\">true</text><text class=\"t t-ok\" x=\"545\" y=\"269\" text-anchor=\"middle\">kept</text></svg>",
+      "say": "Now write `referred_by IS DISTINCT FROM 1`. It treats NULL as an ordinary value, and NULL is distinct from 1, so customers 1 and 2 are kept. On the whole table that is 11 rows: everyone Asha did not refer."
+     }
+    ]
+   },
+   "try": {
+    "title": "Predict five answers, then count",
+    "minutes": 5,
+    "steps": [
+     "Before you run the first query, write down t, f or ∅ for each of its five columns.",
+     "Run it and check your guesses against the rules above.",
+     "Run the two counts. The difference is the number of customers nobody referred.",
+     "Run the last query. Merchant 6 has no payments: what does `sum` return over no rows?"
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "\\pset null '∅'\nSELECT 2 > NULL                       AS a,\n       NULL OR false                  AS b,\n       NOT (NULL = 1)                 AS c,\n       NULL IS NOT DISTINCT FROM NULL AS d,\n       (NULL = 1) IS NULL             AS e;\n\nSELECT count(*) FROM customers WHERE referred_by <> 1;\nSELECT count(*) FROM customers WHERE referred_by IS DISTINCT FROM 1;\n\nSELECT sum(amount_minor), count(*) FROM payments WHERE merchant_id = 6;"
+    },
+    "expect": "```postgresql\n a | b | c | d | e\n---+---+---+---+---\n ∅ | ∅ | ∅ | t | t\n(1 row)\n```\n\n`b` is unknown because `false` cannot decide an OR. `c` is unknown because NOT of unknown is unknown. `d` is true: two NULLs are not distinct. `e` is true because the comparison itself returned NULL. The counts are 6 and 11. The last query returns `∅` for the sum and `0` for the count: `count` never returns NULL, `sum` does when it has no rows."
+   },
+   "refs": [
     {
-      "title": "PostgreSQL 18 documentation: SELECT",
-      "url": "https://www.postgresql.org/docs/18/sql-select.html"
+     "title": "PostgreSQL 18: Comparison functions and operators (IS DISTINCT FROM)",
+     "url": "https://www.postgresql.org/docs/18/functions-comparison.html",
+     "kind": "docs"
     },
     {
-      "title": "PostgreSQL 18 documentation: Comparison functions and operators",
-      "url": "https://www.postgresql.org/docs/18/functions-comparison.html"
-    },
-    {
-      "title": "PostgreSQL 18 documentation: Constraints",
-      "url": "https://www.postgresql.org/docs/18/ddl-constraints.html"
-    },
-    {
-      "title": "Oracle Database SQL Language Reference: Nulls",
-      "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/Nulls.html"
-    },
-    {
-      "title": "PostgreSQL wiki: Don't Do This",
-      "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This"
+     "title": "PostgreSQL 18: Aggregate functions",
+     "url": "https://www.postgresql.org/docs/18/functions-aggregate.html",
+     "kind": "docs"
     }
+   ]
+  },
+  {
+   "h": "A SELECT runs in a different order than you write it",
+   "body": "This query fails, and the reason teaches the most useful rule in SQL:\n\n```postgresql\ncourse=# SELECT payment_id, round(amount_minor / 100.0, 2) AS amount\ncourse-# FROM payments\ncourse-# WHERE amount > 500;\nERROR:  column \"amount\" does not exist\nLINE 3: WHERE amount > 500;\n              ^\n```\n\n`amount` is defined two lines up. Why can't WHERE see it? Because the clause you write first runs late. Think of the query as a Kotlin pipeline: `payments.filter { it.amountMinor > 50000 }.map { Row(it.paymentId, it.amountMinor / 100.0) }.sortedByDescending { it.amount }.take(5)`. You cannot filter on a field that `map` creates later. SQL has the same shape, written in a different order. PostgreSQL evaluates the clauses in this logical order:\n\n1. `FROM`, including joins: which rows exist.\n2. `WHERE`: keep the rows where the condition is true.\n3. `GROUP BY`, then `HAVING`: lesson 4 of this track.\n4. The select list: compute the output columns and their aliases.\n5. `DISTINCT`: drop duplicate output rows.\n6. `ORDER BY`: sort.\n7. `LIMIT`, `OFFSET` or `FETCH FIRST`: cut.\n\nThe **planner**, the part of PostgreSQL that decides how to run a query, may do the physical work in another order, for example by reading an index instead of scanning. The result must still look as if the steps ran in this order. So an alias from step 4 is invisible in step 2 and visible in step 6: `ORDER BY amount` works. In WHERE, filter on the column itself: `WHERE amount_minor > 50000`.\n\nStep 6 has a trap: ties. Payments 17, 18 and 19 all have `amount_minor = 18999`. With `ORDER BY amount_minor DESC LIMIT 5`, any of the three may take the last places, and a different one next week. End the sort with a unique column, `ORDER BY amount_minor DESC, payment_id`, and the order is fixed. If you want every tied row, `FETCH FIRST 5 ROWS WITH TIES` (PostgreSQL 13 and later) keeps going until the tie ends.\n\nStep 4 is where `CASE` lives, SQL's version of Kotlin's `when`. The first branch whose condition is true wins, and `ELSE` catches the rest. Without an ELSE, the rest get NULL. Watch the short form: `CASE referred_by WHEN NULL THEN ...` compares with `=`, so it never matches a NULL.\n\nStep 2 is where time ranges go wrong. `created_at` is a `timestamptz`: an instant in time, stored as UTC, down to the microsecond. `BETWEEN '2026-03-01' AND '2026-03-31'` includes both ends, and its end is midnight at the start of 31 March, so it loses the whole last day. `BETWEEN '2026-03-01' AND '2026-04-01'` includes a payment made at exactly midnight on 1 April. Write every range half-open: `created_at >= '2026-03-01' AND created_at < '2026-04-01'`. It includes the first instant of March and stops just before the first instant of April, so consecutive months never overlap and never leave a gap. A date without a time zone is read in the session's `TimeZone` setting, which is UTC in the course database.",
+   "try": {
+    "title": "Lose a payment with BETWEEN",
+    "minutes": 4,
+    "steps": [
+     "Payment 22 was made half a second before midnight on 31 March. Payment 23 was made at exactly midnight on 1 April. Predict which of them each of the first two queries returns.",
+     "Run them. Then run the third query and count the rows: you asked for two.",
+     "When you are done for the day, leave psql with `\\q` and stop the database with `docker compose -f env/postgres.yml down`. Add `-v` to delete the data as well."
+    ],
+    "code": {
+     "lang": "postgresql",
+     "title": "psql, database course",
+     "src": "SELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at BETWEEN '2026-03-31' AND '2026-04-01'\nORDER BY created_at;\n\nSELECT payment_id, created_at, amount_minor\nFROM payments\nWHERE created_at >= '2026-03-31' AND created_at < '2026-04-01'\nORDER BY created_at;\n\nSELECT payment_id, amount_minor FROM payments\nWHERE merchant_id = 4 AND created_at >= '2026-03-01' AND created_at < '2026-04-01'\nORDER BY amount_minor DESC\nFETCH FIRST 2 ROWS WITH TIES;"
+    },
+    "expect": "BETWEEN returns both payments, because both ends are inclusive:\n\n```postgresql\n payment_id |        created_at        | amount_minor\n------------+--------------------------+--------------\n         22 | 2026-03-31 23:59:59.5+00 |        52000\n         23 | 2026-04-01 00:00:00+00   |        99000\n(2 rows)\n```\n\nThe half-open range returns only payment 22. The last query returns four rows, not two: payment 15 (89900), then 17, 18 and 19, which tie at 18999 for second place."
+   },
+   "refs": [
+    {
+     "title": "PostgreSQL wiki: Don't Do This (BETWEEN with timestamps)",
+     "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This",
+     "kind": "read"
+    },
+    {
+     "title": "PostgreSQL 18: LIMIT and OFFSET",
+     "url": "https://www.postgresql.org/docs/18/queries-limit.html",
+     "kind": "docs"
+    }
+   ]
+  }
+ ],
+ "analogy": "A NULL is a sealed envelope. Ask whether the envelope holds the number 1 and the honest answer is \"can't tell\". Ask whether two sealed envelopes hold the same number and the answer is still \"can't tell\". WHERE lets through only the rows where the answer is a clear yes, so every envelope stays outside. `IS NULL` asks a different question, \"is this an envelope?\", and that question always has an answer. The analogy breaks when SQL groups rows: `GROUP BY`, `DISTINCT` and `ORDER BY` put all the NULLs together as if they were equal, while a `UNIQUE` constraint still treats them as different from each other.",
+ "in_your_world": "Oracle makes this lesson personal. Oracle stores an empty string as NULL, so every empty `VARCHAR2` in your Oracle data is already NULL. Move that code to PostgreSQL and it starts writing real empty strings that `WHERE note IS NULL` no longer finds. In a settlement report, `WHERE status != 'REVERSED'` skips every row whose status was never set, and the totals come out short without an error. A hand-written JPQL query `where r.reason = :reason` called with null becomes `= NULL` in SQL and matches nothing. And a Testcontainers test that reads `LIMIT 1` without `ORDER BY` can pass for months, then fail after a migration rewrites the table.",
+ "mistake": "The most common mistake is writing `<>`, `!=` or `NOT IN` against a nullable column and expecting the NULL rows to count as \"different\". It feels right because in Kotlin and Java `null != 1` is true. In SQL it is unknown, and WHERE drops the row silently, so the query runs, returns believable rows and undercounts. The fix is to decide what NULL means for that column. If it should never happen, declare the column `NOT NULL`. If the NULL rows belong in the answer, say so with `IS DISTINCT FROM` or an explicit `OR col IS NULL`. When you review SQL, stop at every negative comparison and ask which side can be NULL.",
+ "compare": {
+  "title": "Empty strings and row limits: Oracle vs PostgreSQL",
+  "a": {
+   "label": "Oracle",
+   "lang": "sql",
+   "title": "Oracle",
+   "src": "-- an empty string IS NULL in Oracle\nSELECT CASE WHEN '' IS NULL THEN 'null' ELSE 'not null' END AS empty_string\nFROM dual;                               -- 'null' (FROM dual is optional from 23ai)\n\n-- so this fails when full_name is NOT NULL\nINSERT INTO customers (customer_id, email, full_name, country_code)\nVALUES (20, 'x@example.com', '', 'US');  -- cannot insert NULL\n\n-- row limits: 12c and later; older code filters on ROWNUM\nSELECT payment_id FROM payments\nORDER BY amount_minor DESC, payment_id\nFETCH FIRST 5 ROWS ONLY;"
+  },
+  "b": {
+   "label": "PostgreSQL 18",
+   "lang": "sql",
+   "title": "PostgreSQL 18",
+   "src": "-- an empty string is a value: length 0, not NULL\nSELECT CASE WHEN '' IS NULL THEN 'null' ELSE 'not null' END AS empty_string;\n                                         -- 'not null'\n\n-- succeeds and stores a real empty string\nINSERT INTO customers (customer_id, email, full_name, country_code)\nVALUES (20, 'x@example.com', '', 'US');\n\n-- both spellings work; FETCH FIRST is the standard one\nSELECT payment_id FROM payments\nORDER BY amount_minor DESC, payment_id\nFETCH FIRST 5 ROWS ONLY;                 -- or LIMIT 5"
+  },
+  "note": "Oracle treats a zero-length character value as NULL. PostgreSQL follows the SQL standard and keeps `''` and NULL apart. Data copied from Oracle arrives with NULL wherever the application once wrote `''`, and code ported from Oracle starts writing empty strings that `IS NULL` no longer matches. Pick one meaning per column and enforce it with `NOT NULL` or `CHECK (col <> '')`. Both databases accept `FETCH FIRST n ROWS ONLY` and `WITH TIES`. `LIMIT` is PostgreSQL's own spelling. Oracle code older than 12c limits rows with `ROWNUM`, which is assigned before `ORDER BY` runs unless you sort in a subquery first."
+ },
+ "worked": {
+  "title": "A support query, built in the order PostgreSQL runs it",
+  "steps": [
+   {
+    "say": "Support asks: which customers joined in the first quarter of 2026, leaving out the ones Daniel (customer 4) referred, newest first? And did each one come through a referral? Start with FROM and WHERE, and write the quarter as a half-open range. Eight customers, 6 to 13, joined in that quarter.",
+    "code": "-- 1. which rows: the quarter, half-open\nSELECT customer_id, full_name, referred_by\nFROM customers\nWHERE created_at >= '2026-01-01' AND created_at < '2026-04-01';",
+    "lang": "sql"
+   },
+   {
+    "say": "Leave out Daniel's referrals. `referred_by <> 4` would also drop Grace, Ivy and Kofi, whose `referred_by` is NULL. `IS DISTINCT FROM` keeps them and drops only Hugo, customer 8.",
+    "code": "-- 2. a NULL-safe \"not referred by 4\"\n  AND referred_by IS DISTINCT FROM 4",
+    "lang": "sql"
+   },
+   {
+    "say": "Label each row with a CASE. The short form looks tidy and is wrong: `CASE referred_by WHEN NULL` compares `referred_by = NULL`, which is never true, so every row falls through to ELSE. On customers 7, 9 and 11, all organic, it returns `referred` three times. Use the searched form with `IS NULL`.",
+    "code": "-- 3. wrong: CASE referred_by WHEN NULL THEN 'organic' ELSE 'referred' END\nCASE WHEN referred_by IS NULL THEN 'organic' ELSE 'referred' END AS source",
+    "lang": "sql"
+   },
+   {
+    "say": "Put it together. The sort ends with `customer_id` so two customers who joined in the same second still come back in a fixed order. Seven rows: Hugo is the only one left out.\n\n```postgresql\n customer_id |  full_name   | referred_by |  source\n-------------+--------------+-------------+----------\n          13 | Mateo Ruiz   |           8 | referred\n          12 | Lena Novak   |           7 | referred\n          11 | Kofi Mensah  |           ∅ | organic\n          10 | Jonas Weber  |           5 | referred\n           9 | Ivy Chen     |           ∅ | organic\n           7 | Grace Lee    |           ∅ | organic\n           6 | Farid Haddad |           3 | referred\n(7 rows)\n```",
+    "code": "SELECT customer_id, full_name, referred_by,\n       CASE WHEN referred_by IS NULL THEN 'organic' ELSE 'referred' END AS source\nFROM customers\nWHERE created_at >= '2026-01-01' AND created_at < '2026-04-01'   -- half-open quarter\n  AND referred_by IS DISTINCT FROM 4                               -- keeps the NULLs\nORDER BY created_at DESC, customer_id DESC;                        -- unique last key",
+    "lang": "sql"
+   }
   ]
+ },
+ "lab": {
+  "title": "Three one-table queries, checked against the seed",
+  "minutes": 15,
+  "needs": [
+   "Docker"
+  ],
+  "files": [
+   "labs/sql/src/main/resources/sfz/sql/l01/not_referred_by_asha.sql",
+   "labs/sql/src/main/resources/sfz/sql/l01/customer_counts.sql",
+   "labs/sql/src/main/resources/sfz/sql/l01/march_top_payments.sql"
+  ],
+  "run": "./gradlew :sql:test --tests 'sfz.sql.l01.*'",
+  "steps": [
+   "Make sure Docker is running. The tests start their own PostgreSQL 18 container with Testcontainers and load the same schema and seed as the psql database, so you can try every query in psql first.",
+   "Run the tests from the `labs` folder. All six fail. Each failure prints the rows the test expected next to the rows your query returned.",
+   "`not_referred_by_asha.sql` holds a query that looks right. Fix its WHERE clause so the customers nobody referred stay in the answer.",
+   "In `customer_counts.sql`, give each of the four columns the right kind of count. It stays one SELECT with no WHERE.",
+   "Write `march_top_payments.sql`: the five largest succeeded payments of March 2026, ties broken by `payment_id`, with a `band` column from a CASE.",
+   "Run the tests until all six pass. Each exercise has a second test that adds rows first, so a hard-coded answer fails it."
+  ],
+  "hints": [
+   "In psql, `SELECT customer_id, referred_by FROM customers ORDER BY 1;` with `\\pset null '∅'` shows exactly which rows are NULL.",
+   "`count(DISTINCT col)` skips NULLs, like `count(col)`. `count(*) - count(col)` is the number of NULLs in col.",
+   "Three payments sit on the edges of March: 13 at 00:00 on 1 March, 22 at 23:59:59.5 on 31 March and 23 at 00:00 on 1 April. Only 13 and 22 are March payments."
+  ],
+  "done_when": "All six tests in `KeysAndNullTest` pass."
+ },
+ "drill": {
+  "title": "Write the NULL rules from memory",
+  "minutes": 4,
+  "prompt": "Without looking back, write t, f or NULL next to each expression: `NULL = NULL`, `NULL <> 5`, `true AND NULL`, `true OR NULL`, `false AND NULL`, `false OR NULL`, `NOT NULL`, `NULL IS DISTINCT FROM NULL`. Then write a WHERE clause for a nullable column `fee_minor`: \"the fee is not 500, and a row with no fee counts as not 500\".",
+  "answer": {
+   "lang": "sql",
+   "src": "-- NULL = NULL                -> NULL\n-- NULL <> 5                  -> NULL\n-- true AND NULL              -> NULL\n-- true OR NULL               -> true\n-- false AND NULL             -> false\n-- false OR NULL              -> NULL\n-- NOT NULL                   -> NULL\n-- NULL IS DISTINCT FROM NULL -> false\n\nWHERE fee_minor IS DISTINCT FROM 500\n-- or, longer: WHERE fee_minor <> 500 OR fee_minor IS NULL"
+  }
+ },
+ "recap": [
+  "Tables hold facts with no pointers and no order, so a query says what it wants and the database finds it. A SQL table is a bag: duplicates stay unless a key or `DISTINCT` removes them, and rows have no order unless you write `ORDER BY`.",
+  "A candidate key is a minimal set of columns that never repeats. Make one the primary key and give every other one a `UNIQUE` constraint. Data can disprove a key, never prove one.",
+  "Any comparison with NULL is unknown, and WHERE keeps only rows that are true. Say what NULL means with `IS NULL`, `IS DISTINCT FROM` or a `NOT NULL` column.",
+  "`count(*)` counts rows, `count(col)` counts non-NULL values, `count(DISTINCT col)` counts different non-NULL values, and `sum` over no rows is NULL.",
+  "PostgreSQL evaluates FROM, WHERE, GROUP BY, HAVING, the select list, DISTINCT, ORDER BY and LIMIT in that order, so WHERE cannot see a select alias.",
+  "End every sort with a unique column, and write time ranges half-open: `>= start AND < end`."
+ ],
+ "quiz": [
+  {
+   "q": "A new nullable column `refunds.note_code` holds a code for 36 of 40 refunds; 4 have none yet. 10 refunds have `note_code = 'FR'`. How many rows does `SELECT * FROM refunds WHERE note_code <> 'FR'` return?",
+   "options": [
+    "26",
+    "30",
+    "36",
+    "40"
+   ],
+   "answer": 0,
+   "why": "30 refunds are not 'FR', but 4 of those 30 have NULL, and `NULL <> 'FR'` is unknown, so WHERE drops them. 26 remain. 30 is the answer the English question wants, and you get it with `note_code IS DISTINCT FROM 'FR'`."
+  },
+  {
+   "q": "In the current data, no merchant has two payments with the same `created_at`. What does that tell you about the pair `(merchant_id, created_at)`?",
+   "options": [
+    "It is a candidate key, so it could be the primary key",
+    "It is a foreign key to merchants",
+    "Only that it is unique today; it becomes a rule only if you add a UNIQUE constraint",
+    "It is a superkey but not a candidate key"
+   ],
+   "answer": 2,
+   "why": "A key is a promise about every row the table may ever hold. Current data can show that a set of columns is not unique, but it cannot show that it always will be. Until a UNIQUE constraint enforces it, the next import can break it."
+  },
+  {
+   "q": "Why does `SELECT amount_minor / 100 AS amount FROM payments ORDER BY amount` work, while the same query with `WHERE amount > 5` fails?",
+   "options": [
+    "WHERE is evaluated before the select list, and ORDER BY after it",
+    "WHERE cannot compare numeric expressions",
+    "Aliases work only in ORDER BY because of a PostgreSQL limitation that Oracle does not have",
+    "`amount` is a reserved word inside WHERE"
+   ],
+   "answer": 0,
+   "why": "The logical order is FROM, WHERE, GROUP BY, HAVING, select list, DISTINCT, ORDER BY, LIMIT. When WHERE runs, the alias has not been computed yet. Oracle has the same rule for the same reason."
+  },
+  {
+   "q": "A test runs `SELECT payment_id FROM payments WHERE card_id = 8 LIMIT 1` and expects 6, the card's oldest payment. It has passed 200 times. What is true?",
+   "options": [
+    "It will keep passing, because PostgreSQL returns rows in insertion order",
+    "It can start failing after an update to one of those rows, because without ORDER BY the order is whatever is fastest",
+    "LIMIT 1 always returns the row with the lowest primary key",
+    "It fails only on PostgreSQL 18, which changed the scan order"
+   ],
+   "answer": 1,
+   "why": "Without ORDER BY, rows come back in whatever order the plan produces. An UPDATE writes a new row version elsewhere in the table, and an index scan would change the order again. Write `ORDER BY created_at, payment_id`."
+  },
+  {
+   "q": "Table `t` has three rows with `score` 10, 20 and NULL. What does `SELECT count(*), count(score), avg(score) FROM t` return?",
+   "options": [
+    "3, 3, 10",
+    "3, 2, 15",
+    "2, 2, 15",
+    "3, 2, 10"
+   ],
+   "answer": 1,
+   "why": "`count(*)` counts all three rows. `count(score)` and `avg(score)` skip the NULL, so the average is (10 + 20) / 2 = 15. \"3, 2, 10\" is what you would get if NULL counted as zero, which it does not."
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "What does `NULL = NULL` return in SQL?",
+   "back": "NULL, meaning unknown. Use `IS NULL`, or `IS NOT DISTINCT FROM` for NULL-safe equality."
+  },
+  {
+   "front": "Which rows does WHERE keep?",
+   "back": "Only rows whose condition is true. Rows where it is false or unknown are dropped, without any error."
+  },
+  {
+   "front": "`count(*)` vs `count(col)` vs `count(DISTINCT col)`?",
+   "back": "Rows; rows where col is not NULL; different non-NULL values of col."
+  },
+  {
+   "front": "What does `sum(x)` return over zero rows?",
+   "back": "NULL, not 0. Write `coalesce(sum(x), 0)` when you need a number."
+  },
+  {
+   "front": "Candidate key vs primary key?",
+   "back": "A candidate key is any minimal set of columns that is unique. The primary key is the one you choose. Give the others a UNIQUE constraint."
+  },
+  {
+   "front": "Why can't WHERE use an alias from the select list?",
+   "back": "WHERE is evaluated before the select list, so the alias does not exist yet. ORDER BY runs after it and can use it."
+  },
+  {
+   "front": "How do you select all of March 2026 from a timestamptz column?",
+   "back": "`created_at >= '2026-03-01' AND created_at < '2026-04-01'`. Half-open: no gap at the end, no overlap with April."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Relation",
+   "plain": "Codd's name for a table: a set of rows that all have the same named, typed columns."
+  },
+  {
+   "term": "Data independence",
+   "plain": "Programs keep working when the way data is stored changes, because they say which rows they want, not where the rows are."
+  },
+  {
+   "term": "Bag",
+   "plain": "A collection that allows duplicates. SQL tables and query results are bags unless a key or DISTINCT prevents it."
+  },
+  {
+   "term": "Candidate key",
+   "plain": "A minimal set of columns whose values never repeat. A table can have several; the primary key is one of them."
+  },
+  {
+   "term": "Surrogate key",
+   "plain": "A key with no business meaning that the database hands out, such as an identity column."
+  },
+  {
+   "term": "Foreign key",
+   "plain": "A column whose values must exist as a key in another table. The database checks it on every write."
+  },
+  {
+   "term": "Three-valued logic",
+   "plain": "Logic with true, false and unknown. Any comparison with NULL is unknown."
+  },
+  {
+   "term": "Half-open range",
+   "plain": "A range that includes its start and excludes its end: >= start AND < end."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate's query `SELECT * FROM customers WHERE referred_by <> 1` is meant to list everyone customer 1 did not refer. It returns 6 rows, and they expected 11. Explain why, and how to fix it.",
+  "answer": "`referred_by` is NULL for the five customers nobody referred. Comparing NULL with 1 gives unknown, not true, and WHERE keeps only rows where the condition is true, so those five rows are dropped along with the two Asha did refer. That leaves 6. To keep the NULL rows, write `WHERE referred_by IS DISTINCT FROM 1`, which treats NULL as a value that is different from 1, or spell it out as `referred_by <> 1 OR referred_by IS NULL`. Both return 11."
+ },
+ "deeper": {
+  "minutes": 8,
+  "body": "NULL is not treated the same way everywhere in SQL, and the differences are worth knowing before they surprise you.\n\nComparisons say NULL is not equal to NULL. Grouping says the opposite: `GROUP BY referred_by` puts all five NULLs into one group, and `DISTINCT` keeps one NULL. Sorting puts NULLs together too. PostgreSQL sorts NULL as larger than every value, so it comes last in ascending order and first in descending order. Oracle does the same. `NULLS FIRST` and `NULLS LAST` override it:\n\n```postgresql\ncourse=# SELECT referred_by, count(*) FROM customers GROUP BY referred_by ORDER BY referred_by DESC LIMIT 3;\n referred_by | count\n-------------+-------\n           ∅ |     5\n           8 |     1\n           7 |     1\n(3 rows)\n```\n\nA `UNIQUE` constraint goes back to comparison rules: two NULLs are not equal, so a unique column accepts any number of NULLs. PostgreSQL 15 added `UNIQUE NULLS NOT DISTINCT`, which allows at most one:\n\n```postgresql\ncourse=# CREATE TEMP TABLE t2 (code text UNIQUE NULLS NOT DISTINCT);\nCREATE TABLE\ncourse=# INSERT INTO t2 VALUES (NULL), (NULL);\nERROR:  duplicate key value violates unique constraint \"t2_code_key\"\nDETAIL:  Key (code)=(null) already exists.\n```\n\nCodd's original 1970 model had no NULL at all. He added it later, and later still argued for two different marks: one for \"applicable but unknown\" (we don't know the customer's phone number) and one for \"inapplicable\" (this customer has no referrer, and that is a known fact). SQL has only one NULL, and its logic always treats it as \"unknown\". That is why `referred_by IS NULL` reads as \"nobody referred them\" in this schema while `referred_by <> 1` behaves as if the referrer were a secret. When a column's NULL means \"does not apply\", consider whether a real value, a separate table or a `NOT NULL` column with a default says it more clearly."
+ },
+ "sources": [
+  {
+   "title": "PostgreSQL 18 documentation: SELECT",
+   "url": "https://www.postgresql.org/docs/18/sql-select.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: Comparison functions and operators",
+   "url": "https://www.postgresql.org/docs/18/functions-comparison.html"
+  },
+  {
+   "title": "PostgreSQL 18 documentation: Constraints",
+   "url": "https://www.postgresql.org/docs/18/ddl-constraints.html"
+  },
+  {
+   "title": "Oracle Database SQL Language Reference: Nulls",
+   "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/Nulls.html"
+  },
+  {
+   "title": "PostgreSQL wiki: Don't Do This",
+   "url": "https://wiki.postgresql.org/wiki/Don%27t_Do_This"
+  }
+ ]
 }

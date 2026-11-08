@@ -26,14 +26,14 @@ object CourseDb {
                 "-c", "shared_buffers=32MB",
                 "-c", "max_connections=20",
                 "-c", "timezone=UTC",
-                // lesson 14 counts the statements the server ran
+                // sql-10 counts the statements the server ran
                 "-c", "shared_preload_libraries=pg_stat_statements",
             )
             .also { it.start() }
             .also { load(it) }
     }
 
-    /** The JDBC URL, user and password of the seeded database, for a pool or Flyway (lesson 14). */
+    /** The JDBC URL, user and password of the seeded database, for a pool or Flyway (sql-10). */
     val jdbcUrl: String get() = container.jdbcUrl
     val username: String get() = container.username
     val password: String get() = container.password
@@ -48,7 +48,7 @@ object CourseDb {
     }
 
     /**
-     * A new connection that logs in as [user] with [password] (lesson 15). It reaches the server
+     * A new connection that logs in as [user] with [password] (store-14). It reaches the server
      * through the container's port mapping, so pg_hba.conf's last line applies,
      * `host all all all scram-sha-256`, and a wrong password fails with SQLSTATE 28P01.
      */

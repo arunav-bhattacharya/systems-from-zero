@@ -50,7 +50,7 @@ object TestNeo4j {
         statements(resource(seed)).forEach { run(it) }
     }
 
-    /** The text of a classpath resource, such as `/sfz/nosql/l11/ring.cypher`. */
+    /** The text of a classpath resource, such as `/sfz/model/l08/ring.cypher`. */
     fun resource(path: String): String =
         (TestNeo4j::class.java.getResource(path) ?: error("missing resource $path")).readText()
 

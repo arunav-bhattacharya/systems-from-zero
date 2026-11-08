@@ -1,6 +1,6 @@
 #!/bin/bash
 # Point-in-time recovery (env/postgres-ha.yml, --profile pitr). Runs as root.
-# Needs a base backup in /archive/base (lesson sql-16 takes one with pg_basebackup on the primary)
+# Needs a base backup in /archive/base (lesson repl-04 takes one with pg_basebackup on the primary)
 # and the WAL segments the primary archived next to it in /archive. On the first start it:
 #   1. copies the base backup into an empty data directory,
 #   2. tells PostgreSQL where the archived WAL is (restore_command) and where to stop (recovery_target_time),

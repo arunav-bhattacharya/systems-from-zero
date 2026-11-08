@@ -24,8 +24,20 @@ SVG_CLASSES = {"box", "box-a", "box-b", "box-ok", "box-bad", "box-dim", "t", "t-
                "ln", "ln-d", "ln-a", "ln-bad"}
 OPS = {"read", "add", "write", "set", "lock", "unlock", "check", "note"}
 CODE_KEYS = {"src", "code", "svg", "run", "file", "files", "url", "lang", "id", "op", "alt_code", "alt_lang", "needs", "label"}
-PAIR_TRACKS = {t["id"] for t in COURSE["tracks"] if t.get("pairs")}
+# Java and Kotlin side by side: every lesson of a track marked "pairs", or a single lesson marked "pairs"
+PAIR_LESSONS = {l["id"] for t in COURSE["tracks"] for l in t["lessons"] if t.get("pairs") or l.get("pairs")}
 FIRSTS = {t["lessons"][0]["id"] for t in COURSE["tracks"] if t["lessons"]}
+# Lab modules are toolchains (labs/<module>/build.gradle.kts); a lesson's code lives in package sfz.<track>.l<NN>
+# inside whichever module has the libraries it needs.
+MODULES = {p.parent.name for p in (ROOT / "labs").glob("*/build.gradle.kts")}
+
+
+def lab_module(L, track):
+    for f in (L.get("lab") or {}).get("files", []):
+        parts = f.split("/")
+        if len(parts) > 2 and parts[0] == "labs":
+            return parts[1]
+    return track.get("lab")
 KEYWORDS = {"synchronized", "volatile", "wait", "final", "out", "in", "suspend", "reified", "where", "flatMap", "map",
             "fsync", "fork", "exec", "mmap", "epoll", "io_uring", "malloc", "strace", "tcpdump", "dig", "curl", "ss",
             "cgroups", "nice", "acks", "linger.ms", "explain", "explain()", "collect()", "iptables", "nodetool", "psql",
@@ -240,8 +252,11 @@ def check_lesson(path):
     if L.get("title") != TITLES[lid]:
         r.err(f"title must equal course.json: {TITLES[lid]!r}")
     track = TRACK_OF[lid]
-    lab = track["lab"]
+    lab = lab_module(L, track)
+    if lab not in MODULES:
+        r.err(f"lab module '{lab}' is not one of labs/{{{','.join(sorted(MODULES))}}}")
     num = lid.split("-")[1]
+    tid = track["id"]
     need(L, ["minutes", "goal", "warmup", "sections", "analogy", "in_your_world", "mistake", "worked", "lab", "drill",
              "recap", "quiz", "flashcards", "terms", "explain_back", "sources"], "lesson", r)
     if not (25 <= L.get("minutes", 0) <= 45):
@@ -285,8 +300,8 @@ def check_lesson(path):
                 if f:
                     if not (ROOT / f).exists():
                         r.err(f"{w}.try.code.file does not exist: {f}")
-                    if not f.startswith(f"labs/{lab}/"):
-                        r.err(f"{w}.try.code.file must be under labs/{lab}/")
+                    if not f.startswith("labs/"):
+                        r.err(f"{w}.try.code.file must be under labs/")
         for j, ref in enumerate(s.get("refs", [])):
             if not str(ref.get("url", "")).startswith("https://"):
                 r.err(f"{w}.refs[{j}]: url must start with https://")
@@ -301,9 +316,9 @@ def check_lesson(path):
     if words > 2800:
         r.warn(f"section prose is long ({words} words); trim breadth to fit a 40-minute session")
 
-    pairs = track["id"] in PAIR_TRACKS
+    pairs = lid in PAIR_LESSONS
     if pairs and not L.get("compare"):
-        r.err("every lesson in this track needs a 'compare' block (Java and Kotlin side by side)")
+        r.err("this lesson shows Java and Kotlin side by side, so it needs a 'compare' block")
     solos = []
     CHECKING_PAIRS[0] = pairs
     for i, s in enumerate(secs):
@@ -338,15 +353,17 @@ def check_lesson(path):
     for f in lb.get("files", []):
         if not (ROOT / f).exists():
             r.err(f"lab.files: {f} does not exist")
-        if not f.startswith(f"labs/{lab}/"):
-            r.err(f"lab.files: {f} must be under labs/{lab}/")
-    pkg = f"sfz.{lab}.l{num}"
+        if not f.startswith("labs/"):
+            r.err(f"lab.files: {f} must be under labs/")
+        elif not f.startswith(f"labs/{lab}/"):
+            r.err(f"lab.files: keep one lesson's files in one module ({f} is not under labs/{lab}/)")
+    pkg = f"sfz.{tid}.l{num}"
     if lb.get("run") and (f":{lab}:test" not in lb["run"] or pkg not in lb["run"]):
         r.err(f"lab.run should be ./gradlew :{lab}:test --tests '{pkg}.*'")
     for kind in ("main", "solution", "test"):
         d = ROOT / "labs" / lab / "src" / kind
-        if not any((d / lang / "sfz" / lab / f"l{num}").exists() for lang in ("java", "kotlin", "resources")):
-            r.err(f"labs/{lab}/src/{kind}/(java|kotlin|resources)/sfz/{lab}/l{num}/ is missing")
+        if not any((d / lang / "sfz" / tid / f"l{num}").exists() for lang in ("java", "kotlin", "resources")):
+            r.err(f"labs/{lab}/src/{kind}/(java|kotlin|resources)/sfz/{tid}/l{num}/ is missing")
     if not isinstance(lb.get("needs", []), list) or any(x not in ("Docker", "the lab box", "JDK 21") for x in lb.get("needs", [])):
         r.err("lab.needs is a list drawn from: Docker, the lab box, JDK 21")
 

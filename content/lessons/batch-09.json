@@ -1,0 +1,402 @@
+{
+  "id": "batch-09",
+  "title": "Spark 4 for JVM engineers: Connect, ANSI and VARIANT",
+  "minutes": 40,
+  "goal": "By the end you can explain what a Spark Connect client sends and what it can't do, fix a job that Spark 4's ANSI mode stopped without switching ANSI off, store and query JSON as VARIANT, pick the Kotlin API style that keeps Catalyst able to optimize, and say which Spark release a project should pin and why this track pins 4.1.",
+  "warmup": {
+    "q": "A Spark 3 job computes `CAST(amount_text AS INT)` on a settlement file where one line says `12,50`. You upgrade to Spark 4.1 with default settings. What happens on that line?",
+    "options": [
+      "It becomes NULL, as before",
+      "It becomes 1250, because Spark 4 understands decimal commas",
+      "The job fails with CAST_INVALID_INPUT",
+      "It becomes 12, the part before the comma"
+    ],
+    "answer": 2,
+    "why": "Spark 4.0 turned ANSI mode on by default, so an invalid cast raises an error instead of returning NULL. The NULL was Spark 3's behaviour, and it quietly dropped the line out of every sum. `try_cast` gives the NULL back on purpose when that's what you want. Spark doesn't guess at number formats in a cast."
+  },
+  "sections": [
+    {
+      "h": "Spark Connect moves the driver out of your service",
+      "body": "Lessons 6 to 8 followed one query through Spark: the plan, the stages, the shuffle, the optimizer. This lesson is about calling Spark from a JVM service, which Spark 4 changed in three ways. Each moves a decision to a better place: Spark Connect moves the driver out of your process, ANSI mode turns bad data from silent NULLs into named errors, and VARIANT moves JSON parsing from every query to one write.\n\nSpark now ships a feature release every quarter: 4.0 in May 2025, 4.1 in December 2025, 4.2 in July 2026, and 4.3 on 30 October 2026, the first on the quarterly schedule. Which one should a project pin? Not automatically the newest. A Spark job runs with the table-format library that reads and writes its tables, and those libraries ship one build per Spark line. Iceberg 1.12 (September 2026) has runtimes for Spark 3.5, 4.0 and 4.1 only, and Delta Lake 4.4.1 supports 4.0.1, 4.1 and 4.2. So 4.1 is the newest line both formats support, and this track's labs pin Spark 4.1.4 on JDK 21: Spark 4.1 runs on Java 17 and 21, and Java 25 support arrived in 4.2. Everything below works on 4.1; the few things that need 4.2 or 4.3 say so.\n\nEvery Spark program in lessons 6 to 8 started with `SparkSession.builder().master(\"local[2]\")`. That line starts a Spark driver inside your own JVM: the scheduler, the catalog, Catalyst, and on a laptop the executors too. For a batch job that's fine. Inside a service it causes three problems.\n\nThe first is the classpath. Spark 4.1 with its dependencies is hundreds of jars: the demo's server JVM has 212 jars and folders on its classpath, among them Netty, Jackson, Guava and the Hadoop client, and each must agree with the versions your framework already uses. The second is memory: the driver's plans, broadcast tables and collected results live in your heap, so one `collect()` too many takes your HTTP endpoints down with it. The third is the release cycle: the Spark version is baked into your deployable, so upgrading Spark means redeploying the service.\n\nVersion 1: don't embed Spark, submit to it. Package the job as a jar and hand it to `spark-submit`. The service and Spark are now apart, but the service can't ask a question and get rows back.\n\nVersion 2: a client and a server, the way your service talks to Oracle. That's **Spark Connect**. The server is an ordinary Spark driver with the Connect plugin, listening for gRPC calls, on port 15002 by default. (gRPC is a remote-call protocol over HTTP/2; its messages are encoded with protobuf, Google's compact binary format for structured data.) The client is a small library with the same DataFrame API. Building a DataFrame in the client builds a tree of plan nodes and nothing more: no names are checked and nothing is sent. An action encodes the whole tree as a protobuf message and sends it. The server resolves the names against its catalog, optimizes the plan (all of lesson 8 happens on the server), runs it on its executors and streams the result back as Apache Arrow record batches, a columnar format both sides can read without parsing. Spark 3.4 introduced Connect, and Spark 4.0 says its Java client has full API compatibility. The stepper below follows one query through it.\n\nIn the Try it, the client JVM has 57 jars and folders on its classpath and no Spark driver. The settlement report travels as 1,661 bytes of protobuf, most of them call-site details for error messages. A misspelled column fails only at the action, when the server first sees the plan; in classic Spark it would have failed on the line that built the DataFrame.\n\nWhat can't cross is anything that only exists inside a driver. There's no `SparkContext` and there are no RDDs on the client; both calls fail with `UNSUPPORTED_CONNECT_FEATURE`. Lambdas are the subtle case. A plan can say \"call this function\", but the function's bytecode lives in your client's classes, which the server doesn't have. Upload them first, a classes folder with `registerClassFinder` or a jar with `addArtifact`, and the same lambda runs.",
+      "stepper": {
+        "title": "A Spark Connect client sends a plan, the server runs it",
+        "intro": "What happens between `collectAsList()` in the client and the rows it gets back.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"The client builds an unresolved plan locally; nothing is sent\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">1. build the DataFrame</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box-a\" x=\"40\" y=\"80\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"102\" text-anchor=\"middle\">Aggregate by merchant</text><rect class=\"box-a\" x=\"40\" y=\"130\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"152\" text-anchor=\"middle\">Filter status = CAPTURED</text><rect class=\"box-a\" x=\"40\" y=\"180\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"202\" text-anchor=\"middle\">Read parquet(path)</text><line class=\"ln\" x1=\"135\" y1=\"114\" x2=\"135\" y2=\"130\"/><line class=\"ln\" x1=\"135\" y1=\"164\" x2=\"135\" y2=\"180\"/><text class=\"t-s t-m\" x=\"135\" y=\"240\" text-anchor=\"middle\">names not checked yet</text><rect class=\"box-dim\" x=\"450\" y=\"120\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"145\" text-anchor=\"middle\">waiting for requests</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">a Dataset in the client is only a tree of plan nodes</text></svg>",
+            "say": "The client builds a DataFrame: read, filter, aggregate. Each call adds a node to a tree inside the client JVM. Nothing is checked and nothing is sent, so a misspelled column name isn't noticed yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"On collect, the client encodes the plan as protobuf and sends it over gRPC\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">2. the action sends the plan</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box\" x=\"40\" y=\"80\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"102\" text-anchor=\"middle\">Aggregate by merchant</text><rect class=\"box\" x=\"40\" y=\"130\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"152\" text-anchor=\"middle\">Filter status = CAPTURED</text><rect class=\"box\" x=\"40\" y=\"180\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"202\" text-anchor=\"middle\">Read parquet(path)</text><line class=\"ln\" x1=\"135\" y1=\"114\" x2=\"135\" y2=\"130\"/><line class=\"ln\" x1=\"135\" y1=\"164\" x2=\"135\" y2=\"180\"/><rect class=\"box-a\" x=\"40\" y=\"236\" width=\"190\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"135\" y=\"259\" text-anchor=\"middle\">collectAsList()</text><rect class=\"box-dim\" x=\"450\" y=\"120\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"145\" text-anchor=\"middle\">waiting for requests</text><line class=\"ln-a\" x1=\"255\" y1=\"150\" x2=\"425\" y2=\"150\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"140\" text-anchor=\"middle\">ExecutePlan(plan)</text><text class=\"t-s t-m\" x=\"340\" y=\"170\" text-anchor=\"middle\">protobuf, about 1.7 KB</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">the whole query crosses the wire, not one call per step</text></svg>",
+            "say": "An action, here `collectAsList()`, sends the whole tree in one gRPC call: an `ExecutePlan` request holding the plan as a protobuf message. The client sends a description of the query, not one call per step."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"The server resolves the plan against its catalog and runs Catalyst on it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">3. the server plans it</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box-dim\" x=\"40\" y=\"130\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"155\" text-anchor=\"middle\">waiting for results</text><rect class=\"box\" x=\"450\" y=\"80\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"102\" text-anchor=\"middle\">Aggregate by merchant</text><rect class=\"box\" x=\"450\" y=\"130\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"152\" text-anchor=\"middle\">Filter status = CAPTURED</text><rect class=\"box\" x=\"450\" y=\"180\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"202\" text-anchor=\"middle\">Read parquet(path)</text><line class=\"ln\" x1=\"545\" y1=\"114\" x2=\"545\" y2=\"130\"/><line class=\"ln\" x1=\"545\" y1=\"164\" x2=\"545\" y2=\"180\"/><rect class=\"box-a\" x=\"450\" y=\"236\" width=\"190\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"259\" text-anchor=\"middle\">analyze, optimize, plan</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">lesson 7's four plans happen here, on the server</text></svg>",
+            "say": "The server owns the catalog, so it resolves the names, and this is where a misspelled column fails. Then Catalyst optimizes the plan and picks a physical plan, exactly as in lesson 8. AQE runs here too."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"The server runs the job on its executors while the client waits\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">4. the server runs the job</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box-dim\" x=\"40\" y=\"130\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"155\" text-anchor=\"middle\">waiting for results</text><rect class=\"box-a\" x=\"450\" y=\"80\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"102\" text-anchor=\"middle\">job: 2 stages</text><rect class=\"box\" x=\"450\" y=\"130\" width=\"90\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"495\" y=\"152\" text-anchor=\"middle\">task</text><rect class=\"box\" x=\"550\" y=\"130\" width=\"90\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"595\" y=\"152\" text-anchor=\"middle\">task</text><rect class=\"box\" x=\"450\" y=\"180\" width=\"90\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"495\" y=\"202\" text-anchor=\"middle\">task</text><rect class=\"box\" x=\"550\" y=\"180\" width=\"90\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"595\" y=\"202\" text-anchor=\"middle\">task</text><text class=\"t-s t-m\" x=\"545\" y=\"240\" text-anchor=\"middle\">executors read the files</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">the files, the executors and the memory are all on the server side</text></svg>",
+            "say": "The server's scheduler runs the job: stages, tasks, executors, shuffles. The Parquet files are read by the server's executors; the client only waits on its open call."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"Results stream back to the client as Arrow record batches\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">5. rows come back as Arrow</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box-a\" x=\"40\" y=\"130\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"155\" text-anchor=\"middle\">List&lt;Row&gt;: 3 rows</text><rect class=\"box\" x=\"450\" y=\"130\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"155\" text-anchor=\"middle\">job done</text><line class=\"ln-a\" x1=\"425\" y1=\"150\" x2=\"255\" y2=\"150\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"340\" y=\"140\" text-anchor=\"middle\">Arrow batches</text><text class=\"t-s t-m\" x=\"340\" y=\"170\" text-anchor=\"middle\">streamed on the same call</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">Arrow is a columnar in-memory format both sides can read without parsing</text></svg>",
+            "say": "Results stream back on the same call as **Arrow record batches**, a columnar binary format. The client turns them into `Row` objects. For a large result, the client reads the batches as they arrive."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"What a thin client cannot do: no SparkContext, no RDDs, and lambdas need their classes uploaded\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">6. what stays on the server</text><path class=\"ln-d\" d=\"M 20 44 H 250 V 316 H 20 Z\"/><text class=\"t-s t-m\" x=\"135\" y=\"64\" text-anchor=\"middle\">client JVM: your service</text><path class=\"ln-d\" d=\"M 430 44 H 660 V 316 H 430 Z\"/><text class=\"t-s t-m\" x=\"545\" y=\"64\" text-anchor=\"middle\">server JVM: Spark driver</text><text class=\"t-s t-m\" x=\"340\" y=\"300\" text-anchor=\"middle\">gRPC, port 15002</text><rect class=\"box-bad\" x=\"40\" y=\"80\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"102\" text-anchor=\"middle\">sparkContext(): no</text><rect class=\"box-bad\" x=\"40\" y=\"130\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"152\" text-anchor=\"middle\">rdd(): no</text><rect class=\"box-b\" x=\"40\" y=\"180\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"202\" text-anchor=\"middle\">map(lambda): upload</text><rect class=\"box-b\" x=\"40\" y=\"230\" width=\"190\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"135\" y=\"252\" text-anchor=\"middle\">class files first</text><rect class=\"box\" x=\"450\" y=\"130\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"155\" text-anchor=\"middle\">SparkContext, RDDs</text><rect class=\"box\" x=\"450\" y=\"190\" width=\"190\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"215\" text-anchor=\"middle\">your classes, once sent</text><line class=\"ln-d\" x1=\"255\" y1=\"214\" x2=\"425\" y2=\"214\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"204\" text-anchor=\"middle\">addArtifact</text><text class=\"t-s t-m\" x=\"340\" y=\"344\" text-anchor=\"middle\">the client sends plans; code the server can't see must be shipped</text></svg>",
+            "say": "What stays on the server can't be used from the client: `sparkContext()` and `rdd()` throw `UNSUPPORTED_CONNECT_FEATURE`. A lambda is code the server doesn't have; it runs only after the client uploads its class files with `registerClassFinder` or a jar with `addArtifact`."
+          }
+        ]
+      },
+      "try": {
+        "title": "Run a client in one JVM and Spark in another",
+        "minutes": 5,
+        "steps": [
+          "Run `ConnectDemo`. It starts a Spark driver with the Connect plugin on 127.0.0.1:15002, then starts `SettlementClient` as a second JVM whose classpath holds only the Connect client. Read the client's source too: it's the file shown.",
+          "Before reading the output: when the client builds the DataFrame with the misspelled column `stauts`, does anything fail?",
+          "Find where `explain()` was computed, and count the jobs the server ran for the client."
+        ],
+        "code": {
+          "lang": "java",
+          "title": "SettlementClient.java (the client JVM; ConnectDemo.kt starts the server)",
+          "src": "package sfz.batch.l09.client;\n\nimport static org.apache.spark.sql.functions.col;\nimport static org.apache.spark.sql.functions.sum;\n\nimport java.nio.file.Path;\nimport java.util.ArrayList;\nimport java.util.List;\nimport org.apache.spark.api.java.function.MapFunction;\nimport org.apache.spark.sql.Dataset;\nimport org.apache.spark.sql.Encoders;\nimport org.apache.spark.sql.Row;\nimport org.apache.spark.sql.connect.SparkSession;\nimport org.apache.spark.sql.connect.client.REPLClassDirMonitor;\n\n/**\n * A Spark Connect client: no driver, no executors, no SparkContext in this JVM. It builds a\n * DataFrame, which is only a plan, and sends the plan to the server over gRPC.\n *\n * Arguments: the server URL (sc://host:port), the payments folder on the server's disk, and this\n * program's own classes folder (for the lambda at the end).\n */\npublic class SettlementClient {\n    public static void main(String[] args) throws Exception {\n        String url = args[0];\n        String payments = args[1];\n        String classesDir = args[2];\n\n        long t0 = System.nanoTime();\n        SparkSession spark = SparkSession.builder().remote(url).getOrCreate();\n        System.out.printf(\"client: %s, connected in %d ms, server runs Spark %s%n\",\n                spark.getClass().getSimpleName(), (System.nanoTime() - t0) / 1_000_000, spark.version());\n        System.out.printf(\"client: %d jars and folders on this JVM's classpath%n\",\n                System.getProperty(\"java.class.path\").split(java.io.File.pathSeparator).length);\n\n        // building the DataFrame runs nothing and contacts nobody: it is a tree of plan nodes\n        Dataset<Row> report = spark.read().parquet(payments)\n                .where(col(\"status\").equalTo(\"CAPTURED\"))\n                .groupBy(\"merchant_id\").agg(sum(\"amount_cents\").alias(\"total_cents\"))\n                .orderBy(col(\"total_cents\").desc())\n                .limit(3);\n\n        // the message that will cross the wire: an unresolved plan as protobuf. plan() is\n        // package-private in Scala, so the client reaches it by reflection\n        Object plan = report.getClass().getMethod(\"plan\").invoke(report);\n        byte[] bytes = (byte[]) plan.getClass().getMethod(\"toByteArray\").invoke(plan);\n        System.out.printf(\"client: the plan is a %s of %,d bytes. Without call-site details it reads:%n\",\n                plan.getClass().getSimpleName(), bytes.length);\n        for (String line : withoutCommonBlocks(plan.toString())) System.out.println(\"  \" + line);\n\n        // the action: the server resolves, optimizes and runs the plan, and streams Arrow batches back\n        System.out.println(\"client: top merchants \" + report.collectAsList());\n        System.out.println(\"client: explain(), computed by the server:\");\n        report.explain();\n\n        // the client checks nothing while you build: a misspelled column only fails when the server sees the plan\n        Dataset<Row> typo = spark.read().parquet(payments).where(col(\"stauts\").equalTo(\"CAPTURED\"));\n        System.out.println(\"client: built a DataFrame with a misspelled column, no error yet\");\n        try {\n            typo.count();\n        } catch (Exception e) {\n            System.out.println(\"client: count() -> \" + firstLine(e));\n        }\n\n        // what a thin client cannot do: there is no SparkContext and there are no RDDs on this side\n        try {\n            spark.sparkContext();\n        } catch (Exception e) {\n            System.out.println(\"client: sparkContext() -> \" + firstLine(e));\n        }\n        try {\n            report.rdd();\n        } catch (Exception e) {\n            System.out.println(\"client: rdd() -> \" + firstLine(e));\n        }\n\n        // a typed lambda is bytecode the server doesn't have\n        MapFunction<Long, Long> times100 = x -> x * 100;\n        try {\n            spark.range(3).map(times100, Encoders.LONG()).collectAsList();\n        } catch (Exception e) {\n            System.out.println(\"client: map(lambda) -> \" + firstLine(e));\n        }\n        // upload this program's class files, and the same lambda runs on the server\n        spark.registerClassFinder(new REPLClassDirMonitor(Path.of(classesDir).toAbsolutePath().toString()));\n        System.out.println(\"client: map(lambda) after registerClassFinder -> \"\n                + spark.range(3).map(times100, Encoders.LONG()).collectAsList());\n        System.exit(0);\n    }\n\n    /** The protobuf text without its `common { ... }` blocks, which carry plan ids and call sites. */\n    static List<String> withoutCommonBlocks(String text) {\n        List<String> out = new ArrayList<>();\n        int skipping = 0;\n        for (String line : text.split(\"\\n\")) {\n            String t = line.trim();\n            if (skipping > 0) {\n                if (t.endsWith(\"{\")) skipping++;\n                if (t.equals(\"}\")) skipping--;\n                continue;\n            }\n            if (t.equals(\"common {\")) {\n                skipping = 1;\n                continue;\n            }\n            out.add(line);\n        }\n        return out;\n    }\n\n    static String firstLine(Throwable e) {\n        String m = e.getMessage() == null ? \"\" : e.getMessage();\n        String first = m.split(\"\\n\")[0];\n        return e.getClass().getSimpleName() + \": \" + (first.length() > 160 ? first.substring(0, 160) + \"...\" : first);\n    }\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l09.demo.ConnectDemoKt",
+          "file": "labs/bigdata/src/connectClient/java/sfz/batch/l09/client/SettlementClient.java"
+        },
+        "expect": "```text\nserver: Spark 4.1.4 driver with a Connect endpoint at sc://127.0.0.1:15002 (212 jars and folders on its classpath)\nclient: SparkSession, connected in 14794 ms, server runs Spark 4.1.4\nclient: 57 jars and folders on this JVM's classpath\nclient: the plan is a Plan of 1,661 bytes. Without call-site details it reads:\n  root {\n    limit {\n      input {\n        sort {\n          input {\n            aggregate {\n              input {\n                filter {\n                  input {\n                    read {\n                      data_source {\n                        format: \"parquet\"\n                        paths: \".../labs/bigdata/build/l08/payments\"\n                      }\n                    }\n                  }\n                  condition {\n                    unresolved_function {\n                      function_name: \"=\"\n                      arguments {\n                        unresolved_attribute {\n                          unparsed_identifier: \"status\"\n                        }\n                      }\n                      arguments {\n                        literal {\n                          string: \"CAPTURED\"\n                        }\n                      }\n                      is_internal: false\n                    }\n                  }\n                }\n              }\n              group_type: GROUP_TYPE_GROUPBY\n              grouping_expressions {\n                unresolved_attribute {\n                  unparsed_identifier: \"merchant_id\"\n                  plan_id: 2\n                }\n              }\n              aggregate_expressions {\n                alias {\n                  expr {\n                    unresolved_function {\n                      function_name: \"sum\"\n                      arguments {\n                        unresolved_attribute {\n                          unparsed_identifier: \"amount_cents\"\n                        }\n                      }\n                      is_internal: false\n                    }\n                  }\n                  name: \"total_cents\"\n                }\n              }\n            }\n          }\n          order {\n            child {\n              unresolved_attribute {\n                unparsed_identifier: \"total_cents\"\n              }\n            }\n            direction: SORT_DIRECTION_DESCENDING\n            null_ordering: SORT_NULLS_LAST\n          }\n          is_global: true\n        }\n      }\n      limit: 3\n    }\n  }\nclient: top merchants [[428,30799182], [335,30559226], [329,30190996]]\nclient: explain(), computed by the server:\n== Physical Plan ==\nAdaptiveSparkPlan isFinalPlan=false\n+- TakeOrderedAndProject(limit=3, orderBy=[total_cents#14L DESC NULLS LAST], output=[merchant_id#11,total_cents#14L])\n   +- HashAggregate(keys=[merchant_id#11], functions=[sum(amount_cents#13L)])\n      +- Exchange hashpartitioning(merchant_id#11, 4), ENSURE_REQUIREMENTS, [plan_id=104]\n         +- HashAggregate(keys=[merchant_id#11], functions=[partial_sum(amount_cents#13L)])\n            +- Project [merchant_id#11, amount_cents#13L]\n               +- Filter (isnotnull(status#12) AND (status#12 = CAPTURED))\n                  +- FileScan parquet [merchant_id#11,status#12,amount_cents#13L] Batched: true, DataFilters: [isnotnull(status#12), (status#12 = CAPTURED)], Format: Parquet, Location: InMemoryFileIndex(1 paths)[file:/..., PartitionFilters: [], PushedFilters: [IsNotNull(status), EqualTo(status,CAPTURED)], ReadSchema: struct<merchant_id:int,status:string,amount_cents:bigint>\n\n\nclient: built a DataFrame with a misspelled column, no error yet\nclient: count() -> AnalysisException: [UNRESOLVED_COLUMN.WITH_SUGGESTION] A column, variable, or function parameter with name `stauts` cannot be resolved. Did you mean one of the following? [`status...\nclient: sparkContext() -> SparkUnsupportedOperationException: [UNSUPPORTED_CONNECT_FEATURE.SESSION_SPARK_CONTEXT] Feature is not supported in Spark Connect: Access to the SparkContext. SQLSTATE: 0A000\nclient: rdd() -> SparkUnsupportedOperationException: [UNSUPPORTED_CONNECT_FEATURE.RDD] Feature is not supported in Spark Connect: Resilient Distributed Datasets (RDDs). SQLSTATE: 0A000\nclient: map(lambda) -> SparkException: org.apache.spark.SparkClassNotFoundException: [INTERNAL_ERROR] Failed to load class: sfz.batch.l09.client.SettlementClient. Make sure the artifact where the c...\nclient: map(lambda) after registerClassFinder -> [0, 100, 200]\nserver: the client exited with 0; its queries ran here, in this JVM, as 5 jobs and 7 tasks\n```\n\n(Paths shortened.) The plan the client printed is the query nested inside out: `limit` holds `sort`, which holds `aggregate`, which holds `filter`, which holds `read`. Every name in it is still `unresolved_attribute`: the client never checked `status` against anything, which is why the misspelled `stauts` only failed when `count()` sent it. The `explain()` text, with its pushed filters and `Exchange`, was produced by the server's Catalyst and sent back. The two `UNSUPPORTED_CONNECT_FEATURE` errors are the things a thin client doesn't have. The lambda failed until the client uploaded its own class files; after `registerClassFinder` the server loaded the class and ran it. All the work, 5 jobs and 7 tasks, ran in the server's JVM. Connecting took seconds here because the client JVM loads a 25 MB jar on a busy machine; on an idle laptop it's faster."
+      },
+      "refs": [
+        {
+          "title": "Spark Connect overview (Spark docs)",
+          "url": "https://spark.apache.org/docs/latest/spark-connect-overview.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "ANSI mode turns silent nulls into errors",
+      "body": "A card network's settlement file has a line whose amount is `12,50`: someone's spreadsheet used a decimal comma. Your job casts the text to a number. What should happen?\n\nSpark 3, by default, returned NULL. `CAST('12,50' AS INT)` gave NULL, the line's amount dropped out of every `sum`, and the job finished green. Arithmetic behaved like Java's: an `INT` that overflowed wrapped around to a large negative number, and a division by zero gave NULL. Each choice keeps a job running, and each one turns a data problem into a wrong total that nobody sees.\n\nSpark 4.0 switched **ANSI mode** on by default (`spark.sql.ansi.enabled = true`). Spark then follows the SQL standard's rules: an invalid cast, an overflow or a division by zero raises an error that names the problem, such as `CAST_INVALID_INPUT` or `ARITHMETIC_OVERFLOW`, with a SQLSTATE code, and the job stops. The Try it runs the same expressions both ways:\n\n| Expression | ANSI off (Spark 3) | ANSI on (Spark 4) |\n|---|---|---|\n| `CAST('12,50' AS INT)` | NULL | `CAST_INVALID_INPUT` |\n| `CAST(25000000 AS INT) * 100` | -1794967296 | `ARITHMETIC_OVERFLOW` |\n| `1250 / 0` | NULL | `DIVIDE_BY_ZERO` |\n| `CAST(300 AS TINYINT)` | 44 | `CAST_OVERFLOW` |\n\nThe second row is the dangerous one: 25 million euros in cents doesn't fit an `INT`, and Spark 3 answered with a negative number that looks like a refund.\n\nFailing is the right default, but a settlement job can't stop the whole night for one bad line either. So for each column you decide what a bad value means, and you say it in code. Where a bad value should become NULL, use the **try_ functions**: `try_cast`, `try_add`, `try_subtract`, `try_multiply`, `try_divide`, and `try_sum` and `try_avg` for aggregates. Each one returns NULL exactly where the plain version would have raised the error, so you can count those rows and send them to a person. Where the value is right and the type is too small, use a wider type: `CAST(25000000 AS BIGINT) * 100` is simply 2,500,000,000.\n\nThe errors are also better than the old NULLs for a second reason: they come with a name your code can match. A Kotlin job can catch `SparkThrowable` and read `getCondition()`; the lab's tests do exactly that.\n\nANSI mode changes type coercion too: with it on, `'abc' = 1` tries to cast `'abc'` to a number and fails, where Spark 3 returned NULL. When an upgrade turns an old job red, the error is almost always pointing at data that was already wrong.",
+      "try": {
+        "title": "The same expressions with ANSI off and on",
+        "minutes": 3,
+        "steps": [
+          "Run `AnsiDemo`. For six expressions it prints the result with `spark.sql.ansi.enabled` off and on, then the try_ versions.",
+          "Before reading: which of the six do you expect to return a number with ANSI off? Which number?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "AnsiDemo.kt",
+          "src": "package sfz.batch.l09.demo\n\n/**\n * The same expressions with ANSI mode off (Spark 3's default) and on (Spark 4's default), then the\n * try_ functions that give null on purpose.\n */\nfun main() {\n    val spark = demoSpark()\n    println(\"spark.sql.ansi.enabled by default: ${spark.conf().get(\"spark.sql.ansi.enabled\")}\")\n    val cases = listOf(\n        \"CAST('12,50' AS INT)\" to \"a decimal comma in a settlement file\",\n        \"CAST('2026-13-01' AS DATE)\" to \"month 13\",\n        \"CAST(25000000 AS INT) * 100\" to \"25 million euros in cents, as INT\",\n        \"CAST(300 AS TINYINT)\" to \"a value too big for the type\",\n        \"1250 / 0\" to \"an fx rate of zero\",\n        \"element_at(array(10, 20, 30), 5)\" to \"the 5th of 3 elements\",\n    )\n    for ((sql, what) in cases) {\n        spark.conf().set(\"spark.sql.ansi.enabled\", \"false\")\n        val off = valueOrError(spark, \"SELECT $sql\")\n        spark.conf().set(\"spark.sql.ansi.enabled\", \"true\")\n        val on = valueOrError(spark, \"SELECT $sql\")\n        println(\"%-34s (%s)\\n    ANSI off: %s\\n    ANSI on:  %s\".format(sql, what, off, on))\n    }\n    println(\"the safe versions, ANSI on:\")\n    for (sql in listOf(\"try_cast('12,50' AS INT)\", \"try_multiply(CAST(25000000 AS INT), 100)\",\n        \"try_divide(1250, 0)\", \"try_element_at(array(10, 20, 30), 5)\", \"CAST(25000000 AS BIGINT) * 100\")) {\n        println(\"    %-42s -> %s\".format(sql, valueOrError(spark, \"SELECT $sql\")))\n    }\n    spark.stop()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l09.demo.AnsiDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l09/demo/AnsiDemo.kt"
+        },
+        "expect": "```text\nspark.sql.ansi.enabled by default: true\nCAST('12,50' AS INT)               (a decimal comma in a settlement file)\n    ANSI off: NULL\n    ANSI on:  SparkNumberFormatException: [CAST_INVALID_INPUT] The value '12,50' of the type \"STRING\" cannot be cast to \"INT\" because it is malformed\nCAST('2026-13-01' AS DATE)         (month 13)\n    ANSI off: NULL\n    ANSI on:  SparkDateTimeException: [CAST_INVALID_INPUT] The value '2026-13-01' of the type \"STRING\" cannot be cast to \"DATE\" because it is malfor\nCAST(25000000 AS INT) * 100        (25 million euros in cents, as INT)\n    ANSI off: -1794967296\n    ANSI on:  SparkArithmeticException: [ARITHMETIC_OVERFLOW] integer overflow\nCAST(300 AS TINYINT)               (a value too big for the type)\n    ANSI off: 44\n    ANSI on:  SparkArithmeticException: [CAST_OVERFLOW] The value 300 of the type \"INT\" cannot be cast to \"TINYINT\" due to an overflow\n1250 / 0                           (an fx rate of zero)\n    ANSI off: NULL\n    ANSI on:  SparkArithmeticException: [DIVIDE_BY_ZERO] Division by zero\nelement_at(array(10, 20, 30), 5)   (the 5th of 3 elements)\n    ANSI off: NULL\n    ANSI on:  SparkArrayIndexOutOfBoundsException: [INVALID_ARRAY_INDEX_IN_ELEMENT_AT] The index 5 is out of bounds\nthe safe versions, ANSI on:\n    try_cast('12,50' AS INT)                   -> NULL\n    try_multiply(CAST(25000000 AS INT), 100)   -> NULL\n    try_divide(1250, 0)                        -> NULL\n    try_element_at(array(10, 20, 30), 5)       -> NULL\n    CAST(25000000 AS BIGINT) * 100             -> 2500000000\n```\n\nWith ANSI off, four of the six expressions quietly returned NULL and two returned wrong numbers: 25 million euros in cents wrapped around to -1,794,967,296, and 300 became 44 (300 minus 256). With ANSI on, every one of them stopped with a named error class. The try_ versions return NULL on purpose, and a wider type removes the overflow: as a BIGINT the amount is simply 2,500,000,000. The error messages are cut after their first sentence; the full text also says which try_ function to use and gives the SQLSTATE."
+      },
+      "refs": [
+        {
+          "title": "ANSI compliance in Spark SQL (Spark docs)",
+          "url": "https://spark.apache.org/docs/latest/sql-ref-ansi-compliance.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "VARIANT parses JSON once and keeps every field",
+      "body": "A fraud-scoring vendor posts a JSON document for every authorization, and the shape keeps changing: a new `rules` array this month, an `amount` that became an object last quarter. How do you store that in a table?\n\nVersion 1: as a STRING column, and parse it in every query with `get_json_object(body, '$.card.country')`. Nothing is lost and nothing breaks when a field appears. But every query re-reads and re-tokenizes the whole text of every row, once per field it asks for, and the column has no types: a score is just characters.\n\nVersion 2: parse once into a fixed `STRUCT` with `from_json(body, schema)`. Reads are fast and typed. But the schema is a guess about the future: a new field is silently dropped, and a field that changes type becomes NULL.\n\nVersion 3: **VARIANT**, a data type added in Spark 4.0. `parse_json(body)` parses the text once and stores the result as two byte arrays. The metadata is a dictionary of the field names used in the document. The value is a binary tree of typed values: an object stores its field ids sorted by name, with offsets, so finding `card` is a binary search, not a scan of text, and numbers are stored as numbers. Every field is kept, whatever its shape, and a number like `0.93` is stored as an exact decimal. In the Try it, a 126-byte webhook becomes 49 bytes of field names and 76 bytes of typed values: no smaller for one document, but nothing in it ever needs parsing again.\n\nYou read a variant with a path and a target type:\n\n```sql\nSELECT variant_get(event, '$.card.country', 'string') AS country,   -- or the short form:\n       event:risk.score::double                       AS score\nFROM events\n```\n\n`variant_get` fails with `INVALID_VARIANT_CAST` when a value can't be cast to the type you asked for; `try_variant_get` returns NULL instead, and it will cast the string `\"0.85\"` to the double 0.85. `schema_of_variant` tells you what a document holds, which is how you discover that the vendor started sending amounts as objects.\n\nSpark 4.1 made two improvements generally available: VARIANT is on by default, and **shredding** can store frequent fields as ordinary typed Parquet columns next to the binary remainder, so a filter on one field reads one narrow column. Spark 4.3 added functions that edit a variant value directly, such as `variant_set` and `variant_insert`. In the Try it, 300,000 events stored as variant took 3.3 MB of Parquet against 8.1 MB as text, and the same high-risk count took about 40% less time on the variant column, with the same answer.",
+      "try": {
+        "title": "Ask the same question of JSON text and of VARIANT",
+        "minutes": 4,
+        "steps": [
+          "Run `VariantDemo`. It parses one webhook into a VARIANT and reads fields out of it, then writes 300,000 events twice, as JSON text and as VARIANT, and runs the same high-risk count on both.",
+          "Look at the `to_json` line. Why did the keys come back in a different order?",
+          "Compare the two timings and the two sizes on disk."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "VariantDemo.kt",
+          "src": "package sfz.batch.l09.demo\n\nimport org.apache.spark.sql.SaveMode\nimport org.apache.spark.sql.functions.col\nimport org.apache.spark.sql.functions.concat\nimport org.apache.spark.sql.functions.element_at\nimport org.apache.spark.sql.functions.array\nimport org.apache.spark.sql.functions.hash\nimport org.apache.spark.sql.functions.lit\nimport org.apache.spark.sql.functions.pmod\nimport org.apache.spark.unsafe.types.VariantVal\nimport java.io.File\n\n/**\n * Webhook events as JSON text and as VARIANT: what one variant holds, how fields come out of it,\n * and the same question asked of 300,000 events stored both ways in Parquet.\n */\nfun main() {\n    val spark = demoSpark()\n    val body = \"\"\"{\"type\":\"authorization\",\"amount\":1250,\"card\":{\"country\":\"NL\",\"bin\":\"411111\"},\"risk\":{\"score\":0.93,\"rules\":[\"velocity\",\"geo\"]}}\"\"\"\n    val one = spark.sql(\"SELECT parse_json('$body') AS event\")\n    val v = one.first().get(0) as VariantVal\n    println(\"JSON text: ${body.length} bytes; the variant: ${v.metadata.size} bytes of field names + ${v.value.size} bytes of values\")\n    println(\"schema_of_variant: \" + one.selectExpr(\"schema_of_variant(event)\").first().getString(0))\n    println(\"event:card.country::string -> \" + one.selectExpr(\"event:card.country::string\").first().getString(0))\n    println(\"variant_get(event, '$.risk.score', 'double') -> \" + one.selectExpr(\"variant_get(event, '$.risk.score', 'double')\").first().get(0))\n    println(\"to_json(parse_json('{\\\"b\\\":1,\\\"a\\\":2}')) -> \" + spark.sql(\"SELECT to_json(parse_json('{\\\"b\\\":1,\\\"a\\\":2}'))\").first().getString(0))\n\n    // 300,000 events: write them once as text and once as variant\n    val text = File(\"build/l08/events-text\")\n    val variant = File(\"build/l08/events-variant\")\n    if (!File(variant, \"_SUCCESS\").exists()) {\n        val events = spark.range(0, 300_000, 1, 4).select(\n            col(\"id\").alias(\"event_id\"),\n            concat(\n                lit(\"\"\"{\"type\":\"authorization\",\"amount\":\"\"\"), pmod(hash(col(\"id\")), lit(250_000)).cast(\"string\"),\n                lit(\"\"\",\"card\":{\"country\":\"\"\"\"),\n                element_at(array(lit(\"NL\"), lit(\"DE\"), lit(\"FR\"), lit(\"GB\")), pmod(hash(col(\"id\"), lit(1)), lit(4)).plus(1)),\n                lit(\"\"\"\"},\"risk\":{\"score\":\"\"\"), pmod(hash(col(\"id\"), lit(2)), lit(100)).divide(100).cast(\"string\"),\n                lit(\"\"\",\"rules\":[\"velocity\"]},\"merchant\":{\"id\":\"\"\"), pmod(hash(col(\"id\"), lit(3)), lit(500)).cast(\"string\"),\n                lit(\"\"\",\"name\":\"Merchant shop\"}}\"\"\"),\n            ).alias(\"body\"),\n        )\n        events.write().mode(SaveMode.Overwrite).parquet(text.absolutePath)\n        spark.read().parquet(text.absolutePath).selectExpr(\"event_id\", \"parse_json(body) AS event\")\n            .write().mode(SaveMode.Overwrite).parquet(variant.absolutePath)\n    }\n    fun size(dir: File) = dir.listFiles { f -> f.name.endsWith(\".parquet\") }!!.sumOf { it.length() }\n    println(\"on disk: text %,d bytes, variant %,d bytes\".format(size(text), size(variant)))\n\n    spark.read().parquet(text.absolutePath).createOrReplaceTempView(\"events_text\")\n    spark.read().parquet(variant.absolutePath).createOrReplaceTempView(\"events_variant\")\n    val asText = \"\"\"SELECT get_json_object(body, '$.card.country') AS country, count(*) AS high_risk\n                    FROM events_text WHERE CAST(get_json_object(body, '$.risk.score') AS DOUBLE) > 0.8 GROUP BY 1 ORDER BY 1\"\"\"\n    val asVariant = \"\"\"SELECT event:card.country::string AS country, count(*) AS high_risk\n                       FROM events_variant WHERE event:risk.score::double > 0.8 GROUP BY 1 ORDER BY 1\"\"\"\n    for ((label, sql) in listOf(\"text, parsed by every query\" to asText, \"variant, parsed once\" to asVariant)) {\n        spark.sql(sql).collectAsList()                                   // warm-up\n        val t0 = System.nanoTime()\n        val rows = (1..3).map { spark.sql(sql).collectAsList() }.last()\n        println(\"%-28s average of 3: %5.0f ms  %s\".format(label, (System.nanoTime() - t0) / 3e6, rows))\n    }\n    spark.stop()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l09.demo.VariantDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l09/demo/VariantDemo.kt"
+        },
+        "expect": "```text\nJSON text: 126 bytes; the variant: 49 bytes of field names + 76 bytes of values\nschema_of_variant: OBJECT<amount: BIGINT, card: OBJECT<bin: STRING, country: STRING>, risk: OBJECT<rules: ARRAY<STRING>, score: DECIMAL(2,2)>, type: STRING>\nevent:card.country::string -> NL\nvariant_get(event, '$.risk.score', 'double') -> 0.93\nto_json(parse_json('{\"b\":1,\"a\":2}')) -> {\"a\":2,\"b\":1}\non disk: text 8,086,693 bytes, variant 3,343,970 bytes\ntext, parsed by every query  average of 3:  6951 ms  [[DE,14297], [FR,14220], [GB,14230], [NL,14044]]\nvariant, parsed once         average of 3:  4101 ms  [[DE,14297], [FR,14220], [GB,14230], [NL,14044]]\n```\n\n`schema_of_variant` shows the types the variant kept: the amount is a BIGINT, the score an exact DECIMAL(2,2), and the fields come out sorted by name, the same order `to_json` printed `{\"a\":2,\"b\":1}` in. That order is how a variant object stores its fields, so a lookup can binary-search by name. Both queries give the same counts. The text query re-parses every JSON document, twice per row (once per field it reads), on every run; the variant query reads the binary values directly. Times depend on your machine; the ratio between the two lines is what to look at."
+      },
+      "refs": [
+        {
+          "title": "Spark 4.0.0 release notes: the VARIANT type",
+          "url": "https://spark.apache.org/releases/spark-release-4-0-0.html",
+          "kind": "read"
+        },
+        {
+          "title": "Parquet Variant binary encoding (the format Spark's VARIANT uses)",
+          "url": "https://github.com/apache/parquet-format/blob/master/VariantEncoding.md",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "From Kotlin, write expressions the optimizer can read",
+      "body": "You write Spark from Kotlin through Spark's Java API. JetBrains' `kotlin-spark-api` wrapper stops at Spark 3.3.2, and its README says Spark 4 support proved \"near impossible\" with its design. That leaves you with three ways to say what you want, and they're not equal.\n\nColumn expressions and SQL. `where(col(\"status\").equalTo(\"CAPTURED\"))`, `spark.sql(\"SELECT ...\")` and the SQL **pipe syntax** all produce the same thing: a tree of expressions Catalyst can read. Pipe syntax, new in Spark 4.0, writes a query in the order the data flows, one step per line after `|>`:\n\n```sql\nFROM payments\n|> WHERE status = 'CAPTURED'\n|> AGGREGATE sum(amount_cents) AS total GROUP BY merchant_id\n```\n\nThat reads like a Kotlin chain, and it's only syntax: the Try it shows that classic SQL, pipe SQL and the DataFrame API give the same optimized plan, and all three push `status = 'CAPTURED'` into the Parquet scan.\n\nTyped Datasets with lambdas. `spark.table(\"payments\").as(Encoders.bean(PaymentBean::class.java)).filter { it.status == \"CAPTURED\" }` feels the most like Kotlin. Two things cost you. The encoder needs a Java bean: a class with a no-argument constructor and a getter and setter per column, which a Kotlin `data class` with `val`s is not. And the lambda is compiled JVM code that Catalyst can call but can't read. It can't move it, simplify it or hand it to the file reader. In the Try it the lambda version's scan pushes nothing, `PushedFilters: []`, and its plan has a `Filter` that builds a `PaymentBean` from every row (`initializejavabean`) only to call your lambda on it. With Spark Connect, the lambda also needs its class uploaded to the server (section 1).\n\nSo use column expressions or SQL for anything that filters, joins or aggregates, and keep lambdas for the rare logic that has no expression. When you must call your own code per row, a user-defined function (UDF) registered once is clearer than a lambda in a chain, but it's just as opaque to the optimizer.",
+      "try": {
+        "title": "One question, four spellings",
+        "minutes": 4,
+        "steps": [
+          "Run `KotlinApiDemo`. It asks for captured totals per merchant in classic SQL, pipe SQL, the DataFrame API and a typed Dataset with a Kotlin lambda, and prints whether each optimized plan matches classic SQL and what the Parquet scan was asked to filter.",
+          "Predict which spellings push the status filter into the scan.",
+          "Look at the trimmed plan of the lambda version. Where is your Kotlin code in it?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "KotlinApiDemo.kt",
+          "src": "package sfz.batch.l09.demo\n\nimport org.apache.spark.api.java.function.FilterFunction\nimport org.apache.spark.sql.Encoders\nimport org.apache.spark.sql.functions.col\nimport org.apache.spark.sql.functions.sum\n\n/** A Java bean, so Encoders.bean can map rows to it: a no-argument constructor and a getter and setter per column. */\nclass PaymentBean {\n    var payment_id: Long = 0\n    var merchant_id: Int = 0\n    var status: String = \"\"\n    var amount_cents: Long = 0\n}\n\n/**\n * One question asked four ways from Kotlin: classic SQL, SQL pipe syntax, the DataFrame API and a\n * typed Dataset with a Kotlin lambda. Prints whether the plans match and what the file scan was\n * asked to filter.\n */\nfun main() {\n    val spark = demoSpark()\n    demoPayments(spark).createOrReplaceTempView(\"payments\")\n    val classic = spark.sql(\n        \"\"\"\n        SELECT merchant_id, sum(amount_cents) AS total\n        FROM payments\n        WHERE status = 'CAPTURED'\n        GROUP BY merchant_id\n        \"\"\".trimIndent()\n    )\n    val pipe = spark.sql(\n        \"\"\"\n        FROM payments\n        |> WHERE status = 'CAPTURED'\n        |> AGGREGATE sum(amount_cents) AS total GROUP BY merchant_id\n        \"\"\".trimIndent()\n    )\n    val frame = spark.table(\"payments\").where(col(\"status\").equalTo(\"CAPTURED\"))\n        .groupBy(\"merchant_id\").agg(sum(\"amount_cents\").alias(\"total\"))\n    val typed = spark.table(\"payments\").`as`(Encoders.bean(PaymentBean::class.java))\n        .filter(FilterFunction { it.status == \"CAPTURED\" })       // Kotlin code: Spark can only call it\n        .toDF().groupBy(\"merchant_id\").agg(sum(\"amount_cents\").alias(\"total\"))\n\n    val reference = classic.queryExecution().optimizedPlan()\n    for ((label, df) in listOf(\"classic SQL\" to classic, \"pipe SQL\" to pipe, \"DataFrame API\" to frame, \"typed lambda\" to typed)) {\n        val same = df.queryExecution().optimizedPlan().sameResult(reference)\n        val scan = df.queryExecution().executedPlan().toString().lines().first { \"FileScan\" in it }\n        val pushed = Regex(\"\"\"PushedFilters: \\[([^\\]]*)]\"\"\").find(scan)!!.groupValues[1]\n        val first = df.orderBy(\"merchant_id\").first()\n        println(\"%-14s same plan as classic SQL: %-5s  pushed to Parquet: [%s]  merchant %d total %,d\".format(\n            label, same, pushed, first.getInt(0), first.getLong(1)))\n    }\n    println(\"typed lambda plan, trimmed:\")\n    typed.queryExecution().executedPlan().toString().lines()\n        .filter { \"Filter\" in it || \"DeserializeToObject\" in it || \"SerializeFromObject\" in it }\n        .forEach { println(\"  \" + it.trim().replace(Regex(\"#\\\\d+L?\"), \"\").take(110)) }\n    spark.stop()\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l09.demo.KotlinApiDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l09/demo/KotlinApiDemo.kt"
+        },
+        "expect": "```text\nclassic SQL    same plan as classic SQL: true   pushed to Parquet: [IsNotNull(status), EqualTo(status,CAPTURED)]  merchant 0 total 24,095,043\npipe SQL       same plan as classic SQL: true   pushed to Parquet: [IsNotNull(status), EqualTo(status,CAPTURED)]  merchant 0 total 24,095,043\nDataFrame API  same plan as classic SQL: true   pushed to Parquet: [IsNotNull(status), EqualTo(status,CAPTURED)]  merchant 0 total 24,095,043\ntyped lambda   same plan as classic SQL: false  pushed to Parquet: []  merchant 0 total 24,095,043\ntyped lambda plan, trimmed:\n  +- Filter invoke(sfz.batch.l09.demo.KotlinApiDemoKt$$Lambda/0x0000008000f847e0@57421e4e.call(initializejavab\n  +- FileScan parquet [payment_id,merchant_id,status,amount_cents] Batched: true, DataFilters: [], Format: Parqu\n```\n\nClassic SQL, pipe SQL and the DataFrame API produce plans that `sameResult` calls equal, and all three hand `status = 'CAPTURED'` to the Parquet reader. The typed lambda gives the same totals by a different route: its scan reads every row of four columns with nothing pushed, and the `Filter` above it calls `KotlinApiDemoKt$$Lambda...call(initializejavabean(...))`, an object per row and a call into your code. The lambda's name and address change from run to run. The plan lines are cut at 110 characters."
+      },
+      "refs": [
+        {
+          "title": "SQL pipe syntax (Spark docs)",
+          "url": "https://spark.apache.org/docs/latest/sql-pipe-syntax.html",
+          "kind": "docs"
+        },
+        {
+          "title": "kotlin-spark-api README: supported Spark versions",
+          "url": "https://github.com/Kotlin/kotlin-spark-api",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Classic Spark in your service is like running the database engine inside your application's JVM: every query is a method call, but the engine's memory, threads and hundreds of jars are now yours to host, and when it falls over it takes your service with it. Spark Connect is the move to a client and a server, the way your service talks to Oracle: the JDBC driver is small, the work happens elsewhere, and a crash on the server is an exception on the client. ANSI mode is the database refusing to store `'12,50'` in a NUMBER column instead of quietly storing nothing. VARIANT is keeping a parsed JSON document in a binary form so you never parse the text twice. The analogy breaks at the request: a JDBC driver sends SQL text, while a Connect client sends a whole unresolved query plan, built with the DataFrame API, and gets Arrow column batches back instead of a row cursor.",
+  "in_your_world": "If a Quarkus service of yours embeds Spark today, Connect changes three things. The dependency shrinks to one client jar plus the Scala library, so the Jackson, Netty and Guava versions Spark needs stop fighting with Quarkus's. A driver that runs out of memory no longer kills your HTTP endpoint; the server process restarts on its own. And you can upgrade the Spark server without redeploying the service, as long as the client protocol matches. ANSI mode belongs in your settlement reconciliation the way a constraint belongs on your Oracle ledger table: a wrong amount should stop the batch with a named error (`CAST_INVALID_INPUT`, `ARITHMETIC_OVERFLOW`) that your Temporal workflow can catch, retry or route to a person, never turn into a NULL that a SUM silently skips. And the card network or fraud vendor webhooks you keep as JSON strings are the case VARIANT was built for.",
+  "mistake": "The common mistake with Spark 4 is turning ANSI mode off to make an old job pass: `spark.sql.ansi.enabled=false` in the job config, because a cast started failing after the upgrade. The job goes green, and the data problem it found goes back to being invisible: the malformed amount becomes NULL and drops out of every sum, the overflow wraps to a negative number. People do it because the error appears in the middle of a migration, under time pressure, and the flag is a one-line fix. Keep ANSI on. Find the expression the error names, decide what a bad value should mean for that column, and say so in code: `try_cast` or `try_multiply` with the rejected rows written somewhere a person will look, or a wider type (`BIGINT` or `DECIMAL(38, 0)` for money) where the overflow was a type that was too small.",
+  "compare": {
+    "title": "The same settlement total, Spark 3 defaults vs Spark 4 defaults",
+    "a": {
+      "label": "Spark 3: ANSI off",
+      "lang": "text",
+      "src": "SELECT CAST('12,50' AS INT)            -> NULL\nSELECT CAST(25000000 AS INT) * 100     -> -1794967296\nSELECT 1250 / 0                        -> NULL\n\nsum over the file: wrong, and the job is green"
+    },
+    "b": {
+      "label": "Spark 4: ANSI on",
+      "lang": "text",
+      "src": "SELECT CAST('12,50' AS INT)            -> [CAST_INVALID_INPUT]\nSELECT CAST(25000000 AS INT) * 100     -> [ARITHMETIC_OVERFLOW]\nSELECT 1250 / 0                        -> [DIVIDE_BY_ZERO]\n\ntry_cast / try_multiply / try_divide -> NULL, on purpose"
+    },
+    "note": "Both columns come from `AnsiDemo`. Spark 3's defaults never stop a job: each bad value becomes a NULL or a wrapped number, and the damage shows up later as a total that doesn't reconcile. Spark 4's defaults stop at the first bad value with a named error, which turns an invisible data problem into a visible one. The try_ functions are the bridge: they bring back the NULL, but only where you wrote them, so the choice is in the code where a reviewer can see it."
+  },
+  "worked": {
+    "title": "Move a settlement job to Spark 4",
+    "steps": [
+      {
+        "say": "After the upgrade to Spark 4.1 the nightly settlement job fails. The error names the class of the problem and the function to use. Read it before touching any config.",
+        "code": "org.apache.spark.SparkNumberFormatException: [CAST_INVALID_INPUT] The value '12,50' of the type \"STRING\"\n  cannot be cast to \"BIGINT\" because it is malformed. ... Use `try_cast` to tolerate malformed input\n  and return NULL instead. SQLSTATE: 22018",
+        "lang": "text"
+      },
+      {
+        "say": "Find out how many lines are affected and what they look like. ANSI mode just told you something Spark 3 hid: some lines were silently NULL for years.",
+        "code": "// 1. how bad is it?\nlines.where(col(\"amount_text\").try_cast(\"bigint\").isNull()).groupBy(\"source_file\").count().show()\n// source_file              count\n// visa-2026-11-06.csv          14     <- decimal commas from one acquirer",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Decide per column. A malformed amount is a rejected line: convert with `try_cast` and route the nulls to a reject table. An overflow means the type is too small for the arithmetic: widen it rather than hide it.",
+        "code": "// 2. say what a bad value means, in code\nval parsed = lines\n    .withColumn(\"amount_minor\", col(\"amount_text\").try_cast(\"bigint\"))\n    .withColumn(\"eur_ppm\", col(\"amount_minor\").cast(\"decimal(38,0)\").multiply(col(\"rate_ppm\")))   // 38 digits: room for any real amount\nparsed.where(col(\"amount_minor\").isNull()).writeTo(\"settlement.rejects\").append()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Keep the rest of Spark 4's defaults and check the totals against last month's run on Spark 3. Any difference is a row Spark 3 was getting wrong.",
+        "code": "// 3. compare: the Spark 3 total skipped the null lines; the new total plus the rejects should explain the gap\n// never: spark.conf().set(\"spark.sql.ansi.enabled\", \"false\")",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Make a settlement parser ANSI-safe and read webhooks as VARIANT",
+    "minutes": 15,
+    "needs": [
+      "JDK 21"
+    ],
+    "files": [
+      "labs/bigdata/src/main/kotlin/sfz/batch/l09/SettlementLines.kt",
+      "labs/bigdata/src/main/kotlin/sfz/batch/l09/WebhookEvents.kt"
+    ],
+    "run": "./gradlew :bigdata:test --tests 'sfz.batch.l09.*'",
+    "steps": [
+      "Run the tests. `AnsiTest` fails because `SettlementLines.parse` is the Spark 3 code: under Spark 4's ANSI mode the line `'12,50'` stops the whole job with `CAST_INVALID_INPUT`. `VariantTest` fails on `TODO`s.",
+      "Fix `parse` so every line survives: a bad amount and an overflowing product both become null. Then write `rejects`.",
+      "Write `WebhookEvents.parse`: one VARIANT column, `event`, parsed once from the JSON text; a broken body gives a null event, not a failed job.",
+      "Write `highRiskByCountry`. The score is sometimes a number and sometimes the string \"0.85\"; capture events have no score at all.",
+      "Write `amountMinor`. Old events send `\"amount\": 1250`, new ones `\"amount\": {\"value\": \"12.50\", ...}`. Both must come out as 1250.",
+      "Run the tests until all seven pass."
+    ],
+    "hints": [
+      "`Column.try_cast(\"bigint\")` and `functions.try_multiply(a, b)` give null where `cast` and `multiply` would throw.",
+      "`try_parse_json(col(\"body\"))` makes the VARIANT. `variant_get(col(\"event\"), \"$.card.country\", \"string\")` reads a field; `try_variant_get` returns null when the value is missing or can't be cast, and it casts the string \"0.85\" to 0.85 for you.",
+      "For the amount, `coalesce(` the old shape as `bigint`, the new shape's `$.amount.value` as `decimal(12,2)` times 100 cast to `bigint` `)`. Reading an object as `bigint` with `try_variant_get` gives null, so the coalesce falls through."
+    ],
+    "done_when": "All seven tests in `AnsiTest` and `VariantTest` pass."
+  },
+  "drill": {
+    "title": "Three Spark 4 one-liners",
+    "minutes": 4,
+    "prompt": "From memory, in Kotlin: (1) connect to a Spark Connect server on localhost's default port; (2) convert a string column `amount_text` to BIGINT so that bad values become null under ANSI mode; (3) read the nested field `card.country` as a string from a VARIANT column `event`. Then say which of the three lines sends anything to the server.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "// 1. a thin client: no master, no executors in this JVM\nval spark = SparkSession.builder().remote(\"sc://localhost:15002\").getOrCreate()\n\n// 2. ANSI-safe cast: null instead of CAST_INVALID_INPUT\nval amounts = lines.withColumn(\"amount_minor\", col(\"amount_text\").try_cast(\"bigint\"))\n\n// 3. one field out of a VARIANT, no JSON text parsed\nval countries = events.select(variant_get(col(\"event\"), \"$.card.country\", \"string\"))\n\n// only line 1 talks to the server (it opens the session). Lines 2 and 3 add nodes to a plan in this JVM;\n// nothing is sent until an action, and with Connect that is also when a misspelled column name fails"
+    }
+  },
+  "recap": [
+    "Spark Connect splits the application from the driver: the client sends an unresolved plan as protobuf over gRPC (port 15002) and gets Arrow batches back.",
+    "A Connect client has no SparkContext and no RDDs; lambdas only run once their class files are uploaded with `registerClassFinder` or `addArtifact`.",
+    "Spark 4.0 turned ANSI mode on: bad casts, overflow and division by zero now fail with a named error instead of returning NULL or a wrapped number. `try_cast`, `try_add`, `try_multiply`, `try_divide` give null on purpose.",
+    "VARIANT stores JSON parsed once, as a dictionary of field names plus a typed binary value; `variant_get` and `:` paths read fields without parsing text.",
+    "From Kotlin, use the Java API with column expressions or SQL (pipe syntax is only syntax). Typed lambdas are opaque to Catalyst: no pushdown through them."
+  ],
+  "quiz": [
+    {
+      "q": "A service uses the Spark Connect JVM client. A teammate adds `spark.sparkContext().broadcast(lookup)`. What happens?",
+      "options": [
+        "It works, but the broadcast goes through the server",
+        "It fails: a Connect client has no SparkContext",
+        "It works only if the lookup is smaller than 10 MB",
+        "It silently does nothing"
+      ],
+      "answer": 1,
+      "why": "The SparkContext lives in the driver, on the server. The client only builds and sends plans, so `sparkContext()` throws `UNSUPPORTED_CONNECT_FEATURE.SESSION_SPARK_CONTEXT`, as the demo showed. Use the DataFrame `broadcast()` hint in a join instead; it's part of the plan."
+    },
+    {
+      "q": "On Spark 4 with default settings, `SELECT sum(amount_cents) FROM payments` overflows a BIGINT. What do you get?",
+      "options": [
+        "A negative number, as in Java",
+        "NULL",
+        "An error, ARITHMETIC_OVERFLOW, and the job fails",
+        "The sum, automatically widened to DECIMAL"
+      ],
+      "answer": 2,
+      "why": "ANSI mode is on by default since Spark 4.0, so overflow raises `ARITHMETIC_OVERFLOW`. The negative number is what Spark 3 returned with ANSI off. `try_sum` returns NULL instead of failing; for money, casting to `DECIMAL(38, 0)` before summing avoids the overflow altogether."
+    },
+    {
+      "q": "Fraud-vendor events are stored in Parquet as a JSON STRING column. A query reads `get_json_object(body, '$.risk.score')` and `get_json_object(body, '$.card.country')` for 300 million rows. What does moving to VARIANT change?",
+      "options": [
+        "The text is parsed once, on write; reads navigate the binary encoding to the two fields",
+        "Nothing, both parse the JSON text on every read",
+        "VARIANT stores each field as its own Parquet column, always",
+        "VARIANT turns the JSON into a fixed STRUCT schema"
+      ],
+      "answer": 0,
+      "why": "`parse_json` runs once when the data is written, and stores a dictionary of field names and a binary value with offsets, so `variant_get` jumps to a field instead of re-tokenizing the text for each call. Storing frequent fields as separate Parquet columns is shredding, an optional layout (generally available in Spark 4.1), not something every variant gets. The schema stays open: a new field needs no change."
+    },
+    {
+      "q": "Which of these does Catalyst push into the Parquet scan?",
+      "options": [
+        "`ds.filter(FilterFunction { it.status == \"CAPTURED\" })` on a typed Dataset",
+        "A UDF `isCaptured(status)` registered from Kotlin",
+        "All three, since they mean the same thing",
+        "`df.where(col(\"status\").equalTo(\"CAPTURED\"))`"
+      ],
+      "answer": 3,
+      "why": "Only a column expression is something Catalyst can read, rewrite and hand to the file reader. A lambda or a UDF is compiled JVM code that Spark can call but can't look inside, so the plan keeps a `Filter` over every row and the scan's `PushedFilters` stay empty, as the Kotlin API demo showed."
+    },
+    {
+      "q": "From lesson 8: a Spark Connect client runs `payments.join(merchants, \"merchant_id\")` and calls `explain()`. Where were the optimizer's rules applied, and who decided between a broadcast and a sort-merge join?",
+      "options": [
+        "In the client JVM, before the plan was sent",
+        "On the server, after it resolved the client's plan; the client only prints the result",
+        "Half in the client (logical) and half on the server (physical)",
+        "Nowhere: Connect plans run without Catalyst"
+      ],
+      "answer": 1,
+      "why": "The client sends an unresolved plan. Analysis needs the catalog, and the catalog, Catalyst and AQE all live with the driver on the server, so every rule from lesson 8 runs there; `explain()` is a request to the server, which sends back the plan text. That's also why AQE works unchanged with Connect.",
+      "from": "batch-08"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does a Spark Connect client send, and what comes back?",
+      "back": "An unresolved logical plan, encoded as protobuf, over gRPC (default port 15002). Results come back as Arrow record batches."
+    },
+    {
+      "front": "Name two things a Connect client can't do.",
+      "back": "Use the SparkContext, and use RDDs. Lambdas and UDF classes must also be uploaded first (`registerClassFinder`, `addArtifact`)."
+    },
+    {
+      "front": "What did Spark 4.0 change about `CAST('12,50' AS INT)`?",
+      "back": "ANSI mode became the default, so the malformed cast fails with `CAST_INVALID_INPUT` instead of returning NULL. `try_cast` returns NULL on purpose."
+    },
+    {
+      "front": "Which try_ functions cover arithmetic?",
+      "back": "`try_add`, `try_subtract`, `try_multiply`, `try_divide`, `try_mod`, and `try_sum` and `try_avg` for aggregates."
+    },
+    {
+      "front": "What is inside a VARIANT value?",
+      "back": "Two byte arrays: metadata, a dictionary of field names, and value, a typed binary encoding with offsets. Object fields are sorted by name."
+    },
+    {
+      "front": "`variant_get` vs `try_variant_get`?",
+      "back": "Both read a path and cast it to a type. `variant_get` fails on a value it can't cast; `try_variant_get` returns NULL."
+    },
+    {
+      "front": "Why don't typed-Dataset lambdas get predicate pushdown?",
+      "back": "Catalyst sees a lambda as opaque code: it can call it per row but can't read or rewrite it, so nothing reaches the file scan."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Spark Connect",
+      "plain": "Spark's client-server protocol: a thin client sends unresolved plans over gRPC to a server that hosts the driver."
+    },
+    {
+      "term": "gRPC",
+      "plain": "A remote call protocol over HTTP/2 with messages encoded as protobuf; Connect uses it on port 15002 by default."
+    },
+    {
+      "term": "Apache Arrow",
+      "plain": "A columnar in-memory format; Connect streams query results to the client as Arrow record batches."
+    },
+    {
+      "term": "ANSI mode",
+      "plain": "Spark SQL behaving like standard SQL: invalid casts, overflow and division by zero raise errors. On by default since Spark 4.0."
+    },
+    {
+      "term": "try_ functions",
+      "plain": "Variants of casts and arithmetic (`try_cast`, `try_add`, ...) that return NULL where the plain version would raise an error."
+    },
+    {
+      "term": "VARIANT",
+      "plain": "A Spark 4 data type for semi-structured data such as JSON, parsed once into a binary form that keeps every field."
+    },
+    {
+      "term": "Pipe syntax",
+      "plain": "SQL written as a chain of steps joined by `|>`, in the order the data flows; it builds the same plan as classic SQL."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Explain to a teammate why a Spark Connect client can't call `rdd()` but can run `df.groupBy(\"merchant_id\").count()`, and what it would take to run a Kotlin lambda through Connect.",
+    "answer": "A Connect client never runs Spark itself. A DataFrame in the client is only a tree of plan nodes, built from column expressions: read these files, filter on this column, group by that one. On an action, the client encodes the tree as protobuf and sends it over gRPC to the server, where the driver resolves the names, optimizes the plan, runs it on its executors and streams the result back as Arrow batches. `groupBy(...).count()` is just more plan nodes, so it travels fine. An RDD is different: it's a handle on distributed data inside a running SparkContext, with partitions and lineage held in the driver's memory, and its operations are your JVM functions applied to objects. None of that exists in the client process, so `rdd()` and `sparkContext()` throw. A lambda is the same problem in small: the plan can name it, but its bytecode lives in your client's classes, not on the server. To run it, the client must upload those class files first, with `registerClassFinder` for a classes folder or `addArtifact` for a jar, and then the server can load the class and call it. Even then Catalyst can't see inside it, so prefer column expressions."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Connect ships with a few more pieces. Spark 4.1 added a JDBC driver for Spark Connect, so a tool that only speaks JDBC can send SQL to a Connect server, and Spark 4.3 extended it with complex types and SQLSTATE error codes. The Python side can run without any JVM at all: the `pyspark-client` package is pure Python. Sessions on a Connect server are isolated from each other, each with its own temp views and settings, which is what makes one server usable by many services.\n\nVARIANT has a storage trick worth knowing for big tables: shredding. When most events share some fields, the writer can store those fields as ordinary typed Parquet columns next to the variant's binary remainder. A query on `event:card.country` then reads one narrow column with min and max statistics (lesson 5) instead of every variant blob. Spark 4.1 made shredding generally available, and Iceberg's format version 3 (lesson 11) defines the same VARIANT type, so other engines can read it.\n\nSQL pipe syntax keeps growing. Spark 4.2 allowed aggregates inside `|> SELECT` and accepts `|` as a shorter spelling of `|>`. And ANSI mode has a second half this lesson skipped: type coercion. With ANSI on, Spark follows the standard's rules for mixing types, so `'abc' = 1` tries to cast `'abc'` to a number and fails, where Spark 3 returned NULL. `spark.sql.storeAssignmentPolicy`, `ANSI` by default, applies the same strictness when an INSERT puts a value into a column of a narrower type.\n\nSpark 4.3 also added SQL that later lessons of this track use: an `ASOF JOIN` (off by default), which lesson 14 uses for point-in-time joins, and type 2 dimension flows in Declarative Pipelines, which lesson 10 builds by hand. When Iceberg and Delta ship builds for Spark 4.3, moving the labs up is a one-line change in `labs/bigdata/build.gradle.kts`."
+  },
+  "sources": [
+    {
+      "title": "Spark Connect overview (Spark docs)",
+      "url": "https://spark.apache.org/docs/latest/spark-connect-overview.html"
+    },
+    {
+      "title": "ANSI compliance in Spark SQL (Spark docs)",
+      "url": "https://spark.apache.org/docs/latest/sql-ref-ansi-compliance.html"
+    },
+    {
+      "title": "Spark 4.0.0 release notes: ANSI by default, VARIANT, pipe syntax, Connect",
+      "url": "https://spark.apache.org/releases/spark-release-4-0-0.html"
+    },
+    {
+      "title": "Spark 4.1.0 release notes: VARIANT shredding, Connect JDBC driver, the line this track pins",
+      "url": "https://spark.apache.org/releases/spark-release-4.1.0.html"
+    },
+    {
+      "title": "SQL pipe syntax (Spark docs)",
+      "url": "https://spark.apache.org/docs/latest/sql-pipe-syntax.html"
+    }
+  ]
+}

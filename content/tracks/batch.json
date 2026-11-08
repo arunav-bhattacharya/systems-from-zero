@@ -1,0 +1,129 @@
+{
+  "id": "batch",
+  "intro": "By the end of this track you can look at a batch job and say what it will cost before it runs: the bytes it reads after skipping partitions and columns, whether one machine can do it, where Spark will shuffle and which join it will pick. You can model payments as a star schema that keeps history, store them as Parquet in an Apache Iceberg table, correct them with `MERGE INTO` and keep the table fast, run the pipeline from an orchestrator that can retry and backfill it safely, hand its output to training sets and live services without leaking the future or showing half a run, and pick DuckDB, Spark, Trino or a streaming engine by the numbers.\n\nThe track starts on one machine, with a Unix pipeline that is already a map, a shuffle and a reduce, and grows from there: distributed files and MapReduce, Hive's tables over folders, columnar files, Spark's execution model, shuffles, joins and the optimizer, Spark 4 from the JVM, warehouses and dimensional models, lakehouse tables, orchestration, the uses of batch output, and choosing an engine. It builds on the Storage track's column-store lesson and the Stream processing track's Spark lesson, and reminds you of both where they come up; nothing else is assumed.\n\nThe labs live in two modules. Most are in `labs/bigdata`, which runs Spark 4.1.4 (the newest line both Iceberg 1.12 and Delta Lake 4.4 support), Iceberg and DuckDB inside the test JVM on a JDK 21 toolchain that Gradle fetches for you; no cluster, Hadoop or Docker. Lessons 13 and 14 are plain Kotlin simulations in `labs/sim` that run in a second. Each lesson has its own package: run `./gradlew :bigdata:test --tests 'sfz.batch.l06.*'` (or `:sim:` for lessons 13 and 14) from the `labs` folder, and `./gradlew :bigdata:demo -Pmain=...` for the Try-it demos. Spark tests share one local session, so the first test of a run pays a few seconds of start-up. Timings in the lessons were measured on a busy laptop: trust the ratios and the shapes, not the milliseconds.",
+  "cheatsheet": "## Cost of a scan (lessons 1, 2 and 15)\n\n`time = bytes read / bandwidth of the slowest stage` (disk, network or CPU decoding). 1 TB at 500 MB/s is 2,000 s. Two levers: more readers (split the work) and fewer bytes (columns, compression, skipping). Pull \"fewer bytes\" first.\n\n| Step | Example: 4 TB, 3 years, 60 columns |\n|---|---|\n| Partitions read | 30 of 1,095 days: 110 GB |\n| Columns read | 4 of 60: 7.3 GB |\n| One machine's speed | min(cores x decode rate, storage rate): about 3 GB/s laptop, 1.5 GB/s VM from S3 |\n| Users sharing it | time x concurrent queries |\n| Working set | join build side or groups: must fit in RAM |\n\nOn one machine, a hash map counts in one pass while the distinct keys fit in memory; an external merge sort spills sorted runs of size M and merges them F at a time: about N / M runs and ceil(log_F(runs)) passes. `sort | uniq -c` is map, shuffle and reduce.\n\n## Storage and MapReduce (lessons 3 and 4)\n\n- HDFS: 128 MB blocks, 3 replicas, one NameNode with the block map. MapReduce: map, partition by `hash(key) mod R`, shuffle through local disk, sort, reduce. Combiners only for associative and commutative work; for an average carry `(sum, count)`.\n- Object stores replaced HDFS: elastic, cheap, no NameNode. Not file systems: no rename, LIST 1,000 keys per call, 100 to 200 ms to first byte. Since 2020 S3 is strongly consistent; since 2024 it has conditional writes (`If-None-Match: *` create only if absent, `If-Match` replace only if the ETag matches).\n- Hive: a table is a folder plus a schema in the metastore; partitions are `dt=2026-11-07/` folders, pruned only when the query filters the partition column. Writes aren't atomic; small files cost an open each.\n\n## Parquet (lesson 5)\n\nRow groups, one column chunk per column, pages; a footer with offsets and min/max/null counts, read first. Dictionary, RLE and delta encodings, then Snappy or Zstd. Min/max skip row groups only when data is sorted or clustered on the filter column.\n\n## Spark (lessons 6 to 9)\n\n| Concept | Rule |\n|---|---|\n| Lazy plan | transformations build a plan; actions (`count`, `collect`, `write`) run it, each time |\n| Stages | split at each `Exchange` (shuffle); one task per partition; extra tasks run in waves |\n| Failure | a task retried up to 4 times from lineage; lost shuffle files rerun their map tasks |\n| Shuffle | M x R blocks; `spark.sql.shuffle.partitions` = 200, set it high and let AQE merge |\n| Joins | broadcast hash under 10 MB (or `broadcast()`), else sort-merge with a shuffle of both sides |\n| AQE | re-plans at each shuffle: merges small partitions, switches to broadcast, splits skewed partitions (over 5x median and 256 MB) |\n| Skew | one hot key, one slow task: AQE skew join or salting; speculation doesn't help |\n| `cache()` | pays only when reused; `unpersist()` after |\n| Spark 4 | Connect: thin client sends plans over gRPC (15002). ANSI on: bad casts fail, use `try_cast`. VARIANT: JSON parsed once. Labs pin 4.1.4 because Iceberg 1.12 stops at 4.1 |\n\nRead plans with `explain(\"formatted\")`: `Exchange hashpartitioning`, `BroadcastExchange`, `SortMergeJoin`, `AQEShuffleRead`, `InMemoryTableScan`.\n\n## Warehouses and dimensional models (lesson 10)\n\nDeclare the grain, then: a fact table (events: keys and measures) and dimension tables (who, what, where, when). Star: flat dimensions, one join each. Snowflake: normalized dimensions, more joins. One big table: pre-joined, cheap in a column store, expensive to correct.\n\n| Slowly changing dimension | What a change does |\n|---|---|\n| Type 0 | never changes |\n| Type 1 | overwrite: history rewritten (fine for corrections) |\n| Type 2 | close the version (`valid_to`, `is_current = false`), insert a new one with a new surrogate key; facts keep the key valid on their day |\n| Type 3 | one previous value in a column |\n| Types 6 and 7 | current value on every version, or a durable key on the fact, for as-is reports |\n\nEngines broadcast small dimensions and push the surviving join keys into the fact scan at run time (DuckDB dynamic filters, Spark dynamic partition pruning, Snowflake runtime pruning). Redshift: KEY distribution collocates on the join key, ALL copies a table to every node, AUTO decides.\n\n## Table formats and catalogs (lessons 11 and 12)\n\n| Layer | Example | Holds |\n|---|---|---|\n| File format | Parquet | one file's rows, by column, with stats |\n| Table format | Iceberg 1.12, Delta 4.4, Hudi 1.2, DuckLake 1.1 | which files make each version, schemas, partition specs, snapshots |\n| Catalog | Hadoop folder, JDBC, Hive Metastore, REST (Polaris, Unity Catalog) | each table's pointer; the commit's compare-and-swap |\n\nIceberg: pointer, `vN.metadata.json`, a manifest list per snapshot, manifests with per-file stats, Parquet. A commit writes new files, then swaps the pointer only if it still names the base; the loser retries. `VERSION AS OF` until snapshots expire. Hidden partitioning: `PARTITIONED BY (days(created_at))`.\n\n| Row-level change | Writes | Reads |\n|---|---|---|\n| copy-on-write (default) | rewrites every file with a changed row | plain files |\n| merge-on-read, v2 | new rows + position delete files | merge the deletes |\n| merge-on-read, v3 | new rows + one deletion vector per data file | one bitmap per file |\n\nMaintenance, in order: `rewrite_data_files` (a `replace` snapshot), `expire_snapshots` (ends time travel), `remove_orphan_files` (3 days by default, refuses under 24 hours).\n\n## Orchestration (lesson 13)\n\nThree schedulers: the orchestrator (Airflow 3, Dagster, Prefect: when, in what order, for which logical date), the engine (Spark driver: tasks and retries), the resource manager (Kubernetes, YARN: which machine).\n\nA task is safe to retry or backfill when it reads its logical date's partition (never `now()` or \"latest\") and replaces that date's output in one commit (overwrite the partition, delete and insert in one transaction, `MERGE`). Outside effects go in their own task with a record of what was done. Speculation (`spark.speculation`, off by default) fixes slow machines, not skew.\n\n`airflow backfill create --dag-id d --from-date ... --to-date ... --reprocess-behavior none|failed|completed --max-active-runs N --run-backwards`. Time = ceil(days / N) waves x run time; backfill tasks aren't deprioritized, so cap N.\n\n## Batch outputs (lesson 14)\n\n- ELT: load raw, transform in the warehouse with SQL; dbt models are SELECTs ordered by `ref()`.\n- Training data: point-in-time join. For a label at t, the newest feature row with event time <= t and write time <= t, within a TTL. A join to current features leaks the future.\n- Serving: never write row by row into the live database. Publish through Kafka with a completion marker, or build files offline (RocksDB `SstFileWriter` + `IngestExternalFile`) and switch versions with one atomic pointer replace (rename over `CURRENT`). Rollback = publish the previous version.\n\n## Engines (lesson 15)\n\n| Engine | Use it for |\n|---|---|\n| DuckDB 2.0 | anything one machine reads in time: ad hoc, reports, tests; Parquet and Iceberg in place |\n| Polars 2.1, pandas 3.1 | DataFrames on one machine: Polars lazy and out-of-core, pandas eager and in memory |\n| Spark | long batch jobs, backfills, big joins and shuffles, Structured Streaming |\n| Trino 484 | interactive SQL for many users over the lake and other sources (needs Java 25) |\n| ClickHouse | sub-second queries on fresh events, in its own storage |\n| Flink | streaming as the product: per-event latency, very large state |",
+  "recap": [
+    "A scan costs the bytes it reads over the slowest stage's bandwidth. Read fewer bytes (columns, compression, partitions, min/max) before adding machines, and size every job by its bytes after pruning, not by the size of the table.",
+    "One machine goes far: a hash map while the keys fit, an external merge sort when they don't. A cluster earns its overhead only when the data, the deadline or the working set outgrows one machine.",
+    "MapReduce's ideas survived: blocks read in parallel, map then shuffle by key then reduce, re-running deterministic tasks, atomic output commits. Object stores replaced HDFS, and their 2024 conditional writes give a commit the compare-and-swap it needs.",
+    "Spark builds a lazy plan, Catalyst optimizes it, and each shuffle splits a job into stages. Most tuning is about the shuffle: partition counts, broadcast or sort-merge joins, and hot keys, which AQE or salting fix and speculation doesn't.",
+    "Spark 4 runs clients over Connect, fails bad data loudly in ANSI mode and stores JSON as VARIANT; this track pins 4.1 because that's the newest line Iceberg 1.12 and Delta 4.4 both support.",
+    "A warehouse models events as a fact table at a declared grain around flat dimensions, keeps changing attributes as type 2 versions with surrogate keys, and runs star queries by broadcasting dimensions and pushing their keys into the fact scan.",
+    "A lakehouse table is immutable Parquet files plus a tree of metadata committed by one compare-and-swap in a catalog: atomic commits, snapshots, time travel, safe schema and partition changes, and row-level corrections that need compaction and snapshot expiry.",
+    "Every layer retries, so batch tasks must be idempotent: read the logical date's partition and replace its output in one commit. Then retries and backfills are safe; cap backfills so the nightly runs keep running.",
+    "Batch output feeds analysts (ELT with dbt), models (point-in-time training sets that never see the future) and services (stores built offline and switched by one atomic pointer, never written row by row).",
+    "With one copy of the data in an open table format, each workload picks its engine by the numbers: DuckDB or Polars when one machine is enough, Trino for shared interactive SQL, Spark for heavy batch, a streaming engine for continuous work."
+  ],
+  "quiz": [
+    {
+      "q": "A 5 TB payments table holds 2 years of daily partitions and 50 columns of similar size. An analyst's query reads 5 columns of the last 10 days. Which estimate should drive the choice of engine?",
+      "options": [
+        "5 TB, the size of the table",
+        "About 68 GB, the last 10 days",
+        "About 6.8 GB: 10 of 730 days and 5 of 50 columns, a few seconds on one machine",
+        "The number of rows, because engines process rows"
+      ],
+      "answer": 2,
+      "why": "5 TB x 10 / 730 = 68 GB for the days, x 5 / 50 = 6.8 GB for the columns. At 2 to 3 GB/s that's a few seconds on one machine. 68 GB forgets that Parquet reads only the columns a query uses; 5 TB forgets pruning altogether."
+    },
+    {
+      "q": "A Kotlin job counts payments per card with a `HashMap<String, Long>`. With 200 million distinct cards it dies with OutOfMemoryError. What keeps it on one machine?",
+      "options": [
+        "Switch to a `TreeMap`",
+        "An external merge sort: sort runs that fit in memory, write them to disk, merge them, then count adjacent equal keys",
+        "Nothing: it needs a cluster",
+        "Count in parallel threads with the same map"
+      ],
+      "answer": 1,
+      "why": "The hash map's memory grows with the distinct keys, about 100 bytes plus the key each on the JVM, and fails all at once. A sort uses disk gracefully: sorted runs of buffer size, merged F at a time, then a streaming count. A TreeMap holds the same keys, and threads share the same heap."
+    },
+    {
+      "q": "Two writers commit to the same Iceberg table on S3, both starting from `v7.metadata.json`. What makes sure exactly one of them becomes v8?",
+      "options": [
+        "A compare-and-swap: a catalog's conditional update, or since 2024 an S3 write with `If-None-Match` or `If-Match`",
+        "S3's strong read-after-write consistency alone",
+        "A lock on the table's folder",
+        "The last writer wins, and Iceberg merges the two later"
+      ],
+      "answer": 0,
+      "why": "A commit must swap the pointer only if it still names the version the writer started from. Consistency makes reads current but doesn't stop two writers from both writing; folders can't be locked on S3. Catalogs do the swap with a conditional update or an HTTP commit with requirements, and S3's conditional writes now offer the same primitive."
+    },
+    {
+      "q": "A join stage has 200 tasks; 199 finish in 30 seconds and one runs for 40 minutes, having read 30% of the shuffle data. What fixes it?",
+      "options": [
+        "`spark.speculation=true`",
+        "More shuffle partitions",
+        "A bigger executor for every task",
+        "AQE's skew join (with its thresholds met) or salting the hot key"
+      ],
+      "answer": 3,
+      "why": "One hot key lands in one partition however many partitions there are, and a speculative copy reads the same oversized partition. Splitting the key is the fix: AQE splits partitions over 5 times the median and 256 MB, or you salt the key and replicate the other side."
+    },
+    {
+      "q": "In a star schema, merchant 7 moves from LOW to HIGH risk. Which design keeps last quarter's report unchanged when it is rerun?",
+      "options": [
+        "Overwrite merchant 7's dimension row (type 1)",
+        "Close merchant 7's current version and add a new one with a new surrogate key (type 2), with each fact keeping the key valid on its day",
+        "Copy the tier onto the fact rows only for new payments",
+        "Delete merchant 7's old payments"
+      ],
+      "answer": 1,
+      "why": "Type 2 keeps both versions, and each payment points at the version it was made under, so a rerun groups old payments by their old tier. Type 1 moves the whole history into HIGH; the other options lose or split data."
+    },
+    {
+      "q": "A merge-on-read Iceberg table takes a correction batch every 5 minutes. After a month, reads are slow and the bucket has doubled, though the rows are right. What was missing?",
+      "options": [
+        "Scheduled maintenance: compaction (`rewrite_data_files`), then `expire_snapshots`, and `remove_orphan_files` now and then",
+        "A bigger cluster",
+        "Switching to copy-on-write",
+        "A REST catalog instead of a JDBC one"
+      ],
+      "answer": 0,
+      "why": "Merge-on-read writes small data and delete files that every reader must merge, and old snapshots keep old files alive. Compaction rewrites them into a few clean files; expiry deletes files only old snapshots used. Copy-on-write would rewrite large files every 5 minutes instead."
+    },
+    {
+      "q": "An Airflow task does `INSERT INTO daily_totals SELECT ... WHERE day = '{{ ds }}'` with `retries=3`. Which change makes retries and backfills safe?",
+      "options": [
+        "Lower `retries` to 1",
+        "Use `now()` instead of `ds` so the data is always fresh",
+        "Run the backfill with `--max-active-runs 1`",
+        "Replace the day in one transaction (delete the day and insert it, or overwrite the partition)"
+      ],
+      "answer": 3,
+      "why": "An attempt that dies after its insert committed leaves its rows, and the retry adds them again. Replacing the day makes a second run leave what the first did. Fewer retries make it rarer, not right; `now()` breaks backfills; serial backfill runs still double each day."
+    },
+    {
+      "q": "A fraud model's training set joins each payment to the card's newest feature row. Offline recall is 98%; in production it is 62%. What is the fix?",
+      "options": [
+        "Train a more complex model",
+        "Join each payment to the newest row whose event time and write time are both at or before the payment (point in time)",
+        "Use only the oldest feature row per card",
+        "Add more months of data"
+      ],
+      "answer": 1,
+      "why": "The newest rows were computed after the payments and included chargebacks caused by the very frauds being labelled: label leakage. A point-in-time join shows the model only what existed at decision time, which is what production shows it."
+    },
+    {
+      "q": "A nightly job recomputes risk scores for 1 million merchants that the authorization service reads. How should it publish them?",
+      "options": [
+        "Build the new scores as a new version offline, check it, then switch a pointer to it in one atomic step",
+        "UPDATE each merchant's row in the live database as the job computes it",
+        "Truncate the table, then insert the new scores",
+        "Email the file to the service owners"
+      ],
+      "answer": 0,
+      "why": "Row-by-row updates cost a round trip each, compete with live traffic, show readers a mix of two runs and leave half a table if the job dies; truncating leaves the table empty for a while. A new version plus one pointer flip is all or nothing, and rollback is flipping back."
+    },
+    {
+      "q": "On a laptop, the same filter, join and aggregation over 10 million payments takes about 0.1 s in DuckDB and about 1.4 s in Spark local mode. Why?",
+      "options": [
+        "Spark reads Parquet row by row",
+        "DuckDB caches the answer",
+        "Spark pays for planning stages, scheduling tasks, writing and fetching shuffle files and running in the JVM, which only pay off across many machines",
+        "DuckDB skips the join"
+      ],
+      "answer": 2,
+      "why": "Both engines read columns and really run the join. Spark's fixed costs exist so work can spread over machines and survive failures; on one machine they're pure overhead. The crossover comes when the data or the working set outgrows one machine."
+    }
+  ]
+}

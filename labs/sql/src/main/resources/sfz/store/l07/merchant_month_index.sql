@@ -1,0 +1,24 @@
+-- Lesson store-07, exercise 1 of 3: an index for the merchant dashboard (a trap)
+--
+-- The dashboard runs this query for any merchant and any month:
+--
+--   SELECT payment_id, amount_minor, created_at
+--   FROM payments
+--   WHERE merchant_id = 6
+--     AND created_at >= '2026-03-01' AND created_at < '2026-04-01'
+--   ORDER BY created_at DESC
+--   LIMIT 20;
+--
+-- Write ONE CREATE INDEX that lets PostgreSQL answer it by reading a few pages: an index scan,
+-- no Sort node, and at most 40 buffers for the whole query.
+--
+-- The tests run your statement on a 200,000-row copy of payments (schema lab11, where merchant 6
+-- has one payment in a thousand), then EXPLAIN (ANALYZE, BUFFERS) the query. In psql, try it on
+-- the large data set: SET search_path = big, public; (and DROP INDEX it when you are done).
+--
+-- The index below has the right columns in the wrong order: the scan walks backward through
+-- every payment of March, of every merchant, to find merchant 6's twenty.
+-- Check it: ./gradlew :sql:test --tests 'sfz.store.l07.*'   (from the labs folder)
+-- Keep this file plain SQL: psql backslash commands such as \pset do not work in it.
+
+CREATE INDEX payments_merchant_month_idx ON payments (created_at, merchant_id);

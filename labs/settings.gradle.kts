@@ -5,6 +5,7 @@ plugins {
 
 rootProject.name = "systems-from-zero-labs"
 
-// one subproject per track; each has exercises (src/main), solutions (src/solution),
+// one subproject per toolchain; a lesson lives in package sfz.<track>.lNN of the module whose libraries it needs.
+// Each has exercises (src/main), solutions (src/solution),
 // shared tests (src/test) and runnable demos (src/demo)
-include("net", "os", "sql", "nosql", "internals", "kafka", "redis", "bigdata")
+include("net", "os", "sql", "nosql", "internals", "kafka", "redis", "bigdata", "sim", "flow")

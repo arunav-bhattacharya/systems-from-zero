@@ -1,0 +1,129 @@
+{
+  "id": "cache",
+  "intro": "By the end of this track you can say why a cache works and what it costs. You can work out what a hit ratio does to latency and to the database behind it, explain how an in-memory store runs commands and what each key costs in memory, predict when a key expires or is evicted, choose a caching pattern, keep a cache from serving an old row after a write, build rate limits and idempotency keys that survive crashed pods, and say what survives a crash and how a cluster splits the keys. Each lesson teaches the concept first. Redis 8.10 is the worked example throughout, with Valkey, memcached, Caffeine and Dragonfly where they answer the same question differently, and the published numbers from Meta, Uber, Twitter and Cloudflare as the evidence.\n\nYou need to read Java or Kotlin; every sample comes in both. Lesson 1 needs no Redis at all. Lesson 2 builds the model the rest of the track uses: one thread runs every command to completion. The Operating systems track's lessons on the page cache, copy-on-write and malloc come back in lessons 9 and 10, with a one-line reminder each time. Some topics start here and finish in later tracks: scripts and transactions in Transactions, locks with fencing tokens in Faults, time and truth, replication and partitioning in their own tracks, Redis Streams in Messaging and logs.\n\nThe labs live in `labs/redis`, one package per lesson (`sfz.cache.l01` to `sfz.cache.l10`). Each lab is a failing test suite: run `./gradlew :redis:test --tests 'sfz.cache.lNN.*'` from the `labs` folder and make it pass; `src/solution` holds reference answers, which `./gradlew :redis:solutionTest` checks. Model labs (a Zipf generator and an LRU cache, an event loop, sampled LRU, a HyperLogLog, a replication backlog, a cluster router) need only a JDK. The others start a pinned `redis:8.10.3` container through Testcontainers, so Docker must be running. Try-its use `env/redis.yml` (one server, plus a tiny `small` one for eviction), `env/redis-ha.yml` (a primary, a replica and three Sentinels) and `env/redis-cluster.yml` (three cluster nodes). Everything was tested with Redis 8.10.3, Jedis 8.0.2, Lettuce 7.9.0, Testcontainers 2.0.5 and JDK 25; lessons name the Redis version of every command newer than 7.2.",
+  "cheatsheet": "### Why caches work (lesson 1)\n\n| Layer | About |\n|---|---|\n| L1 cache | 1 ns |\n| RAM | 100 ns |\n| a read from the page cache | 1 µs |\n| a round trip in a data center | 0.1 to 0.5 ms |\n| a round trip across regions | 70 ms or more |\n\nAverage latency = h × hit time + (1 − h) × miss time. The slow layer sees (1 − h) × requests, so going from 99% to 99.9% hits cuts its load tenfold: count misses, not hits. A request with n lookups hits on all of them with probability h^n. Reads are skewed (Zipf, α mostly 1 to 2.5 in Twitter's caches), which is why a small cache catches most of them; a miss-ratio curve says how big it must be. A cache is derived data and never the only copy.\n\n### The model (lesson 2)\n\nOne thread runs every command to completion, one after another. So **every single command is atomic**, and **one slow command stalls every client**. Background threads, forked children and I/O threads (`io-threads`, off by default) never run commands.\n\n| Question | Answer |\n|---|---|\n| Is one command atomic? | Yes, always. A sequence of commands is not. |\n| What makes Redis slow for everyone? | One O(N) command (`KEYS`, `HGETALL` on a big hash, `DEL` of a big key, a long script), a fork, a starved VM. |\n| Round trip vs command | A `GET` costs about half a microsecond of server time and a few hundred microseconds of network. Batch round trips. |\n\n### Types and memory (lessons 3 and 4)\n\n| Need | Type | Watch out |\n|---|---|---|\n| A value, a counter | string: `SET`, `INCR` | a plain `SET` drops the TTL; use `KEEPTTL` |\n| An object's fields | hash: `HSET`, `HINCRBY` | listpack up to 512 fields of 64 bytes, then a hash table |\n| A ranking | sorted set: `ZADD`, `ZRANGE ... REV` | ties sort by member; ranks start at 0; listpack up to 128 |\n| Membership | set | `SMEMBERS` on a big set is O(N); use `SSCAN` |\n| Daily active cards | bitmap: `SETBIT`, `BITCOUNT` | needs a dense integer id per card |\n| Distinct count | HyperLogLog: `PFADD`, `PFCOUNT` | 12 KB, 0.81% standard error, can't list members |\n| Nearby terminals | geo (a sorted set) | distances assume a sphere |\n| A work queue or event log | stream | trim with `MAXLEN ~` or `MINID ~` |\n\nEvery key also costs a slot in the keyspace's hash table: about 55 bytes for a tiny key on Redis 8.10, 46 on Valkey 9.1.\n\n### Expiry versus eviction (lesson 5)\n\n| | Expiry | Eviction |\n|---|---|---|\n| Removes | keys whose TTL deadline passed | keys Redis picks when `used_memory` reaches `maxmemory` |\n| When | lazily on access, plus a sampling cycle 10 times a second | before a write that needs room |\n| You control it with | `EXPIRE`, `SET ... EX`, `PERSIST` | `maxmemory`, `maxmemory-policy` |\n| Default | no TTL | `maxmemory 0` (no limit), `noeviction` (writes fail when full) |\n\nData (idempotency keys, rate limits, locks): `noeviction`, a TTL on every key, an alert near `maxmemory`. Cache: `allkeys-lru`. Separate instances. `volatile-*` policies act like `noeviction` when no key has a TTL.\n\nEviction is a bet on the future: LRU bets on recency, LFU on frequency, ARC and W-TinyLFU on both, and S3-FIFO and SIEVE drop one-hit wonders quickly and move nothing on a hit. Redis samples 5 keys into a pool of 16 and evicts the best candidate (LRU, LFU, or LRM since 8.6).\n\n### Caching patterns and stampedes (lesson 6)\n\n| Pattern | Who loads on a miss | Who writes, and when |\n|---|---|---|\n| Cache-aside | your code | your code: the database, then `DEL` the key |\n| Read-through | the cache's loader | pair it with a write pattern |\n| Write-through | | the cache: the database first, before `put` returns |\n| Write-behind | | the cache: now in memory, the database later (the cache is the system of record until it flushes) |\n| Refresh-ahead | the cache, before expiry | |\n\nFor payments: cache-aside, `DEL` after the commit, a TTL on every entry with ±10% jitter, and \"not found\" cached briefly. A stampede is rate × rebuild time: 10 reads a second and a 3-second rebuild make 30 rebuilds.\n\n| Stampede fix | Reach |\n|---|---|\n| single-flight (`ConcurrentHashMap` of futures, Caffeine `get(key, loader)`) | one JVM |\n| `SET lock:<k> <token> NX PX 2000`, losers poll the cache | all pods |\n| XFetch: recompute early when `now - delta * beta * ln(rand()) >= expiry` | all pods, no lock; about 2 to 3 rebuilds per refresh at beta 1 |\n\n### Keeping a cache honest (lesson 7)\n\nA cache is honest as long as no copy older than the newest invalidation can get into it.\n\n| Way in | Fix |\n|---|---|\n| two writers' `SET`s arrive out of commit order | delete instead of set, or set only if the version is newer |\n| stale set: a reader read before the commit and fills after the `DEL` | a lease: `SET lease:{k} <token> NX PX 10000` on a miss, writer `DEL k lease:{k}`, a Lua fill that checks the token |\n| a version check after a `DEL` or an eviction has nothing to compare with | leave a tombstone `{ver}` that outlives the slowest fill |\n| the pod dies between `COMMIT` and `DEL` | invalidate from the database's change log (CDC), still through the version check |\n| everything you haven't found | a TTL as the backstop, and a measured mismatch rate |\n\nMeta's leases cut peak database load on stampede-prone keys from 17,000 to 1,300 queries a second; measuring took TAO from six to ten nines of consistency at five minutes.\n\n### Rate limits and idempotency keys (lesson 8)\n\n| Limiter | State per subject | Accuracy |\n|---|---|---|\n| fixed window (`INCR` + TTL in one script, or `INCREX ... EX 60 ENX` on 8.8) | one counter | up to twice the limit across a boundary |\n| sliding log (sorted set, one script) | one member per request | exact |\n| sliding window counter | two counters | Cloudflare: 0.003% wrong decisions, 6% average deviation |\n| token bucket (hash of `tokens`, `ts`) | two numbers | a burst up to the capacity, then the rate |\n| GCRA (one theoretical arrival time) | one number | the same answers as the token bucket |\n\nIdempotency key: `SET idem:<key> <pending> NX GET PX 30000` before the work, where the pending value carries the body's hash and an owner token; after it, the stored response as DONE for 24 hours (`SET ... IFEQ <my pending>` on 8.4). PENDING with the same hash: 409. A different hash: 422. DONE: replay the stored response. A pod that charges and dies before DONE still needs the provider's idempotency key or the database transaction.\n\n### Durability and failover (lesson 9)\n\n| | Process killed (kill -9, OOM) | Machine dies (power, kernel panic) | Cost |\n|---|---|---|---|\n| No persistence | everything | everything | none |\n| RDB, default save points | writes since the last snapshot: minutes | the same | a fork plus copy-on-write pages per snapshot |\n| AOF `everysec` (default) | nothing | about the last second | one background fsync a second |\n| AOF `always` | nothing | nothing | an fsync per event-loop pass: far fewer writes a second |\n\nReplication is asynchronous: a replica follows the stream with an offset, and after a break resyncs from the backlog (`repl-backlog-size`, 1 MB) or with a full snapshot. `WAIT n ms` counts replicas that have this connection's writes; it undoes nothing. `WAITAOF` (7.2) waits for fsync. A fork copies the page table on the main thread (48 MB for 24 GB of data; about 10 to 25 ms per GB on modern machines, over 200 on old Xen VMs), and copy-on-write can nearly double memory under heavy writes; turn off transparent huge pages.\n\n| | Sentinel | Cluster |\n|---|---|---|\n| Data | one primary holds everything | split over primaries by hash slot |\n| Failover | 3 or more Sentinels: a quorum agrees, a majority acts | the other primaries vote for a replica |\n| Clients | ask a Sentinel for the primary | load the slot table, follow `MOVED` and `ASK` |\n| Multi-key commands | anything | only keys in one slot: use hash tags |\n\n### Cluster (lesson 10)\n\n`slot = CRC16(key) mod 16384`; only the part inside the first `{...}` is hashed when there is one. `MOVED <slot> <addr>`: update your table. `ASK <slot> <addr>`: send this one command there after `ASKING`. `CROSSSLOT`: a multi-key command, transaction or script spans slots. Tag by the smallest unit that must change atomically (`{payment:p-981}`), never by tenant.\n\n### When Redis is slow (lesson 10)\n\n| Check | What it tells you |\n|---|---|\n| `SLOWLOG GET 10` | commands that ran over 10 ms on the command thread |\n| `LATENCY LATEST`, `LATENCY DOCTOR` | forks, fsyncs, expiry cycles (set `latency-monitor-threshold` first) |\n| `INFO commandstats` | calls and microseconds per command |\n| `INFO persistence`, `INFO stats` | `latest_fork_usec`, `rdb_last_cow_size`, `evicted_keys`, `expired_keys` |\n| `INFO memory` | `used_memory`, `used_memory_rss`, `mem_fragmentation_ratio` |\n| `redis-cli --bigkeys`, `--memkeys`, `HOTKEYS` (8.6) | big keys and hot keys |\n| `redis-cli --intrinsic-latency 100` | stalls of the machine itself |\n\nNever `KEYS` in production: `SCAN` with `MATCH` and `COUNT`. `UNLINK`, not `DEL`, for big keys.\n\n### Java and Kotlin\n\n| | Jedis 8 | Lettuce 7.9 |\n|---|---|---|\n| Entry point | `RedisClient.builder().hostAndPort(h, p).build()` | `RedisClient.create(\"redis://h:p\")`, then `connect()` |\n| Connections | a pool: one connection per call | one multiplexed connection |\n| Style | blocking calls | sync, async, reactive, Kotlin coroutines (`coroutines()`) |\n| Pipelines and WAIT | `redis.pipelined()`: one connection for the batch | every call on the shared connection |\n| Cluster | `RedisClusterClient` | `io.lettuce.core.cluster.RedisClusterClient` |\n| Sentinel | `RedisSentinelClient` | `RedisURI.Builder.sentinel(...)` |\n\n### Commands by version\n\n| Since | Commands |\n|---|---|\n| 7.0 | functions (`FUNCTION LOAD`, `FCALL`), multi-part AOF, `EXPIRE ... NX/XX/GT/LT`, sharded pub/sub |\n| 7.2 | `WAITAOF` |\n| 7.4 | `HEXPIRE` and the other hash-field TTLs |\n| 8.4 | `SET ... IFEQ`, `DELEX`, `XREADGROUP ... CLAIM`, `CLUSTER MIGRATION` |\n| 8.6 | `XADD ... IDMP`, LRM eviction, `HOTKEYS` |\n| 8.8 | `INCREX`, `XNACK` |\n| 8.10 | `BACKUP` |\n\nValkey (BSD, forked from Redis 7.2.4 in 2024) runs everything up to 7.2; check the newer commands before relying on them there.\n\n### Where the rest went\n\nMULTI, WATCH, pipelines and Lua in full: the Transactions track's lesson on serial execution. Locks, leases and fencing tokens: the Faults, time and truth track. Pub/sub and Streams: the Messaging and logs track's lesson on Redis. Replication and partitioning in general: the Replication and Partitioning tracks.",
+  "recap": [
+    "A cache works because reads are skewed and the slow layer is a hundred to a thousand times slower. Count misses: from 99% to 99.9% hits cuts the database's load tenfold.",
+    "An in-memory store is fast mainly because it skips the disk format. Redis runs every command on one thread, so each command is atomic and one slow command stalls every client.",
+    "Memory goes per key and per encoding: compact listpacks up to a size threshold, then hash tables and skip lists. Sketches such as HyperLogLog trade a known error for fixed memory.",
+    "Expiry removes keys whose deadline passed, lazily and by sampling. Eviction is a bet on the future that Redis approximates by sampling; data gets `noeviction`, a cache `allkeys-lru`.",
+    "Caching patterns differ in who loads and who writes. For payments use cache-aside: delete after the commit, jitter TTLs, and stop stampedes with single-flight, a lock or XFetch.",
+    "Delete-on-write still loses to a stale set. A lease or a version check with tombstones makes Redis refuse old copies, change data capture survives crashed writers, and the TTL is the backstop.",
+    "Rate limits and idempotency keys check and record in one command or script. Pick fixed window, sliding log, sliding counter, token bucket or GCRA by accuracy and memory.",
+    "RDB loses minutes, the AOF with everysec about a second on a machine crash and nothing on a process crash. Forks cost about 10 to 25 ms per GB; replication is asynchronous.",
+    "Redis Cluster splits keys into 16,384 slots. Clients route by slot and follow MOVED and ASK; multi-key commands and scripts need one slot, which hash tags provide.",
+    "When Redis is slow, look for one slow command first (SLOWLOG, LATENCY, commandstats), then forks, big and hot keys, and the machine. SCAN, never KEYS; UNLINK for big keys."
+  ],
+  "quiz": [
+    {
+      "q": "A cache in front of Oracle answers 99% of 100,000 reads a second, with hits at 0.5 ms and misses at 10 ms. A change lifts the hit ratio to 99.9%. What happens?",
+      "options": [
+        "The load on Oracle falls by 0.9%, and so does the average latency",
+        "The load on Oracle falls from 1,000 to 100 queries a second, while the average latency barely moves, from about 0.6 to 0.51 ms",
+        "Both the load and the latency halve",
+        "Nothing measurable: past 99% a cache can't do better"
+      ],
+      "answer": 1,
+      "why": "Oracle sees only the misses: 1% of 100,000 is 1,000 a second, 0.1% is 100. The average is 0.99 × 0.5 + 0.01 × 10 ≈ 0.6 ms before and 0.999 × 0.5 + 0.001 × 10 ≈ 0.51 ms after, because hits already dominate it (lesson 1). Near the top, each extra nine is worth little in latency and a tenfold cut in database load."
+    },
+    {
+      "q": "A clean-up job runs `KEYS fraud:*` over 30 million keys on the production Redis. Another service sends `GET payment:42` meanwhile. What happens to the GET?",
+      "options": [
+        "It runs at once on an I/O thread",
+        "It returns the value from before the KEYS started, like a snapshot read",
+        "It fails at once with a BUSY error",
+        "It waits until the KEYS has walked every key, because one thread runs every command in turn"
+      ],
+      "answer": 3,
+      "why": "One thread executes every command to completion (lesson 2), so the GET waits in line behind a command that walks 30 million keys. I/O threads only read, parse and write; they never run commands. BUSY is for scripts that run past 5 seconds, and Redis has no snapshot reads. SCAN does the same walk in small slices so other clients get served in between (lesson 10)."
+    },
+    {
+      "q": "A per-merchant sorted set grows from 120 to 140 members, and `MEMORY USAGE` on it jumps about tenfold. Why?",
+      "options": [
+        "Past 128 members (`zset-max-listpack-entries`) Redis converts the compact listpack into a skip list plus a hash table, and never converts back",
+        "The members got longer",
+        "The sorted set was copied for a snapshot",
+        "Scores became doubles"
+      ],
+      "answer": 0,
+      "why": "Small sorted sets live in a listpack, one compact block of memory. At 129 members (or a member over 64 bytes) Redis converts the key to a skip list and a hash table, with pointers and headers for every member: about 1 KB became 11 KB on the lab server (lesson 3). Scores are always doubles, and snapshots don't change a key's encoding."
+    },
+    {
+      "q": "You must count distinct cards per merchant per day, about 10 million cards in all, within about 1%, in as little memory as possible. Which structure?",
+      "options": [
+        "A set of card ids per merchant per day",
+        "A sorted set scored by time",
+        "A HyperLogLog per merchant per day: at most 12 KB each, 0.81% standard error",
+        "A hash of card id to count"
+      ],
+      "answer": 2,
+      "why": "A HyperLogLog estimates distinct counts in at most 12 KB whatever the count, with a 0.81% standard error, and PFMERGE gives the union across days (lesson 4). A set or hash stores every id, hundreds of megabytes at this scale. The price: it can't list or remove members."
+    },
+    {
+      "q": "An idempotency store runs with `maxmemory-policy allkeys-lru`. Under memory pressure a 23-hour-old key disappears although its TTL was 24 hours, and a retried payment is charged twice. What removed it?",
+      "options": [
+        "Expiry: Redis expires keys early when memory is tight",
+        "A replica deleted it",
+        "The active expiry cycle sampled it by mistake",
+        "Eviction: allkeys-lru picked the key idle longest, whatever its TTL"
+      ],
+      "answer": 3,
+      "why": "Expiry only removes keys whose deadline has passed, and never early. Eviction removes keys Redis chooses when `used_memory` reaches `maxmemory`, and under allkeys-lru the oldest unread key goes first: a 23-hour-old idempotency key is the perfect candidate (lesson 5). Data like this belongs on an instance with `noeviction`, a `maxmemory` and an alert."
+    },
+    {
+      "q": "A hot merchant key is read about 10 times a second and takes 3 seconds to rebuild. About how many rebuilds start when it expires with a plain TTL, and with probabilistic early expiration (XFetch, beta = 1)?",
+      "options": [
+        "1 with a plain TTL, because the first miss rebuilds it, and 1 with XFetch",
+        "10 and 0: XFetch never lets the key expire",
+        "About 30 with a plain TTL, and about 2 or 3 with XFetch, starting a little before the deadline",
+        "About 30 with both: XFetch changes only when the rebuilds happen"
+      ],
+      "answer": 2,
+      "why": "Every read that arrives before the first rebuild finishes misses and rebuilds too: 10 a second × 3 seconds ≈ 30. XFetch lets each reader recompute early with odds that rise near the deadline, so usually one or two readers refresh before it and nobody misses; the lesson's simulation measured 2.7 rebuilds per refresh, close to the paper's 2.4 (lesson 6)."
+    },
+    {
+      "q": "A service commits a merchant rename to Oracle and then runs `DEL merchant:{m-17}`, yet readers keep getting the old name for an hour. Which race explains it, and what stops it?",
+      "options": [
+        "Two writers' SETs arrived out of order; delete instead of set",
+        "A reader read the old row before the commit and stored it after the delete; fill only while a lease the delete revokes is valid, or only if the version is newer than what the cache has seen",
+        "Redis ignored the DEL because the key had a TTL; use PERSIST first",
+        "The DEL went to a replica; send it to the primary"
+      ],
+      "answer": 1,
+      "why": "The service already deletes, so reordered SETs can't be the cause. This is the stale set: the DEL hit an empty key, then a slow reader's SET stored the row it read before the commit, with a full TTL (lesson 7). A lease taken on the miss and removed by the DEL makes the late fill fail; a version check with a tombstone refuses it too. A TTL never stops a DEL, and replicas refuse writes."
+    },
+    {
+      "q": "A rate limiter runs `INCR rl:card:7`, and if the result is 1, `EXPIRE rl:card:7 60`. A pod is killed between the two calls. What happens, and what fixes it?",
+      "options": [
+        "Nothing: Redis runs both commands as one step because they come from the same client",
+        "The counter has no TTL and never resets, so the card stays blocked; do both in one Lua script, or `INCREX ... EX 60 ENX` on Redis 8.8",
+        "Redis notices the missing EXPIRE and sets a default TTL",
+        "The INCR is rolled back when the connection drops"
+      ],
+      "answer": 1,
+      "why": "Each command is atomic because one thread runs it to the end (lesson 2), but two commands are two steps, and a crash can fall between them (lesson 8). Nothing in Redis ties the INCR to the EXPIRE that should follow, and there is no rollback. A script runs the count and the deadline as one command, and Redis 8.8's INCREX does it natively."
+    },
+    {
+      "q": "The machine running Redis loses power. Which configuration loses fewer acknowledged writes, and roughly how many?",
+      "options": [
+        "RDB with the default save points: nothing, since snapshots are on disk",
+        "They lose the same: both write to disk",
+        "The AOF with everysec: about the last second. RDB loses everything since the last snapshot, often minutes",
+        "The AOF with everysec: nothing, since every write is logged before the reply"
+      ],
+      "answer": 2,
+      "why": "A snapshot holds the data as of its fork; with save points that is up to minutes old (lesson 9). The AOF passes every write to the kernel before replying, which protects against a process crash, but a power cut also empties the page cache, so writes not yet fsynced are lost: about one second under everysec. Only `always` loses nothing, at a large cost in throughput."
+    },
+    {
+      "q": "The idempotency store will need 300 GB and 1 million commands a second, far more than one server. Sentinel or Cluster?",
+      "options": [
+        "Cluster: it splits the keys over many primaries by hash slot, each with its own replica and failover",
+        "Sentinel: it adds servers when memory runs low",
+        "Sentinel with more replicas, reading from all of them",
+        "Either: they are two names for the same thing"
+      ],
+      "answer": 0,
+      "why": "Sentinel watches one primary that holds every key and promotes a replica when it fails; replicas copy everything, so they split neither the memory nor the writes (lessons 9 and 10). Cluster gives each primary a share of the 16,384 slots and fails each one over separately. The price is that multi-key commands, transactions and scripts need their keys in one slot."
+    }
+  ]
+}

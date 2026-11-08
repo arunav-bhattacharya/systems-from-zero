@@ -1,4 +1,4 @@
-// Lesson nosql-10: two transactions collide on one document, then an outside write waits and a
+// Lesson txn-08: two transactions collide on one document, then an outside write waits and a
 // transaction outlives its time limit. Run against env/mongo.yml (a one-member replica set):
 //   docker compose -f env/mongo.yml exec mongo mongosh sfz --quiet /sfz/nosql-10-transactions.js
 db.accounts.drop()

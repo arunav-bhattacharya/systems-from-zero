@@ -1,0 +1,404 @@
+{
+  "id": "batch-13",
+  "title": "Orchestrating batch work: DAGs, retries and backfills",
+  "minutes": 40,
+  "goal": "By the end you can say which of three schedulers (the resource manager, the engine and the workflow orchestrator) decides what, make a batch task safe to retry by keying it to its partition and replacing its output, explain why speculative execution helps a slow machine and not a skewed key, and plan a backfill that is safe to rerun and leaves room for the nightly jobs.",
+  "warmup": {
+    "q": "A nightly Airflow task runs `INSERT INTO daily_totals SELECT ... WHERE day = '{{ ds }}'`. One night its worker is killed after the INSERT committed but before Airflow heard back. Airflow retries the task, and the retry succeeds. What does `daily_totals` hold for that day?",
+    "options": [
+      "One row: Airflow undoes a failed attempt before it retries",
+      "Two rows: the day is counted twice",
+      "No rows: the failed attempt's transaction was rolled back",
+      "One row: the database refuses the duplicate"
+    ],
+    "answer": 1,
+    "why": "The first INSERT had committed before the worker died, so its row stays. Airflow only knows the attempt didn't report success; it can't undo work a task did in another system, and it runs the task again. Without a unique constraint the database accepts the second row. With one, the retry fails instead, which is still not a correct pipeline. The fix is a write that replaces the day, so running twice leaves what running once does."
+  },
+  "sections": [
+    {
+      "h": "Three schedulers decide where, how and when",
+      "body": "The nightly settlement pipeline is three jobs. Job 1 imports the acquirer's settlement file. Job 2 is a Spark job that builds settlement lines from it. Job 3 publishes the report finance reads at 08:00.\n\nVersion 1 is cron: job 1 at 00:30, job 2 at 02:00, job 3 at 04:00, with the gaps guessed from how long each job usually takes. It works most nights. On the nights the acquirer's file lands two hours late, job 2 starts at 02:00 anyway and builds the report from a half-imported day; in the Try it that happens on 2 of 30 nights, and nothing fails, so nobody notices. Cron also doesn't retry a job that died, doesn't stop two runs of the same job from overlapping, and keeps no record of which day each run was for.\n\nVersion 2 states the dependencies and lets a program start each job when the jobs it needs have finished. The jobs and their \"must finish before\" edges form a **DAG**, a directed acyclic graph. Acyclic means no job depends on itself through a chain, so there is always an order that runs every job after everything it needs: a topological order. The program that runs DAGs is a **workflow orchestrator**: Apache Airflow (3.4 is current), Dagster and Prefect are the common ones. Each run of a DAG is for one **logical date**, the day of data it processes, which is not the same as the moment it runs: the run for 6 November starts in the early hours of 7 November, or months later in a backfill.\n\nThe orchestrator is only the top of three layers that all schedule something, as the figure shows. The middle layer is the engine's own scheduler. Lesson 6 showed Spark's driver splitting a job into stages and tasks and retrying a failed task from its lineage, up to 4 attempts by default (`spark.task.maxFailures`); Airflow never sees those tasks. The bottom layer is the resource manager, which decides which machine runs each process and with how much CPU and memory: YARN on Hadoop clusters, Kubernetes almost everywhere else. On Kubernetes the Spark driver runs in a pod and asks the Kubernetes API for executor pods (Spark 4.3's documentation lists Kubernetes 1.34 or newer), and the kubelet on each node runs them in cgroups, the Operating systems track's containers lesson.\n\nResource managers share a cluster between jobs that each want more than their share. Say 160 cores and two jobs that each ask for 100. The scheduler can give each 80, run one and queue the other, or take cores away from a low-priority job that is already running, which kills its tasks. Batch work is the usual victim, because it can be redone: it runs on cheap capacity that the cloud provider can reclaim at short notice, and DDIA cites Google's Borg paper for the observation that tasks are killed by preemption more often than by hardware faults. So every layer retries, and the rest of this lesson is about making retries safe.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three layers of scheduling: a workflow orchestrator submits jobs to an engine scheduler, which asks a resource manager for machines\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"30\" width=\"260\" height=\"62\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"57.0\" text-anchor=\"middle\">Workflow orchestrator</text><text class=\"t-s t-m\" x=\"150.0\" y=\"75.0\" text-anchor=\"middle\">Airflow, Dagster, Prefect</text><text class=\"t-s\" x=\"300\" y=\"67\" text-anchor=\"start\">when each job runs, in what order, for which day</text><rect class=\"box-b\" x=\"20\" y=\"120\" width=\"260\" height=\"62\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"147.0\" text-anchor=\"middle\">Engine scheduler</text><text class=\"t-s t-m\" x=\"150.0\" y=\"165.0\" text-anchor=\"middle\">the Spark driver</text><text class=\"t-s\" x=\"300\" y=\"157\" text-anchor=\"start\">a job's stages and tasks, and their retries</text><rect class=\"box\" x=\"20\" y=\"210\" width=\"260\" height=\"62\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"237.0\" text-anchor=\"middle\">Resource manager</text><text class=\"t-s t-m\" x=\"150.0\" y=\"255.0\" text-anchor=\"middle\">Kubernetes, YARN</text><text class=\"t-s\" x=\"300\" y=\"247\" text-anchor=\"start\">which machine runs each container, with how much CPU</text><line class=\"ln\" x1=\"150\" y1=\"92\" x2=\"150\" y2=\"118\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"150\" y1=\"182\" x2=\"150\" y2=\"208\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"160\" y=\"108\" text-anchor=\"start\">submits a job</text><text class=\"t-s t-m\" x=\"160\" y=\"198\" text-anchor=\"start\">asks for executors</text></svg>",
+        "caption": "Three layers that all schedule: the orchestrator decides when each job runs and for which day, the engine schedules a job's tasks, and the resource manager places processes on machines."
+      },
+      "try": {
+        "title": "Cron's guess against a DAG's dependency",
+        "minutes": 3,
+        "steps": [
+          "Run `CronVsDagDemo`. It simulates 30 nights. The acquirer's file usually lands around 00:30 and sometimes hours late, the import takes 40 to 80 minutes, and the report starts either at 02:00 (cron) or when the import finishes (a DAG).",
+          "Before reading: on how many nights will the cron report be wrong, and will any of its runs fail?",
+          "Is the DAG's report always later than cron's? Look at the median."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "CronVsDagDemo.kt",
+          "src": "package sfz.batch.l13.demo\n\nimport kotlin.random.Random\n\n/**\n * Thirty nights of a two-job pipeline. Job 1 imports the acquirer's settlement file, which usually\n * lands at about 00:30 but some nights is hours late. Job 2 builds the settlement report from it.\n * With cron, job 2 starts at 02:00 every night, a guess that \"job 1 is surely done by then\". With\n * a DAG, job 2 starts when job 1 finishes.\n */\nfun main() {\n    val rnd = Random(2026)\n    fun clock(m: Int) = \"%02d:%02d\".format(m / 60, m % 60)\n    var wrong = 0\n    val cronReady = mutableListOf<Int>()\n    val dagReady = mutableListOf<Int>()\n    println(\"night  file lands  import done  cron report (02:00)        DAG report\")\n    for (night in 1..30) {\n        val late = rnd.nextDouble() < 0.1\n        val lands = 30 + if (late) 60 + rnd.nextInt(120) else rnd.nextInt(15)\n        val imported = lands + 40 + rnd.nextInt(40)                  // the import takes 40 to 80 minutes\n        val cronOk = imported <= 120\n        if (!cronOk) wrong++\n        cronReady += 120 + 10\n        dagReady += imported + 10                                     // the report itself takes 10 minutes\n        if (!cronOk || night <= 3) {\n            println(\"%5d  %10s  %11s  %-25s  %s\".format(night, clock(lands), clock(imported),\n                if (cronOk) \"${clock(130)}, right\" else \"${clock(130)}, read a partial day\", \"${clock(imported + 10)}, right\"))\n        }\n    }\n    println(\"(nights 4 to 30 not shown unless cron got them wrong)\")\n    println(\"cron: $wrong of 30 reports built from a partial import; every report ready at ${clock(130)}\")\n    println(\"DAG:  0 of 30 wrong; reports ready at a median ${clock(dagReady.sorted()[15])}, the latest at ${clock(dagReady.max())}\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l13.demo.CronVsDagDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l13/demo/CronVsDagDemo.kt"
+        },
+        "expect": "```text\nnight  file lands  import done  cron report (02:00)        DAG report\n    1       00:33        01:34  02:10, right               01:44, right\n    2       00:41        01:54  02:10, right               02:04, right\n    3       00:40        01:35  02:10, right               01:45, right\n    4       02:09        03:01  02:10, read a partial day  03:11, right\n   25       02:41        03:23  02:10, read a partial day  03:33, right\n(nights 4 to 30 not shown unless cron got them wrong)\ncron: 2 of 30 reports built from a partial import; every report ready at 02:10\nDAG:  0 of 30 wrong; reports ready at a median 01:52, the latest at 03:33\n```\n\nOn 28 nights the guess of 02:00 was safe, and on two nights the file landed after 02:00, so the cron report read a day that was still being imported. Neither run failed, which is the dangerous part. The DAG started the report when the import finished: it was never wrong, it was usually earlier than cron (a median of 01:52), and on the two late nights it was later, because there was nothing correct to report before then. The run is deterministic, so you get the same nights."
+      },
+      "refs": [
+        {
+          "title": "Spark: running on Kubernetes",
+          "url": "https://spark.apache.org/docs/latest/running-on-kubernetes.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A retry is safe only if running twice equals running once",
+      "body": "Every layer retries, so every task runs more than once sooner or later. Lesson 3 showed when re-running is harmless: MapReduce reran a lost task from the same immutable input, and the task's output became visible only through an atomic rename, so a second attempt could never leave two copies. Inside one engine, those rules hold by design.\n\nThe orchestrator's tasks break them, because they write to other systems: a warehouse table, a database, an API. And the orchestrator can't see inside them. It knows that an attempt started and that it either reported success or didn't. The case that does the damage is a task that did its writes and then died before reporting success: the worker was preempted, the pod ran out of memory during clean-up, the network dropped the reply. The orchestrator sees a failed attempt and runs it again. The stepper follows one such night.\n\nA task that is safe to retry is **idempotent**: running it twice leaves the same result as running it once. Three rules get you there.\n\n1. Read a fixed input: the partition for the run's logical date. Never \"the latest data\" or `now()`, because a retry tomorrow, or a backfill next month, would read something else.\n2. Write by replacing, never by adding: overwrite the day's partition (`INSERT OVERWRITE ... PARTITION`), delete and insert the day in one transaction, `MERGE` on a key, or make one table-format commit that replaces the day (lessons 11 and 12). Appending with `INSERT INTO` adds a second copy on every retry.\n3. Make the output appear in one step, so a crash leaves the old result or the new one, never half of each.\n\nAirflow's best-practices guide says the same in its own words: treat a task like a database transaction that never leaves partial results, use upserts instead of inserts, and read the partition for `data_interval_start` instead of the latest data. Prefect 3 makes \"at most once\" part of the API: a transaction with a key writes a record when it commits, and a rerun with the same key finds the record and skips the work.\n\nIn the Try it, one night's load task crashes right after writing its total. With `INSERT INTO`, the retry writes a second row and the report shows 11,949,314 cents for a day whose payments add up to 5,974,657. With a partition overwrite, the retry replaces the row and the report is right. Over 90 nights where a crash like that hits a fifth of the loads, the appending pipeline ends up 28% too high, and a retry policy alone made it worse.",
+      "stepper": {
+        "title": "One night, one crash after a write, two kinds of load",
+        "intro": "The same run of extract, load and report on 6 November, written into two tables: one by appending, one by replacing the day's partition.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 1 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">minute 5: extract</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">staging/2026-11-06</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">235 payments, ok</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"470\" y=\"95\" text-anchor=\"middle\">empty</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"470\" y=\"235\" text-anchor=\"middle\">empty</text></svg>",
+            "say": "Minute 5: `extract` copies the day's 235 payments into the `staging` partition for 2026-11-06. Both `daily_totals` tables are still empty for that day."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 2 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">minute 15: load, attempt 1</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">writes the day's total</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">5,974,657 cents</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box-a\" x=\"296\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box-a\" x=\"296\" y=\"198\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"220\" text-anchor=\"middle\">5,974,657</text></svg>",
+            "say": "Minute 15: `load` attempt 1 sums the staging partition and writes the total, 5,974,657 cents, into each table. The append adds a row; the overwrite replaces the day's partition with one row. So far they look the same."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 3 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-bad\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">the worker dies</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">before it reports success</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">the scheduler sees a failure</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"198\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"220\" text-anchor=\"middle\">5,974,657</text></svg>",
+            "say": "The worker dies before it can tell the orchestrator it succeeded. The write is done and committed, but the orchestrator only sees an attempt that never reported back, so it marks it **failed** and schedules a retry."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 4 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">minute 30: load, attempt 2</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">the retry writes again</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">and reports success</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box-bad\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">5,974,657</text><rect class=\"box-a\" x=\"414\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"468\" y=\"80\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box-ok\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box-a\" x=\"296\" y=\"198\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"220\" text-anchor=\"middle\">5,974,657</text></svg>",
+            "say": "Minute 30: attempt 2 does the same work. The appending table now has **two** rows for the day. The overwriting table still has one: replacing a partition with the same contents changes nothing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 5 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">minute 35: report</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">reads daily_totals</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">for 2026-11-06</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box-bad\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">5,974,657</text><rect class=\"box\" x=\"414\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"468\" y=\"80\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-bad\" x=\"470\" y=\"122\" text-anchor=\"middle\">report: 11,949,314 cents, wrong</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box-ok\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"198\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"220\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-ok\" x=\"470\" y=\"262\" text-anchor=\"middle\">report: 5,974,657 cents, right</text></svg>",
+            "say": "Minute 35: `report` sums the day. From the appending table it reports 11,949,314 cents, twice the truth, and every task in the run shows green. From the overwriting table it reports 5,974,657."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Step 6 of 6: a load that crashes after writing, retried, with an appending load and with a partition-overwrite load\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"230\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"135.0\" y=\"82.0\" text-anchor=\"middle\">next week: a backfill</text><text class=\"t-s\" x=\"135.0\" y=\"100.0\" text-anchor=\"middle\">reruns 2026-11-06</text><text class=\"t-s t-m\" x=\"135.0\" y=\"118.0\" text-anchor=\"middle\">every task once more</text><text class=\"t-s t-m\" x=\"135\" y=\"26\" text-anchor=\"middle\">what happens</text><text class=\"t-s t-m\" x=\"280\" y=\"32\" text-anchor=\"start\">append: INSERT INTO daily_totals</text><rect class=\"box-bad\" x=\"280\" y=\"40\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box\" x=\"296\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">5,974,657</text><rect class=\"box\" x=\"414\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"468\" y=\"80\" text-anchor=\"middle\">5,974,657</text><rect class=\"box-a\" x=\"532\" y=\"58\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"586\" y=\"80\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-bad\" x=\"470\" y=\"122\" text-anchor=\"middle\">report: 17,923,971 cents, wrong</text><text class=\"t-s t-m\" x=\"280\" y=\"172\" text-anchor=\"start\">overwrite: replace partition 2026-11-06</text><rect class=\"box-ok\" x=\"280\" y=\"180\" width=\"380\" height=\"100\" rx=\"8\"/><rect class=\"box-a\" x=\"296\" y=\"198\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s t-code\" x=\"350\" y=\"220\" text-anchor=\"middle\">5,974,657</text><text class=\"t-s t-ok\" x=\"470\" y=\"262\" text-anchor=\"middle\">report: 5,974,657 cents, right</text></svg>",
+            "say": "A week later a backfill reruns 6 November. The appending table gains a third row; the overwriting table is unchanged. An idempotent task survives retries and backfills alike, because both are just running it again."
+          }
+        ]
+      },
+      "try": {
+        "title": "Crash a load after its write, then retry",
+        "minutes": 4,
+        "steps": [
+          "Run `RetryDemo`. It runs one night with a load that crashes after writing and is retried, once with an appending load and once with an overwriting load, then 90 nights where such crashes hit at random.",
+          "Predict the report for each load before reading the output.",
+          "Some nights crashed twice. What does the appending table hold for such a night?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "RetryDemo.kt (the pipeline is in Model.kt)",
+          "src": "package sfz.batch.l13.demo\n\nimport java.time.LocalDate\nimport kotlin.random.Random\n\n/**\n * One night where the load task's worker dies right after it wrote its result, run with an\n * appending load and with an overwriting load. Then 90 nights with random crashes of that kind.\n */\nfun main() {\n    val day = LocalDate.of(2026, 11, 6)\n    for ((name, load) in listOf(\"append (INSERT INTO)\" to append, \"overwrite the partition\" to overwrite)) {\n        val w = Warehouse()\n        println(\"load = $name\")\n        runDay(w, day, load, crashes = 1) { println(\"  $it\") }\n        println(\"  the source says %,d cents\".format(payments(day).sum()))\n    }\n\n    val days = (0 until 90).map { LocalDate.of(2026, 8, 9).plusDays(it.toLong()) }\n    val rnd = Random(7)\n    val crashes = days.associateWith { var n = 0; while (n < 2 && rnd.nextDouble() < 0.2) n++; n }\n    val truth = days.sumOf { payments(it).sum() }\n    println(\"90 nights, each load crashing after its write with chance 20% (sometimes twice): ${crashes.values.count { it > 0 }} nights hit\")\n    for ((name, load) in listOf(\"append\" to append, \"overwrite\" to overwrite)) {\n        val w = Warehouse()\n        days.forEach { runDay(w, it, load, crashes.getValue(it)) }\n        val wrong = days.count { w.read(\"daily_totals\", it) != listOf(payments(it).sum()) }\n        println(\"  %-9s total %,15d cents, %+.1f%% against the source, %d wrong days\".format(name, w.total(\"daily_totals\"), 100.0 * (w.total(\"daily_totals\") - truth) / truth, wrong))\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l13.demo.RetryDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l13/demo/RetryDemo.kt"
+        },
+        "expect": "```text\nload = append (INSERT INTO)\n  minute   5  extract   attempt 1: staging has 235 payments, ok\n  minute  15  load      attempt 1: wrote its total, daily_totals now has 1 row(s), then the worker died\n  minute  20  scheduler retries load after 5 minutes\n  minute  30  load      attempt 2: wrote its total, daily_totals now has 2 row(s), ok\n  minute  35  report    attempt 1: reports the day as 11,949,314 cents\n  the source says 5,974,657 cents\nload = overwrite the partition\n  minute   5  extract   attempt 1: staging has 235 payments, ok\n  minute  15  load      attempt 1: wrote its total, daily_totals now has 1 row(s), then the worker died\n  minute  20  scheduler retries load after 5 minutes\n  minute  30  load      attempt 2: wrote its total, daily_totals now has 1 row(s), ok\n  minute  35  report    attempt 1: reports the day as 5,974,657 cents\n  the source says 5,974,657 cents\n90 nights, each load crashing after its write with chance 20% (sometimes twice): 21 nights hit\n  append    total     720,540,797 cents, +28.0% against the source, 21 wrong days\n  overwrite total     563,126,222 cents, +0.0% against the source, 0 wrong days\n```\n\nThe two pipelines did exactly the same things in the same order; only the load's write differed. The appending load left one row per attempt, so the report doubled the day. The overwriting load replaced the day's partition on each attempt, so the retry was harmless. Over 90 nights, 21 had a crash of this kind, and the appending pipeline's total ended 28% above the source: some nights crashed twice and were counted three times. Every run reported success in the end."
+      },
+      "refs": [
+        {
+          "title": "Airflow best practices: tasks should be idempotent",
+          "url": "https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Prefect: transactions",
+          "url": "https://www.prefect.io/docs/v3/advanced/transactions",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A backup copy fixes a slow machine, not a big partition",
+      "body": "A stage of a batch job finishes when its slowest task finishes. One slow task, a **straggler**, holds back everything after it. The MapReduce paper lists real causes: a machine whose failing disk had dropped from 30 MB/s to 1 MB/s, other jobs competing for the same machine, and a bug that switched off the processor caches and made some machines more than 100 times slower.\n\nVersion 1 is to wait. With backup tasks switched off, the paper's 1 TB sort took 1,283 seconds instead of 891, 44% longer, and its last five tasks alone added about 300 seconds.\n\nVersion 2 is the backup task: near the end of a job, start a second copy of every task still running, on another machine, and take whichever copy finishes first. The paper puts the cost at a few percent more computing resources, and it removed the tail. The same paper killed 200 of 1,746 worker processes in the middle of the sort, and the job finished in 933 seconds, 5% slower than normal, because their tasks were simply rerun elsewhere.\n\nSpark calls it **speculative execution**, and it is off by default (`spark.speculation=false`). When you turn it on, Spark checks every 100 ms, and once 90% of a stage's tasks have finished (`spark.speculation.quantile`), any task running more than 3 times the median task time (`spark.speculation.multiplier`) gets a copy on a free slot. Since Spark 3.4 it first checks that the task is really progressing slowly for its input (`spark.speculation.efficiency.enabled`). It's off by default for the reason of the last section: two copies of a task run at the same time. Their output must commit atomically and carry no outside effects, or a task that writes to a database or calls an API does it twice.\n\nAnd speculation only fixes one kind of straggler. If the machine is slow, the copy runs on a healthy machine and wins. If the task is slow because its partition is big, the copy reads the same big partition and is just as slow. That's lesson 8's skew: one hot key sends 30% of the rows to one task, and the fix is to split the key, with AQE's skew join or salting, not to run it twice. In the Try it, one slow machine stretched a 40-second stage to 120 seconds, and speculation brought it back to 48. One skewed task stretched it to 144 seconds, and speculation launched a copy that changed nothing.",
+      "try": {
+        "title": "Speculate on a slow machine and on a skewed task",
+        "minutes": 3,
+        "steps": [
+          "Run `SpeculationDemo`. It simulates a stage of 200 tasks on 20 slots, once with one machine 30 times slower and once with one task holding 30 times the data, each without and with Spark's speculation rule.",
+          "Predict which case speculation rescues before you read the table.",
+          "Read the `stage` function. When does the rule start copying tasks, and which copy wins?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SpeculationDemo.kt",
+          "src": "package sfz.batch.l13.demo\n\n/**\n * One stage of 200 tasks on 20 task slots, on virtual time, run four ways. In the first case one\n * machine (two slots) has a failing disk and runs 30 times slower. In the second, one task has 30\n * times the data of the others (a skewed key). Each case runs without and with speculation, using\n * Spark's rule: once 90% of the stage's tasks are done, a task running longer than 3 times the\n * median task time gets a copy on a free slot, and whichever copy finishes first wins.\n */\nfun main() {\n    println(\"%-34s %18s %18s\".format(\"stage of 200 tasks, 20 slots\", \"no speculation\", \"speculation\"))\n    for ((name, slowSlots, bigTask) in listOf(\n        Triple(\"one slow machine (2 slots, 30x)\", setOf(0, 1), -1),\n        Triple(\"one skewed task (30x the data)\", emptySet(), 137),\n    )) {\n        val plain = stage(slowSlots, bigTask, speculate = false)\n        val spec = stage(slowSlots, bigTask, speculate = true)\n        println(\"%-34s %15.1f s %15.1f s   (%d speculative %s)\".format(name, plain.first, spec.first, spec.second, if (spec.second == 1) \"copy\" else \"copies\"))\n    }\n    println(\"a healthy stage takes %.1f s\".format(stage(emptySet(), -1, speculate = false).first))\n}\n\n/** Returns the stage's finish time in seconds and the number of speculative copies launched. */\nprivate fun stage(slowSlots: Set<Int>, bigTask: Int, speculate: Boolean): Pair<Double, Int> {\n    val tasks = 200\n    val slots = 20\n    val work = DoubleArray(tasks) { if (it == bigTask) 30.0 * 4 else 4.0 }       // seconds on a healthy slot\n    val speed = DoubleArray(slots) { if (it in slowSlots) 1.0 / 30 else 1.0 }\n    data class Copy(val task: Int, val slot: Int, val start: Double)\n    val running = mutableListOf<Copy>()\n    val done = BooleanArray(tasks)\n    val durations = mutableListOf<Double>()\n    val busy = BooleanArray(slots)\n    var next = 0\n    var copies = 0\n    var t = 0.0\n    val dt = 0.1\n    while (done.any { !it }) {\n        // start pending tasks on free slots, lowest slot first\n        for (s in 0 until slots) if (!busy[s] && next < tasks) { running += Copy(next++, s, t); busy[s] = true }\n        // speculation check, as Spark does every 100 ms\n        if (speculate && next == tasks && done.count { it } >= 0.9 * tasks) {\n            val median = durations.sorted()[durations.size / 2]\n            for (c in running.toList()) {\n                val alreadyCopied = running.count { it.task == c.task } > 1\n                if (!alreadyCopied && t - c.start > 3 * median) {\n                    val free = (0 until slots).firstOrNull { !busy[it] } ?: continue\n                    running += Copy(c.task, free, t); busy[free] = true; copies++\n                }\n            }\n        }\n        t += dt\n        // finish copies whose work is done; the first copy of a task to finish wins, the other is killed\n        for (c in running.toList()) {\n            if (c !in running) continue\n            if ((t - c.start) * speed[c.slot] >= work[c.task] - 1e-9) {\n                done[c.task] = true\n                durations += t - c.start\n                for (o in running.filter { it.task == c.task }) { running.remove(o); busy[o.slot] = false }\n            }\n        }\n    }\n    return t to copies\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l13.demo.SpeculationDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l13/demo/SpeculationDemo.kt"
+        },
+        "expect": "```text\nstage of 200 tasks, 20 slots           no speculation        speculation\none slow machine (2 slots, 30x)              120.0 s            48.0 s   (2 speculative copies)\none skewed task (30x the data)               144.0 s           144.0 s   (1 speculative copy)\na healthy stage takes 40.0 s\n```\n\nThe two cases look the same from outside: a stage that should take 40 seconds takes two or three times as long because of one or two tasks. Speculation tells them apart by accident. On the slow machine, the two tasks that landed there got copies on healthy slots, which finished long before the originals: 48 seconds. The skewed task's copy had the same 30 times more data to process, so it was no faster, and the stage still took 144 seconds. Times are virtual seconds from the simulation, so they're the same on every machine."
+      },
+      "refs": [
+        {
+          "title": "Dean and Ghemawat, MapReduce (OSDI 2004): backup tasks, section 3.6",
+          "url": "https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Spark configuration: spark.speculation and friends",
+          "url": "https://spark.apache.org/docs/latest/configuration.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A backfill reruns history, so every task must be safe to rerun",
+      "body": "A **backfill** runs a DAG for past logical dates. You need one whenever history has to be recomputed: a bug in the fee calculation was live for 90 days, a new report needs a year of data, a column was added to a table that existing rows should have too. Every day of history becomes one run.\n\nAirflow 3 runs backfills inside the scheduler, from the UI, the REST API or the command line:\n\n```bash\nairflow backfill create --dag-id settlement \\\n    --from-date 2026-08-09 --to-date 2026-11-06 \\\n    --reprocess-behavior completed --max-active-runs 8\n```\n\n`--reprocess-behavior` says which days to run: `none` runs only days that have no run yet, `failed` adds days whose run failed, and `completed` reruns every day. `--max-active-runs` caps how many of the backfill's runs go at once, and it matters more than it looks: Airflow's documentation says the scheduler does not deprioritize backfill tasks, so a backfill without a cap competes on equal terms with tonight's scheduled runs. `--run-backwards` processes the newest days first.\n\nThe arithmetic is waves. A year of daily runs of 20 minutes each, 16 at a time, takes 23 waves: about 7.7 hours. Run backwards, the newest week is ready after 20 minutes, which is usually what people are waiting for. The Try it prints the table for 1, 4 and 16 runs at a time.\n\nWhether a backfill is safe is decided by the tasks, not by the orchestrator. It is safe when every run reads only its own logical date's input and replaces its own output, because then running a day twice changes nothing and `--reprocess-behavior completed` is harmless. It is unsafe in three common ways. A task that appends doubles every day it reruns, as the Try it shows. A task that reads \"the latest partition\" or `now()` gets today's data in every historical run; the lab has one, and it copies today's total into all 90 backfilled days. A task with an outside effect, an email to each merchant or a call to a partner's API, repeats it for every day.\n\nThe newer orchestrators move the unit of work from tasks to data. In Airflow 3, a task can declare the **assets** it updates (tables or files), and another DAG can run whenever one of them changes. Dagster is built around software-defined assets: you declare each table and the function that computes it from its upstream tables, and running that function and storing the result is called materializing the asset. Give an asset daily partitions and a backfill becomes \"materialize these 90 partitions\", which only works if each partition is computed from its own inputs and replaced whole. Prefect 3 (3.9 is current) stays closer to plain Python: flows and tasks are functions marked `@flow` and `@task`.",
+      "try": {
+        "title": "Size a year's backfill, then run it twice",
+        "minutes": 3,
+        "steps": [
+          "Run `BackfillDemo`. It schedules 365 daily runs of 20 minutes with 1, 4 and 16 runs at a time, oldest first and backwards, then runs the whole backfill twice with each kind of load.",
+          "Before reading: how long does 16 at a time take? Work it out as waves.",
+          "Which number would your finance team care about first, the total time or the time until the newest week is ready?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "BackfillDemo.kt",
+          "src": "package sfz.batch.l13.demo\n\nimport java.time.LocalDate\n\n/**\n * A year of history backfilled with the daily-totals pipeline (20 minutes a run), with Airflow's\n * `--max-active-runs` at 1, 4 and 16, oldest first and with `--run-backwards`. Then the same backfill\n * run a second time, the way `--reprocess-behavior completed` would, with each kind of load.\n */\nfun main() {\n    val days = (0 until 365).map { LocalDate.of(2025, 11, 7).plusDays(it.toLong()) }\n    fun hours(m: Long) = \"%.1f h\".format(m / 60.0)\n    println(\"365 daily runs of 20 minutes:\")\n    for (active in listOf(1, 4, 16)) {\n        val (end, firstWeekDone) = backfill(days, active, backwards = false)\n        val (endB, newestWeekDone) = backfill(days, active, backwards = true)\n        println(\"  max active runs %2d: done after %7s; the newest week is ready after %7s, or %7s with run backwards\".format(\n            active, hours(end), hours(firstWeekDone), hours(newestWeekDone)))\n        check(end == endB)\n    }\n    for ((name, load) in listOf(\"append\" to append, \"overwrite\" to overwrite)) {\n        val w = Warehouse()\n        repeat(2) { days.forEach { runDay(w, it, load, crashes = 0) } }\n        val truth = days.sumOf { payments(it).sum() }\n        println(\"backfill run twice, load = %-9s total is %.2f times the source\".format(name, w.total(\"daily_totals\").toDouble() / truth))\n    }\n}\n\n/** Returns when the whole backfill ends, and when the newest 7 days are all done, in minutes. */\nprivate fun backfill(days: List<LocalDate>, active: Int, backwards: Boolean): Pair<Long, Long> {\n    val freeAt = LongArray(active)\n    val ends = mutableMapOf<LocalDate, Long>()\n    for (d in if (backwards) days.reversed() else days) {\n        val slot = freeAt.indices.minBy { freeAt[it] }\n        freeAt[slot] += 20\n        ends[d] = freeAt[slot]\n    }\n    return ends.values.max() to days.takeLast(7).maxOf { ends.getValue(it) }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.batch.l13.demo.BackfillDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/batch/l13/demo/BackfillDemo.kt"
+        },
+        "expect": "```text\n365 daily runs of 20 minutes:\n  max active runs  1: done after 121.7 h; the newest week is ready after 121.7 h, or   2.3 h with run backwards\n  max active runs  4: done after  30.7 h; the newest week is ready after  30.7 h, or   0.7 h with run backwards\n  max active runs 16: done after   7.7 h; the newest week is ready after   7.7 h, or   0.3 h with run backwards\nbackfill run twice, load = append    total is 2.00 times the source\nbackfill run twice, load = overwrite total is 1.00 times the source\n```\n\nThe total time is waves times run time: ceil(365 / 16) = 23 waves of 20 minutes is 7.7 hours, if the cluster really has room for 16 runs at once. Oldest first, the newest week is ready only at the very end; backwards, it's ready in the first wave. Running the whole backfill a second time, which is what `--reprocess-behavior completed` does after a partial failure, doubled the appending pipeline's numbers and left the overwriting pipeline's exactly right."
+      },
+      "refs": [
+        {
+          "title": "Airflow: backfill",
+          "url": "https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/backfill.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Dagster: assets",
+          "url": "https://dagster.io/docs/guides/build/assets",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A workflow orchestrator is a restaurant's expediter. Cooks (the engines) cook, the floor manager (the resource manager) decides which station each cook works at, and the expediter decides when each dish starts, based on what has to be ready first: the sauce before the plate, the plate before the pass. If a plate is dropped, the expediter calls it again. Calling a dish again is only safe if cooking it twice leaves one dish on the pass: a cook who adds a second steak to the same plate, instead of replacing the plate, turns every dropped plate into a double order. A backfill is the night the inspector asks the kitchen to recook last month's menu from the recipes and the delivery notes. The analogy breaks at the past: a kitchen can't recook yesterday's dinner, while a batch pipeline can recompute any day from its stored input, as long as each run reads only that day's input and replaces only that day's output.",
+  "in_your_world": "You already write idempotent code for payments. A Temporal activity can run more than once, so you give the card-issuer call an idempotency key and make the ledger write an upsert keyed by payment id. Batch tasks need the same discipline at the size of a day: the settlement job for 6 November reads the 6 November partition and replaces the 6 November output, so an Airflow retry, a Temporal retry of the activity that submits the Spark job, or a backfill next quarter all leave the same numbers. Keep the outside effects (the email to the merchant, the payout file sent to the bank) in their own task, keyed by day and merchant with a record of what was sent, so rerunning the computation never repeats them.",
+  "mistake": "The common mistake is turning on retries, or running a backfill, for tasks that append. `retries=3` feels like reliability, so it goes into the default arguments of every DAG, and nothing looks wrong: each run ends green. But every attempt that died after its write leaves its rows behind, and the next attempt adds them again, so the tables drift upward a few nights a month, and a backfill with `--reprocess-behavior completed` doubles a whole quarter at once. People make the mistake because their tasks were written as scripts that run once, and `INSERT INTO` is the natural way to write a script. The fix is in the task, not the orchestrator: read the logical date's partition, replace the logical date's output in one commit (overwrite the partition, delete and insert in one transaction, or MERGE on a key), and move outside effects into a separate task that records what it already did. Then turn retries on.",
+  "worked": {
+    "title": "Turn a cron script into a DAG that is safe to retry and backfill",
+    "steps": [
+      {
+        "say": "Start from what runs today: a crontab line and a script that totals \"yesterday\" and appends the result. It reads relative to the clock and appends, so a rerun on any other day computes the wrong day, and a rerun on the same day doubles it.",
+        "code": "# crontab: 02:00 every night\n0 2 * * * /opt/jobs/daily_totals.sh\n\n-- daily_totals.sh runs this SQL\nINSERT INTO daily_totals (day, total_cents)\nSELECT current_date - 1, sum(amount_cents)\nFROM payments\nWHERE created_at >= current_date - 1 AND created_at < current_date;",
+        "lang": "sql"
+      },
+      {
+        "say": "Make the day a parameter. The orchestrator passes the run's logical date, so the run for 6 November computes 6 November whether it runs that night, after a retry, or in a backfill months later.",
+        "code": "-- :day is the run's logical date (Airflow's {{ ds }} or data_interval_start)\nSELECT :day, sum(amount_cents)\nFROM payments\nWHERE created_at >= :day AND created_at < :day + INTERVAL '1 day';",
+        "lang": "sql"
+      },
+      {
+        "say": "Replace instead of append, in one transaction, so a crash leaves the old row or the new one and a rerun writes the same single row again.",
+        "code": "BEGIN;\nDELETE FROM daily_totals WHERE day = :day;\nINSERT INTO daily_totals (day, total_cents)\nSELECT :day, sum(amount_cents)\nFROM payments\nWHERE created_at >= :day AND created_at < :day + INTERVAL '1 day';\nCOMMIT;",
+        "lang": "sql"
+      },
+      {
+        "say": "Put it in a DAG with its dependency on the import and with retries, which are now safe. The `@dag` and `@task` decorators come from Airflow 3's task SDK, `airflow.sdk`.",
+        "code": "from datetime import datetime, timedelta\nfrom airflow.sdk import dag, task\n\n@dag(schedule=\"@daily\", start_date=datetime(2026, 1, 1), catchup=False,\n     default_args={\"retries\": 2, \"retry_delay\": timedelta(minutes=5)})\ndef daily_totals():\n    @task\n    def import_settlement_file(ds=None): ...   # reads the acquirer's file for day ds\n\n    @task\n    def load_totals(ds=None): ...              # the DELETE + INSERT above, for day ds\n\n    import_settlement_file() >> load_totals()\n\ndaily_totals()",
+        "lang": "python"
+      },
+      {
+        "say": "Recompute the 90 days a bug was live: a backfill, capped so tonight's runs still get scheduled, newest first so this week's numbers are fixed first. Because every run replaces its own day, running it again after a partial failure is harmless.",
+        "code": "airflow backfill create --dag-id daily_totals \\\n    --from-date 2026-08-09 --to-date 2026-11-06 \\\n    --reprocess-behavior completed --max-active-runs 8 --run-backwards",
+        "lang": "bash"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A DAG runner with retries and backfills, on virtual time",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/batch/l13/Dag.kt",
+      "labs/sim/src/main/kotlin/sfz/batch/l13/Runner.kt",
+      "labs/sim/src/main/kotlin/sfz/batch/l13/PaymentTasks.kt",
+      "labs/sim/src/main/kotlin/sfz/batch/l13/Warehouse.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.batch.l13.*'",
+    "steps": [
+      "Run the tests. All 13 fail on `TODO`s. Read `Warehouse.kt` and `PaymentTasks.kt` first: the pipeline is extract (5 minutes), load (10) and report (5), and `Faults` makes chosen attempts crash right after their writes.",
+      "Exercise 1, `Dag.topologicalOrder`: Kahn's algorithm. Count each task's unfinished dependencies, keep the ready tasks in id order, and throw `IllegalArgumentException` if some tasks never become ready (a cycle).",
+      "Exercise 2, `DagRunner.run`: run the tasks in that order on a clock that starts at `startMinute`. A task whose dependencies didn't all succeed is `UPSTREAM_FAILED` and never runs. Each attempt adds the task's minutes; a failed attempt waits `retryDelayMinutes` and tries again, up to `maxRetries` retries.",
+      "Exercise 3, `DagRunner.backfill`: `maxActiveRuns` slots, each day given to the slot that is free earliest. The timing test expects 23 waves of 20 minutes for 90 days at 4 runs at a time.",
+      "Exercise 4, `overwriteDailyTotal`: the idempotent load. Then look at what the append test proves about the given `appendDailyTotal`, and at the test where `latestDailyTotal` copies today into every backfilled day.",
+      "Run until all 13 pass. The last one is a jqwik property: 30 random crash patterns, and your overwrite load must match the source every time."
+    ],
+    "hints": [
+      "Kahn: `waiting = tasks.associate { it.id to it.deps.size }`, `dependents` grouped by dependency, `ready = sortedSetOf<String>()`. Take `ready.first()`, append it, decrement its dependents, add those that reach 0. If the order is shorter than the task list, there's a cycle.",
+      "In `run`, wrap the action: `runCatching { task.action(RunContext(logicalDate, attempt, warehouse)) }.isSuccess`. The first attempt plus `maxRetries` retries means `attempt > maxRetries` is the last one. Record attempts per task, 0 for a task that never ran.",
+      "In `backfill`, `val freeAt = LongArray(maxActiveRuns)`; for each day `val slot = freeAt.indices.minBy { freeAt[it] }`, run with `startMinute = freeAt[slot]`, then set `freeAt[slot]` to the run's end.",
+      "The idempotent load is one line different from the given append: `ctx.warehouse.overwrite(\"daily_totals\", ctx.logicalDate, listOf(total))`."
+    ],
+    "done_when": "All 13 tests in `DagRunnerTest` and `BackfillTest` pass."
+  },
+  "drill": {
+    "title": "Make a nightly task safe to retry",
+    "minutes": 5,
+    "prompt": "This task runs every night and is retried on failure: `INSERT INTO fee_totals SELECT merchant_id, sum(fee_cents) FROM settlement_lines WHERE settled_at >= now() - INTERVAL '1 day' GROUP BY merchant_id`. From memory, name its two problems and rewrite it so that a retry, or a backfill of any past day, leaves the right numbers. Use `:day` for the run's logical date.",
+    "answer": {
+      "lang": "sql",
+      "src": "-- problem 1: now() makes the input depend on when the task runs, so a retry or a backfill reads another window\n-- problem 2: INSERT INTO adds a second copy of every merchant's total on each retry\n\nBEGIN;\nDELETE FROM fee_totals WHERE day = :day;                          -- replace the day, never add to it\nINSERT INTO fee_totals (day, merchant_id, fee_cents)\nSELECT :day, merchant_id, sum(fee_cents)\nFROM settlement_lines\nWHERE settled_at >= :day AND settled_at < :day + INTERVAL '1 day'  -- the logical date's input only\nGROUP BY merchant_id;\nCOMMIT;"
+    }
+  },
+  "recap": [
+    "Three layers schedule batch work: the workflow orchestrator (Airflow, Dagster, Prefect) decides when each job runs, in what order and for which logical date; the engine (the Spark driver) schedules and retries a job's tasks; the resource manager (Kubernetes, YARN) places processes on machines.",
+    "A DAG states dependencies, so a job starts when its inputs are complete instead of at a guessed time, and every run is for one logical date.",
+    "Retries happen at every layer, so tasks must be idempotent: read the logical date's partition (never the latest data or `now()`), replace that date's output in one commit, and keep outside effects in their own task with a record of what was done.",
+    "Speculative execution copies a straggling task to another machine, which fixes a slow machine and does nothing for skew. Spark leaves it off by default because both copies run, so outputs must commit atomically.",
+    "A backfill runs the DAG for past dates. Cap it with `--max-active-runs` (backfill tasks aren't deprioritized), size it in waves, run it backwards to get recent days first, and expect `--reprocess-behavior completed` to rerun days that already succeeded."
+  ],
+  "quiz": [
+    {
+      "q": "A Spark job on Kubernetes, started by an Airflow task, loses one executor pod halfway through a stage. Who reruns the lost tasks?",
+      "options": [
+        "Airflow, which retries the whole task",
+        "Kubernetes, which restarts the pod with the same tasks inside",
+        "The Spark driver, which reruns those tasks on other executors from their lineage",
+        "Nobody: the stage fails and the job must be resubmitted"
+      ],
+      "answer": 2,
+      "why": "Tasks belong to the engine's layer. The driver notices the lost executor, asks Kubernetes for capacity if it needs it, and reruns the missing tasks (up to `spark.task.maxFailures` attempts each). Airflow sees nothing unless the whole Spark job fails, and Kubernetes only places pods; it doesn't know what tasks are."
+    },
+    {
+      "q": "From lesson 8: in a join stage, one task runs for 40 minutes while 199 finish in 30 seconds, and the Spark UI shows that task read 30% of the shuffle data. A teammate sets `spark.speculation=true`. What happens?",
+      "options": [
+        "Spark starts a copy of the long task on another executor, the copy reads the same 30% and is just as slow",
+        "The copy finishes in about 30 seconds, like the other tasks",
+        "Spark splits the big task into smaller ones",
+        "Nothing: speculation only works with dynamic allocation"
+      ],
+      "answer": 0,
+      "why": "The task is slow because of its data, one hot key, not because of its machine. A copy processes the same oversized partition and loses the race or ties. Splitting the partition is what AQE's skew join or salting do, as lesson 8 showed; speculation can't split anything.",
+      "from": "batch-08"
+    },
+    {
+      "q": "You need to backfill 180 days. Each run takes 30 minutes, and you set `--max-active-runs 12`. Roughly how long does it take, if the cluster can run 12 at once?",
+      "options": [
+        "30 minutes",
+        "7.5 hours",
+        "15 hours",
+        "90 hours"
+      ],
+      "answer": 1,
+      "why": "ceil(180 / 12) = 15 waves of 30 minutes each: 450 minutes, 7.5 hours. 90 hours is the runs one after another; 15 hours forgets that each wave is 30 minutes, not 60. Run backwards, the most recent days are done in the first wave."
+    },
+    {
+      "q": "Which daily task is safe to run again for any past day?",
+      "options": [
+        "It appends the day's totals to a table that has a unique index on `(day, merchant_id)`",
+        "It totals the newest partition of `payments` and overwrites the run's day",
+        "It reads the run's own day of `payments` and replaces that day's partition of the output in one commit",
+        "It emails each merchant their totals, then writes them to the table"
+      ],
+      "answer": 2,
+      "why": "Only the third reads a fixed input and replaces a fixed output, so running it again changes nothing. The unique index turns a retry into an error rather than a correct result. Reading the newest partition puts today's data into every historical day of a backfill. The email repeats on every run, whatever the table does."
+    },
+    {
+      "q": "A task calls a partner's API to report each merchant's daily total, then writes the totals to the warehouse. It times out after the API calls and is retried. What is the right fix?",
+      "options": [
+        "Raise the retry count so it eventually succeeds",
+        "Turn off retries for this task",
+        "Write the totals first, and make the API calls in a separate task that skips merchants and days already recorded as sent",
+        "Run it with speculative execution so a second copy finishes first"
+      ],
+      "answer": 2,
+      "why": "The outside effect is the part that can't be undone or overwritten, so it gets its own task, keyed by day and merchant, with a record of what was already sent: the batch version of an idempotency key. More retries repeat the calls more often, no retries makes a transient timeout a lost day, and speculation would run the calls twice on purpose."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Which three layers schedule batch work, and what does each decide?",
+      "back": "The orchestrator: when each job runs, in what order, for which day. The engine: a job's stages, tasks and their retries. The resource manager: which machine runs each process, with what CPU and memory."
+    },
+    {
+      "front": "What is a run's logical date?",
+      "back": "The day of data the run processes, as opposed to when it runs. The 6 November run may run that night, after a retry, or in a backfill months later."
+    },
+    {
+      "front": "What makes a batch task idempotent?",
+      "back": "It reads a fixed input (its logical date's partition) and replaces a fixed output (that date's partition) in one commit, so running it again leaves the same result."
+    },
+    {
+      "front": "Why does `INSERT INTO` plus retries over-count?",
+      "back": "An attempt that dies after its write but before reporting success leaves its rows, and the retry adds them again."
+    },
+    {
+      "front": "When does speculative execution help?",
+      "back": "When a task is slow because of its machine (a bad disk, contention). Not when its partition is big: the copy reads the same data."
+    },
+    {
+      "front": "What do `--reprocess-behavior` and `--max-active-runs` control in an Airflow 3 backfill?",
+      "back": "Which days rerun (`none`, `failed` or `completed`), and how many backfill runs go at once. The scheduler doesn't deprioritize backfill tasks, so the cap protects the nightly runs."
+    },
+    {
+      "front": "How long do 365 daily runs of 20 minutes take with 16 at a time?",
+      "back": "ceil(365 / 16) = 23 waves of 20 minutes: about 7.7 hours."
+    }
+  ],
+  "terms": [
+    {
+      "term": "DAG",
+      "plain": "A directed acyclic graph: tasks as nodes, \"must finish before\" as edges, with no cycles, so there is always an order to run them in."
+    },
+    {
+      "term": "Workflow orchestrator",
+      "plain": "A scheduler for whole jobs and their dependencies, such as Airflow, Dagster or Prefect."
+    },
+    {
+      "term": "Logical date",
+      "plain": "The day of data a DAG run is for, independent of when it actually runs."
+    },
+    {
+      "term": "Idempotent task",
+      "plain": "A task whose effect is the same whether it runs once or many times."
+    },
+    {
+      "term": "Backfill",
+      "plain": "Running a pipeline for past logical dates, to fill or recompute history."
+    },
+    {
+      "term": "Straggler",
+      "plain": "A task much slower than the rest of its stage, which delays everything after it."
+    },
+    {
+      "term": "Speculative execution",
+      "plain": "Starting a copy of a straggling task elsewhere and keeping whichever copy finishes first."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Explain to a teammate why your settlement totals were 28% too high after a quarter of nightly runs that all showed green, and what you changed so that retries and backfills are safe.",
+    "answer": "Every run showed green because every task eventually succeeded, but some of them succeeded on their second or third attempt. The load task appended the day's total with INSERT INTO. On some nights its worker died after the insert had committed but before it told the orchestrator it was done, so the orchestrator treated the attempt as failed and ran it again, and the retry inserted the same total a second time. Nights that crashed twice were counted three times. Nothing failed, so nothing alerted; the numbers just drifted up. Retries didn't cause the problem, they exposed that the task wasn't idempotent. We changed the task in two ways. It now reads only the partition for its logical date, never the latest data or the current time, so any rerun of 6 November sees the same input. And it replaces that day's output in one transaction (delete the day and insert it, or overwrite the partition) instead of appending, so a second attempt leaves exactly what the first one did. With that, retries are safe, and we could backfill the whole quarter with reprocess set to completed to repair the history, newest days first, with a cap on concurrent runs so the nightly jobs kept running."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Resource managers deserve a closer look if you run your own clusters. YARN splits the work into a central ResourceManager, a NodeManager on every machine, and one ApplicationMaster per job that negotiates for containers; Kubernetes has its scheduler, a kubelet per node, and operators that play the ApplicationMaster's role. Both keep their state in a coordination service (ZooKeeper for YARN's high availability, etcd for Kubernetes), which the Consistency and consensus track covers. Spark executors and machine learning jobs want all their containers at once or none, since half the executors can deadlock waiting for the other half. The default Kubernetes scheduler places pods one at a time, which is why Spark's documentation names batch schedulers such as Volcano and Apache YuniKorn.\n\nPreemption changes how you size jobs. Tasks on spot or preemptible capacity are cheap and get killed, so you want many small tasks (the MapReduce paper ran 200,000 map tasks on 2,000 machines) and outputs that survive a lost executor. Spark's graceful decommissioning (`spark.decommission.enabled`) moves shuffle and cached blocks off an executor that is about to be removed, and remote shuffle services keep shuffle data outside the executors entirely.\n\nOrchestrators keep growing toward data. Airflow 3 added DAG versioning, so a run finishes on the code it started with, and event-driven scheduling on top of assets. Dagster's partitioned assets make \"which days of this table are stale?\" a question the orchestrator can answer. Designing Data-Intensive Applications (2nd edition) covers job orchestration, preemption and workflows in chapter 11."
+  },
+  "sources": [
+    {
+      "title": "Dean and Ghemawat, MapReduce: Simplified Data Processing on Large Clusters (OSDI 2004)",
+      "url": "https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf"
+    },
+    {
+      "title": "Airflow: backfill",
+      "url": "https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/backfill.html"
+    },
+    {
+      "title": "Airflow: best practices",
+      "url": "https://airflow.apache.org/docs/apache-airflow/stable/best-practices.html"
+    },
+    {
+      "title": "Spark configuration (speculation, task retries)",
+      "url": "https://spark.apache.org/docs/latest/configuration.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 11",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

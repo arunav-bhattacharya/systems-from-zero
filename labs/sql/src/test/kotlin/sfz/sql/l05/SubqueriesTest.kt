@@ -12,7 +12,7 @@ class SubqueriesTest {
 
     @Test
     fun `above_merchant_average compares each payment with its own merchant`() = rollback {
-        val rows = exercise(5, "above_merchant_average")
+        val rows = exercise("sql/l05", "above_merchant_average")
         rows.assertColumns("payment_id", "merchant_id", "amount_minor", "merchant_avg")
         // averages: m1 4704.86, m2 1935, m3 343.75, m4 48620.86, m5 55916.67, m7 1498.33
         rows.assertRowsInOrder(
@@ -38,7 +38,7 @@ class SubqueriesTest {
             "INSERT INTO payments (payment_id, card_id, merchant_id, amount_minor, status, created_at) " +
                 "VALUES (100, 9, 3, 5000, 'succeeded', '2026-06-01 08:00+00')",
         )
-        exercise(5, "above_merchant_average").assertRowsInOrder(
+        exercise("sql/l05", "above_merchant_average").assertRowsInOrder(
             row(3, 4, 129900, 48621),
             row(7, 1, 6120, 4705),
             row(8, 4, 54999, 48621),
@@ -56,7 +56,7 @@ class SubqueriesTest {
 
     @Test
     fun `above_average_spenders averages over customers`() = rollback {
-        val rows = exercise(5, "above_average_spenders")
+        val rows = exercise("sql/l05", "above_average_spenders")
         rows.assertColumns("customer_id", "full_name", "spend_minor")
         // nine customers spent 720455 in total: the average customer spends 80050.56
         rows.assertRowsInOrder(
@@ -74,7 +74,7 @@ class SubqueriesTest {
             "INSERT INTO payments (payment_id, card_id, merchant_id, amount_minor, status, created_at) " +
                 "VALUES (100, 9, 5, 300000, 'succeeded', '2026-06-20 18:00+00')",
         )
-        exercise(5, "above_average_spenders").assertRowsInOrder(
+        exercise("sql/l05", "above_average_spenders").assertRowsInOrder(
             row(1, "Asha Rao", 120555),
             row(2, "Ben Carter", 170768),
             row(4, "Daniel Kim", 133625),
@@ -84,7 +84,7 @@ class SubqueriesTest {
 
     @Test
     fun `monthly_active_customers counts customers, not payments`() = rollback {
-        val rows = exercise(5, "monthly_active_customers")
+        val rows = exercise("sql/l05", "monthly_active_customers")
         rows.assertColumns("month", "active_customers", "new_customers", "returning_customers")
         rows.assertRowsInOrder(
             row("2026-01", 5, 5, 0),
@@ -105,7 +105,7 @@ class SubqueriesTest {
                 "(102, 10, 2, 900,  'failed',    '2026-06-23 09:00+00'), " +   // Hugo fails again: not active
                 "(103, 1,  1, 700,  'succeeded', '2026-06-24 09:00+00')",      // Asha, already active in June
         )
-        exercise(5, "monthly_active_customers").assertRowsInOrder(
+        exercise("sql/l05", "monthly_active_customers").assertRowsInOrder(
             row("2026-01", 5, 5, 0),
             row("2026-02", 5, 2, 3),
             row("2026-03", 6, 2, 4),

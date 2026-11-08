@@ -1,4 +1,4 @@
--- Lesson nosql-10: two Accord tables for a transfer across partitions (Cassandra 6.0-alpha2 only).
+-- Lesson txn-08: two Accord tables for a transfer across partitions (Cassandra 6.0-alpha2 only).
 -- ALPHA: the BEGIN TRANSACTION syntax may change before 6.0 is released. Safe to run again.
 -- Load it with: cqlsh -f /sfz/nosql-10-accord.cql
 CREATE KEYSPACE IF NOT EXISTS payments

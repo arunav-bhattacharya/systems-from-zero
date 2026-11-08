@@ -1,0 +1,378 @@
+{
+  "id": "shard-04",
+  "title": "Secondary indexes across shards: local and global",
+  "minutes": 40,
+  "goal": "By the end you can say how many shards a lookup by a non-key column asks under a local and under a global index, work out how fan-out raises the tail latency of a scatter-gather read, explain why a global index can lag behind its table, and say which kind Cassandra, MongoDB, OpenSearch and DynamoDB give you.",
+  "warmup": {
+    "q": "A payments table is hash-sharded by payment id over 32 shards. Each shard has an index on card fingerprint that covers its own rows. The fraud check asks for every payment card F made today. How many shards does it ask?",
+    "options": [
+      "1: the index says where to look",
+      "As many as card F has payments",
+      "All 32",
+      "None: the router holds the index"
+    ],
+    "answer": 2,
+    "why": "Each shard's index covers only that shard's rows, and card F's payments were placed by payment id, so any shard may hold one. The query has to ask all 32 and merge. \"As many as it has payments\" is how a global index behaves, where one index shard holds all of F's entries and points at the rows."
+  },
+  "sections": [
+    {
+      "h": "A local index: one shard per write, every shard per read",
+      "body": "Lessons 1 to 3 found rows by their partition key. Real services also look rows up by something else. The payments table is hash-sharded by payment id over 8 shards, and the fraud check needs \"every payment card F made in the last hour\", by card fingerprint. That needs a **secondary index**: an index on a column that isn't the partition key, from each value to the rows that have it. On one server you'd write `CREATE INDEX` and move on. With shards, you have to decide where the index entries live.\n\nThe simplest answer: each shard indexes its own rows. Shard 2's index maps card F to the payments of card F that happen to be stored on shard 2, and to nothing else. This is a local index, also called document-partitioned. Writes stay simple. A row and its index entry go to the same shard, in one local transaction, so the index is never behind its rows.\n\nReads by card pay for it. Card F's payments were placed by payment id, so they can be on any shard, and shard 2's index knows nothing about shard 5. The query has to ask every shard and merge the answers: a scatter-gather read. In the Try-it, card-242's 10 payments sit on 6 of the 8 shards and the query asks all 8. A card with no payments at all still asks all 8.\n\nThe cost grows with the shard count. Every fraud check costs one request per shard. At 2,000 checks a second, that's 16,000 shard requests a second on 8 shards and 64,000 on 32. Adding shards adds no capacity for this query: every new shard receives all 2,000 checks a second, just like the old ones. The slowest of the shards also sets the latency, which the next section measures.\n\nA local index can't enforce uniqueness either. No shard sees the others' entries, so none can tell that a value is already used elsewhere. MongoDB says it directly: on a sharded collection, a unique index is enforced only if it is the shard key or starts with the shard key.\n\nNone of this hurts when the query also names the partition key. On a table sharded by merchant, \"card F's payments at M-0042\" goes to M-0042's shard and uses the local index there. **A local index is cheap when queries also carry the partition key, and expensive when they don't.**",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 340\" role=\"img\" aria-label=\"Top: a local index, where a lookup by card asks all four shards. Bottom: a global index sharded by card, where the lookup asks one index shard and then the two shards that hold the rows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-a\" x=\"16\" y=\"20\" text-anchor=\"start\">local index: each shard indexes only its own rows</text><rect class=\"box-b\" x=\"250\" y=\"30\" width=\"200\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"52.0\" text-anchor=\"middle\">find card F</text><rect class=\"box\" x=\"16\" y=\"96\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"119.0\" text-anchor=\"middle\">shard 0</text><text class=\"t-s t-code\" x=\"91.0\" y=\"137.0\" text-anchor=\"middle\">F: pay-9</text><line class=\"ln-a\" x1=\"350\" y1=\"64\" x2=\"91\" y2=\"94\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"188\" y=\"96\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t\" x=\"263.0\" y=\"119.0\" text-anchor=\"middle\">shard 1</text><text class=\"t-s t-code\" x=\"263.0\" y=\"137.0\" text-anchor=\"middle\">F: none</text><line class=\"ln-a\" x1=\"350\" y1=\"64\" x2=\"263\" y2=\"94\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"360\" y=\"96\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t\" x=\"435.0\" y=\"119.0\" text-anchor=\"middle\">shard 2</text><text class=\"t-s t-code\" x=\"435.0\" y=\"137.0\" text-anchor=\"middle\">F: pay-12</text><line class=\"ln-a\" x1=\"350\" y1=\"64\" x2=\"435\" y2=\"94\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"532\" y=\"96\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t\" x=\"607.0\" y=\"119.0\" text-anchor=\"middle\">shard 3</text><text class=\"t-s t-code\" x=\"607.0\" y=\"137.0\" text-anchor=\"middle\">F: none</text><line class=\"ln-a\" x1=\"350\" y1=\"64\" x2=\"607\" y2=\"94\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"172\" text-anchor=\"middle\">asks all 4 shards, even those with nothing for F; a write touches 1 shard</text><text class=\"t-s t-a\" x=\"16\" y=\"200\" text-anchor=\"start\">global index: the index itself is sharded by card</text><rect class=\"box-b\" x=\"16\" y=\"236\" width=\"120\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"76.0\" y=\"261.0\" text-anchor=\"middle\">find card F</text><rect class=\"box\" x=\"180\" y=\"210\" width=\"150\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"255.0\" y=\"228.0\" text-anchor=\"middle\">index 0</text><text class=\"t-s t-m\" x=\"255.0\" y=\"246.0\" text-anchor=\"middle\">other cards</text><rect class=\"box-a\" x=\"180\" y=\"264\" width=\"150\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"255.0\" y=\"282.0\" text-anchor=\"middle\">index 1</text><text class=\"t-s t-code\" x=\"255.0\" y=\"300.0\" text-anchor=\"middle\">F: pay-9, pay-12</text><rect class=\"box-a\" x=\"380\" y=\"210\" width=\"140\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"450.0\" y=\"237.0\" text-anchor=\"middle\">shard 0</text><rect class=\"box-dim\" x=\"540\" y=\"210\" width=\"140\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"610.0\" y=\"237.0\" text-anchor=\"middle\">shard 1</text><rect class=\"box-a\" x=\"380\" y=\"264\" width=\"140\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"450.0\" y=\"291.0\" text-anchor=\"middle\">shard 2</text><rect class=\"box-dim\" x=\"540\" y=\"264\" width=\"140\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"610.0\" y=\"291.0\" text-anchor=\"middle\">shard 3</text><line class=\"ln-a\" x1=\"136\" y1=\"262\" x2=\"178\" y2=\"284\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"330\" y1=\"286\" x2=\"378\" y2=\"286\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"330\" y1=\"272\" x2=\"378\" y2=\"236\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"328\" text-anchor=\"middle\">asks 1 index shard, then only the shards holding F's rows; a write touches 2</text></svg>",
+        "caption": "A local index keeps each shard's entries with its rows, so a lookup by card asks every shard; a global index shards the entries by card, so a lookup asks one index shard and then only the shards that hold the rows."
+      },
+      "try": {
+        "title": "Count the shards a fraud check asks",
+        "minutes": 2,
+        "steps": [
+          "Read `ShardsContactedDemo.kt`. It shards 10,000 payments over 1,000 cards by payment id, on 8 and then 32 shards, and counts the shards a lookup asks: by id, by card through a local index, and by card through a global index sharded by card.",
+          "Predict: going from 8 to 32 shards, what happens to the cost of 2,000 fraud checks a second with each index?",
+          "Run it from the `labs` folder. No Docker needed."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ShardsContactedDemo.kt",
+          "src": "package sfz.shard.l04.demo\n\nimport java.nio.ByteBuffer\nimport java.security.MessageDigest\n\nfun shardFor(key: String, shards: Int): Int =\n    Math.floorMod(ByteBuffer.wrap(MessageDigest.getInstance(\"MD5\").digest(key.toByteArray())).long, shards.toLong()).toInt()\n\n/** 10,000 payments over 1,000 cards, sharded by payment id. The fraud check asks: what has card-242 done? */\nfun main() {\n    val payments = (0 until 10_000).map { \"pay-$it\" to \"card-${it % 1_000}\" }\n    for (shards in listOf(8, 32)) {\n        val rowShard = payments.associate { (id, _) -> id to shardFor(id, shards) }\n        val card242 = payments.filter { it.second == \"card-242\" }.map { it.first }\n        println(\"$shards shards; card-242 has ${card242.size} payments, on shards ${card242.map { rowShard.getValue(it) }.sorted()}\")\n        println(\"  find pay-1234 by id:            asks 1 shard\")\n        // local index: each shard indexes its own rows, so all of them must be asked\n        println(\"  find by card, local index:      asks $shards shards; each payment writes 1 shard\")\n        // global index: all of card-242's entries sit on one index shard, then fetch the rows\n        val rowShards = card242.map { rowShard.getValue(it) }.toSet().size\n        println(\"  find by card, global index:     asks 1 index shard + $rowShards row shards; each payment writes 2 shards\")\n        println(\"  2,000 fraud checks a second cost ${\"%,d\".format(2_000 * shards)} shard requests with the local index, ${\"%,d\".format(2_000 * (1 + rowShards))} with the global one\")\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l04.demo.ShardsContactedDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l04/demo/ShardsContactedDemo.kt"
+        },
+        "expect": "```text\n8 shards; card-242 has 10 payments, on shards [0, 1, 1, 3, 4, 4, 4, 5, 7, 7]\n  find pay-1234 by id:            asks 1 shard\n  find by card, local index:      asks 8 shards; each payment writes 1 shard\n  find by card, global index:     asks 1 index shard + 6 row shards; each payment writes 2 shards\n  2,000 fraud checks a second cost 16,000 shard requests with the local index, 14,000 with the global one\n32 shards; card-242 has 10 payments, on shards [0, 1, 4, 5, 15, 17, 19, 20, 23, 28]\n  find pay-1234 by id:            asks 1 shard\n  find by card, local index:      asks 32 shards; each payment writes 1 shard\n  find by card, global index:     asks 1 index shard + 10 row shards; each payment writes 2 shards\n  2,000 fraud checks a second cost 64,000 shard requests with the local index, 22,000 with the global one\n```\n\nThe local index's read cost is the shard count, so it quadruples from 8 to 32. The global index asks one index shard plus the shards that hold the card's rows, which depends on how many payments the card has, not on the shard count (at most 11 here). If the index stored the columns the check needs, it would ask 1 shard. Writes go the other way: 1 shard for the local index, 2 for the global one."
+      },
+      "refs": [
+        {
+          "title": "MongoDB manual: unique indexes (sharded collections)",
+          "url": "https://www.mongodb.com/docs/manual/core/index-unique/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A scatter-gather read is as slow as its slowest shard",
+      "body": "A scatter-gather read is done when the last shard answers. The What data systems are for track's lesson on latency and the tail worked out what that means. If each server is slow 1 time in 100, independently, a request that waits for all N servers is slow with probability 1 - 0.99^N: 9.6% for 10 shards, 39.5% for 50, 63% for 100. The demo below draws shard replies of 2 to 3 ms, with 1 reply in 100 at 50 ms. Asking one shard, the p99 is 3.0 ms. Asking 10, the p99 is 50 ms and 9.7% of queries take over 10 ms. Asking 100, even the median is 50 ms. **At 10 shards, each shard's p99 becomes the query's p90.**\n\nSo a local index works when scatter-gather reads are rare, or ask few shards. Every product with local indexes has this shape underneath, with a few tricks on top.\n\nMongoDB keeps every index per shard. `mongos` sends a query that names the shard key to the shards that own it and broadcasts any other query to every shard of the collection. Each shard picks its own best index, and mongos merges the cursors. It pushes a `limit` down to every shard and applies it again to the merged result.\n\nCassandra's secondary indexes are local to each node too. Cassandra 5.0's Storage-Attached Indexes (SAI) index memtables and SSTables as they're written, take a fraction of the disk space of the old indexes, and can use several column indexes in one query. A query on SAI columns without a partition key becomes a read across the token ranges, in rounds. The coordinator asks a few ranges at once, estimates from the rows that come back how many more ranges it needs, and stops as soon as the `LIMIT` is met. A query whose matches are rare visits most of the ring. Restrict the partition key as well, and it's a read of one partition.\n\nOpenSearch and Elasticsearch are the extreme case. Each shard of an index is a separate Lucene index, with its own inverted index (a map from each word to the documents that contain it, from the Storage engines track) over its own documents. A search goes to one copy of every shard; each copy returns its best hits, the coordinating node merges them, then fetches the winning documents. With custom routing, documents that share a routing value live on one shard, and a search that passes that value asks only that shard. Elastic's shard sizing advice follows from all this: each shard runs its part of a search on one thread, so too many small shards waste the search thread pool.\n\nThe cure for the tail is the same in all of them: ask fewer shards. Include the partition key, route by it, or keep the shard count no larger than the data needs. Hedged requests help too: if a shard hasn't answered after a short wait, send the same read to another replica of that shard and take whichever answers first.",
+      "try": {
+        "title": "Measure the tail as the fan-out grows",
+        "minutes": 3,
+        "steps": [
+          "Read `FanOutTailDemo.kt`. One shard answers in 2 to 3 ms, but 1 time in 100 it takes 50 ms. A query that asks N shards takes as long as the slowest of N such replies. It runs 20,000 queries for each N on virtual time (a seeded random generator, so no sleeping).",
+          "Predict the p99 for 1 shard and for 10, and the N at which the median becomes 50 ms.",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "FanOutTailDemo.kt",
+          "src": "package sfz.shard.l04.demo\n\nimport java.util.Random\n\n/** Each shard answers in 2 to 3 ms, except 1 time in 100 it takes 50 ms. A scatter-gather waits for the slowest. */\nfun main() {\n    val rnd = Random(42)\n    fun shardMillis() = if (rnd.nextInt(100) == 0) 50.0 else 2.0 + rnd.nextDouble()\n    fun pct(sorted: List<Double>, p: Double) = sorted[maxOf(0, Math.ceil(p / 100 * sorted.size).toInt() - 1)]\n    println(\"shards asked   p50 ms   p90 ms   p99 ms   queries over 10 ms   1 - 0.99^shards\")\n    for (shards in listOf(1, 2, 5, 10, 20, 50, 100)) {\n        val q = List(20_000) { (1..shards).maxOf { shardMillis() } }.sorted()\n        val slow = q.count { it > 10.0 } / 200.0\n        println(\"%12d   %6.1f   %6.1f   %6.1f   %17.1f%%   %14.1f%%\".format(\n            shards, pct(q, 50.0), pct(q, 90.0), pct(q, 99.0), slow, (1 - Math.pow(0.99, shards.toDouble())) * 100))\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l04.demo.FanOutTailDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l04/demo/FanOutTailDemo.kt"
+        },
+        "expect": "```text\nshards asked   p50 ms   p90 ms   p99 ms   queries over 10 ms   1 - 0.99^shards\n           1      2.5      2.9      3.0                 0.9%              1.0%\n           2      2.7      3.0     50.0                 2.1%              2.0%\n           5      2.9      3.0     50.0                 4.9%              4.9%\n          10      2.9      3.0     50.0                 9.7%              9.6%\n          20      3.0     50.0     50.0                18.1%             18.2%\n          50      3.0     50.0     50.0                39.5%             39.5%\n         100     50.0     50.0     50.0                63.0%             63.4%\n```\n\nThe measured share of slow queries tracks 1 - 0.99^N closely. The p99 jumps to 50 ms as soon as a query asks two shards, the p90 at 20, and at 100 shards more than half of all queries wait for a slow reply, so the median is 50 ms. Nothing about any single shard changed; only how many each query waits for."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: Storage-Attached Indexing concepts",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/cql/indexing/sai/sai-concepts.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MongoDB manual: sharded cluster query routing",
+          "url": "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/",
+          "kind": "docs"
+        },
+        {
+          "title": "OpenSearch documentation: search shard routing",
+          "url": "https://docs.opensearch.org/latest/search-plugins/searching-data/search-shard-routing/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A global index puts each value on one shard, and can lag behind",
+      "body": "Turn the index around. Build one index over all the rows, and shard the index by the value being indexed. All of card F's entries go to the index shard chosen by `hash(F)`, whichever row shards the payments live on. This is a global index, also called term-partitioned. A lookup by card asks one index shard, which returns payment ids, and then fetches those rows from their shards: in the first Try-it, 1 index shard plus 6 row shards for card-242's 10 payments, and 1 shard for a card with none. If the index also stores the columns the fraud check needs (DynamoDB calls them projected attributes), there's no row fetch, and the lookup asks exactly one shard.\n\nThe cost moves to writes. A new payment lands on its row shard, and its index entry lands on its card's index shard, usually another machine. Each indexed column adds one more shard per write, and an update that changes an indexed value touches two entries: it deletes the old one and inserts the new one. Keeping a row and its entries in step across machines leaves two choices.\n\nThe first is one distributed transaction per write. CockroachDB, TiDB and YugabyteDB do this: an index is stored as its own range of keys, split and placed like table data, and its entries are written in the same transaction as the row. The index is never behind its rows, and it can enforce a unique constraint. Each write pays for a commit across shards, which the Transactions track covers.\n\nThe second is to update the index asynchronously. DynamoDB's global secondary indexes (GSIs) work this way. The docs say changes reach a GSI \"within a fraction of a second, under normal conditions\", longer in rare failures, and a GSI can only be read with eventual consistency. So a read through the index can miss a write that has already succeeded. The stepper walks through one, and the Try-it measures how often a fraud check that runs 50 ms after each payment misses it.\n\nAn asynchronous index has a second effect. A GSI has partitions of its own, keyed by its own partition key. If the GSI can't absorb its updates, DynamoDB throttles writes to the base table, even when the table itself has spare capacity. An index on a column with few values, such as `status`, sends every `PENDING` payment's entry to one GSI partition, and the throttling reason names it: `IndexWriteKeyRangeThroughputExceeded`. A hot key in an index is still a hot key, as lesson 2 showed for tables.\n\nDynamoDB has local secondary indexes (LSIs) as well: the same partition key with a different sort key, stored with the base table's partition. Each LSI lives with its rows, so it can be read with strong consistency. That's the trade in one product. A local index stays consistent but needs the partition key; a global index finds any value on one shard but may lag.",
+      "stepper": {
+        "title": "One payment through an asynchronous global index",
+        "intro": "Click Next. Virtual time runs from 0 to 150 ms.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"At 0 ms the payment row is written to row shard 2 and acknowledged\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 0 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box-a\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-m\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">empty</text><rect class=\"box\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"154.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"172.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><line class=\"ln-a\" x1=\"166\" y1=\"140\" x2=\"258\" y2=\"70\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">the write is acknowledged once its row shard has stored it</text></svg>",
+            "say": "Card F pays. The service writes payment `pay-9001` to its row shard, chosen by the payment id, and the write is acknowledged as soon as that shard has it. The index on card lives somewhere else: card F's entries are on index shard 1."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"The index entry for card F is queued, due to land at 120 ms\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 0 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-code\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">F: pay-9001, due 120 ms</text><rect class=\"box\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"154.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"172.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><line class=\"ln-a\" x1=\"355\" y1=\"96\" x2=\"355\" y2=\"212\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">the index entry is queued for another machine</text></svg>",
+            "say": "The row shard sends the index entry, `F: pay-9001`, toward index shard 1 asynchronously. It's queued. In this model it lands 120 ms later; DynamoDB only promises a fraction of a second under normal conditions, longer when something is failing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"At 50 ms the fraud check reads the index and sees three payments, not four\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 50 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-code\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">F: pay-9001, due 120 ms</text><rect class=\"box-bad\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"154.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"172.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><line class=\"ln-a\" x1=\"166\" y1=\"160\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">a stale read: the index answers from before the write</text></svg>",
+            "say": "50 ms later the next authorization on card F runs the fraud check: how many payments did F make in the last minute? It reads index shard 1 and gets three. `pay-9001` is missing, though its write succeeded 50 ms ago. Nothing is broken; this is what asynchronous means."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"At 50 ms a read of pay-9001 by its id finds it on row shard 2\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 50 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box-ok\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-code\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">F: pay-9001, due 120 ms</text><rect class=\"box\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"154.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"172.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><line class=\"ln-a\" x1=\"166\" y1=\"140\" x2=\"258\" y2=\"70\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">a read by the partition key always sees the write</text></svg>",
+            "say": "At the same moment, a read of `pay-9001` by its id goes to row shard 2 and finds it. Reads by the partition key see every acknowledged write; reads through the global index may not. That gap is the whole trade."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"At 120 ms the queued entry lands on index shard 1\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 120 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-m\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">empty</text><rect class=\"box-a\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"145.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"163.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><text class=\"t-s t-a\" x=\"582.0\" y=\"181.0\" text-anchor=\"middle\">+ pay-9001</text><line class=\"ln-a\" x1=\"450\" y1=\"240\" x2=\"478\" y2=\"194\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">the entry lands; the index has caught up</text></svg>",
+            "say": "At 120 ms the entry lands on index shard 1. From now on a lookup by card F returns four payments. If the index shard were overloaded, the queue would grow, and DynamoDB would start throttling writes to the base table so the index can't fall further behind."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 324\" role=\"img\" aria-label=\"At 150 ms the fraud check sees all four payments from one index shard\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"16\" y=\"26\" text-anchor=\"start\">t = 150 ms</text><rect class=\"box\" x=\"16\" y=\"120\" width=\"150\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"91.0\" y=\"146.0\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"91.0\" y=\"164.0\" text-anchor=\"middle\">and fraud check</text><rect class=\"box\" x=\"260\" y=\"30\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"59.0\" text-anchor=\"middle\">row shard 2</text><text class=\"t-s t-code\" x=\"355.0\" y=\"77.0\" text-anchor=\"middle\">pay-9001, card F</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"190\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"355.0\" y=\"243.0\" text-anchor=\"middle\">index update queue</text><text class=\"t-s t-m\" x=\"355.0\" y=\"261.0\" text-anchor=\"middle\">empty</text><rect class=\"box-ok\" x=\"480\" y=\"120\" width=\"204\" height=\"76\" rx=\"8\"/><text class=\"t\" x=\"582.0\" y=\"145.0\" text-anchor=\"middle\">index shard 1</text><text class=\"t-s t-code\" x=\"582.0\" y=\"163.0\" text-anchor=\"middle\">F: pay-12 pay-31 pay-77</text><text class=\"t-s t-a\" x=\"582.0\" y=\"181.0\" text-anchor=\"middle\">+ pay-9001</text><line class=\"ln-a\" x1=\"166\" y1=\"160\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"350\" y=\"312\" text-anchor=\"middle\">one index shard answers with all of card F's payments</text></svg>",
+            "say": "A check at 150 ms sees all four, from one index shard. One shard per lookup is why you'd build a global index; the window between 0 and 120 ms is what it costs. A card-testing bot that fires payments 50 ms apart lives entirely inside that window."
+          }
+        ]
+      },
+      "try": {
+        "title": "How often does the fraud check miss the newest payment?",
+        "minutes": 2,
+        "steps": [
+          "Read `StaleIndexDemo.kt`. It's a model, on virtual time: each index entry lands 30 to 120 ms after its row, and 1 time in 50 it takes 600 ms (a busy index shard). Those lags are made up; DynamoDB doesn't publish a distribution. The fraud check reads the index some time after each payment.",
+          "Predict the share of checks that miss the payment when the check runs 50 ms after it.",
+          "Run it from the `labs` folder. Then change the 600 to 2,000 and see which line moves."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "StaleIndexDemo.kt",
+          "src": "package sfz.shard.l04.demo\n\nimport java.util.Random\n\n/**\n * A model of an asynchronous global index, on virtual time. Each index entry lands some time after its\n * row: here 30 to 120 ms, and 1 time in 50 it takes 600 ms (a busy index shard). These lags are made\n * up for the model; DynamoDB only promises \"a fraction of a second, under normal conditions\".\n * The fraud check reads the index some milliseconds after each payment. How often is it missing?\n */\nfun main() {\n    val rnd = Random(7)\n    val lags = List(10_000) { if (rnd.nextInt(50) == 0) 600L else 30L + rnd.nextInt(91) }\n    println(\"check runs after   index still missing the payment\")\n    for (after in listOf(10L, 50L, 100L, 250L, 1_000L)) {\n        val missing = lags.count { it > after }\n        println(\"%13d ms   %,6d of 10,000 (%.1f%%)\".format(after, missing, missing / 100.0))\n    }\n    println(\"reading the row by its key: 0 of 10,000 missing, at any time\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l04.demo.StaleIndexDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l04/demo/StaleIndexDemo.kt"
+        },
+        "expect": "```text\ncheck runs after   index still missing the payment\n           10 ms   10,000 of 10,000 (100.0%)\n           50 ms    7,694 of 10,000 (76.9%)\n          100 ms    2,316 of 10,000 (23.2%)\n          250 ms      206 of 10,000 (2.1%)\n         1000 ms        0 of 10,000 (0.0%)\nreading the row by its key: 0 of 10,000 missing, at any time\n```\n\nWith these lags, a check 50 ms after a payment misses it three times in four, and even at 250 ms the slow tail of the lag still causes 2.1% misses. With 2,000 instead of 600, the 1,000 ms line goes from 0 to about 2%: the rare slow update decides how long you have to wait to be sure. Reads by the key are never stale, because they go to the shard that took the write."
+      },
+      "refs": [
+        {
+          "title": "Amazon DynamoDB Developer Guide: using global secondary indexes",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Amazon DynamoDB Developer Guide: GSI write throttling and back pressure",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/gsi-throttling.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Choosing an index for each query",
+      "body": "Every difference between the two designs follows from where the index entries live.\n\n| | Local index (document-partitioned) | Global index (term-partitioned) |\n|---|---|---|\n| Entries live | with their rows, on every shard | on index shards chosen by the indexed value |\n| A write touches | its own shard | its row shard, plus one index shard per indexed column |\n| A lookup by the value asks | every shard, or one if it also names the partition key | 1 index shard, plus the row shards unless the columns are projected |\n| Behind its rows? | never | never with a distributed transaction (CockroachDB, TiDB); yes when asynchronous (DynamoDB GSI) |\n| Unique constraint | only if it includes the partition key | yes, with a transactional index |\n| Examples | MongoDB, Cassandra SAI, OpenSearch, DynamoDB LSI | DynamoDB GSI, CockroachDB, TiDB, YugabyteDB |\n\nPick by query, not by table. For each lookup that doesn't use the partition key, ask three questions. How often does it run? How many shards will a scatter-gather ask, now and after the next two growth steps? And must it see a write that finished a moment ago?\n\nRun that over the payment platform's two lookups by card. The analyst's screen, \"card F's payments this month\", runs a few times a minute and tolerates a second of lag, so a GSI is a fine choice, and so is a local index on 8 shards. The authorization-time velocity check is the opposite: 2,000 times a second, inside a 20 ms budget, and it must count the payment from 50 ms ago, because card-testing bots can fire payments that fast. A local index on 64 shards fails the budget (1 - 0.99^64 is 47% of checks waiting on a slow shard). A GSI fails the freshness test. The answer is a separate table partitioned by card: a velocity counter that the authorization updates synchronously, in the same request, on the card's own shard. That's a hand-made global index, kept consistent by the code path that writes it.\n\nHand-made indexes have one known failure: drift. If the service writes the payment and then crashes before updating the card table, the two disagree, and nothing repairs them. Keep the two writes in one transaction where the store allows it (DynamoDB transactions cover up to 100 items), or derive the second table from the first table's change stream, which the Stream processing track builds."
+    }
+  ],
+  "analogy": "Picture a library service with eight branches, books shelved by accession number. With local catalogues, each branch keeps a card catalogue of its own books only. Adding a book is easy, because the branch files its own card, but finding every book by one author means phoning all eight branches and waiting for the slowest librarian. With a central catalogue split by author's surname (A to F at branch 1, G to M at branch 2, and so on), one phone call gets the full list, and then you fetch each book from wherever it sits. But when branch 5 buys a book by Fowler, it has to post a catalogue card to branch 1; until the card arrives, a search at branch 1 doesn't show the book. The analogy breaks on scale: phoning eight branches sounds fine, but a scatter-gather over 100 shards waits for the slowest of 100 machines on every single query.",
+  "in_your_world": "Oracle uses the same two words for partitioned tables on one server. A local index is partitioned exactly like its table, one index partition per table partition. A global index is partitioned by its own key, and operations on table partitions, such as dropping an old month, have to fix up every global index. The trade you know from Oracle maintenance is the same one at cluster scale, with machines instead of partitions. In a payments service, the fraud check and the merchant dashboard are where this bites. If you're on DynamoDB, every GSI is a second table with its own partitions and hot keys, updated asynchronously, so check each one with Contributor Insights before peak and never use one for a check that must see the payment you just wrote. If you're on Cassandra, a query that filters on an SAI column without the partition key is a scan across the ring in rounds, so keep it off hot paths.",
+  "mistake": "The most common mistake is treating a global secondary index as read-your-writes. A service writes a payment, gets a success, and immediately queries a GSI, to show the confirmation page or to run a velocity check, and sometimes the payment isn't there. It happens because on one database an index is always in step with its table, and nothing in the GSI query looks different. The fix is to read anything you just wrote by its key from the base table, merge your own just-written item into the results in code, or use a design that is consistent by construction: an LSI, a transactional index, or a table you update in the same transaction.",
+  "worked": {
+    "title": "Design the velocity check for card payments",
+    "steps": [
+      {
+        "say": "Write down the requirement with numbers. The check runs inside every authorization, so its budget is part of the card network's response time.",
+        "lang": "text",
+        "code": "checks             2,000 / s at peak\nquestion           how many payments has card F made in the last 60 s?\nbudget             20 ms at p99\nmust see           a payment from 50 ms ago (card-testing bots fire that fast)\npayments table     hash-sharded by payment id, 64 shards\none shard          2 to 3 ms, 1 reply in 100 takes 50 ms"
+      },
+      {
+        "say": "Option A, a local index on card. Every check asks every shard. Work out the load and the tail before trying it.",
+        "lang": "kotlin",
+        "code": "val shards = 64\nval shardRequests = 2_000 * shards                // 128,000 a second, for one query type\nval slow = 1 - Math.pow(0.99, shards.toDouble())   // 0.47: 47% of checks wait on a 50 ms reply\n// p99 = 50 ms against a 20 ms budget: rejected"
+      },
+      {
+        "say": "Option B, a GSI on card. One index shard per check, so the load and tail are fine. But the entry for a payment lands some time after it, a fraction of a second normally and longer under failure. The bot's second payment, 50 ms after the first, is checked against an index that may not have the first one yet. Rejected for this check; keep it for the analyst's screen.",
+        "lang": "text",
+        "code": "requests per check   1 index shard (attributes projected)\nfresh?               no: GSI reads are eventually consistent\nverdict              fine for the analyst screen, wrong for authorization"
+      },
+      {
+        "say": "Option C, a velocity table partitioned by card, updated in the authorization itself. Count and increment happen on the card's own shard, in one request, so the next check always sees it. Expire old buckets with a TTL.",
+        "lang": "kotlin",
+        "code": "// partition key: card fingerprint; one item per card per minute bucket\nsuspend fun velocity(card: String, now: Instant): Long {\n    val bucket = now.epochSecond / 60\n    // one conditional update on ONE shard: add 1 and return the new count, atomically\n    return store.increment(key = \"VEL#$card#$bucket\", by = 1, ttlSeconds = 120)\n}\n\n// in the authorization: refuse when the card exceeds its limit\nif (velocity(card, clock.instant()) > 5) decline(\"velocity\")"
+      },
+      {
+        "say": "Check what C costs. It's one more write per payment on the card's shard, and a hot card is a hot key, so a test card hammered by a bot concentrates on one partition: that's the behaviour you want, since it's the card you're about to block. The payment row and the counter are two items, so put them in one transaction, or accept that a crash between them undercounts by one.",
+        "lang": "text",
+        "code": "                    A local index   B GSI          C velocity table\nshards per check    64              1              1\np99 within 20 ms    no              yes            yes\nsees 50 ms ago      yes             not always     yes\nextra write         none            1 (async)      1 (sync, same request)"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a local and a global index, and catch a stale read",
+    "minutes": 15,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/shard/l04/Indexes.kt",
+      "labs/sim/src/main/kotlin/sfz/shard/l04/FanOut.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.shard.l04.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All 7 fail with `NotImplementedError`. Time is a `VirtualClock`: nothing happens between two calls to `advance`, so every staleness check is exact.",
+      "In `Indexes.kt`, write `LocalIndexTable.insert` and `findByCard`. The two local-index tests pass: one write touches 1 shard, one lookup asks all 8, even for a card nobody used.",
+      "Write `GlobalIndexTable.insert`, which stores the row now and queues the index entry for `clock.now + lagMillis`, and `findByCard`, which first applies every entry that is due. The test with a 200 ms lag checks that the index misses the payment at 100 ms and has it at 200 ms.",
+      "In `FanOut.kt`, write `scatterMillis`. All 7 pass.",
+      "Experiment: in `a fraud check 50 ms after each payment...`, change the lag of 20 to 50, then to 51. At 50 the check still sees every payment (an entry due at the check's own moment is applied first); at 51 it misses every one. Then put it back."
+    ],
+    "hints": [
+      "`LocalIndexTable.insert`: `store(p)`, then `index[shardOf(p.id)].getOrPut(p.card) { mutableSetOf() } += p.id`, and return 1.",
+      "`LocalIndexTable.findByCard`: `index.flatMap { it[card].orEmpty() }.toSet()`, with `shardsContacted = shards`.",
+      "`GlobalIndexTable.insert`: `pending += Pending(clock.now + lagMillis, seq++, p.card, p.id)`. The `seq` keeps entries with the same due time in the order they were written.",
+      "`GlobalIndexTable.findByCard`: `while (pending.isNotEmpty() && pending.peek().dueAt <= clock.now)`, poll and add to `index[indexShardOf(e.card)]`. Then `shardsContacted = 1 + ids.map(::shardOf).toSet().size`.",
+      "`scatterMillis`: `(1..shards).maxOf { shardMillis(rnd) }`."
+    ],
+    "done_when": "All 7 tests in `IndexesTest` pass."
+  },
+  "drill": {
+    "title": "Both lookups from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write the lookup by card for a local index (`localIndex: List<Map<String, Set<String>>>`, one map per shard) and for a global index (`globalIndex: List<Map<String, Set<String>>>`, one map per index shard, chosen by `shardFor(card, n)`), each returning the ids and the number of shards asked. Then say in one sentence what the global version needs on every write that the local one doesn't.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun findLocal(localIndex: List<Map<String, Set<String>>>, card: String): Pair<Set<String>, Int> =\n    // every shard may hold some of the card's rows: ask them all\n    localIndex.flatMap { it[card].orEmpty() }.toSet() to localIndex.size\n\nfun findGlobal(globalIndex: List<Map<String, Set<String>>>, card: String, rowShardOf: (String) -> Int): Pair<Set<String>, Int> {\n    // one index shard holds every entry for this card\n    val ids = globalIndex[shardFor(card, globalIndex.size)][card].orEmpty()\n    return ids to 1 + ids.map(rowShardOf).toSet().size // plus the shards that hold the rows\n}\n// A global index needs a second write, to another machine, for every indexed column of every row:\n// either in a distributed transaction or asynchronously, and then reads through it can be stale."
+    }
+  },
+  "recap": [
+    "A secondary index on sharded data lives in one of two places: with its rows on every shard (local, document-partitioned) or sharded by the indexed value (global, term-partitioned).",
+    "A local index costs one shard per write and every shard per lookup, unless the lookup also names the partition key. It can't enforce uniqueness across shards.",
+    "A scatter-gather is as slow as its slowest shard: with 1% slow replies, 1 - 0.99^N of queries are slow, 9.6% at 10 shards. More shards add no capacity for such a query.",
+    "A global index answers a lookup from one index shard (plus row fetches unless the columns are projected) but needs a write to another machine for each indexed column: a distributed transaction (CockroachDB, TiDB, YugabyteDB) or an asynchronous update (DynamoDB GSI).",
+    "Asynchronous global indexes can miss a write that already succeeded, and a GSI that can't keep up throttles writes to the base table. Index keys with few values make hot index partitions.",
+    "MongoDB, Cassandra (SAI) and OpenSearch keep local indexes; DynamoDB offers both, LSIs and GSIs. Choose per query: how often, how many shards, and how fresh."
+  ],
+  "quiz": [
+    {
+      "q": "A DynamoDB table of payments has a GSI on `cardFingerprint`. The code writes a payment, gets a success, and 30 ms later queries the GSI for that card. What can happen?",
+      "options": [
+        "It always sees the payment, because the write succeeded",
+        "It may not see the payment: the GSI is updated asynchronously and read with eventual consistency",
+        "It sees the payment if the query sets `ConsistentRead` to true",
+        "The query fails with a conditional check error"
+      ],
+      "answer": 1,
+      "why": "GSI entries land after the base write, usually within a fraction of a second, and GSIs support only eventually consistent reads, so `ConsistentRead` isn't available on them. A read of the item by its key from the base table would see it."
+    },
+    {
+      "q": "A query through a local index asks 20 shards. Each shard is slow (over 10 ms) 1 time in 100, independently. About what share of queries is slow?",
+      "options": [
+        "1%, the same as one shard",
+        "About 5%",
+        "About 18%",
+        "20%, one per shard"
+      ],
+      "answer": 2,
+      "why": "The query is fast only if all 20 replies are fast: 0.99^20 = 0.818, so about 18.2% are slow. 20% is the tempting answer from adding the per-shard rates, which overcounts the queries where two shards are slow at once."
+    },
+    {
+      "q": "A MongoDB collection is sharded on `{ merchantId: 1 }`. You want `paymentId` to be unique across the collection. What can MongoDB enforce with an index?",
+      "options": [
+        "A unique index on `{ paymentId: 1 }`, checked across all shards",
+        "A unique hashed index on `paymentId`",
+        "Nothing: sharded collections can't have unique indexes",
+        "A unique index on `{ merchantId: 1, paymentId: 1 }`, which makes the pair unique, not `paymentId` alone"
+      ],
+      "answer": 3,
+      "why": "Each shard checks uniqueness against its own entries only, so MongoDB enforces a unique index on a sharded collection only when it is the shard key or starts with it. That makes (merchantId, paymentId) unique; two merchants could still share a paymentId. Hashed indexes can't be unique at all."
+    },
+    {
+      "q": "From lesson 2: a DynamoDB table keyed by payment id has a GSI on `status` (PENDING, CAPTURED or FAILED). On Black Friday, writes to the table are throttled with the reason `IndexWriteKeyRangeThroughputExceeded`, although the table has spare capacity. Why?",
+      "options": [
+        "Every new payment's index entry has status PENDING, so they all go to one GSI partition, a hot key in the index; DynamoDB throttles base writes when a GSI can't keep up",
+        "The table's partition keys are hot, and the GSI is reporting it",
+        "GSIs are limited to 1,000 writes a second in total",
+        "On-demand tables can't have GSIs on Black Friday"
+      ],
+      "answer": 0,
+      "from": "shard-02",
+      "why": "A GSI is partitioned by its own key, so an index on a column with three values puts most writes on one or two index partitions, the hot-key problem from lesson 2, inside the index. When a GSI partition can't absorb its updates, DynamoDB pushes back on the base table's writes. The table's own keys are spread fine."
+    },
+    {
+      "q": "An OpenSearch index has 5 primary shards, each with 1 replica, on 10 nodes. A search without custom routing is sent to how many shard copies?",
+      "options": [
+        "One copy of each of the 5 shards",
+        "All 10 copies",
+        "One shard, chosen by hashing the query text",
+        "The 5 primaries only, never the replicas"
+      ],
+      "answer": 0,
+      "why": "Each shard holds a local inverted index of its own documents, so every shard must be searched, but any one copy of a shard will do; OpenSearch picks among copies by recent response time and queue size. Replicas serve searches too. Only custom routing narrows a search to one shard."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Local secondary index: what do a write and a lookup by the indexed value cost?",
+      "back": "A write touches 1 shard. A lookup asks every shard (scatter-gather), unless it also names the partition key."
+    },
+    {
+      "front": "Global secondary index: what do a write and a lookup cost?",
+      "back": "A lookup asks 1 index shard, plus the row shards unless the columns are projected. A write touches its row shard plus one index shard per indexed column."
+    },
+    {
+      "front": "Why can a global index be stale?",
+      "back": "Its entries live on other machines. DynamoDB updates GSIs asynchronously, usually within a fraction of a second. CockroachDB and TiDB avoid it by writing entries in the same distributed transaction as the row."
+    },
+    {
+      "front": "Tail latency of a scatter-gather over N shards?",
+      "back": "P(slow) = 1 - (1 - p)^N. With p = 1% and N = 10, about 9.6%: each shard's p99 becomes the query's p90."
+    },
+    {
+      "front": "When does MongoDB enforce a unique index on a sharded collection?",
+      "back": "Only when the index is the shard key or starts with it, because each shard can check only its own rows."
+    },
+    {
+      "front": "What is GSI back pressure?",
+      "back": "If a GSI can't absorb its updates, DynamoDB throttles writes to the base table, even when the table has spare capacity."
+    },
+    {
+      "front": "How does a Cassandra SAI query without a partition key run?",
+      "back": "As a read across the token ranges in rounds; the coordinator adjusts how many ranges it asks at once from the rows returned and stops when the LIMIT is met."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Secondary index",
+      "plain": "An index on a column that isn't the partition key, from each value to the rows that have it."
+    },
+    {
+      "term": "Local index",
+      "plain": "Each shard indexes only its own rows (document-partitioned). Writes touch one shard; lookups by the value ask every shard."
+    },
+    {
+      "term": "Global index",
+      "plain": "One index over all rows, itself sharded by the indexed value (term-partitioned). Lookups ask one index shard; writes touch extra shards."
+    },
+    {
+      "term": "Scatter-gather",
+      "plain": "A read that sends the same query to many shards and merges their answers; it finishes when the slowest shard answers."
+    },
+    {
+      "term": "Projected attributes",
+      "plain": "Columns copied into an index entry so a lookup can answer from the index without fetching the row."
+    },
+    {
+      "term": "GSI back pressure",
+      "plain": "DynamoDB throttling writes to a table because one of its global secondary indexes can't keep up."
+    },
+    {
+      "term": "Storage-Attached Index (SAI)",
+      "plain": "Cassandra 5.0's local secondary index, built as memtables and SSTables are written; queries without a partition key read across token ranges in rounds."
+    }
+  ],
+  "explain_back": {
+    "prompt": "An engineer wants to add a DynamoDB GSI on card fingerprint and use it for the velocity check in the authorization path. Explain what the GSI gives, what it doesn't, and what you'd do instead.",
+    "answer": "A GSI is a second copy of the data, partitioned by card fingerprint instead of payment id, so all of one card's entries sit on one index partition. A lookup by card is one request to one partition, and with the needed attributes projected it never touches the base table. That's much better than scanning or scatter-gathering every partition. What it doesn't give is freshness. DynamoDB updates GSIs asynchronously, usually within a fraction of a second, and GSI reads are only eventually consistent. A card-testing bot that fires payments 50 ms apart can get its second and third payments checked against an index that doesn't have the first yet, which is exactly the case a velocity check exists for. It also adds write load on its own partitions, and if those can't keep up, DynamoDB throttles the payments table itself. Instead I'd keep a small velocity table partitioned by card, one item per card per minute, and increment it in the authorization request itself, so the next check on that card always sees it. I'd keep the GSI for the analyst's screen, where a second of lag doesn't matter."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Designing Data-Intensive Applications, 2nd edition, chapter 7 explains a cost of term-partitioned indexes this lesson skipped: a query with two conditions, say card F and merchant M-0042, finds each condition's matches on a different index shard, and the lists of matches have to be shipped across the network and intersected. Search engines spend a lot of engineering on exactly that.\n\nHand-made indexes are common in Cassandra, where the standard advice is one table per query. Cassandra's materialized views were meant to maintain such tables for you, but they've been marked experimental since 4.0; most teams write both tables from the application, or from a change stream. The book points out that hand-made indexes drift when a write reaches one table and not the other.\n\nDynamoDB keeps adding to GSIs: since November 2025 a GSI key can combine up to four partition-key attributes and four sort-key attributes, so you no longer build concatenated keys like `MERCH#M-0042#FAILED` by hand. Multi-Region strongly consistent global tables allow GSIs (still eventually consistent) but not LSIs.\n\nOpenSearch decides which copy of each shard a search goes to by adaptive replica selection: it prefers copies that answered recent requests quickly and have short search queues, which is a built-in way of steering around the slow replica that sets a scatter-gather's tail."
+  },
+  "sources": [
+    {
+      "title": "Apache Cassandra documentation: Storage-Attached Indexing concepts",
+      "url": "https://cassandra.apache.org/doc/latest/cassandra/developing/cql/indexing/sai/sai-concepts.html"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: using global secondary indexes",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html"
+    },
+    {
+      "title": "Amazon DynamoDB Developer Guide: GSI write throttling and back pressure",
+      "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/gsi-throttling.html"
+    },
+    {
+      "title": "Dean and Barroso, The Tail at Scale, Communications of the ACM 56(2), 2013",
+      "url": "https://www.barroso.org/publications/TheTailAtScale.pdf"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 7 (Kleppmann and Riccomini)",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

@@ -1,0 +1,127 @@
+{
+  "id": "repl",
+  "intro": "This track is about keeping copies of the same data on several machines, and about what goes wrong when the copies drift apart. Lessons 1 to 4 build single-leader replication from zero: one leader orders every write into a log, followers replay it, and the leader says OK before, or after, a follower has the write. You meet the three kinds of replication log (statements, physical WAL, logical rows), the read anomalies a lagging follower causes and the session tokens that fix them, and then all of it inside PostgreSQL: streaming standbys, `synchronous_commit`, failover and point-in-time recovery. Lessons 5 and 6 allow more than one leader, one per region and then one per device, which brings write conflicts, sync engines, operational transformation and text CRDTs. Lessons 7 and 8 drop the leader altogether: quorums, hints, read repair and Merkle trees, then how a store tells concurrent writes apart and merges them without loss. At the end you can say, for any replicated store your payments services use, what a write's OK promises, what a read can miss, and what happens to two writes that race.\n\nYou need the Foundations track's picture of faults, and the Storage engines track's write-ahead log, which every replication log in lessons 2 and 4 reuses. The Data models track's lessons on Dynamo, Cassandra and MongoDB come back in lessons 7 and 8. Consensus (Raft) and the formal consistency models arrive later, in the Consistency and consensus track; where a lesson needs them, it says what it needs in place.\n\nMost labs model the mechanism and run on virtual time with only the JDK, so a minute of replication runs in milliseconds and every test is exact: lessons 1 to 3, 5 and 6 live in `labs/sim`, lesson 4's in `labs/sql` and lessons 7 and 8's in `labs/nosql`. Run one lesson from `labs/` with `./gradlew :sim:test --tests 'sfz.repl.l05.*'` (the lesson's lab names its module); the reference answers live in `src/solution`. Some Try-its use real databases in Docker: a PostgreSQL primary and standby (`env/postgres-ha.yml`) and a three-node Cassandra cluster (`env/cassandra-cluster.yml`, about 3 GB). Start one at a time and stop it with `down -v` when the lesson ends.",
+  "cheatsheet": "## Three ways to replicate\n\n| | Single leader | Multi-leader | Leaderless |\n|---|---|---|---|\n| Who accepts a write | one leader (per shard) | a leader per region or device | any node (the coordinator) sends to all N |\n| Order of writes | the leader's log | each leader's own log; leaders copy each other's | none; timestamps or version vectors decide |\n| Main risk | failover loses async writes, split brain | write conflicts, invariants checked locally | stale reads, concurrent writes merged or lost |\n| Examples | PostgreSQL, MySQL, MongoDB, Kafka, DynamoDB per partition | DynamoDB global tables (MREC), pgactive, sync engines | Dynamo, Cassandra, ScyllaDB, Riak |\n\n## When is a write done?\n\n| Mode | The client hears OK when | A failover can lose | Notes |\n|---|---|---|---|\n| Asynchronous | the leader has it | every write the new leader hadn't received | the default in PostgreSQL and MySQL |\n| Semi-synchronous | one follower has it | nothing, until the follower is slow | MySQL silently falls back to asynchronous on timeout |\n| Fully synchronous | every follower has it | nothing | one dead follower stops all writes |\n| Quorum (W of N) | W replicas have it | nothing acknowledged, if R + W > N for reads | a timed-out write isn't undone |\n\nPostgreSQL `synchronous_commit` with a synchronous standby: `off` (no wait, not even the local flush), `local` (local flush), `remote_write` (standby's OS has it), `on` (standby flushed it), `remote_apply` (standby replayed it, so it is visible there).\n\n## Replication logs\n\n| Log | Ships | Breaks on | Used by |\n|---|---|---|---|\n| Statements | the SQL text | `NOW()`, `RAND()`, auto-increment, triggers | old MySQL, VoltDB (deterministic) |\n| Physical WAL | changed bytes of pages | different major versions | PostgreSQL streaming, Oracle |\n| Logical rows | row inserted, updated, deleted, with keys | heavier than WAL | MySQL row binlog, PostgreSQL logical replication, CDC |\n\n## Reading from followers that lag\n\n| Anomaly | What the user sees | Fix |\n|---|---|---|\n| Read-your-writes | pays, reloads, the payment is missing | session token: the log position of my last write; read only from a node at or past it, else the leader |\n| Monotonic reads | the capture appears, then disappears | token of the highest position I've seen, or stick to one follower |\n| Consistent prefix | a capture before its authorization | keep causally related writes in one log (one shard per payment) |\n\n## Many leaders (lesson 5)\n\n- Topologies: circle, star, all-to-all. Origin ids stop loops (PostgreSQL: `origin = none`). All-to-all lets an UPDATE overtake its INSERT; timestamps can't fix that, holding a change until its dependencies arrive can.\n- Conflict handling: avoid it (a home region per record), last write wins (lab: 1% lost at writes 5 s apart, 38.5% at 50 ms), keep siblings and merge. Invariants (balance at zero or above, unique keys) need agreement before commit.\n\n| | waits for another region | doesn't wait |\n|---|---|---|\n| one writer per row | CockroachDB (Raft per range, `REGIONAL BY ROW`) | Aurora Global Database (RPO seconds on failover) |\n| several writers per row | DynamoDB MRSC (3 Regions, `ReplicatedWriteConflictException`), MySQL Group Replication (first commit wins, up to 9 members) | DynamoDB MREC (last writer wins per item, local conditional checks), pgactive |\n\n## Sync engines and collaborative text (lesson 6)\n\n| Design | Who orders writes | Products | Cost |\n|---|---|---|---|\n| Server reconciliation | the server, one at a time; clients rebase | Linear, Replicache and Zero, PowerSync | changes are guesses until the server answers |\n| Read-path sync | n/a: writes go through your API | ElectricSQL shapes | no offline writes |\n| Operational transformation | a central server, usually | Google Docs | slow to merge long-diverged branches (one trace: an hour) |\n| Text CRDT | nobody | Automerge, Yjs | an id per character and tombstones forever (Automerge 2: 700 MB for Moby Dick; 3: 1.3 MB) |\n\n## Leaderless (lesson 7)\n\n| N | W | R | Read sees the last acknowledged write? | Writes survive | Reads survive |\n|---|---|---|---|---|---|\n| 3 | 1 | 1 | no | 2 down | 2 down |\n| 3 | 2 | 2 | yes (Dynamo's common choice) | 1 down | 1 down |\n| 3 | 3 | 1 | yes | 0 down | 2 down |\n\nCatch-up: hinted handoff (Cassandra `max_hint_window` 3 h), read repair (keys that get read), anti-entropy with Merkle trees (`nodetool repair`, before `gc_grace_seconds`, 10 days, runs out). Quorums still miss: sloppy quorums, timed-out writes that landed, concurrent writes, reads during a write, replicas restored from old data. `Unavailable` means not attempted; `WriteTimeout` means unknown.\n\n## Concurrent writes (lesson 8)\n\n- A happens before B if B's writer knew of A. Concurrent: neither. Knowledge, not time.\n- Last write wins drops one of two concurrent writes: Jepsen, Riak, 71.7% of acknowledged writes lost with no fault, 91.4% with a partition, 0% with siblings merged as a set. Safe only for keys written once.\n- Version vectors: one counter per replica. All entries at most the other's: ancestor. Each bigger somewhere: concurrent, keep siblings.\n- CRDTs: G-Counter (max per slot), PN-Counter (two G-Counters), OR-Set (unique tags; a remove deletes the tags it saw). No CRDT keeps an invariant like \"balance at zero or above\".\n\n## Numbers worth remembering\n\n| | |\n|---|---|\n| Cross-region round trip (Atlantic) | about 70 ms |\n| Dynamo's latency target | 300 ms at the 99.9th percentile |\n| Dynamo carts seeing a single version | 99.94% of requests |\n| Cassandra hint window | 3 hours |\n| Cassandra tombstone grace | 10 days |\n| DynamoDB MREC replication | typically within a second |\n| One frame at 60 Hz | 16 ms |",
+  "recap": [
+    "Replication keeps full copies on several machines for availability, durability, nearby reads and read throughput. All of the difficulty is in the changes, not the data.",
+    "Single leader: one leader orders every write into a log and followers replay it. Asynchronous replication says OK first and can lose acknowledged writes on failover; synchronous replication lets one follower stop writes; semi-synchronous sits between and may quietly fall back.",
+    "Replication logs ship statements (break on nondeterminism), physical WAL (ties both sides to one version) or logical rows (version-independent, and the basis of change data capture).",
+    "A lagging follower breaks read-your-writes, monotonic reads and consistent prefix. The fix is the same idea each time: carry a log position and never read below it, or keep related writes in one log.",
+    "Multi-leader puts a leader per region or device: local writes, survival of a region, and write conflicts. All-to-all replication lets changes overtake; conflicts are avoided by a home region, settled by last write wins (which loses writes) or kept as siblings and merged.",
+    "Sync engines keep a replica on the device. Server reconciliation lets the server order and check every mutation while clients rebase; collaborative text needs operational transformation (through a server) or a text CRDT (ids per character, no server).",
+    "Leaderless stores send every write to N replicas and wait for W; reads ask R. R + W > N gives overlap, not linearizability. Hints, read repair and Merkle-tree anti-entropy bring stale copies back.",
+    "Concurrency is about what each writer knew, not the clock. Last write wins drops one of two concurrent writes (71.7% in Jepsen's Riak test); version vectors detect concurrency, and CRDTs merge counters and sets without loss, but no merge keeps an invariant."
+  ],
+  "quiz": [
+    {
+      "q": "A PostgreSQL primary replicates asynchronously to one standby. It acknowledges a refund at 10:00:00.000 and crashes 50 ms later; the standby is promoted. What can happen to the refund?",
+      "options": [
+        "It's safe: an acknowledged commit is always on the standby",
+        "It may be lost: asynchronous replication acknowledged it before the standby had it, so the new primary may never have received it",
+        "It's applied twice, once by each server",
+        "The promotion waits until the old primary comes back and hands it over"
+      ],
+      "answer": 1,
+      "why": "Asynchronous means the client hears OK once the leader's own WAL is flushed; shipping to the standby happens after. A crash inside that window loses acknowledged writes on failover. Synchronous commit to the standby (`on` or `remote_apply`) closes the window at the price of a round trip per commit."
+    },
+    {
+      "q": "A leader replicates the statement `UPDATE holds SET expires_at = NOW() + interval '7 days' WHERE merchant_id = 'M-0042'` to its followers as SQL text. What goes wrong?",
+      "options": [
+        "Nothing: every follower runs the same statement and gets the same rows",
+        "The followers reject it, because statements can't be replicated",
+        "Each follower evaluates `NOW()` when it replays, so the expiry times differ from the leader's; shipping the logical row changes with their values fixes it",
+        "The statement runs twice on the leader"
+      ],
+      "answer": 2,
+      "why": "Statement-based replication breaks on anything nondeterministic: `NOW()`, `RAND()`, auto-increment values in concurrent inserts, triggers. A logical (row-based) log ships the resulting rows, with the values the leader computed, so replay is exact and independent of the storage format."
+    },
+    {
+      "q": "A customer pays, and the app immediately reloads the payment list from a follower that is 300 ms behind. The payment is missing. Which fix gives read-your-writes without sending every read to the leader?",
+      "options": [
+        "Remember the log position of the customer's last write in the session, and read only from a node that has replayed past it, falling back to the leader",
+        "Send every read to a random follower, so the lag averages out",
+        "Make the follower's cache bigger",
+        "Retry the read until the payment appears"
+      ],
+      "answer": 0,
+      "why": "The session knows exactly what it needs: everything up to its own write's position. Any follower at or past that position is good enough, and the leader serves only while every follower is behind. Random followers make it worse (and add monotonic-read violations); blind retries have no bound when a follower is stuck."
+    },
+    {
+      "q": "Authorizations and captures are written to two different shards, each with its own lagging followers. A reporting job sees captures whose authorizations don't exist yet. What fixes this anomaly?",
+      "options": [
+        "Reading at a higher isolation level on each shard",
+        "Adding more followers to the authorization shard",
+        "Synchronizing the clocks of the two shards",
+        "Putting each payment's events on one shard, so they sit in one log and are replayed in order"
+      ],
+      "answer": 3,
+      "why": "This is a consistent-prefix violation: two logs with no common order, read at different lags. Inside one log, replay order is commit order, so routing every event of a payment to the same shard makes the anomaly impossible. Clocks and isolation levels don't create an order between independent logs."
+    },
+    {
+      "q": "Which PostgreSQL `synchronous_commit` level makes a COMMIT wait until the change is visible to queries on the synchronous standby?",
+      "options": [
+        "`on`",
+        "`remote_write`",
+        "`remote_apply`",
+        "`local`"
+      ],
+      "answer": 2,
+      "why": "`remote_apply` waits for the standby to replay the commit, so a read there sees it, at the largest latency cost. `on` waits for the standby to flush the WAL to disk (durable, but not yet visible), `remote_write` only for the standby's operating system to have it, and `local` for nothing beyond the primary's own flush."
+    },
+    {
+      "q": "A checkout service stores idempotency keys in a DynamoDB global table in MREC mode, in two Regions. A retry with the same key lands in the second Region 200 ms after the first attempt. What can happen?",
+      "options": [
+        "The second put fails with ReplicatedWriteConflictException",
+        "Both conditional puts succeed, because each Region checks `attribute_not_exists` against its own copy, and the card is charged twice",
+        "The second put waits until the first one has replicated",
+        "Nothing: global tables make conditional writes global"
+      ],
+      "answer": 1,
+      "why": "MREC replicates asynchronously, typically within a second, and evaluates conditions against the local Region's version. Inside the lag both Regions pass the check. MRSC would have detected the race and failed one write with ReplicatedWriteConflictException; a home Region per merchant would have avoided it."
+    },
+    {
+      "q": "Three regions replicate all-to-all. A capture (an UPDATE) reaches region ap before the INSERT of the payment it captures. Which approach leaves ap correct whatever the clocks read?",
+      "options": [
+        "Discard the UPDATE, because the row doesn't exist",
+        "Keep the version with the later timestamp",
+        "Switch to a circular topology",
+        "Hold the UPDATE until ap has applied everything the capturing region had applied when it made it"
+      ],
+      "answer": 3,
+      "why": "The capture causally depends on the insert, and carrying that dependency (a version vector) lets ap wait and apply both in order. Discarding leaves ap disagreeing forever; timestamps get it right only when clocks happen to agree with the order of events. A circle avoids overtaking but makes every node a single point of failure."
+    },
+    {
+      "q": "A dispute console works offline. Agent A approves a refund while agent B, also offline, closes the dispute. Which sync design makes sure a closed dispute can't be refunded?",
+      "options": [
+        "Store the dispute in a CRDT, so both edits survive the merge",
+        "Last write wins on the dispute row",
+        "Server reconciliation: both mutations run on the server in one order with the business rule, and the loser is rejected and rolled back on its client",
+        "Operational transformation of the two edits"
+      ],
+      "answer": 2,
+      "why": "A CRDT guarantees convergence, not business rules: both the refund and the close would survive. Last write wins would silently drop one decision. OT is for text positions. Server reconciliation runs the rule once, at a definite point in the order, and tells the agent whose mutation lost."
+    },
+    {
+      "q": "A leaderless store keeps N = 3 copies. Writes use W = 1 and reads R = 2. Can a read miss a write that was acknowledged?",
+      "options": [
+        "Yes: 1 + 2 = 3 is not more than 3, so the two replicas a read asks may both lack the write",
+        "No: R = 2 is a majority",
+        "No, as long as hinted handoff is on",
+        "Only if two replicas are down"
+      ],
+      "answer": 0,
+      "why": "Overlap needs R + W > N. With W = 1, the write may sit on one replica, and the other two form a valid read set that misses it, with every node up. Hints help a down replica catch up later; they don't change the overlap arithmetic."
+    },
+    {
+      "q": "Two replicas hold versions with version vectors `[(eu, 3), (us, 1)]` and `[(eu, 2), (us, 2)]`. What should a store that uses last write wins do, and what should one that uses version vectors do?",
+      "options": [
+        "Both keep `[(eu, 3), (us, 1)]`, because 3 is the biggest counter",
+        "Last write wins keeps whichever has the later timestamp and drops the other; the version vector store sees each is bigger on one entry, calls them concurrent and keeps both as siblings",
+        "Both keep `[(eu, 2), (us, 2)]`, because its total is bigger",
+        "Both reject the second write"
+      ],
+      "answer": 1,
+      "why": "Neither vector is at most the other in every entry (eu: 3 > 2, us: 1 < 2), so neither writer saw the other's write: they're concurrent. Last write wins can't know that and keeps one by clock, silently losing the other. Version vectors detect the conflict and hand both versions to the application, or to a CRDT merge."
+    }
+  ]
+}

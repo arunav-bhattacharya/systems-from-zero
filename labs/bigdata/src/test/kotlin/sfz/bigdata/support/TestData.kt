@@ -59,7 +59,7 @@ object TestData {
     /**
      * [n] payments like [payments], except that every payment whose id ends in 00 to [hotPercent] - 1
      * (so [hotPercent] percent of them) belongs to [hotMerchant]: one marketplace merchant with far
-     * more payments than the other 499. Lesson 7 uses it for skew.
+     * more payments than the other 499. Lesson 8 uses it for skew.
      */
     fun skewedPayments(n: Int, hotMerchant: Int = 7, hotPercent: Int = 30, seed: Long = 42): List<Payment> =
         payments(n, seed = seed).map { if (it.paymentId % 100 < hotPercent) it.copy(merchantId = hotMerchant) else it }

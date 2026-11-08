@@ -1,4 +1,4 @@
-// Lesson nosql-02: 1,000 payments for 50 accounts and 5 merchants, plus one account document.
+// Lesson model-02: 1,000 payments for 50 accounts and 5 merchants, plus one account document.
 // Inside mongosh: load("/sfz/nosql-02-payments.js")   (it starts from scratch each time)
 db.payments.drop();
 db.accounts.drop();

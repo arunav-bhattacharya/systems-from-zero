@@ -1,461 +1,461 @@
 {
-  "id": "os-10",
-  "title": "File systems: inodes, links and file descriptors",
-  "minutes": 40,
-  "goal": "By the end you can tell a file's name from its inode and its file descriptor, predict what two processes writing one log file will do, find and recover a deleted file a process still holds open, and fix \"Too many open files\".",
-  "warmup": {
-    "q": "A cron job runs `rm /var/log/ledger/app.log` to free space, while the payment service still has the file open and keeps logging to it. What happens to the disk space?",
-    "options": [
-      "It's free at once: the file is gone",
-      "It stays in use until the service closes the file, though `ls` and `du` no longer show it",
-      "The service's next write fails with `ENOENT` and it stops logging",
-      "The kernel creates a new `app.log` at the service's next write"
-    ],
-    "answer": 1,
-    "why": "`rm` removes a name. The kernel frees the file's inode and blocks only when it has no names left and no process has it open. The service's file descriptor still points at it, so its writes keep landing in a file nobody can see by name, and `df` keeps counting it. The service gets no error, and nothing recreates the name."
-  },
-  "sections": [
-    {
-      "h": "A file is an inode, and a name only points to it",
-      "body": "`stat` on a file in the lab box prints `Inode: 1573046` and `Links: 1`. Give the file a second name with `ln`, and `stat` on either name prints the same inode number and `Links: 2`. Two names, one file. To see why file systems work like that, start with what one has to store.\n\nA disk is a long array of blocks, 4 KB each in this track. For every file, something must record which blocks hold its bytes, how many bytes there are, who owns it, who may read it and when it last changed. The simplest design keeps all of that next to the name, one row per file: name, owner, size, blocks. A directory would be a table of such rows.\n\nIt breaks on the first file you want under two names. The settlement job writes `ledger.csv`, and the audit export wants the same 2 GB file as `ledger-2026.csv` without copying it. With the size and block list stored next to each name, the two rows must agree forever. Append a record through one name and the other row's size is wrong.\n\nSo Unix splits the row in two. The **inode** (index node) is the file itself: its type, size, owner, permissions, timestamps, a link count and the list of blocks that hold the data. It has a number and no name. A **directory** is a file whose content is a list of entries, each one a name and an inode number. Opening `/tmp/ledger.csv` means reading the root directory to find `tmp` and its inode number, reading that directory to find `ledger.csv` and its number, then reading that inode.\n\nA second name is just a second entry with the same number. That's a **hard link**, and the link count says how many entries point at the inode. `rm` doesn't delete a file. It calls `unlink`, which removes one entry and subtracts one from the count. The kernel frees the inode and its blocks when the count reaches 0 and, as section 3 shows, no process still has the file open. Renaming changes one entry and leaves the inode alone, which is why lesson 9 of this track could use `rename` to swap a file in one step.\n\nA **symbolic link** works differently. It's an inode of its own whose content is a path: `latest.csv` holds the 10 bytes `ledger.csv`, and the kernel looks that path up again every time the link is opened. Remove the name it points to and the symlink dangles, while a hard link keeps working. A hard link holds only a number, so it can't reach into another file system, whose inode numbers mean something else, and Linux refuses hard links to directories, which could make loops in the tree.",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 720 272\" role=\"img\" aria-label=\"A directory maps three names to inode numbers; two names share inode 13, which points at block 2065; latest.csv is inode 12, a symlink holding the path ledger.csv\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">directory / (inode 2)</text><text class=\"t-s t-m\" x=\"300\" y=\"24\" text-anchor=\"start\">inodes</text><text class=\"t-s t-m\" x=\"560\" y=\"24\" text-anchor=\"start\">data blocks</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"150\" rx=\"8\"/><text class=\"t-s t-code\" x=\"36\" y=\"64\" text-anchor=\"start\">ledger.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"64\" text-anchor=\"end\">→ 13</text><text class=\"t-s t-code\" x=\"36\" y=\"108\" text-anchor=\"start\">ledger-2026.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"108\" text-anchor=\"end\">→ 13</text><text class=\"t-s t-code\" x=\"36\" y=\"152\" text-anchor=\"start\">latest.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"152\" text-anchor=\"end\">→ 12</text><rect class=\"box-a\" x=\"300\" y=\"34\" width=\"200\" height=\"96\" rx=\"8\"/><text class=\"t t-a\" x=\"400\" y=\"58\" text-anchor=\"middle\">inode 13</text><text class=\"t-s t-m\" x=\"400\" y=\"80\" text-anchor=\"middle\">file, 31 bytes</text><text class=\"t-s t-m\" x=\"400\" y=\"98\" text-anchor=\"middle\">links 2</text><text class=\"t-s t-code\" x=\"400\" y=\"116\" text-anchor=\"middle\">extent: block 2065</text><rect class=\"box-b\" x=\"300\" y=\"150\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"174\" text-anchor=\"middle\">inode 12</text><text class=\"t-s t-code\" x=\"400\" y=\"196\" text-anchor=\"middle\">symlink: \"ledger.csv\"</text><rect class=\"box\" x=\"560\" y=\"44\" width=\"140\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"630\" y=\"72\" text-anchor=\"middle\">block 2065</text><text class=\"t-s t-code\" x=\"630\" y=\"96\" text-anchor=\"middle\">auth-7731,...</text><line class=\"ln-a\" x1=\"240\" y1=\"60\" x2=\"300\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"240\" y1=\"104\" x2=\"300\" y2=\"92\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"240\" y1=\"148\" x2=\"300\" y2=\"176\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"500\" y1=\"82\" x2=\"560\" y2=\"82\" marker-end=\"url(#arr)\"/><path class=\"ln-d\" d=\"M300 210 C 260 230, 180 230, 120 190\" fill=\"none\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"240\" text-anchor=\"start\">Two entries hold 13: a hard link. The symlink has its own inode and only a path,</text><text class=\"t-s t-m\" x=\"20\" y=\"260\" text-anchor=\"start\">which the kernel looks up again, by name, every time the link is opened.</text></svg>",
-        "caption": "The model for this lesson, as the last Try-it's `debugfs` shows it on disk: names live in directories, everything else lives in the inode."
-      },
-      "try": {
-        "title": "Two names, one inode",
-        "minutes": 3,
-        "steps": [
-          "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
-          "The block makes a file, a hard link and a symlink, prints their inodes and link counts, then removes the original name. Predict what each `cat` prints and the link count after `rm`.",
-          "The last line traces the system calls behind `ln`, `ln -s`, `mv` and `rm`."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "cd /tmp\necho 'auth-7731,4111,120.00,approved' > ledger.csv\nln ledger.csv ledger-2026.csv\nln -s ledger.csv latest.csv\nstat -c '%n: inode %i, %h links, %s bytes, %F' ledger.csv ledger-2026.csv latest.csv\nrm ledger.csv\ncat ledger-2026.csv\ncat latest.csv\nstat -c '%n: inode %i, %h links' ledger-2026.csv\nstrace -f -e trace=linkat,symlinkat,unlinkat,renameat2 sh -c 'ln ledger-2026.csv b.csv; ln -s b.csv c.csv; mv b.csv d.csv; rm d.csv c.csv' 2>&1 | grep -E 'link|rename'"
-        },
-        "expect": "Inode numbers differ on your machine:\n\n```text\nledger.csv: inode 1573046, 2 links, 31 bytes, regular file\nledger-2026.csv: inode 1573046, 2 links, 31 bytes, regular file\nlatest.csv: inode 1573048, 1 links, 10 bytes, symbolic link\nauth-7731,4111,120.00,approved\nledger-2026.csv: inode 1573046, 1 links\n[pid    19] linkat(AT_FDCWD, \"ledger-2026.csv\", AT_FDCWD, \"b.csv\", 0) = 0\n[pid    20] symlinkat(\"b.csv\", AT_FDCWD, \"c.csv\") = 0\n[pid    21] renameat2(AT_FDCWD, \"b.csv\", AT_FDCWD, \"d.csv\", RENAME_NOREPLACE) = 0\n[pid    22] unlinkat(AT_FDCWD, \"d.csv\", 0) = 0\n[pid    22] unlinkat(AT_FDCWD, \"c.csv\", 0) = 0\ncat: latest.csv: No such file or directory\n```\n\nThe hard link has the same inode as the original, and the count is 2. The symlink has its own inode and is 10 bytes long: the path `ledger.csv`. After `rm`, the data is still there through `ledger-2026.csv`, whose count dropped to 1, and the symlink fails because the name it holds is gone (`cat`'s complaint prints last because it goes to standard error). The trace shows the four calls: `linkat` adds an entry for an existing inode, `symlinkat` makes a new inode holding a path, `renameat2` moves an entry and `unlinkat` removes one. None of them touches the file's data."
-      },
-      "refs": [
-        {
-          "title": "inode(7): what an inode holds",
-          "url": "https://man7.org/linux/man-pages/man7/inode.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "symlink(7)",
-          "url": "https://man7.org/linux/man-pages/man7/symlink.7.html",
-          "kind": "docs"
-        },
-        {
-          "title": "OSTEP chapter 39: Files and Directories",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf",
-          "kind": "read"
-        }
-      ]
-    },
-    {
-      "h": "Three tables sit between a file descriptor and the inode",
-      "body": "`share.c` lets a child process write three records to `auth.log`, then lets its parent write three more. Run one way, the file ends with all six records. Run another way, with exactly the same writes, it ends with the parent's three, and the child's are gone. The difference is where the file offset lives.\n\nA **file descriptor** is the small number `open()` returns (lesson 1 of this track): 3 for the first file a program opens, because 0, 1 and 2 are standard input, output and error. Every `read` and `write` through it moves an **offset**, the position where the next byte goes. The obvious design keeps the offset in the descriptor: each process has its own fd numbers, and each fd has its own offset.\n\nThat design breaks shell redirection. `(date; hostname) > out.txt` runs two programs one after the other. The shell opened `out.txt` once, and both programs inherited fd 1 through `fork` and `exec` (lesson 2 of this track). If each had its own offset starting at 0, `hostname` would write over the output of `date`. In fact you get both lines, one under the other.\n\nSo Linux keeps three tables. Each process has an **fd table** that maps fd numbers to pointers. Each pointer leads to an **open file description**, made by one `open()` call, which holds the offset and the flags the file was opened with. The description points at the inode. `fork` copies the fd table, so the child's fd 3 reaches the parent's description, and the two share one offset. `dup2`, which a shell uses for `>`, does the same inside one process. A second `open()` of the same file, even by the same process, makes a new description with its own offset at 0. `/proc/<pid>/fdinfo/<fd>` prints the description's `pos` and `flags`.\n\nThat explains `share.c`. Opened once before `fork`, the child's writes move the shared offset to 42, the parent writes from 42, and nothing is lost. Opened separately after `fork`, the parent's description is still at 0, and its writes land on the child's bytes. The stepper walks through both.\n\nTwo processes that open one log file on their own, such as two JVMs or a service and a sidecar, need **`O_APPEND`**. With it, the kernel moves the offset to the end of the file before every write, in the same step as the write, so no writer lands on another's bytes. Java's `FileOutputStream(file, true)` opens a file this way, and so do Logback's and Log4j's file appenders by default. Keep one record per `write()` call as well: on Linux's local file systems another writer can't split a single write, but it can land between two.",
-      "stepper": {
-        "title": "open, fork, and two writers",
-        "intro": "Three runs of `share.c`. Follow the arrows from each process's fd 3 to a description, and from the description to the inode.",
-        "frames": [
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent opens auth.log: fd 3 points at description A, offset 0, which points at the inode\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box-dim\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"110.0\" y=\"213.0\" text-anchor=\"middle\">no child yet</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 0</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-m\" x=\"514\" y=\"160\" text-anchor=\"start\">(empty)</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">open(): one new description, put in the lowest free fd, 3</text></svg>",
-            "say": "The payment service, PID 40, calls `open(\"auth.log\", O_WRONLY|O_CREAT|O_TRUNC)`. The kernel makes an **open file description** A, holding the offset (0) and the flags, pointing at the file's inode. It stores a pointer to A in the lowest free slot of the process's fd table, 3, and returns 3."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"fork copies the fd table: the child's fd 3 points at the same description A\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 0</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-m\" x=\"514\" y=\"160\" text-anchor=\"start\">(empty)</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">fork(): the table is copied, the description is shared (refs 2)</text></svg>",
-            "say": "`fork` gives the child, PID 41, a copy of the fd table: its fd 3 holds the same pointer, so it reaches the same description A. Nothing about the file was copied. A now has two references, and one offset."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The child writes three records: the shared offset moves from 0 to 42\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the child's writes moved A's offset to 42</text></svg>",
-            "say": "The child writes three 14-byte records through its fd 3. Each `write` puts the bytes at A's offset and moves it on: 0, 14, 28, 42. The inode's size grows to 42."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent writes next and starts at 42, so all six records survive\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the parent never wrote, yet its offset was 42: share.c printed exactly that</text></svg>",
-            "say": "The parent writes its three records. Its fd 3 reaches the same A, whose offset the child left at 42, so the records go after the child's. This is why `(date; hostname) > out.txt` keeps both lines: both programs inherit one description from the shell."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"Run two: each process opens the file itself, so the child gets its own description B\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-a\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">two open() calls made two descriptions, each with its own offset</text></svg>",
-            "say": "Second run. This time the file is opened after `fork`, once by each process. Two `open` calls make two descriptions: the parent's A and the child's B. The child writes its three records through B, and B's offset reaches 42. A's offset is still 0."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent writes at its own offset, 0, right over the child's records\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-bad\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the child's records are gone: same writes, different tables</text></svg>",
-            "say": "The parent writes through A, starting at A's offset, 0. Its three records land on the same 42 bytes the child wrote, and the child's records are gone. No call failed. Two services logging to one file with plain `open` lose lines exactly like this."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"With O_APPEND both descriptions jump to the end of the file before every write\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">O_APPEND: offset = size, then write, as one step</text></svg>",
-            "say": "Third run: both open with `O_APPEND`. The descriptions are still separate, but before each write the kernel sets the offset to the file's current size, in the same step as the write. The parent's offset was 0, its first record goes to 42, and all six survive. Logging frameworks open their files this way."
-          },
-          {
-            "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"When the child exits, its fd table goes and description B is freed; the inode stays\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box-dim\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"110.0\" y=\"213.0\" text-anchor=\"middle\">child exited</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">close: the last reference frees the description; the inode keeps its name</text></svg>",
-            "say": "The child exits and the kernel closes its descriptors. B had one reference, so B is freed. When the parent closes fd 3, A goes too. The inode still has one link, its name `auth.log`, so it stays. Section 3 is about the case where the name went first."
-          }
-        ]
-      },
-      "try": {
-        "title": "One offset or two",
-        "minutes": 3,
-        "steps": [
-          "Read `os/c/l10/share.c`. Its `run` function opens the file before `fork` in mode 1, after `fork` in mode 2, and after `fork` with `O_APPEND` in mode 3. The offsets it prints come from `/proc/self/fdinfo`.",
-          "Predict the file's contents and the parent's offset before it writes, for each mode. Then run it in the lab box."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "gcc -O2 -o /tmp/share os/c/l10/share.c && /tmp/share /tmp/auth.log"
-        },
-        "expect": "```text\n1. open, then fork (one shared description)\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 42\n   parent wrote 3 records, its offset is now 84\n   file: 84 bytes\n     child  auth 1\n     child  auth 2\n     child  auth 3\n     parent auth 1\n     parent auth 2\n     parent auth 3\n2. fork, then each process opens the file\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 0\n   parent wrote 3 records, its offset is now 42\n   file: 42 bytes\n     parent auth 1\n     parent auth 2\n     parent auth 3\n3. fork, then each opens it with O_APPEND\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 0\n   parent wrote 3 records, its offset is now 84\n   file: 84 bytes\n     child  auth 1\n     child  auth 2\n     child  auth 3\n     parent auth 1\n     parent auth 2\n     parent auth 3\n```\n\nIn run 1 the parent's offset is 42 before it has written a byte: the child moved it, because they share one description. In run 2 the parent's own description is at 0, and its records replace the child's; the file is only 42 bytes. In run 3 the parent's offset also starts at 0, but `O_APPEND` sends each write to the end of the file, and all six records survive."
-      },
-      "refs": [
-        {
-          "title": "open(2): open file descriptions and O_APPEND",
-          "url": "https://man7.org/linux/man-pages/man2/open.2.html",
-          "kind": "docs"
-        },
-        {
-          "title": "proc_pid_fd(5): /proc/<pid>/fd and fdinfo",
-          "url": "https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "A deleted file lives until its last descriptor closes",
-      "body": "`LogHolder` is a JVM that writes 40 MB to `/dev/shm/auth.log` and keeps logging into it. Delete the file under it, and `df` still says 41 MB of `/dev/shm` are in use, while `du` says 0.\n\nBoth are right. `du` walks directory entries and adds up the files they reach, and no entry reaches this inode any more. `df` asks the file system how many blocks are allocated, and these blocks still are. The rule from the first section has a second half: the kernel frees an inode when its link count is 0 **and** no open file description points at it. The JVM's fd 4 still points at a description, which still points at the inode, so the service keeps writing to a file nobody can find by name.\n\nYou can find it from the process's side. `/proc/<pid>/fd/` has one entry per descriptor, and for a file that has lost every name it shows the old path followed by `(deleted)`. `lsof +L1` lists every open file with fewer than one link, which is exactly this case. The `/proc` entry also opens the file: `cp /proc/<pid>/fd/4 recovered.log` copies all 40 MB back out, for as long as the process lives.\n\nOn a server this shows up as a full disk nobody can explain. A cleanup job deletes old logs, or someone runs `rm` on a 20 GB log to make room, and the space doesn't come back until the service restarts. Two fixes don't need a restart. Truncate the file instead of deleting it, through its name (`: > app.log`) or, once it's deleted, through `/proc` (`: > /proc/<pid>/fd/4`), and `df` drops at once. That works cleanly when the writer opened the file with `O_APPEND`, because its next write goes to the new end. A writer without `O_APPEND` keeps its old offset, 40 MB in, and its next write leaves a 40 MB hole of zeros in front of it. The lasting fix is in how logs rotate. Let the logging framework roll its own files (Logback's and Log4j's rolling appenders rename the old file and open a new one), or, for a program that can't reopen its log, use logrotate's `copytruncate`, which copies the file and then truncates it in place.\n\nThe same rule works for you on purpose. A program can create a temporary file, open it and `unlink` it at once. Nobody else can open it by name, and the kernel frees it the moment the program closes it, even if the program crashes.",
-      "try": {
-        "title": "Delete a log that a JVM still holds",
-        "minutes": 4,
-        "steps": [
-          "`os/src/demo/java/sfz/os/l10/demo/LogHolder.java` opens `/dev/shm/auth.log` in append mode, writes 40 MB and keeps logging a line a second. `/dev/shm` is a small in-memory file system in every container, so `df` there shows only this file.",
-          "The block deletes the file while the JVM runs, then looks at it from `df`, `du`, `/proc` and `lsof`, copies it back, and frees the space by truncating it through `/proc`. Predict each `df` line before you run it."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l10/demo/LogHolder.java\njava -cp /tmp/out sfz.os.l10.demo.LogHolder /dev/shm/auth.log 40 60 & pid=$!\nsleep 3\nrm /dev/shm/auth.log\ndf -m /dev/shm; du -sm /dev/shm\nls -l /proc/$pid/fd | grep deleted\nlsof +L1\ncp /proc/$pid/fd/4 /tmp/recovered.log; ls -l /tmp/recovered.log\n: > /proc/$pid/fd/4\ndf -m /dev/shm\nkill $pid",
-          "file": "labs/os/src/demo/java/sfz/os/l10/demo/LogHolder.java"
-        },
-        "expect": "PIDs and the device number differ:\n\n```text\npid 33 wrote 40 MB to /dev/shm/auth.log and keeps it open\nFilesystem     1M-blocks  Used Available Use% Mounted on\nshm                   64    41        24  63% /dev/shm\n0\t/dev/shm\nl-wx------ 1 root root 64 Nov  7 20:58 4 -> /dev/shm/auth.log (deleted)\nCOMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME\njava     33 root    4w   REG  0,179 41943200     0    2 /dev/shm/auth.log (deleted)\n-rw-r--r-- 1 root root 41943200 Nov  7 20:58 /tmp/recovered.log\nFilesystem     1M-blocks  Used Available Use% Mounted on\nshm                   64     0        64   0% /dev/shm\n```\n\nAfter `rm`, `df` still counts 41 MB and `du` finds nothing. The JVM's fd 4 shows the path with `(deleted)`, and `lsof` lists it with `NLINK 0`. Copying `/proc/<pid>/fd/4` gets every byte back. Truncating through the same entry frees the blocks while the JVM keeps running, and because the file was opened with `O_APPEND`, its next line goes to offset 0 of the now empty file."
-      },
-      "refs": [
-        {
-          "title": "unlink(2): when the space is freed",
-          "url": "https://man7.org/linux/man-pages/man2/unlink.2.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "Every open file and socket is a descriptor, and the table has a limit",
-      "body": "`FdLeak` opens a config file for every \"request\" and never closes it. With the limit set to 256 descriptors, open number 253 fails with `java.io.FileNotFoundException: /etc/hostname (Too many open files)`. The JVM already had 4 open (0, 1, 2 and the JDK's `lib/modules` file), and 4 + 252 is 256.\n\nAn fd table can't grow forever, because every entry pins kernel memory: the description and, behind it, a file, a socket's buffers or a pipe. So the kernel caps the table with a resource limit, `RLIMIT_NOFILE`, which `ulimit -n` sets. When a process holds as many descriptors as its limit, `open`, `socket`, `accept` and `pipe` all fail with `EMFILE`, which Java reports as \"Too many open files\". The name misleads: every TCP connection is a descriptor too, so a JDBC pool of 20 Oracle connections holds 20, an HTTP client keeping 200 connections alive holds 200, and a server holds one per client.\n\nThe limit has two values. The **soft** limit is the one the kernel enforces. A process may raise it up to the **hard** limit, and only a privileged process can raise the hard one. The JVM raises it for you: at start-up HotSpot sets the soft limit to the hard limit (the `MaxFDLimit` flag, on by default). `strace` shows the two calls, and a JVM started under `ulimit -S -n 256` opened 5,000 files without trouble. So what limits a JVM is the hard limit: 1,048,576 in the lab box, Docker's default here. For a running service, `grep 'open files' /proc/<pid>/limits` tells you.\n\nA high limit doesn't fix a leak. It only moves the failure. Above every process sits a limit for the whole machine, `fs.file-max`, 812,037 in this Docker VM. My first version of `FdLeak` had no cap. It reached that limit after 810,087 opens and failed with \"Too many open files in system\" (`ENFILE`), and for that moment every other process in the VM was refused new files too. `FdLeak` now stops itself at 5,000.\n\nTo watch a service, count its descriptors over time with `ls /proc/<pid>/fd | wc -l`, or export the same number as a metric (Micrometer's `process.files.open`). A count that climbs with traffic and never comes back down is a leak: a stream, a socket or a `Files.list` result that nobody closes. In Java, `try (...)` closes it for you, and in Kotlin, `use {}`.",
-      "try": {
-        "title": "Run out of descriptors",
-        "minutes": 3,
-        "steps": [
-          "`os/src/demo/java/sfz/os/l10/demo/FdLeak.java` opens `/etc/hostname` in a loop without closing it, and stops at 5,000.",
-          "The block runs it under a soft limit of 256, then under a soft and hard limit of 256, then shows the JVM's `prlimit64` calls and the failing `openat`. Predict which run fails."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the lab box",
-          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l10/demo/FdLeak.java\ngrep 'open files' /proc/self/limits\n(ulimit -S -n 256; java -cp /tmp/out sfz.os.l10.demo.FdLeak)\n(ulimit -n 256; java -cp /tmp/out sfz.os.l10.demo.FdLeak)\n(ulimit -S -n 256; strace -f -e trace=prlimit64 java -version 2>&1 | grep NOFILE)\n(ulimit -n 256; strace -f -o /tmp/leak.txt -e trace=openat java -cp /tmp/out sfz.os.l10.demo.FdLeak > /dev/null; grep -m1 EMFILE /tmp/leak.txt)",
-          "file": "labs/os/src/demo/java/sfz/os/l10/demo/FdLeak.java"
-        },
-        "expect": "Thread IDs differ:\n\n```text\nMax open files            1048576              1048576              files     \nopen file descriptors at start: 4\nopened 5000 files without an error; open file descriptors: 5004\nopen file descriptors at start: 4\nopen number 253 failed: java.io.FileNotFoundException: /etc/hostname (Too many open files)\nopen file descriptors when it failed: 256\n[pid    82] prlimit64(0, RLIMIT_NOFILE, NULL, {rlim_cur=256, rlim_max=1024*1024}) = 0\n[pid    82] prlimit64(0, RLIMIT_NOFILE, {rlim_cur=1024*1024, rlim_max=1024*1024}, NULL) = 0\n106   openat(AT_FDCWD, \"/etc/hostname\", O_RDONLY) = -1 EMFILE (Too many open files)\n```\n\nThe soft limit alone stops nothing: the JVM reads `{rlim_cur=256, rlim_max=1024*1024}` and sets the soft limit to the hard one before your code runs, so all 5,000 opens work. With the hard limit at 256 too, the 253rd open fails, the kernel returns `EMFILE` and Java throws. The JVM started with 4 descriptors, so the table was full at exactly 256."
-      },
-      "refs": [
-        {
-          "title": "getrlimit(2): RLIMIT_NOFILE",
-          "url": "https://man7.org/linux/man-pages/man2/getrlimit.2.html",
-          "kind": "docs"
-        },
-        {
-          "title": "Documentation for /proc/sys/fs: file-max and file-nr",
-          "url": "https://docs.kernel.org/admin-guide/sysctl/fs.html",
-          "kind": "docs"
-        }
-      ]
-    },
-    {
-      "h": "A journal keeps inodes and blocks consistent through a crash",
-      "body": "`debugfs` reads an ext4 file system straight from its disk image. For `ledger.csv` it prints `Inode: 13`, `Size: 31`, `Links: 2` and, under `EXTENTS`, `(0):2065`: block 0 of the file is block 2065 of the disk. That's the inode from the first section, as bytes on a disk.\n\nAdding one block to a file changes at least three places on the disk: the new data block, the block bitmap (one bit per block, set while the block is in use) and the inode (a new size and a new extent). The disk writes them one at a time. Lose power between two of those writes, and the file system contradicts itself. A block marked as used that no inode owns is lost space. An inode pointing at a block that the bitmap still calls free is worse: the next file gets that block too, and two files share bytes.\n\nThe old fix was `fsck`. After every crash, it reads every inode and every bitmap and repairs what disagrees. On a big disk that takes minutes to hours, and the server can't start until it's done.\n\nA **journal** turns the scattered writes into one decision. The file system first writes every changed block to a log area of its own (inode 8, 4 MB in the Try-it's image), then a commit record. Only after the commit is on disk does it copy those blocks to their real places, a step called checkpointing. After a crash, the mount replays each transaction that has a commit record and ignores the one that doesn't, in about the time it takes to read the journal. The figure shows the order.\n\next4 by default journals metadata only (inodes, bitmaps, directories) in the mode `data=ordered`. Its documentation puts it this way: \"All data are forced directly out to the main file system prior to its metadata being committed to the journal.\" So after a crash, an inode never points at a block that still holds some other file's old bytes. ext4 commits a transaction at least every 5 seconds (`commit=5`). XFS has the same shape at this level: it logs metadata changes, not file data, and it splits the disk into allocation groups so many threads can allocate space at once.\n\nKeep lesson 9's rule next to this one. A journal makes the file system's structure survive a crash, and nothing more. Data you wrote without `fsync` can still be missing afterwards, and a file can come back shorter than your last `write()` left it.",
-      "figure": {
-        "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"An ext4 journal transaction: the data block is written in place first, then the inode, bitmap and directory blocks go to the journal followed by a commit record, then they are checkpointed to their home locations\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the journal: a log area of the file system (inode 8, 4 MB here)</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"680\" height=\"64\" rx=\"8\"/><rect class=\"box-dim\" x=\"36\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"94.0\" y=\"69.0\" text-anchor=\"middle\">begin</text><rect class=\"box-a\" x=\"168\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226.0\" y=\"69.0\" text-anchor=\"middle\">inode 13</text><rect class=\"box-a\" x=\"300\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"358.0\" y=\"69.0\" text-anchor=\"middle\">bitmap</text><rect class=\"box-a\" x=\"432\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"490.0\" y=\"69.0\" text-anchor=\"middle\">dir /</text><rect class=\"box-ok\" x=\"564\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"622.0\" y=\"69.0\" text-anchor=\"middle\">commit</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">the file system's home locations</text><rect class=\"box\" x=\"20\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"96.0\" y=\"166.0\" text-anchor=\"middle\">inode table</text><rect class=\"box\" x=\"196\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272.0\" y=\"166.0\" text-anchor=\"middle\">block bitmap</text><rect class=\"box\" x=\"372\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"448.0\" y=\"166.0\" text-anchor=\"middle\">directory /</text><rect class=\"box-b\" x=\"548\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"624.0\" y=\"166.0\" text-anchor=\"middle\">block 2065</text><line class=\"ln-d\" x1=\"226\" y1=\"84\" x2=\"110\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"358\" y1=\"84\" x2=\"272\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"490\" y1=\"84\" x2=\"448\" y2=\"136\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"20\" y=\"232\" text-anchor=\"start\">1. data=ordered: the new data block goes to its home first (yellow)</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">2. the changed metadata blocks go to the journal, then a commit record (green)</text><text class=\"t-s\" x=\"20\" y=\"272\" text-anchor=\"start\">3. checkpoint: later, the metadata is copied to its home locations (dashed)</text><text class=\"t-s t-a\" x=\"20\" y=\"296\" text-anchor=\"start\">crash before the commit: the transaction is ignored. After it: replayed at mount.</text></svg>",
-        "caption": "One ext4 transaction in data=ordered mode. A crash at any point leaves either the old metadata or the new, never a mix."
-      },
-      "try": {
-        "title": "Read an inode and the journal off a disk image",
-        "minutes": 4,
-        "steps": [
-          "This one needs the privileged box, because it mounts a disk image: from the `labs` folder, `docker compose -f env/labbox.yml run --rm box-priv`.",
-          "The block builds a 64 MB ext4 image from a folder with a file, a hard link and a symlink, reads the inodes and the journal with `debugfs` and `dumpe2fs` (no mount needed for those), then mounts it to show the journal options. `umount` releases the loop device again."
-        ],
-        "code": {
-          "lang": "bash",
-          "title": "in the privileged lab box",
-          "src": "mkdir -p /tmp/src && cd /tmp/src\necho 'auth-7731,4111,120.00,approved' > ledger.csv\nln ledger.csv ledger-2026.csv; ln -s ledger.csv latest.csv\ncd /tmp; truncate -s 64M disk.img; mkfs.ext4 -q -F -d /tmp/src disk.img\ndebugfs -R 'ls -l /' disk.img 2>/dev/null\ndebugfs -R 'stat ledger.csv' disk.img 2>/dev/null | grep -E 'Inode:|Links|Size:|EXTENTS' -A1 | grep -v -E '^--|Fragment|ctime|Generation'\ndumpe2fs -h disk.img 2>/dev/null | grep -E 'Journal (inode|size)|Total journal size'\nmkdir -p /mnt/ledger && mount -o loop disk.img /mnt/ledger\ncat /proc/fs/ext4/loop*/options | grep -E 'data=|commit='\numount /mnt/ledger"
-        },
-        "expect": "```text\n      2   40755 (2)      0      0    4096  7-Nov-2026 20:58 .\n      2   40755 (2)      0      0    4096  7-Nov-2026 20:58 ..\n     11   40700 (2)      0      0   16384  7-Nov-2026 20:58 lost+found\n     12  120777 (7)      0      0      10  7-Nov-2026 20:58 latest.csv\n     13  100644 (1)      0      0      31  7-Nov-2026 20:58 ledger-2026.csv\n     13  100644 (1)      0      0      31  7-Nov-2026 20:58 ledger.csv\n\nInode: 13   Type: regular    Mode:  0644   Flags: 0x80000\nUser:     0   Group:     0   Project:     0   Size: 31\nFile ACL: 0\nLinks: 2   Blockcount: 8\nEXTENTS:\n(0):2065\nJournal inode:            8\nTotal journal size:       4096k\ncommit=5\ndata=ordered\n```\n\nThe root directory lists `ledger.csv` and `ledger-2026.csv` with the same inode, 13, and a link count of 2. `latest.csv` is inode 12, a symlink (`120777`). Inode 13 holds the size, the link count and one extent, block 2065, and no name anywhere. Inode 8 is the 4 MB journal, and the mounted file system runs with `data=ordered` and `commit=5`."
-      },
-      "refs": [
-        {
-          "title": "ext4 General Information: data= and commit= options",
-          "url": "https://docs.kernel.org/admin-guide/ext4.html",
-          "kind": "docs"
-        },
-        {
-          "title": "OSTEP chapter 42: Crash Consistency: FSCK and Journaling",
-          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf",
-          "kind": "read"
-        }
-      ]
-    }
+ "id": "os-10",
+ "title": "File systems: inodes, links and file descriptors",
+ "minutes": 40,
+ "goal": "By the end you can tell a file's name from its inode and its file descriptor, predict what two processes writing one log file will do, find and recover a deleted file a process still holds open, and fix \"Too many open files\".",
+ "warmup": {
+  "q": "A cron job runs `rm /var/log/ledger/app.log` to free space, while the payment service still has the file open and keeps logging to it. What happens to the disk space?",
+  "options": [
+   "It's free at once: the file is gone",
+   "It stays in use until the service closes the file, though `ls` and `du` no longer show it",
+   "The service's next write fails with `ENOENT` and it stops logging",
+   "The kernel creates a new `app.log` at the service's next write"
   ],
-  "analogy": "Think of the inode as an object on the JVM heap and a directory as a `Map<String, Inode>`. A hard link is a second map entry referring to the same object, and `rm` removes an entry, not the object. An open file description is an iterator over the object, with its own position: `fork` hands the same iterator to the child, while a second `open()` makes a new iterator at position 0. The object goes away when no map entry and no iterator refers to it. The analogy breaks on how that's decided. The JVM's garbage collector traces from roots and handles cycles. The kernel counts: a link count plus a count of open descriptions, freed the moment both are zero. Counting can't free a cycle, and that's one reason Linux won't let you hard-link a directory.",
-  "in_your_world": "Payment services trip over this lesson in two ways. The first is a disk that fills up although the files are gone: a cleanup job or a person deleted a large log while the JVM still held it, and on Kubernetes a node under disk pressure may even evict pods for it. `lsof +L1` on the node, or `/proc/<pid>/fd` in the container, shows the culprit, and truncating through `/proc` frees it without a restart. The second is \"Too many open files\", which is almost never about files. Every Oracle connection in a HikariCP pool, every Kafka broker connection, every keep-alive connection an HTTP client holds to the card issuer is a descriptor. A leak, such as a `Files.list` stream in a health check or a `Response` body nobody closes, grows the count with traffic until the next connection attempt fails. Export `process.files.open` next to `process.files.max` and alert on the ratio, not on the error.",
-  "mistake": "Deleting a log file to free disk space while the service that writes it is still running. It feels like the direct fix: the file is big, remove it. The space doesn't come back, because `rm` only removes the name and the service's open descriptor keeps the inode and its blocks alive. People then delete more files, or restart the service at a bad time, without knowing why the first delete did nothing. Truncate instead (`: > app.log`, or `truncate -s 0 app.log`), which frees the blocks at once and keeps the writer's descriptor valid. If the file is already deleted, find it with `lsof +L1` and truncate it through `/proc/<pid>/fd/<n>`. For the long term, let the logging framework roll its own files, or configure logrotate with `copytruncate` for programs that can't reopen their logs.",
-  "compare": {
-    "title": "Open before fork against open after fork",
-    "a": {
-      "label": "open, then fork",
-      "lang": "c",
-      "title": "one description: the file gets 84 bytes, all six records",
-      "src": "int fd = open(\"auth.log\", O_WRONLY | O_CREAT | O_TRUNC, 0644);\nif (fork() == 0) {          // the child's fd 3 points at the SAME description\n    records(fd, \"child\");    // shared offset: 0 -> 42\n    _exit(0);\n}\nwait(NULL);\nrecords(fd, \"parent\");       // starts at 42: 42 -> 84\n\n// child  auth 1 ... child  auth 3\n// parent auth 1 ... parent auth 3"
-    },
-    "b": {
-      "label": "fork, then open",
-      "lang": "c",
-      "title": "two descriptions: 42 bytes, the child's records are gone",
-      "src": "if (fork() == 0) {\n    int fd = open(\"auth.log\", O_WRONLY);   // the child's own description\n    records(fd, \"child\");                  // its offset: 0 -> 42\n    _exit(0);\n}\nint fd = open(\"auth.log\", O_WRONLY);       // the parent's own, at 0\nwait(NULL);\nrecords(fd, \"parent\");                     // writes over bytes 0 to 42\n\n// parent auth 1 ... parent auth 3"
-    },
-    "note": "The writes are the same on both sides; only the number of `open()` calls differs. One `open` makes one open file description, and `fork` shares it, offset included. Two `open` calls make two descriptions, each starting at 0, and the later writer wins. Adding `O_APPEND` to the opens on the right gives the left side's result, because the kernel then moves each description to the end of the file before every write."
-  },
-  "worked": {
-    "title": "Find what holds a deleted file and free the space",
+  "answer": 1,
+  "why": "`rm` removes a name. The kernel frees the file's inode and blocks only when it has no names left and no process has it open. The service's file descriptor still points at it, so its writes keep landing in a file nobody can see by name, and `df` keeps counting it. The service gets no error, and nothing recreates the name."
+ },
+ "sections": [
+  {
+   "h": "A file is an inode, and a name only points to it",
+   "body": "`stat` on a file in the lab box prints `Inode: 1573046` and `Links: 1`. Give the file a second name with `ln`, and `stat` on either name prints the same inode number and `Links: 2`. Two names, one file. To see why file systems work like that, start with what one has to store.\n\nA disk is a long array of blocks, 4 KB each in this track. For every file, something must record which blocks hold its bytes, how many bytes there are, who owns it, who may read it and when it last changed. The simplest design keeps all of that next to the name, one row per file: name, owner, size, blocks. A directory would be a table of such rows.\n\nIt breaks on the first file you want under two names. The settlement job writes `ledger.csv`, and the audit export wants the same 2 GB file as `ledger-2026.csv` without copying it. With the size and block list stored next to each name, the two rows must agree forever. Append a record through one name and the other row's size is wrong.\n\nSo Unix splits the row in two. The **inode** (index node) is the file itself: its type, size, owner, permissions, timestamps, a link count and the list of blocks that hold the data. It has a number and no name. A **directory** is a file whose content is a list of entries, each one a name and an inode number. Opening `/tmp/ledger.csv` means reading the root directory to find `tmp` and its inode number, reading that directory to find `ledger.csv` and its number, then reading that inode.\n\nA second name is just a second entry with the same number. That's a **hard link**, and the link count says how many entries point at the inode. `rm` doesn't delete a file. It calls `unlink`, which removes one entry and subtracts one from the count. The kernel frees the inode and its blocks when the count reaches 0 and, as section 3 shows, no process still has the file open. Renaming changes one entry and leaves the inode alone, which is why lesson 9 of this track could use `rename` to swap a file in one step.\n\nA **symbolic link** works differently. It's an inode of its own whose content is a path: `latest.csv` holds the 10 bytes `ledger.csv`, and the kernel looks that path up again every time the link is opened. Remove the name it points to and the symlink dangles, while a hard link keeps working. A hard link holds only a number, so it can't reach into another file system, whose inode numbers mean something else, and Linux refuses hard links to directories, which could make loops in the tree.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 720 272\" role=\"img\" aria-label=\"A directory maps three names to inode numbers; two names share inode 13, which points at block 2065; latest.csv is inode 12, a symlink holding the path ledger.csv\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">directory / (inode 2)</text><text class=\"t-s t-m\" x=\"300\" y=\"24\" text-anchor=\"start\">inodes</text><text class=\"t-s t-m\" x=\"560\" y=\"24\" text-anchor=\"start\">data blocks</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"150\" rx=\"8\"/><text class=\"t-s t-code\" x=\"36\" y=\"64\" text-anchor=\"start\">ledger.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"64\" text-anchor=\"end\">→ 13</text><text class=\"t-s t-code\" x=\"36\" y=\"108\" text-anchor=\"start\">ledger-2026.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"108\" text-anchor=\"end\">→ 13</text><text class=\"t-s t-code\" x=\"36\" y=\"152\" text-anchor=\"start\">latest.csv</text><text class=\"t-s t-code\" x=\"224\" y=\"152\" text-anchor=\"end\">→ 12</text><rect class=\"box-a\" x=\"300\" y=\"34\" width=\"200\" height=\"96\" rx=\"8\"/><text class=\"t t-a\" x=\"400\" y=\"58\" text-anchor=\"middle\">inode 13</text><text class=\"t-s t-m\" x=\"400\" y=\"80\" text-anchor=\"middle\">file, 31 bytes</text><text class=\"t-s t-m\" x=\"400\" y=\"98\" text-anchor=\"middle\">links 2</text><text class=\"t-s t-code\" x=\"400\" y=\"116\" text-anchor=\"middle\">extent: block 2065</text><rect class=\"box-b\" x=\"300\" y=\"150\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"174\" text-anchor=\"middle\">inode 12</text><text class=\"t-s t-code\" x=\"400\" y=\"196\" text-anchor=\"middle\">symlink: \"ledger.csv\"</text><rect class=\"box\" x=\"560\" y=\"44\" width=\"140\" height=\"76\" rx=\"8\"/><text class=\"t-s t-code\" x=\"630\" y=\"72\" text-anchor=\"middle\">block 2065</text><text class=\"t-s t-code\" x=\"630\" y=\"96\" text-anchor=\"middle\">auth-7731,...</text><line class=\"ln-a\" x1=\"240\" y1=\"60\" x2=\"300\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"240\" y1=\"104\" x2=\"300\" y2=\"92\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"240\" y1=\"148\" x2=\"300\" y2=\"176\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"500\" y1=\"82\" x2=\"560\" y2=\"82\" marker-end=\"url(#arr)\"/><path class=\"ln-d\" d=\"M300 210 C 260 230, 180 230, 120 190\" fill=\"none\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"240\" text-anchor=\"start\">Two entries hold 13: a hard link. The symlink has its own inode and only a path,</text><text class=\"t-s t-m\" x=\"20\" y=\"260\" text-anchor=\"start\">which the kernel looks up again, by name, every time the link is opened.</text></svg>",
+    "caption": "The model for this lesson, as the last Try-it's `debugfs` shows it on disk: names live in directories, everything else lives in the inode."
+   },
+   "try": {
+    "title": "Two names, one inode",
+    "minutes": 3,
     "steps": [
-      {
-        "say": "Start from the symptom. A volume is full, and `du` over it adds up to far less than `df` says is used. The gap is blocks that no name reaches. Here it's the whole 41 MB.",
-        "code": "df -m /dev/shm\n# Filesystem     1M-blocks  Used Available Use% Mounted on\n# shm                   64    41        24  63% /dev/shm\ndu -sm /dev/shm\n# 0\t/dev/shm",
-        "lang": "bash"
-      },
-      {
-        "say": "Find the holder. `lsof +L1` lists open files with a link count below 1. Without `lsof`, search the fd entries of every process for `(deleted)`.",
-        "code": "lsof +L1\n# COMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME\n# java     33 root    4w   REG  0,179 41943200     0    2 /dev/shm/auth.log (deleted)\nfind /proc/[0-9]*/fd -lname '*(deleted)' 2>/dev/null\n# /proc/33/fd/4",
-        "lang": "bash"
-      },
-      {
-        "say": "Check how the file was opened before you truncate it. In `fdinfo`, the `flags` are octal: `01` is `O_WRONLY` and `02000` is `O_APPEND`. With `O_APPEND`, the writer's next line goes to the new end; without it, it lands at the old offset and leaves a hole.",
-        "code": "grep -E 'pos|flags' /proc/33/fdinfo/4\n# pos:\t41943348\n# flags:\t0402001",
-        "lang": "bash"
-      },
-      {
-        "say": "Keep a copy if you need the contents, then truncate through `/proc`. The blocks are freed at once, and the service keeps running and logging.",
-        "code": "cp /proc/33/fd/4 /tmp/recovered.log\n: > /proc/33/fd/4\ndf -m /dev/shm\n# shm                   64     0        64   0% /dev/shm",
-        "lang": "bash"
-      },
-      {
-        "say": "Then fix the cause: whatever deleted the file should truncate or rename it instead, and the service should open a new file when its log rolls.",
-        "code": "# logrotate, for a program that can't reopen its log:\n/var/log/ledger/app.log {\n    daily\n    rotate 7\n    copytruncate\n}",
-        "lang": "text"
-      }
+     "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
+     "The block makes a file, a hard link and a symlink, prints their inodes and link counts, then removes the original name. Predict what each `cat` prints and the link count after `rm`.",
+     "The last line traces the system calls behind `ln`, `ln -s`, `mv` and `rm`."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "cd /tmp\necho 'auth-7731,4111,120.00,approved' > ledger.csv\nln ledger.csv ledger-2026.csv\nln -s ledger.csv latest.csv\nstat -c '%n: inode %i, %h links, %s bytes, %F' ledger.csv ledger-2026.csv latest.csv\nrm ledger.csv\ncat ledger-2026.csv\ncat latest.csv\nstat -c '%n: inode %i, %h links' ledger-2026.csv\nstrace -f -e trace=linkat,symlinkat,unlinkat,renameat2 sh -c 'ln ledger-2026.csv b.csv; ln -s b.csv c.csv; mv b.csv d.csv; rm d.csv c.csv' 2>&1 | grep -E 'link|rename'"
+    },
+    "expect": "Inode numbers differ on your machine:\n\n```text\nledger.csv: inode 1573046, 2 links, 31 bytes, regular file\nledger-2026.csv: inode 1573046, 2 links, 31 bytes, regular file\nlatest.csv: inode 1573048, 1 links, 10 bytes, symbolic link\nauth-7731,4111,120.00,approved\nledger-2026.csv: inode 1573046, 1 links\n[pid    19] linkat(AT_FDCWD, \"ledger-2026.csv\", AT_FDCWD, \"b.csv\", 0) = 0\n[pid    20] symlinkat(\"b.csv\", AT_FDCWD, \"c.csv\") = 0\n[pid    21] renameat2(AT_FDCWD, \"b.csv\", AT_FDCWD, \"d.csv\", RENAME_NOREPLACE) = 0\n[pid    22] unlinkat(AT_FDCWD, \"d.csv\", 0) = 0\n[pid    22] unlinkat(AT_FDCWD, \"c.csv\", 0) = 0\ncat: latest.csv: No such file or directory\n```\n\nThe hard link has the same inode as the original, and the count is 2. The symlink has its own inode and is 10 bytes long: the path `ledger.csv`. After `rm`, the data is still there through `ledger-2026.csv`, whose count dropped to 1, and the symlink fails because the name it holds is gone (`cat`'s complaint prints last because it goes to standard error). The trace shows the four calls: `linkat` adds an entry for an existing inode, `symlinkat` makes a new inode holding a path, `renameat2` moves an entry and `unlinkat` removes one. None of them touches the file's data."
+   },
+   "refs": [
+    {
+     "title": "inode(7): what an inode holds",
+     "url": "https://man7.org/linux/man-pages/man7/inode.7.html",
+     "kind": "docs"
+    },
+    {
+     "title": "symlink(7)",
+     "url": "https://man7.org/linux/man-pages/man7/symlink.7.html",
+     "kind": "docs"
+    },
+    {
+     "title": "OSTEP chapter 39: Files and Directories",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf",
+     "kind": "read"
+    }
+   ]
+  },
+  {
+   "h": "Three tables sit between a file descriptor and the inode",
+   "body": "`share.c` lets a child process write three records to `auth.log`, then lets its parent write three more. Run one way, the file ends with all six records. Run another way, with exactly the same writes, it ends with the parent's three, and the child's are gone. The difference is where the file offset lives.\n\nA **file descriptor** is the small number `open()` returns (lesson 1 of this track): 3 for the first file a program opens, because 0, 1 and 2 are standard input, output and error. Every `read` and `write` through it moves an **offset**, the position where the next byte goes. The obvious design keeps the offset in the descriptor: each process has its own fd numbers, and each fd has its own offset.\n\nThat design breaks shell redirection. `(date; hostname) > out.txt` runs two programs one after the other. The shell opened `out.txt` once, and both programs inherited fd 1 through `fork` and `exec` (lesson 2 of this track). If each had its own offset starting at 0, `hostname` would write over the output of `date`. In fact you get both lines, one under the other.\n\nSo Linux keeps three tables. Each process has an **fd table** that maps fd numbers to pointers. Each pointer leads to an **open file description**, made by one `open()` call, which holds the offset and the flags the file was opened with. The description points at the inode. `fork` copies the fd table, so the child's fd 3 reaches the parent's description, and the two share one offset. `dup2`, which a shell uses for `>`, does the same inside one process. A second `open()` of the same file, even by the same process, makes a new description with its own offset at 0. `/proc/<pid>/fdinfo/<fd>` prints the description's `pos` and `flags`.\n\nThat explains `share.c`. Opened once before `fork`, the child's writes move the shared offset to 42, the parent writes from 42, and nothing is lost. Opened separately after `fork`, the parent's description is still at 0, and its writes land on the child's bytes. The stepper walks through both.\n\nTwo processes that open one log file on their own, such as two JVMs or a service and a sidecar, need **`O_APPEND`**. With it, the kernel moves the offset to the end of the file before every write, in the same step as the write, so no writer lands on another's bytes. Java's `FileOutputStream(file, true)` opens a file this way, and so do Logback's and Log4j's file appenders by default. Keep one record per `write()` call as well: on Linux's local file systems another writer can't split a single write, but it can land between two.",
+   "stepper": {
+    "title": "open, fork, and two writers",
+    "intro": "Three runs of `share.c`. Follow the arrows from each process's fd 3 to a description, and from the description to the inode.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent opens auth.log: fd 3 points at description A, offset 0, which points at the inode\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box-dim\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"110.0\" y=\"213.0\" text-anchor=\"middle\">no child yet</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 0</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-m\" x=\"514\" y=\"160\" text-anchor=\"start\">(empty)</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">open(): one new description, put in the lowest free fd, 3</text></svg>",
+      "say": "The payment service, PID 40, calls `open(\"auth.log\", O_WRONLY|O_CREAT|O_TRUNC)`. The kernel makes an **open file description** A, holding the offset (0) and the flags, pointing at the file's inode. It stores a pointer to A in the lowest free slot of the process's fd table, 3, and returns 3."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"fork copies the fd table: the child's fd 3 points at the same description A\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 0</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-m\" x=\"514\" y=\"160\" text-anchor=\"start\">(empty)</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">fork(): the table is copied, the description is shared (refs 2)</text></svg>",
+      "say": "`fork` gives the child, PID 41, a copy of the fd table: its fd 3 holds the same pointer, so it reaches the same description A. Nothing about the file was copied. A now has two references, and one offset."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The child writes three records: the shared offset moves from 0 to 42\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the child's writes moved A's offset to 42</text></svg>",
+      "say": "The child writes three 14-byte records through its fd 3. Each `write` puts the bytes at A's offset and moves it on: 0, 14, 28, 42. The inode's size grows to 42."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent writes next and starts at 42, so all six records survive\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"90\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the parent never wrote, yet its offset was 42: share.c printed exactly that</text></svg>",
+      "say": "The parent writes its three records. Its fd 3 reaches the same A, whose offset the child left at 42, so the records go after the child's. This is why `(date; hostname) > out.txt` keeps both lines: both programs inherit one description from the shell."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"Run two: each process opens the file itself, so the child gets its own description B\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 0</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-a\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">two open() calls made two descriptions, each with its own offset</text></svg>",
+      "say": "Second run. This time the file is opened after `fork`, once by each process. Two `open` calls make two descriptions: the parent's A and the child's B. The child writes its three records through B, and B's offset reaches 42. A's offset is still 0."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"The parent writes at its own offset, 0, right over the child's records\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-bad\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 42</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">the child's records are gone: same writes, different tables</text></svg>",
+      "say": "The parent writes through A, starting at A's offset, 0. Its three records land on the same 42 bytes the child wrote, and the child's records are gone. No call failed. Two services logging to one file with plain `open` lose lines exactly like this."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"With O_APPEND both descriptions jump to the end of the file before every write\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box-a\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"178\" text-anchor=\"middle\">child pid 41</text><text class=\"t-s t-m\" x=\"34\" y=\"206\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"220\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"240\" text-anchor=\"start\">fd 3</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"186\" text-anchor=\"middle\">description B</text><text class=\"t-s t-code\" x=\"345\" y=\"208\" text-anchor=\"middle\">offset 42</text><text class=\"t-s t-code\" x=\"345\" y=\"226\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"244\" text-anchor=\"middle\">refs 1</text><line class=\"ln-a\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"190\" y1=\"235\" x2=\"250\" y2=\"214\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"440\" y1=\"208\" x2=\"500\" y2=\"92\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">O_APPEND: offset = size, then write, as one step</text></svg>",
+      "say": "Third run: both open with `O_APPEND`. The descriptions are still separate, but before each write the kernel sets the offset to the file's current size, in the same step as the write. The parent's offset was 0, its first record goes to 42, and all six survive. Logging frameworks open their files this way."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 720 298\" role=\"img\" aria-label=\"When the child exits, its fd table goes and description B is freed; the inode stays\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fd tables (per process)</text><text class=\"t-s t-m\" x=\"250\" y=\"22\" text-anchor=\"start\">open file descriptions</text><text class=\"t-s t-m\" x=\"500\" y=\"22\" text-anchor=\"start\">inode</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"54\" text-anchor=\"middle\">parent pid 40</text><text class=\"t-s t-m\" x=\"34\" y=\"82\" text-anchor=\"start\">fd 0, 1, 2: terminal</text><rect class=\"box\" x=\"30\" y=\"96\" width=\"160\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"44\" y=\"116\" text-anchor=\"start\">fd 3</text><rect class=\"box-dim\" x=\"20\" y=\"156\" width=\"180\" height=\"104\" rx=\"8\"/><text class=\"t-s t-m\" x=\"110.0\" y=\"213.0\" text-anchor=\"middle\">child exited</text><rect class=\"box-a\" x=\"250\" y=\"40\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t\" x=\"345\" y=\"62\" text-anchor=\"middle\">description A</text><text class=\"t-s t-code\" x=\"345\" y=\"84\" text-anchor=\"middle\">offset 84</text><text class=\"t-s t-code\" x=\"345\" y=\"102\" text-anchor=\"middle\">O_WRONLY|O_APPEND</text><text class=\"t-s t-m\" x=\"345\" y=\"120\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"250\" y=\"164\" width=\"190\" height=\"88\" rx=\"8\"/><text class=\"t-s t-m\" x=\"345.0\" y=\"203.0\" text-anchor=\"middle\">description B</text><text class=\"t-s t-m\" x=\"345.0\" y=\"223.0\" text-anchor=\"middle\">none</text><line class=\"ln\" x1=\"190\" y1=\"111\" x2=\"250\" y2=\"84\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"32\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t-s t-code\" x=\"600\" y=\"54\" text-anchor=\"middle\">inode 1573046</text><text class=\"t-s t-m\" x=\"600\" y=\"74\" text-anchor=\"middle\">auth.log, size 84</text><text class=\"t-s t-m\" x=\"600\" y=\"92\" text-anchor=\"middle\">links 1</text><line class=\"ln\" x1=\"440\" y1=\"84\" x2=\"500\" y2=\"67\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"500\" y=\"118\" width=\"200\" height=\"142\" rx=\"8\"/><text class=\"t-s t-m\" x=\"514\" y=\"138\" text-anchor=\"start\">the file's bytes</text><text class=\"t-s t-code\" x=\"514\" y=\"158\" text-anchor=\"start\">child  auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"175\" text-anchor=\"start\">child  auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"192\" text-anchor=\"start\">child  auth 3</text><text class=\"t-s t-code\" x=\"514\" y=\"209\" text-anchor=\"start\">parent auth 1</text><text class=\"t-s t-code\" x=\"514\" y=\"226\" text-anchor=\"start\">parent auth 2</text><text class=\"t-s t-code\" x=\"514\" y=\"243\" text-anchor=\"start\">parent auth 3</text><text class=\"t-s t-a\" x=\"20\" y=\"286\" text-anchor=\"start\">close: the last reference frees the description; the inode keeps its name</text></svg>",
+      "say": "The child exits and the kernel closes its descriptors. B had one reference, so B is freed. When the parent closes fd 3, A goes too. The inode still has one link, its name `auth.log`, so it stays. Section 3 is about the case where the name went first."
+     }
     ]
-  },
-  "lab": {
-    "title": "Build a file system with inodes, links and shared offsets",
-    "minutes": 15,
-    "files": [
-      "labs/os/src/main/kotlin/sfz/os/l10/FileSystem.kt",
-      "labs/os/src/test/resources/sfz/os/l10/share.txt",
-      "labs/os/src/test/resources/sfz/os/l10/deleted-log.txt"
-    ],
-    "run": "./gradlew :os:test --tests 'sfz.os.l10.*'",
+   },
+   "try": {
+    "title": "One offset or two",
+    "minutes": 3,
     "steps": [
-      "Read `FileSystem.kt`. `Inode`, `OpenFile` (the open file description) and `Proc` (a process's fd table) are the three tables. Path lookup, `mkdir`, `symlink`, `rename`, `read`, `dup2`, `exit`, `dfBlocks` and `duBlocks` are written for you, and so are the private helpers you'll call: `parent` (the directory and last name of a path), `newInode`, `desc` (the description behind an fd), `release` and `dropName`.",
-      "Run the tests from the `labs` folder. All eleven fail.",
-      "Write `link` and `unlink`. A name is an entry in a directory's `entries` map; the inode keeps the count in `links`.",
-      "Write `open` and `close`. `open` refuses with `EMFILE` at the limit, creates the file with `CREATE`, makes a new `OpenFile` and takes the lowest free fd. `close` frees the description on its last reference, and then maybe the inode.",
-      "Write `write` and `fork`. The three `share.c` tests replay the C program's three runs against its captured output, offsets included."
+     "Read `os/c/l10/share.c`. Its `run` function opens the file before `fork` in mode 1, after `fork` in mode 2, and after `fork` with `O_APPEND` in mode 3. The offsets it prints come from `/proc/self/fdinfo`.",
+     "Predict the file's contents and the parent's offset before it writes, for each mode. Then run it in the lab box."
     ],
-    "hints": [
-      "`fork` must put the same `OpenFile` object in the child's table and add one to its `refs`. A copy of the object would give the child its own offset, which is what `open` does.",
-      "In `write`, handle `APPEND` first: set the offset to `data.length`, then write. `StringBuilder.replace(start, end, text)` overwrites from `start` and grows the builder when the text runs past the end.",
-      "Only decrement `inode.openFiles` when a description's `refs` reaches 0, then call `release`. That's what keeps a deleted file alive while any process holds it.",
-      "The lowest free fd: start at 0 and count up while `fd in p.fds`."
-    ],
-    "done_when": "All eleven tests in `FileSystemTest` pass."
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "gcc -O2 -o /tmp/share os/c/l10/share.c && /tmp/share /tmp/auth.log"
+    },
+    "expect": "```text\n1. open, then fork (one shared description)\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 42\n   parent wrote 3 records, its offset is now 84\n   file: 84 bytes\n     child  auth 1\n     child  auth 2\n     child  auth 3\n     parent auth 1\n     parent auth 2\n     parent auth 3\n2. fork, then each process opens the file\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 0\n   parent wrote 3 records, its offset is now 42\n   file: 42 bytes\n     parent auth 1\n     parent auth 2\n     parent auth 3\n3. fork, then each opens it with O_APPEND\n   child wrote 3 records, its offset is now 42\n   parent's offset before it writes: 0\n   parent wrote 3 records, its offset is now 84\n   file: 84 bytes\n     child  auth 1\n     child  auth 2\n     child  auth 3\n     parent auth 1\n     parent auth 2\n     parent auth 3\n```\n\nIn run 1 the parent's offset is 42 before it has written a byte: the child moved it, because they share one description. In run 2 the parent's own description is at 0, and its records replace the child's; the file is only 42 bytes. In run 3 the parent's offset also starts at 0, but `O_APPEND` sends each write to the end of the file, and all six records survive."
+   },
+   "refs": [
+    {
+     "title": "open(2): open file descriptions and O_APPEND",
+     "url": "https://man7.org/linux/man-pages/man2/open.2.html",
+     "kind": "docs"
+    },
+    {
+     "title": "proc_pid_fd(5): /proc/<pid>/fd and fdinfo",
+     "url": "https://man7.org/linux/man-pages/man5/proc_pid_fd.5.html",
+     "kind": "docs"
+    }
+   ]
   },
-  "drill": {
-    "title": "Draw the tables after a fork and a second open",
+  {
+   "h": "A deleted file lives until its last descriptor closes",
+   "body": "`LogHolder` is a JVM that writes 40 MB to `/dev/shm/auth.log` and keeps logging into it. Delete the file under it, and `df` still says 41 MB of `/dev/shm` are in use, while `du` says 0.\n\nBoth are right. `du` walks directory entries and adds up the files they reach, and no entry reaches this inode any more. `df` asks the file system how many blocks are allocated, and these blocks still are. The rule from the first section has a second half: the kernel frees an inode when its link count is 0 **and** no open file description points at it. The JVM's fd 4 still points at a description, which still points at the inode, so the service keeps writing to a file nobody can find by name.\n\nYou can find it from the process's side. `/proc/<pid>/fd/` has one entry per descriptor, and for a file that has lost every name it shows the old path followed by `(deleted)`. `lsof +L1` lists every open file with fewer than one link, which is exactly this case. The `/proc` entry also opens the file: `cp /proc/<pid>/fd/4 recovered.log` copies all 40 MB back out, for as long as the process lives.\n\nOn a server this shows up as a full disk nobody can explain. A cleanup job deletes old logs, or someone runs `rm` on a 20 GB log to make room, and the space doesn't come back until the service restarts. Two fixes don't need a restart. Truncate the file instead of deleting it, through its name (`: > app.log`) or, once it's deleted, through `/proc` (`: > /proc/<pid>/fd/4`), and `df` drops at once. That works cleanly when the writer opened the file with `O_APPEND`, because its next write goes to the new end. A writer without `O_APPEND` keeps its old offset, 40 MB in, and its next write leaves a 40 MB hole of zeros in front of it. The lasting fix is in how logs rotate. Let the logging framework roll its own files (Logback's and Log4j's rolling appenders rename the old file and open a new one), or, for a program that can't reopen its log, use logrotate's `copytruncate`, which copies the file and then truncates it in place.\n\nThe same rule works for you on purpose. A program can create a temporary file, open it and `unlink` it at once. Nobody else can open it by name, and the kernel frees it the moment the program closes it, even if the program crashes.",
+   "try": {
+    "title": "Delete a log that a JVM still holds",
     "minutes": 4,
-    "prompt": "A process opens `ledger.csv` (fd 3), forks, and then the child opens `ledger.csv` again (fd 4). The child writes 10 bytes to fd 3 and 5 bytes to fd 4; then the parent writes 7 bytes to fd 3. None of the opens used `O_APPEND`. From memory, write down how many open file descriptions exist, which fds point at each, each description's offset at the end, and the file's size.",
-    "answer": {
-      "lang": "text",
-      "src": "descriptions: 2\n  D1 (the parent's open, before fork): parent fd 3, child fd 3   refs 2\n  D2 (the child's second open):       child fd 4                 refs 1\n\nchild writes 10 bytes on fd 3  -> D1 offset 0 -> 10\nchild writes  5 bytes on fd 4  -> D2 offset 0 -> 5   (over bytes 0-4)\nparent writes 7 bytes on fd 3  -> D1 offset 10 -> 17\n\nend: D1 offset 17, D2 offset 5, file size 17\none inode, link count 1, open descriptions 2"
+    "steps": [
+     "`os/src/demo/java/sfz/os/l10/demo/LogHolder.java` opens `/dev/shm/auth.log` in append mode, writes 40 MB and keeps logging a line a second. `/dev/shm` is a small in-memory file system in every container, so `df` there shows only this file.",
+     "The block deletes the file while the JVM runs, then looks at it from `df`, `du`, `/proc` and `lsof`, copies it back, and frees the space by truncating it through `/proc`. Predict each `df` line before you run it."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l10/demo/LogHolder.java\njava -cp /tmp/out sfz.os.l10.demo.LogHolder /dev/shm/auth.log 40 60 & pid=$!\nsleep 3\nrm /dev/shm/auth.log\ndf -m /dev/shm; du -sm /dev/shm\nls -l /proc/$pid/fd | grep deleted\nlsof +L1\ncp /proc/$pid/fd/4 /tmp/recovered.log; ls -l /tmp/recovered.log\n: > /proc/$pid/fd/4\ndf -m /dev/shm\nkill $pid",
+     "file": "labs/os/src/demo/java/sfz/os/l10/demo/LogHolder.java"
+    },
+    "expect": "PIDs and the device number differ:\n\n```text\npid 33 wrote 40 MB to /dev/shm/auth.log and keeps it open\nFilesystem     1M-blocks  Used Available Use% Mounted on\nshm                   64    41        24  63% /dev/shm\n0\t/dev/shm\nl-wx------ 1 root root 64 Nov  7 20:58 4 -> /dev/shm/auth.log (deleted)\nCOMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME\njava     33 root    4w   REG  0,179 41943200     0    2 /dev/shm/auth.log (deleted)\n-rw-r--r-- 1 root root 41943200 Nov  7 20:58 /tmp/recovered.log\nFilesystem     1M-blocks  Used Available Use% Mounted on\nshm                   64     0        64   0% /dev/shm\n```\n\nAfter `rm`, `df` still counts 41 MB and `du` finds nothing. The JVM's fd 4 shows the path with `(deleted)`, and `lsof` lists it with `NLINK 0`. Copying `/proc/<pid>/fd/4` gets every byte back. Truncating through the same entry frees the blocks while the JVM keeps running, and because the file was opened with `O_APPEND`, its next line goes to offset 0 of the now empty file."
+   },
+   "refs": [
+    {
+     "title": "unlink(2): when the space is freed",
+     "url": "https://man7.org/linux/man-pages/man2/unlink.2.html",
+     "kind": "docs"
     }
+   ]
   },
-  "recap": [
-    "An inode is the file: type, size, owner, permissions, times, link count and block list, but no name. A directory maps names to inode numbers.",
-    "A hard link is another name for the same inode; a symlink is its own inode holding a path. `rm` is `unlink`: one name less, and the inode is freed when no names and no open descriptions remain.",
-    "Three tables: the per-process fd table points at open file descriptions (offset and flags, one per `open()`), which point at inodes. `fork` and `dup2` share descriptions; a second `open()` makes a new one.",
-    "`O_APPEND` moves the offset to the end before every write, so separate writers don't overwrite each other.",
-    "A deleted file that's still open keeps its space: `df` counts it, `du` doesn't. Find it with `lsof +L1` or `/proc/<pid>/fd`, and truncate it to free the space.",
-    "Sockets count as descriptors too. The JVM raises its soft `RLIMIT_NOFILE` to the hard limit; a leak ends in `EMFILE`, or `ENFILE` at the machine's `fs.file-max`. A journal keeps metadata consistent through a crash, not your un-fsynced data."
-  ],
-  "quiz": [
+  {
+   "h": "Every open file and socket is a descriptor, and the table has a limit",
+   "body": "`FdLeak` opens a config file for every \"request\" and never closes it. With the limit set to 256 descriptors, open number 253 fails with `java.io.FileNotFoundException: /etc/hostname (Too many open files)`. The JVM already had 4 open (0, 1, 2 and the JDK's `lib/modules` file), and 4 + 252 is 256.\n\nAn fd table can't grow forever, because every entry pins kernel memory: the description and, behind it, a file, a socket's buffers or a pipe. So the kernel caps the table with a resource limit, `RLIMIT_NOFILE`, which `ulimit -n` sets. When a process holds as many descriptors as its limit, `open`, `socket`, `accept` and `pipe` all fail with `EMFILE`, which Java reports as \"Too many open files\". The name misleads: every TCP connection is a descriptor too, so a JDBC pool of 20 Oracle connections holds 20, an HTTP client keeping 200 connections alive holds 200, and a server holds one per client.\n\nThe limit has two values. The **soft** limit is the one the kernel enforces. A process may raise it up to the **hard** limit, and only a privileged process can raise the hard one. The JVM raises it for you: at start-up HotSpot sets the soft limit to the hard limit (the `MaxFDLimit` flag, on by default). `strace` shows the two calls, and a JVM started under `ulimit -S -n 256` opened 5,000 files without trouble. So what limits a JVM is the hard limit: 1,048,576 in the lab box, Docker's default here. For a running service, `grep 'open files' /proc/<pid>/limits` tells you.\n\nA high limit doesn't fix a leak. It only moves the failure. Above every process sits a limit for the whole machine, `fs.file-max`, 812,037 in this Docker VM. My first version of `FdLeak` had no cap. It reached that limit after 810,087 opens and failed with \"Too many open files in system\" (`ENFILE`), and for that moment every other process in the VM was refused new files too. `FdLeak` now stops itself at 5,000.\n\nTo watch a service, count its descriptors over time with `ls /proc/<pid>/fd | wc -l`, or export the same number as a metric (Micrometer's `process.files.open`). A count that climbs with traffic and never comes back down is a leak: a stream, a socket or a `Files.list` result that nobody closes. In Java, `try (...)` closes it for you, and in Kotlin, `use {}`.",
+   "try": {
+    "title": "Run out of descriptors",
+    "minutes": 3,
+    "steps": [
+     "`os/src/demo/java/sfz/os/l10/demo/FdLeak.java` opens `/etc/hostname` in a loop without closing it, and stops at 5,000.",
+     "The block runs it under a soft limit of 256, then under a soft and hard limit of 256, then shows the JVM's `prlimit64` calls and the failing `openat`. Predict which run fails."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the lab box",
+     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l10/demo/FdLeak.java\ngrep 'open files' /proc/self/limits\n(ulimit -S -n 256; java -cp /tmp/out sfz.os.l10.demo.FdLeak)\n(ulimit -n 256; java -cp /tmp/out sfz.os.l10.demo.FdLeak)\n(ulimit -S -n 256; strace -f -e trace=prlimit64 java -version 2>&1 | grep NOFILE)\n(ulimit -n 256; strace -f -o /tmp/leak.txt -e trace=openat java -cp /tmp/out sfz.os.l10.demo.FdLeak > /dev/null; grep -m1 EMFILE /tmp/leak.txt)",
+     "file": "labs/os/src/demo/java/sfz/os/l10/demo/FdLeak.java"
+    },
+    "expect": "Thread IDs differ:\n\n```text\nMax open files            1048576              1048576              files     \nopen file descriptors at start: 4\nopened 5000 files without an error; open file descriptors: 5004\nopen file descriptors at start: 4\nopen number 253 failed: java.io.FileNotFoundException: /etc/hostname (Too many open files)\nopen file descriptors when it failed: 256\n[pid    82] prlimit64(0, RLIMIT_NOFILE, NULL, {rlim_cur=256, rlim_max=1024*1024}) = 0\n[pid    82] prlimit64(0, RLIMIT_NOFILE, {rlim_cur=1024*1024, rlim_max=1024*1024}, NULL) = 0\n106   openat(AT_FDCWD, \"/etc/hostname\", O_RDONLY) = -1 EMFILE (Too many open files)\n```\n\nThe soft limit alone stops nothing: the JVM reads `{rlim_cur=256, rlim_max=1024*1024}` and sets the soft limit to the hard one before your code runs, so all 5,000 opens work. With the hard limit at 256 too, the 253rd open fails, the kernel returns `EMFILE` and Java throws. The JVM started with 4 descriptors, so the table was full at exactly 256."
+   },
+   "refs": [
     {
-      "q": "From lesson 2: a shell runs `(date; hostname) > out.txt`. Why does `out.txt` end up with both lines instead of `hostname` writing over `date`?",
-      "options": [
-        "The shell opens `out.txt` with `O_APPEND`",
-        "Both programs inherit fd 1 pointing at the one open file description the shell made, so they share its offset",
-        "The kernel always writes at the end of a file that two processes have open",
-        "The shell collects both outputs and writes them once at the end"
-      ],
-      "answer": 1,
-      "from": "os-02",
-      "why": "The shell opens the file once, and each child gets fd 1 through `fork`, pointing at the same description, so the second program starts where the first stopped. `>` opens with `O_TRUNC`, not `O_APPEND` (that's `>>`). The kernel doesn't append on its own: two separate `open()` calls would overwrite each other, as `share.c` showed. And the shell doesn't buffer its children's output."
+     "title": "getrlimit(2): RLIMIT_NOFILE",
+     "url": "https://man7.org/linux/man-pages/man2/getrlimit.2.html",
+     "kind": "docs"
     },
     {
-      "q": "A node's `/var` is 98% full. `du -sh /var` adds up to 30 GB of a 100 GB volume. What's the most likely explanation, and the first command to run?",
-      "options": [
-        "The file system is corrupted; run `fsck`",
-        "The journal has grown to 70 GB; resize it",
-        "Deleted files are still held open by running processes; run `lsof +L1`",
-        "`du` doesn't count files larger than 4 GB; use `ls -l` instead"
-      ],
-      "answer": 2,
-      "why": "`df` counts allocated blocks and `du` counts what names reach. A large gap means blocks with no names, which is almost always files deleted while a process holds them open. `lsof +L1` lists them, and truncating through `/proc/<pid>/fd/<n>` frees the space. The journal has a fixed size (4 MB in the Try-it's image, a few hundred MB at most on large disks), and `du` counts big files fine."
-    },
-    {
-      "q": "`/data` holds `rates.csv`, plus a hard link `rates-backup.csv` and a symlink `rates-latest.csv -> rates.csv`, all in the same directory. A job runs `mv rates.csv archive/`. Which names still open the data?",
-      "options": [
-        "`archive/rates.csv` and `rates-backup.csv`; the symlink now dangles",
-        "All three: links follow the file wherever it moves",
-        "Only `archive/rates.csv`",
-        "`archive/rates.csv` and `rates-latest.csv`; the hard link broke"
-      ],
-      "answer": 0,
-      "why": "`mv` within one file system is a rename: it moves a directory entry, and the inode doesn't change. The hard link holds the inode number, so it still works. The symlink holds the path `rates.csv`, which no longer exists in `/data`, so it dangles. Nothing follows a moved file except names that hold its inode number."
-    },
-    {
-      "q": "Ops set `ulimit -S -n 1024` for a service user, but a JVM under that user still fails with \"Too many open files\" only after about a million descriptors. Why?",
-      "options": [
-        "The kernel ignores soft limits",
-        "HotSpot raises its soft `RLIMIT_NOFILE` to the hard limit at start-up, so only the hard limit applies",
-        "Each Java stream uses 1,000 kernel descriptors",
-        "Sockets don't count against `RLIMIT_NOFILE`"
-      ],
-      "answer": 1,
-      "why": "The soft limit is what the kernel enforces, but any process may raise it up to the hard limit, and the JVM does exactly that (`MaxFDLimit`, on by default; `strace` shows the `prlimit64` call). The leak then runs until the hard limit, or the machine's `fs.file-max`. Sockets are descriptors and count like files."
-    },
-    {
-      "q": "From lesson 9: ext4 in `data=ordered` mode loses power 2 s after a service appended records with `write()` and no `fsync`. After the reboot the mount takes a second, with no `fsck`. What can you expect?",
-      "options": [
-        "The file is exactly as the last `write()` left it: the journal made it durable",
-        "The file system may need a full `fsck` before it's usable",
-        "The file system is consistent, but the file may be missing the last records or be shorter",
-        "The file is lost entirely, because the journal discards open files"
-      ],
-      "answer": 2,
-      "from": "os-09",
-      "why": "The journal replays committed metadata transactions, so the structure is consistent and no `fsck` is needed. It journals metadata only, and ext4 commits every 5 s at most, while dirty data waits up to 30 s for writeback. Records that only reached the page cache are gone, and the size may roll back to the last committed transaction. Durability of data still needs `fsync`."
+     "title": "Documentation for /proc/sys/fs: file-max and file-nr",
+     "url": "https://docs.kernel.org/admin-guide/sysctl/fs.html",
+     "kind": "docs"
     }
-  ],
-  "flashcards": [
-    {
-      "front": "What does an inode hold, and what doesn't it hold?",
-      "back": "Type, size, owner, permissions, timestamps, link count and where the data blocks are. Not its name: names live in directories."
-    },
-    {
-      "front": "Hard link or symlink: which survives renaming the original name?",
-      "back": "The hard link: it holds the inode number. A symlink holds a path, which dangles once that name is gone."
-    },
-    {
-      "front": "When does the kernel free a deleted file's blocks?",
-      "back": "When its link count is 0 and no open file description points at it, so after the last process closes it."
-    },
-    {
-      "front": "What's in an open file description?",
-      "back": "The file offset and the open flags (such as `O_APPEND`), plus a pointer to the inode. One per `open()`; shared by `fork` and `dup2`."
-    },
-    {
-      "front": "Why does `O_APPEND` stop two writers from overwriting each other?",
-      "back": "The kernel sets the offset to the end of the file before each write, in the same step as the write."
-    },
-    {
-      "front": "`df` says 80 GB used, `du` says 30 GB. Where's the rest?",
-      "back": "Usually in deleted files that processes still hold open. `lsof +L1` finds them."
-    },
-    {
-      "front": "What's the difference between EMFILE and ENFILE?",
-      "back": "`EMFILE`: this process hit its `RLIMIT_NOFILE`. `ENFILE`: the whole machine hit `fs.file-max`."
-    }
-  ],
-  "terms": [
-    {
-      "term": "Inode",
-      "plain": "The record of one file: type, size, owner, permissions, times, link count and the blocks holding its data. It has a number, not a name."
-    },
-    {
-      "term": "Directory entry",
-      "plain": "One name in a directory, paired with an inode number."
-    },
-    {
-      "term": "Hard link",
-      "plain": "A second directory entry for the same inode. The inode's link count counts them."
-    },
-    {
-      "term": "Symbolic link",
-      "plain": "A small inode whose content is a path, looked up again each time the link is opened."
-    },
-    {
-      "term": "File descriptor",
-      "plain": "A small number in a process's fd table that points at an open file description."
-    },
-    {
-      "term": "Open file description",
-      "plain": "What one open() call creates: the offset, the flags and a pointer to the inode. fork and dup2 share it."
-    },
-    {
-      "term": "RLIMIT_NOFILE",
-      "plain": "The per-process limit on open descriptors, with a soft value the kernel enforces and a hard ceiling."
-    },
-    {
-      "term": "Journal",
-      "plain": "A log area where a file system writes a change and a commit record before applying it, so a crash leaves the old state or the new one."
-    }
-  ],
-  "explain_back": {
-    "prompt": "A teammate asks why the settlement service's disk was still full after they deleted its 20 GB log, and why it only cleared after a restart. Explain it, and say what they should do next time.",
-    "answer": "A file on Linux is an inode, and its name is just an entry in a directory pointing at that inode. `rm` removes the entry and lowers the link count to 0, but the kernel only frees the inode and its blocks when no process has the file open either. The service still had the log open, through a file descriptor that points at an open file description, which points at the inode. So the 20 GB stayed allocated, the service kept writing into a file nobody could see by name, and `df` and `du` disagreed. The restart closed the descriptor, and that's when the space came back. Next time, truncate the file instead of deleting it, with `: > app.log`, which frees the blocks at once and leaves the service's descriptor working. If it's already deleted, `lsof +L1` shows which process holds it, and truncating `/proc/<pid>/fd/<n>` frees it without a restart. Because our logger opens with `O_APPEND`, its next line simply goes to the start of the empty file. And whatever cleans up logs should rename or truncate them, so the logging framework can roll to a new file."
+   ]
   },
-  "deeper": {
-    "minutes": 10,
-    "body": "A file system can run out of inodes before it runs out of space. ext4 makes a fixed number when you run `mkfs` (16,384 for the 64 MB image in the last Try-it, one per 4 KB block in a small image). A volume full of tiny files, such as a mail spool or a cache that writes one file per key, can show free blocks in `df -h` and still refuse new files with `ENOSPC`. `df -i` shows inode use. XFS allocates inodes as it needs them, so it rarely hits this.\n\nSmall files have their own tricks. The symlink in the Try-it had `Blockcount: 0`: ext4 stores a target shorter than 60 bytes inside the inode itself (a \"fast symlink\"). And a file can have holes. Writing at offset 1 GB in an empty file makes its size 1 GB, but blocks are allocated only where data was written; `ls -l` shows the size and `du` shows the blocks. That's the hole a writer without `O_APPEND` leaves after you truncate its file under it.\n\nLinux has a direct way to make a file that never has a name: `open(dir, O_TMPFILE | O_RDWR)` creates an unnamed inode in that directory's file system. You can write it, `fsync` it, and if you decide to keep it, give it a name with `linkat` from `/proc/self/fd/<n>`. It's another way to publish a complete file in one step, next to the temp-file-and-rename pattern from lesson 9.\n\nFor ext4's journal itself, `/proc/fs/jbd2/<device>/info` prints how many transactions committed and how long they took, and the mount option `data=journal` puts file data through the journal too: every block is written twice, and a small file is fully consistent after a crash. Almost nobody runs it, because the double writes cost throughput."
-  },
-  "sources": [
+  {
+   "h": "A journal keeps inodes and blocks consistent through a crash",
+   "body": "`debugfs` reads an ext4 file system straight from its disk image. For `ledger.csv` it prints `Inode: 13`, `Size: 31`, `Links: 2` and, under `EXTENTS`, `(0):2065`: block 0 of the file is block 2065 of the disk. That's the inode from the first section, as bytes on a disk.\n\nAdding one block to a file changes at least three places on the disk: the new data block, the block bitmap (one bit per block, set while the block is in use) and the inode (a new size and a new extent). The disk writes them one at a time. Lose power between two of those writes, and the file system contradicts itself. A block marked as used that no inode owns is lost space. An inode pointing at a block that the bitmap still calls free is worse: the next file gets that block too, and two files share bytes.\n\nThe old fix was `fsck`. After every crash, it reads every inode and every bitmap and repairs what disagrees. On a big disk that takes minutes to hours, and the server can't start until it's done.\n\nA **journal** turns the scattered writes into one decision. The file system first writes every changed block to a log area of its own (inode 8, 4 MB in the Try-it's image), then a commit record. Only after the commit is on disk does it copy those blocks to their real places, a step called checkpointing. After a crash, the mount replays each transaction that has a commit record and ignores the one that doesn't, in about the time it takes to read the journal. The figure shows the order.\n\next4 by default journals metadata only (inodes, bitmaps, directories) in the mode `data=ordered`. Its documentation puts it this way: \"All data are forced directly out to the main file system prior to its metadata being committed to the journal.\" So after a crash, an inode never points at a block that still holds some other file's old bytes. ext4 commits a transaction at least every 5 seconds (`commit=5`). XFS has the same shape at this level: it logs metadata changes, not file data, and it splits the disk into allocation groups so many threads can allocate space at once.\n\nKeep lesson 9's rule next to this one. A journal makes the file system's structure survive a crash, and nothing more. Data you wrote without `fsync` can still be missing afterwards, and a file can come back shorter than your last `write()` left it.",
+   "figure": {
+    "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"An ext4 journal transaction: the data block is written in place first, then the inode, bitmap and directory blocks go to the journal followed by a commit record, then they are checkpointed to their home locations\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">the journal: a log area of the file system (inode 8, 4 MB here)</text><rect class=\"box\" x=\"20\" y=\"32\" width=\"680\" height=\"64\" rx=\"8\"/><rect class=\"box-dim\" x=\"36\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"94.0\" y=\"69.0\" text-anchor=\"middle\">begin</text><rect class=\"box-a\" x=\"168\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226.0\" y=\"69.0\" text-anchor=\"middle\">inode 13</text><rect class=\"box-a\" x=\"300\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"358.0\" y=\"69.0\" text-anchor=\"middle\">bitmap</text><rect class=\"box-a\" x=\"432\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"490.0\" y=\"69.0\" text-anchor=\"middle\">dir /</text><rect class=\"box-ok\" x=\"564\" y=\"44\" width=\"116\" height=\"40\" rx=\"8\"/><text class=\"t-s t-code\" x=\"622.0\" y=\"69.0\" text-anchor=\"middle\">commit</text><text class=\"t-s t-m\" x=\"20\" y=\"204\" text-anchor=\"start\">the file system's home locations</text><rect class=\"box\" x=\"20\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"96.0\" y=\"166.0\" text-anchor=\"middle\">inode table</text><rect class=\"box\" x=\"196\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"272.0\" y=\"166.0\" text-anchor=\"middle\">block bitmap</text><rect class=\"box\" x=\"372\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"448.0\" y=\"166.0\" text-anchor=\"middle\">directory /</text><rect class=\"box-b\" x=\"548\" y=\"138\" width=\"152\" height=\"46\" rx=\"8\"/><text class=\"t-s t-code\" x=\"624.0\" y=\"166.0\" text-anchor=\"middle\">block 2065</text><line class=\"ln-d\" x1=\"226\" y1=\"84\" x2=\"110\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"358\" y1=\"84\" x2=\"272\" y2=\"136\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"490\" y1=\"84\" x2=\"448\" y2=\"136\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"20\" y=\"232\" text-anchor=\"start\">1. data=ordered: the new data block goes to its home first (yellow)</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">2. the changed metadata blocks go to the journal, then a commit record (green)</text><text class=\"t-s\" x=\"20\" y=\"272\" text-anchor=\"start\">3. checkpoint: later, the metadata is copied to its home locations (dashed)</text><text class=\"t-s t-a\" x=\"20\" y=\"296\" text-anchor=\"start\">crash before the commit: the transaction is ignored. After it: replayed at mount.</text></svg>",
+    "caption": "One ext4 transaction in data=ordered mode. A crash at any point leaves either the old metadata or the new, never a mix."
+   },
+   "try": {
+    "title": "Read an inode and the journal off a disk image",
+    "minutes": 4,
+    "steps": [
+     "This one needs the privileged box, because it mounts a disk image: from the `labs` folder, `docker compose -f env/labbox.yml run --rm box-priv`.",
+     "The block builds a 64 MB ext4 image from a folder with a file, a hard link and a symlink, reads the inodes and the journal with `debugfs` and `dumpe2fs` (no mount needed for those), then mounts it to show the journal options. `umount` releases the loop device again."
+    ],
+    "code": {
+     "lang": "bash",
+     "title": "in the privileged lab box",
+     "src": "mkdir -p /tmp/src && cd /tmp/src\necho 'auth-7731,4111,120.00,approved' > ledger.csv\nln ledger.csv ledger-2026.csv; ln -s ledger.csv latest.csv\ncd /tmp; truncate -s 64M disk.img; mkfs.ext4 -q -F -d /tmp/src disk.img\ndebugfs -R 'ls -l /' disk.img 2>/dev/null\ndebugfs -R 'stat ledger.csv' disk.img 2>/dev/null | grep -E 'Inode:|Links|Size:|EXTENTS' -A1 | grep -v -E '^--|Fragment|ctime|Generation'\ndumpe2fs -h disk.img 2>/dev/null | grep -E 'Journal (inode|size)|Total journal size'\nmkdir -p /mnt/ledger && mount -o loop disk.img /mnt/ledger\ncat /proc/fs/ext4/loop*/options | grep -E 'data=|commit='\numount /mnt/ledger"
+    },
+    "expect": "```text\n      2   40755 (2)      0      0    4096  7-Nov-2026 20:58 .\n      2   40755 (2)      0      0    4096  7-Nov-2026 20:58 ..\n     11   40700 (2)      0      0   16384  7-Nov-2026 20:58 lost+found\n     12  120777 (7)      0      0      10  7-Nov-2026 20:58 latest.csv\n     13  100644 (1)      0      0      31  7-Nov-2026 20:58 ledger-2026.csv\n     13  100644 (1)      0      0      31  7-Nov-2026 20:58 ledger.csv\n\nInode: 13   Type: regular    Mode:  0644   Flags: 0x80000\nUser:     0   Group:     0   Project:     0   Size: 31\nFile ACL: 0\nLinks: 2   Blockcount: 8\nEXTENTS:\n(0):2065\nJournal inode:            8\nTotal journal size:       4096k\ncommit=5\ndata=ordered\n```\n\nThe root directory lists `ledger.csv` and `ledger-2026.csv` with the same inode, 13, and a link count of 2. `latest.csv` is inode 12, a symlink (`120777`). Inode 13 holds the size, the link count and one extent, block 2065, and no name anywhere. Inode 8 is the 4 MB journal, and the mounted file system runs with `data=ordered` and `commit=5`."
+   },
+   "refs": [
     {
-      "title": "Arpaci-Dusseau, OSTEP chapter 39: Files and Directories",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf"
+     "title": "ext4 General Information: data= and commit= options",
+     "url": "https://docs.kernel.org/admin-guide/ext4.html",
+     "kind": "docs"
     },
     {
-      "title": "Arpaci-Dusseau, OSTEP chapter 42: Crash Consistency: FSCK and Journaling",
-      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf"
-    },
-    {
-      "title": "open(2), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man2/open.2.html"
-    },
-    {
-      "title": "inode(7), Linux manual page",
-      "url": "https://man7.org/linux/man-pages/man7/inode.7.html"
-    },
-    {
-      "title": "ext4 General Information (Linux kernel documentation)",
-      "url": "https://docs.kernel.org/admin-guide/ext4.html"
+     "title": "OSTEP chapter 42: Crash Consistency: FSCK and Journaling",
+     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf",
+     "kind": "read"
     }
+   ]
+  }
+ ],
+ "analogy": "Think of the inode as an object on the JVM heap and a directory as a `Map<String, Inode>`. A hard link is a second map entry referring to the same object, and `rm` removes an entry, not the object. An open file description is an iterator over the object, with its own position: `fork` hands the same iterator to the child, while a second `open()` makes a new iterator at position 0. The object goes away when no map entry and no iterator refers to it. The analogy breaks on how that's decided. The JVM's garbage collector traces from roots and handles cycles. The kernel counts: a link count plus a count of open descriptions, freed the moment both are zero. Counting can't free a cycle, and that's one reason Linux won't let you hard-link a directory.",
+ "in_your_world": "Payment services trip over this lesson in two ways. The first is a disk that fills up although the files are gone: a cleanup job or a person deleted a large log while the JVM still held it, and on Kubernetes a node under disk pressure may even evict pods for it. `lsof +L1` on the node, or `/proc/<pid>/fd` in the container, shows the culprit, and truncating through `/proc` frees it without a restart. The second is \"Too many open files\", which is almost never about files. Every Oracle connection in a HikariCP pool, every Kafka broker connection, every keep-alive connection an HTTP client holds to the card issuer is a descriptor. A leak, such as a `Files.list` stream in a health check or a `Response` body nobody closes, grows the count with traffic until the next connection attempt fails. Export `process.files.open` next to `process.files.max` and alert on the ratio, not on the error.",
+ "mistake": "Deleting a log file to free disk space while the service that writes it is still running. It feels like the direct fix: the file is big, remove it. The space doesn't come back, because `rm` only removes the name and the service's open descriptor keeps the inode and its blocks alive. People then delete more files, or restart the service at a bad time, without knowing why the first delete did nothing. Truncate instead (`: > app.log`, or `truncate -s 0 app.log`), which frees the blocks at once and keeps the writer's descriptor valid. If the file is already deleted, find it with `lsof +L1` and truncate it through `/proc/<pid>/fd/<n>`. For the long term, let the logging framework roll its own files, or configure logrotate with `copytruncate` for programs that can't reopen their logs.",
+ "compare": {
+  "title": "Open before fork against open after fork",
+  "a": {
+   "label": "open, then fork",
+   "lang": "c",
+   "title": "one description: the file gets 84 bytes, all six records",
+   "src": "int fd = open(\"auth.log\", O_WRONLY | O_CREAT | O_TRUNC, 0644);\nif (fork() == 0) {          // the child's fd 3 points at the SAME description\n    records(fd, \"child\");    // shared offset: 0 -> 42\n    _exit(0);\n}\nwait(NULL);\nrecords(fd, \"parent\");       // starts at 42: 42 -> 84\n\n// child  auth 1 ... child  auth 3\n// parent auth 1 ... parent auth 3"
+  },
+  "b": {
+   "label": "fork, then open",
+   "lang": "c",
+   "title": "two descriptions: 42 bytes, the child's records are gone",
+   "src": "if (fork() == 0) {\n    int fd = open(\"auth.log\", O_WRONLY);   // the child's own description\n    records(fd, \"child\");                  // its offset: 0 -> 42\n    _exit(0);\n}\nint fd = open(\"auth.log\", O_WRONLY);       // the parent's own, at 0\nwait(NULL);\nrecords(fd, \"parent\");                     // writes over bytes 0 to 42\n\n// parent auth 1 ... parent auth 3"
+  },
+  "note": "The writes are the same on both sides; only the number of `open()` calls differs. One `open` makes one open file description, and `fork` shares it, offset included. Two `open` calls make two descriptions, each starting at 0, and the later writer wins. Adding `O_APPEND` to the opens on the right gives the left side's result, because the kernel then moves each description to the end of the file before every write."
+ },
+ "worked": {
+  "title": "Find what holds a deleted file and free the space",
+  "steps": [
+   {
+    "say": "Start from the symptom. A volume is full, and `du` over it adds up to far less than `df` says is used. The gap is blocks that no name reaches. Here it's the whole 41 MB.",
+    "code": "df -m /dev/shm\n# Filesystem     1M-blocks  Used Available Use% Mounted on\n# shm                   64    41        24  63% /dev/shm\ndu -sm /dev/shm\n# 0\t/dev/shm",
+    "lang": "bash"
+   },
+   {
+    "say": "Find the holder. `lsof +L1` lists open files with a link count below 1. Without `lsof`, search the fd entries of every process for `(deleted)`.",
+    "code": "lsof +L1\n# COMMAND PID USER   FD   TYPE DEVICE SIZE/OFF NLINK NODE NAME\n# java     33 root    4w   REG  0,179 41943200     0    2 /dev/shm/auth.log (deleted)\nfind /proc/[0-9]*/fd -lname '*(deleted)' 2>/dev/null\n# /proc/33/fd/4",
+    "lang": "bash"
+   },
+   {
+    "say": "Check how the file was opened before you truncate it. In `fdinfo`, the `flags` are octal: `01` is `O_WRONLY` and `02000` is `O_APPEND`. With `O_APPEND`, the writer's next line goes to the new end; without it, it lands at the old offset and leaves a hole.",
+    "code": "grep -E 'pos|flags' /proc/33/fdinfo/4\n# pos:\t41943348\n# flags:\t0402001",
+    "lang": "bash"
+   },
+   {
+    "say": "Keep a copy if you need the contents, then truncate through `/proc`. The blocks are freed at once, and the service keeps running and logging.",
+    "code": "cp /proc/33/fd/4 /tmp/recovered.log\n: > /proc/33/fd/4\ndf -m /dev/shm\n# shm                   64     0        64   0% /dev/shm",
+    "lang": "bash"
+   },
+   {
+    "say": "Then fix the cause: whatever deleted the file should truncate or rename it instead, and the service should open a new file when its log rolls.",
+    "code": "# logrotate, for a program that can't reopen its log:\n/var/log/ledger/app.log {\n    daily\n    rotate 7\n    copytruncate\n}",
+    "lang": "text"
+   }
   ]
+ },
+ "lab": {
+  "title": "Build a file system with inodes, links and shared offsets",
+  "minutes": 15,
+  "files": [
+   "labs/os/src/main/kotlin/sfz/os/l10/FileSystem.kt",
+   "labs/os/src/test/resources/sfz/os/l10/share.txt",
+   "labs/os/src/test/resources/sfz/os/l10/deleted-log.txt"
+  ],
+  "run": "./gradlew :os:test --tests 'sfz.os.l10.*'",
+  "steps": [
+   "Read `FileSystem.kt`. `Inode`, `OpenFile` (the open file description) and `Proc` (a process's fd table) are the three tables. Path lookup, `mkdir`, `symlink`, `rename`, `read`, `dup2`, `exit`, `dfBlocks` and `duBlocks` are written for you, and so are the private helpers you'll call: `parent` (the directory and last name of a path), `newInode`, `desc` (the description behind an fd), `release` and `dropName`.",
+   "Run the tests from the `labs` folder. All eleven fail.",
+   "Write `link` and `unlink`. A name is an entry in a directory's `entries` map; the inode keeps the count in `links`.",
+   "Write `open` and `close`. `open` refuses with `EMFILE` at the limit, creates the file with `CREATE`, makes a new `OpenFile` and takes the lowest free fd. `close` frees the description on its last reference, and then maybe the inode.",
+   "Write `write` and `fork`. The three `share.c` tests replay the C program's three runs against its captured output, offsets included."
+  ],
+  "hints": [
+   "`fork` must put the same `OpenFile` object in the child's table and add one to its `refs`. A copy of the object would give the child its own offset, which is what `open` does.",
+   "In `write`, handle `APPEND` first: set the offset to `data.length`, then write. `StringBuilder.replace(start, end, text)` overwrites from `start` and grows the builder when the text runs past the end.",
+   "Only decrement `inode.openFiles` when a description's `refs` reaches 0, then call `release`. That's what keeps a deleted file alive while any process holds it.",
+   "The lowest free fd: start at 0 and count up while `fd in p.fds`."
+  ],
+  "done_when": "All eleven tests in `FileSystemTest` pass."
+ },
+ "drill": {
+  "title": "Draw the tables after a fork and a second open",
+  "minutes": 4,
+  "prompt": "A process opens `ledger.csv` (fd 3), forks, and then the child opens `ledger.csv` again (fd 4). The child writes 10 bytes to fd 3 and 5 bytes to fd 4; then the parent writes 7 bytes to fd 3. None of the opens used `O_APPEND`. From memory, write down how many open file descriptions exist, which fds point at each, each description's offset at the end, and the file's size.",
+  "answer": {
+   "lang": "text",
+   "src": "descriptions: 2\n  D1 (the parent's open, before fork): parent fd 3, child fd 3   refs 2\n  D2 (the child's second open):       child fd 4                 refs 1\n\nchild writes 10 bytes on fd 3  -> D1 offset 0 -> 10\nchild writes  5 bytes on fd 4  -> D2 offset 0 -> 5   (over bytes 0-4)\nparent writes 7 bytes on fd 3  -> D1 offset 10 -> 17\n\nend: D1 offset 17, D2 offset 5, file size 17\none inode, link count 1, open descriptions 2"
+  }
+ },
+ "recap": [
+  "An inode is the file: type, size, owner, permissions, times, link count and block list, but no name. A directory maps names to inode numbers.",
+  "A hard link is another name for the same inode; a symlink is its own inode holding a path. `rm` is `unlink`: one name less, and the inode is freed when no names and no open descriptions remain.",
+  "Three tables: the per-process fd table points at open file descriptions (offset and flags, one per `open()`), which point at inodes. `fork` and `dup2` share descriptions; a second `open()` makes a new one.",
+  "`O_APPEND` moves the offset to the end before every write, so separate writers don't overwrite each other.",
+  "A deleted file that's still open keeps its space: `df` counts it, `du` doesn't. Find it with `lsof +L1` or `/proc/<pid>/fd`, and truncate it to free the space.",
+  "Sockets count as descriptors too. The JVM raises its soft `RLIMIT_NOFILE` to the hard limit; a leak ends in `EMFILE`, or `ENFILE` at the machine's `fs.file-max`. A journal keeps metadata consistent through a crash, not your un-fsynced data."
+ ],
+ "quiz": [
+  {
+   "q": "From lesson 2: a shell runs `(date; hostname) > out.txt`. Why does `out.txt` end up with both lines instead of `hostname` writing over `date`?",
+   "options": [
+    "The shell opens `out.txt` with `O_APPEND`",
+    "Both programs inherit fd 1 pointing at the one open file description the shell made, so they share its offset",
+    "The kernel always writes at the end of a file that two processes have open",
+    "The shell collects both outputs and writes them once at the end"
+   ],
+   "answer": 1,
+   "from": "os-02",
+   "why": "The shell opens the file once, and each child gets fd 1 through `fork`, pointing at the same description, so the second program starts where the first stopped. `>` opens with `O_TRUNC`, not `O_APPEND` (that's `>>`). The kernel doesn't append on its own: two separate `open()` calls would overwrite each other, as `share.c` showed. And the shell doesn't buffer its children's output."
+  },
+  {
+   "q": "A node's `/var` is 98% full. `du -sh /var` adds up to 30 GB of a 100 GB volume. What's the most likely explanation, and the first command to run?",
+   "options": [
+    "The file system is corrupted; run `fsck`",
+    "The journal has grown to 70 GB; resize it",
+    "Deleted files are still held open by running processes; run `lsof +L1`",
+    "`du` doesn't count files larger than 4 GB; use `ls -l` instead"
+   ],
+   "answer": 2,
+   "why": "`df` counts allocated blocks and `du` counts what names reach. A large gap means blocks with no names, which is almost always files deleted while a process holds them open. `lsof +L1` lists them, and truncating through `/proc/<pid>/fd/<n>` frees the space. The journal has a fixed size (4 MB in the Try-it's image, a few hundred MB at most on large disks), and `du` counts big files fine."
+  },
+  {
+   "q": "`/data` holds `rates.csv`, plus a hard link `rates-backup.csv` and a symlink `rates-latest.csv -> rates.csv`, all in the same directory. A job runs `mv rates.csv archive/`. Which names still open the data?",
+   "options": [
+    "`archive/rates.csv` and `rates-backup.csv`; the symlink now dangles",
+    "All three: links follow the file wherever it moves",
+    "Only `archive/rates.csv`",
+    "`archive/rates.csv` and `rates-latest.csv`; the hard link broke"
+   ],
+   "answer": 0,
+   "why": "`mv` within one file system is a rename: it moves a directory entry, and the inode doesn't change. The hard link holds the inode number, so it still works. The symlink holds the path `rates.csv`, which no longer exists in `/data`, so it dangles. Nothing follows a moved file except names that hold its inode number."
+  },
+  {
+   "q": "Ops set `ulimit -S -n 1024` for a service user, but a JVM under that user still fails with \"Too many open files\" only after about a million descriptors. Why?",
+   "options": [
+    "The kernel ignores soft limits",
+    "HotSpot raises its soft `RLIMIT_NOFILE` to the hard limit at start-up, so only the hard limit applies",
+    "Each Java stream uses 1,000 kernel descriptors",
+    "Sockets don't count against `RLIMIT_NOFILE`"
+   ],
+   "answer": 1,
+   "why": "The soft limit is what the kernel enforces, but any process may raise it up to the hard limit, and the JVM does exactly that (`MaxFDLimit`, on by default; `strace` shows the `prlimit64` call). The leak then runs until the hard limit, or the machine's `fs.file-max`. Sockets are descriptors and count like files."
+  },
+  {
+   "q": "From lesson 9: ext4 in `data=ordered` mode loses power 2 s after a service appended records with `write()` and no `fsync`. After the reboot the mount takes a second, with no `fsck`. What can you expect?",
+   "options": [
+    "The file is exactly as the last `write()` left it: the journal made it durable",
+    "The file system may need a full `fsck` before it's usable",
+    "The file system is consistent, but the file may be missing the last records or be shorter",
+    "The file is lost entirely, because the journal discards open files"
+   ],
+   "answer": 2,
+   "from": "os-09",
+   "why": "The journal replays committed metadata transactions, so the structure is consistent and no `fsck` is needed. It journals metadata only, and ext4 commits every 5 s at most, while dirty data waits up to 30 s for writeback. Records that only reached the page cache are gone, and the size may roll back to the last committed transaction. Durability of data still needs `fsync`."
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "What does an inode hold, and what doesn't it hold?",
+   "back": "Type, size, owner, permissions, timestamps, link count and where the data blocks are. Not its name: names live in directories."
+  },
+  {
+   "front": "Hard link or symlink: which survives renaming the original name?",
+   "back": "The hard link: it holds the inode number. A symlink holds a path, which dangles once that name is gone."
+  },
+  {
+   "front": "When does the kernel free a deleted file's blocks?",
+   "back": "When its link count is 0 and no open file description points at it, so after the last process closes it."
+  },
+  {
+   "front": "What's in an open file description?",
+   "back": "The file offset and the open flags (such as `O_APPEND`), plus a pointer to the inode. One per `open()`; shared by `fork` and `dup2`."
+  },
+  {
+   "front": "Why does `O_APPEND` stop two writers from overwriting each other?",
+   "back": "The kernel sets the offset to the end of the file before each write, in the same step as the write."
+  },
+  {
+   "front": "`df` says 80 GB used, `du` says 30 GB. Where's the rest?",
+   "back": "Usually in deleted files that processes still hold open. `lsof +L1` finds them."
+  },
+  {
+   "front": "What's the difference between EMFILE and ENFILE?",
+   "back": "`EMFILE`: this process hit its `RLIMIT_NOFILE`. `ENFILE`: the whole machine hit `fs.file-max`."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Inode",
+   "plain": "The record of one file: type, size, owner, permissions, times, link count and the blocks holding its data. It has a number, not a name."
+  },
+  {
+   "term": "Directory entry",
+   "plain": "One name in a directory, paired with an inode number."
+  },
+  {
+   "term": "Hard link",
+   "plain": "A second directory entry for the same inode. The inode's link count counts them."
+  },
+  {
+   "term": "Symbolic link",
+   "plain": "A small inode whose content is a path, looked up again each time the link is opened."
+  },
+  {
+   "term": "File descriptor",
+   "plain": "A small number in a process's fd table that points at an open file description."
+  },
+  {
+   "term": "Open file description",
+   "plain": "What one open() call creates: the offset, the flags and a pointer to the inode. fork and dup2 share it."
+  },
+  {
+   "term": "RLIMIT_NOFILE",
+   "plain": "The per-process limit on open descriptors, with a soft value the kernel enforces and a hard ceiling."
+  },
+  {
+   "term": "Journal",
+   "plain": "A log area where a file system writes a change and a commit record before applying it, so a crash leaves the old state or the new one."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A teammate asks why the settlement service's disk was still full after they deleted its 20 GB log, and why it only cleared after a restart. Explain it, and say what they should do next time.",
+  "answer": "A file on Linux is an inode, and its name is just an entry in a directory pointing at that inode. `rm` removes the entry and lowers the link count to 0, but the kernel only frees the inode and its blocks when no process has the file open either. The service still had the log open, through a file descriptor that points at an open file description, which points at the inode. So the 20 GB stayed allocated, the service kept writing into a file nobody could see by name, and `df` and `du` disagreed. The restart closed the descriptor, and that's when the space came back. Next time, truncate the file instead of deleting it, with `: > app.log`, which frees the blocks at once and leaves the service's descriptor working. If it's already deleted, `lsof +L1` shows which process holds it, and truncating `/proc/<pid>/fd/<n>` frees it without a restart. Because our logger opens with `O_APPEND`, its next line simply goes to the start of the empty file. And whatever cleans up logs should rename or truncate them, so the logging framework can roll to a new file."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "A file system can run out of inodes before it runs out of space. ext4 makes a fixed number when you run `mkfs` (16,384 for the 64 MB image in the last Try-it, one per 4 KB block in a small image). A volume full of tiny files, such as a mail spool or a cache that writes one file per key, can show free blocks in `df -h` and still refuse new files with `ENOSPC`. `df -i` shows inode use. XFS allocates inodes as it needs them, so it rarely hits this.\n\nSmall files have their own tricks. The symlink in the Try-it had `Blockcount: 0`: ext4 stores a target shorter than 60 bytes inside the inode itself (a \"fast symlink\"). And a file can have holes. Writing at offset 1 GB in an empty file makes its size 1 GB, but blocks are allocated only where data was written; `ls -l` shows the size and `du` shows the blocks. That's the hole a writer without `O_APPEND` leaves after you truncate its file under it.\n\nLinux has a direct way to make a file that never has a name: `open(dir, O_TMPFILE | O_RDWR)` creates an unnamed inode in that directory's file system. You can write it, `fsync` it, and if you decide to keep it, give it a name with `linkat` from `/proc/self/fd/<n>`. It's another way to publish a complete file in one step, next to the temp-file-and-rename pattern from lesson 9.\n\nFor ext4's journal itself, `/proc/fs/jbd2/<device>/info` prints how many transactions committed and how long they took, and the mount option `data=journal` puts file data through the journal too: every block is written twice, and a small file is fully consistent after a crash. Almost nobody runs it, because the double writes cost throughput."
+ },
+ "sources": [
+  {
+   "title": "Arpaci-Dusseau, OSTEP chapter 39: Files and Directories",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-intro.pdf"
+  },
+  {
+   "title": "Arpaci-Dusseau, OSTEP chapter 42: Crash Consistency: FSCK and Journaling",
+   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/file-journaling.pdf"
+  },
+  {
+   "title": "open(2), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man2/open.2.html"
+  },
+  {
+   "title": "inode(7), Linux manual page",
+   "url": "https://man7.org/linux/man-pages/man7/inode.7.html"
+  },
+  {
+   "title": "ext4 General Information (Linux kernel documentation)",
+   "url": "https://docs.kernel.org/admin-guide/ext4.html"
+  }
+ ]
 }

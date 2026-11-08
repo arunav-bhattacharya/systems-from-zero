@@ -192,11 +192,13 @@ def attach_videos(lessons):
 def compile_course():
     C = json.loads((ROOT / "content/course.json").read_text())
     out = {"title": C["title"], "tagline": C["tagline"], "repo": REPO, "tracks": [], "lessons": {}, "order": [],
-           "envs": [{"file": e["file"], "start": e.get("start") or f"docker compose -f env/{e['file']} up -d", "what": inline(e["what"]), "tracks": e["tracks"]} for e in C.get("envs", [])]}
+           "parts": [{"id": p["id"], "title": p["title"], "short": inline(p.get("short", ""))} for p in C.get("parts", [])],
+           "redirects": C.get("redirects", {}),
+           "envs":[{"file": e["file"], "start": e.get("start") or f"docker compose -f env/{e['file']} up -d", "what": inline(e["what"]), "tracks": e["tracks"]} for e in C.get("envs", [])]}
     for t in C["tracks"]:
         tp = ROOT / "content/tracks" / f"{t['id']}.json"
         T = json.loads(tp.read_text()) if tp.exists() and not validate.check_track(t["id"]).errors else {}
-        ids = []
+        ids, mods = [], []
         for i, ref in enumerate(t["lessons"], 1):
             ids.append(ref["id"])
             out["order"].append(ref["id"])
@@ -205,13 +207,18 @@ def compile_course():
                 print(f"skipping {ref['id']}: it does not pass site/validate.py yet", file=sys.stderr)
             elif lp.exists():
                 try:
-                    out["lessons"][ref["id"]] = lesson(json.loads(lp.read_text()), i, t)
+                    data = json.loads(lp.read_text())
+                    out["lessons"][ref["id"]] = lesson(data, i, t)
+                    m = validate.lab_module(data, t)
+                    if m and m not in mods:
+                        mods.append(m)
                     continue
                 except Exception as e:
                     print(f"warning: {ref['id']} failed to compile: {e}", file=sys.stderr)
             out["lessons"][ref["id"]] = {"id": ref["id"], "track": t["id"], "n": i, "title": ref["title"], "ready": False}
         out["tracks"].append({
-            "id": t["id"], "lab": t["lab"], "title": t["title"], "short": t["short"], "lessons": ids,
+            "id": t["id"], "lab": t.get("lab") or (mods[0] if mods else ""), "labs": mods or [t.get("lab", "")],
+            "part": t.get("part", ""), "title": t["title"], "short": t["short"], "lessons": ids,
             "intro": md(T.get("intro", "")), "cheatsheet": md(T.get("cheatsheet", "")),
             "recap": [inline(x) for x in T.get("recap", [])], "quiz": [mcq(q) for q in T.get("quiz", [])],
         })

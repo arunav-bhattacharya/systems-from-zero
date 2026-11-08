@@ -1,0 +1,128 @@
+{
+  "id": "shard",
+  "intro": "This track splits data across machines. Lessons 1 to 4 build the ideas: why you shard at all (data volume and write throughput; replicas already scale reads), splitting by key range, by hash or by tenant, consistent hashing with virtual nodes and the hot keys it can't fix, rebalancing and how a request finds its shard, and secondary indexes that are either local to each shard or partitioned on their own. Lessons 5 to 9 are case studies, each opening with the ideas it puts together: Cassandra's token ring, gossip and failure detection, then running a Cassandra cluster; MongoDB's replica sets, shard keys and balancer; DynamoDB's partitions, splits and capacity; and OpenSearch's shards, replicas and query then fetch. At the end you can choose a partition key for a payments service in any of them, predict where each insert lands and which reads ask every shard, and say what the cluster does when a node joins, dies or runs hot.\n\nYou need the Replication track first. Leaders and followers, quorums, hints and read repair come back in every case study, and the Data models track's key designs for DynamoDB, Cassandra and MongoDB are the tables these lessons spread over machines. Raft and coordination services come later, in the Consensus track; where a lesson leans on them it says what it needs in place.\n\nEvery lab is a package `sfz.shard.l01` to `l09` and needs only the JDK; the case studies' labs (lessons 5 to 9) live in `labs/nosql`, and each lesson's lab names its module. You build a range router and a hash router with tenants placed on cells, a hash ring with virtual nodes, gossip and a phi accrual detector, rack-aware placement, a model of Cassandra's range movement checked against a real join's log, a MongoDB shard-key simulator, a DynamoDB partition and capacity model, and a search cluster that routes, allocates and fails over. Run `./gradlew :nosql:test --tests 'sfz.shard.l05.*'` from `labs/` for one lesson; the reference answers live in `src/solution`. The Try-its run real clusters in Docker (`env/cassandra-cluster.yml`, `env/mongo-sharded.yml`, `env/dynamodb.yml`, `env/opensearch-cluster.yml`, 2 to 4 GB each). Start one at a time and stop it with `down -v` when the lesson ends.",
+  "cheatsheet": "## Why shard, and how to split\n\nShard for data that won't fit one machine or writes one leader can't take. For reads, add replicas first: sharding is heavy and hard to undo.\n\n| Scheme | A key goes to | Good at | Breaks on | Used by |\n|---|---|---|---|---|\n| Key range | the shard whose range holds the key | range scans, sorted order | monotonic keys (timestamps, sequences): every insert hits the last range | MongoDB ranged keys, HBase, CockroachDB, Vitess |\n| Hash, `hash mod N` | `hash(key) % N` | even spread | changing N moves about N/(N+1) of the keys (80% from 4 to 5 nodes) | OpenSearch per index (N fixed at creation) |\n| Fixed shard count | a logical shard, then a map from shard to node | moving whole shards; uneven hardware | needing more nodes than shards | Citus, Riak, Elasticsearch and OpenSearch |\n| Hash range | a range of hash values that splits when big or hot | even spread, automatic splits | range queries over the partition key | DynamoDB, MongoDB hashed keys, YugabyteDB |\n| Ring with virtual nodes | the first token clockwise from the key's hash | few keys move on a join, spread over many nodes | nothing about load: a hot key stays hot | Cassandra (16 tokens per node), ScyllaDB before tablets |\n| Tenant or cell | the shard that holds the tenant | isolation, per-tenant moves and deletes | one tenant too big for one shard | cell-based services, Citus schema sharding |\n\nA good partition key has many values, no dominant value, no steady growth, and appears in the busiest queries. Even keys are not even load: one hot key (a merchant's running total) lives on one shard. Write sharding spreads it over `key#0` to `key#9` and makes every read ask all ten.\n\n## Rebalancing and routing: who holds the map\n\n| System | The map lives in | A request finds its shard by | Moves happen |\n|---|---|---|---|\n| Cassandra 5.0 | every node's copy, kept in step by gossip | any node coordinates; drivers route by token | only when an operator adds or removes a node |\n| Cassandra 6.0 (alpha) | a log ordered by the Cluster Metadata Service, one epoch per change | the same | as logged steps: PREPARE_JOIN, START_JOIN, MID_JOIN, FINISH_JOIN |\n| MongoDB 9.0 | config server replica set (`config.chunks`) | `mongos` routers with a cached map; `StaleConfig` refreshes it | the balancer, when shards differ by 3 chunk sizes; `moveCollection`, `reshardCollection` |\n| DynamoDB | MemDS, cached on request routers | any router | splits by size, throughput and consumption; never merges |\n| OpenSearch | cluster state, changed only by the elected cluster manager | any node coordinates | allocation and relocation by the manager |\n| Kafka 4.x | KRaft controller quorum | clients fetch metadata | reassignment tools |\n| Redis Cluster | each node's slot map | client slot map, fixed by `-MOVED` and `-ASK` | slot migration |\n\nAutomatic rebalancing is convenient and dangerous: a slow node judged dead moves its load onto the others, and the overload spreads. Dynamo and Cassandra make membership changes explicit for that reason.\n\n## Secondary indexes across shards\n\n| | Local (document-partitioned) | Global (term-partitioned) |\n|---|---|---|\n| Each shard indexes | its own rows only | one slice of the indexed values, for all rows |\n| A write touches | one shard | the row's shard plus index shards (async or a distributed transaction) |\n| A lookup by the indexed value | asks every shard and waits for the slowest | asks one index shard, then fetches the rows |\n| Examples | MongoDB, Cassandra SAI, OpenSearch | DynamoDB GSIs (lag, can throttle the table), CockroachDB, TiDB |\n\nTail amplification: if each of 10 shards answers within its p99 99% of the time, a scatter to all 10 does so 0.99^10, about 90%, of the time. A unique constraint on a non-key column needs a global index or its own collection keyed by that value.\n\n## Membership and failure detection\n\n| | Cassandra 5.0 gossip | SWIM (memberlist: Consul, Nomad, Serf) |\n|---|---|---|\n| Each period | Syn, Ack, Ack2 with one random peer, every second | ping one random member; if no ack, ask k others to ping it |\n| Spreads | versioned endpoint states; the generation (start time) wins across restarts | changes piggybacked on pings and acks |\n| Decides \"down\" | each node's phi accrual detector, locally: phi = 0.434 x silence / mean gap, convict at 8 (about 18.4 mean gaps) | suspect first; the member refutes with a higher incarnation number |\n| Cost | 3 messages per exchange; news reaches N nodes in about log N rounds | about 2 messages per member per period at any size; first detection after about 1.6 periods |\n\nLifeguard adds local health: a slow detector stretches its own timeouts, and suspicion timeouts shrink as others confirm. False positives fell more than 50 times. Seeds only introduce new nodes; a seed never bootstraps.\n\n## Numbers worth remembering\n\n| What | Value |\n|---|---|\n| Cassandra | 16 tokens per node with `allocate_tokens_for_local_replication_factor: 3`; gossip every 1 s; `phi_convict_threshold` 8; hints 3 h; `gc_grace_seconds` 10 days; join sleeps `ring_delay` 30 s in 5.0; streaming 24 MiB/s per source |\n| MongoDB | chunk 128 MB; balancer acts at 3 chunk sizes (384 MB); election after 10 s, heartbeats every 2 s; oplog 5% of disk, 990 MB to 50 GB; resharding-based commands at least 5 minutes by default |\n| DynamoDB | per partition 3,000 RCU, 1,000 WCU, about 10 GB; burst 300 s of unused share; new on-demand table 4,000 writes and 12,000 reads a second, then double the previous peak; quota 40,000 units per table |\n| OpenSearch | shards of 10 to 50 GB; 1,000 shard copies per node; refresh 1 s; `max_result_window` 10,000; rebuild a lost replica after 1 min at 40 MB/s; heap at most about 31 GB; disk watermarks 85, 90 and 95% |\n\n## Commands you'll reach for\n\n```bash\nnodetool status | ring | getendpoints <ks> <table> <key> | gossipinfo | failuredetector\nnodetool cleanup | decommission | removenode <host id> | repair -pr | drain | snapshot -t <tag>\nnodetool cms describe                                   # Cassandra 6.0: the metadata service and its epoch\n```\n\n```javascript\nsh.status(); db.payments.getShardDistribution()\ndb.payments.find({ accountId: \"A-1001\" }).explain().queryPlanner.winningPlan.stage   // SINGLE_SHARD or SHARD_MERGE\ndb.adminCommand({ moveCollection: \"sfz.merchants\", toShard: \"shard2\" })\n```\n\n```bash\ncurl -s 'localhost:9200/_cat/shards?v'; curl -s 'localhost:9200/_cluster/health'\naws dynamodb put-item ... --return-consumed-capacity TOTAL   # then read ThrottlingReasons on errors\n```",
+  "recap": [
+    "Shard for data volume and write throughput; scale reads with replicas. Sharding is hard to undo, so choose the key from the access patterns before the first split.",
+    "Key ranges keep order and break on monotonic keys; hashes spread evenly and lose range scans; `hash mod N` moves almost every key when N changes, so systems fix the shard count, split hash ranges, or use a ring with virtual nodes.",
+    "Even keys aren't even load. A hot key lives on one shard whatever the cluster's size (1,000 WCU per DynamoDB partition); write sharding spreads it and makes reads ask every suffix.",
+    "Somebody holds the map of shards to nodes: every node through gossip (Cassandra 5.0), a consensus log (Cassandra 6.0, Kafka KRaft), config servers behind routers (MongoDB), a metadata service behind routers (DynamoDB), or an elected manager (OpenSearch). Routers with stale maps get redirected and refresh.",
+    "Local secondary indexes keep writes on one shard and make every other lookup a scatter-gather that waits for the slowest shard; global indexes answer from one shard but update asynchronously or with a distributed transaction.",
+    "Cassandra: each node computes replicas from its own map, gossip spreads versioned state in about log N rounds, phi accrual convicts after about 18 mean gaps, and joins stream each range from the replica they replace; cleanup and repair are the operator's jobs.",
+    "SWIM probes one random member per period, indirectly through k others when a ping fails, and piggybacks changes; suspicion and Lifeguard's local health keep a slow link or a slow detector from killing a healthy member.",
+    "MongoDB: a shard key with a monotonic prefix puts every insert on the MaxKey chunk; the balancer evens stored data, not writes; 8.0 and 9.0 move whole collections with `moveCollection` and `unshardCollection`.",
+    "DynamoDB and OpenSearch: DynamoDB partitions split by size and traffic but never above their ceilings, and OpenSearch fixes primaries per index, promotes replicas on failure (yellow) and is red only when every copy of a shard is gone."
+  ],
+  "quiz": [
+    {
+      "q": "A payments service is CPU-bound on reads from one PostgreSQL primary; writes are 300 a second and the data is 200 GB. A teammate proposes sharding. What do you suggest first?",
+      "options": [
+        "Add read replicas and send the reads that tolerate a little lag to them; sharding is for data that won't fit or writes one leader can't take",
+        "Shard by account id across four machines",
+        "Shard by payment date so old data lives elsewhere",
+        "Use consistent hashing so adding machines later is cheap"
+      ],
+      "answer": 0,
+      "why": "Sharding addresses data volume and write throughput. Here both are small, and the load is reads, which replicas scale without the costs of sharding: cross-shard queries, transactions and an expensive key change later. A date key would also put every new write on one shard."
+    },
+    {
+      "q": "A ledger table is range-partitioned on `created_at` over 8 shards, with boundaries that split automatically. What happens at peak, 5,000 inserts a second?",
+      "options": [
+        "About 625 inserts a second on each shard",
+        "All 5,000 land on the shard holding the newest range, because every new row is later than all the others",
+        "The router spreads them round-robin and the balancer sorts them later",
+        "Splitting cuts the hot range so the load spreads within seconds"
+      ],
+      "answer": 1,
+      "why": "A monotonic key sends every insert to the end of the key space, which one shard owns. Splits and balancing move the old data away, but the newest range is always in one place, as MongoDB's MaxKey chunk showed. A hashed prefix, such as the account id, spreads the inserts."
+    },
+    {
+      "q": "A cache cluster maps keys with `hash(key) % N`. It grows from 10 nodes to 11. About what share of keys now map to a different node?",
+      "options": [
+        "About 9%: one eleventh",
+        "About 50%",
+        "About 91%: a key stays only when hash mod 10 equals hash mod 11",
+        "None: the hash doesn't change"
+      ],
+      "answer": 2,
+      "why": "For a key to stay, `h % 10` must equal `h % 11`, which holds for about 1 in 11 keys, so about 91% move. Consistent hashing exists to move only the fair share, about 1/11, onto the new node, which is why rings, fixed shard counts and splittable hash ranges replaced plain modulo."
+    },
+    {
+      "q": "A sharded service has no shard key in its \"find a payment by card fingerprint\" query, and every shard keeps a local index on the fingerprint. With 20 shards whose p99 is 15 ms, why is the query's p99 much worse than 15 ms?",
+      "options": [
+        "Local indexes are slower than global ones on each shard",
+        "The router serializes the 20 requests",
+        "Each shard rebuilds its local index on every query",
+        "The query must ask all 20 shards and wait for the slowest; all 20 answer within their p99 only 0.99^20, about 82%, of the time"
+      ],
+      "answer": 3,
+      "why": "A local index says nothing about other shards, so a lookup on a non-key column is a scatter-gather and inherits the worst shard's latency. A global index on the fingerprint answers from one index shard, at the cost of asynchronous or transactional index writes, as DynamoDB GSIs show."
+    },
+    {
+      "q": "Which statement about who holds a cluster's shard map is true?",
+      "options": [
+        "In Cassandra 5.0 every node holds a copy kept in step by gossip; in 6.0 it moves to a log ordered by the Cluster Metadata Service",
+        "Cassandra 5.0 keeps it on its seed nodes",
+        "MongoDB's mongos routers store it on disk and are the source of truth",
+        "OpenSearch lets any node change the routing table"
+      ],
+      "answer": 0,
+      "why": "Cassandra 5.0 nodes each keep the whole map and gossip versioned changes; 6.0's Transactional Cluster Metadata orders membership, tokens and schema in one log of epochs. Seeds only introduce new nodes, mongos only caches the config servers' map, and only OpenSearch's elected cluster manager changes the cluster state."
+    },
+    {
+      "q": "A Cassandra node freezes in a 40-second GC pause. Its peers' heartbeats normally arrive about once a second. What do the other nodes do?",
+      "options": [
+        "Mark it down after one missed gossip round",
+        "Each node marks it down on its own after about 18 to 20 seconds, when phi passes 8, then keeps hints for its writes; nobody moves its data",
+        "The seeds decide it's down and tell everyone, and its ranges stream to other nodes",
+        "Nothing until an operator runs `nodetool removenode`"
+      ],
+      "answer": 1,
+      "why": "Phi accrual compares the silence with the mean gap and convicts at phi 8, about 18.4 mean gaps, and each node decides locally. Down means no reads and hints for writes, never a move: only an operator changes the ring. When the node wakes, its own local-pause guard stops it from convicting everyone else."
+    },
+    {
+      "q": "In a SWIM cluster, member A's pings to member B time out because a firewall rule drops packets between those two hosts only. Why isn't B declared dead?",
+      "options": [
+        "B's phi stays under 8",
+        "SWIM never declares members dead",
+        "A retries the direct ping until it succeeds",
+        "A asks k other members to ping B; their acks come back through them, so the direct failure is routed around"
+      ],
+      "answer": 3,
+      "why": "Indirect probes are SWIM's defence against a bad link between two specific members. Only if those also fail is B suspected, and B can still refute with a higher incarnation number. Lifeguard adds the other half: a slow or overloaded prober stretches its own timeouts."
+    },
+    {
+      "q": "A Cassandra cluster grows from 6 to 9 nodes with RF 3. A week later the six old nodes' disks are as full as before. Why, and what's the fix?",
+      "options": [
+        "Old nodes keep the rows of ranges they handed over until `nodetool cleanup` rewrites their SSTables; run it on each old node, one at a time",
+        "Streaming failed; rebuild the new nodes",
+        "Compaction is behind; raise its throughput",
+        "Hints for the new nodes are piling up"
+      ],
+      "answer": 0,
+      "why": "A join copies each range from the replica it replaces and deletes nothing on the old owners. Cleanup is a special compaction that drops the ranges a node no longer replicates. Normal compaction keeps every row, and the new nodes being UN shows the streams worked."
+    },
+    {
+      "q": "A provisioned DynamoDB table has 40,000 WCU and uses 6,000, but writes to one running-total item at 1,500 a second are throttled with `TableWriteKeyRangeThroughputExceeded`. What fixes it?",
+      "options": [
+        "Raise the table to 80,000 WCU",
+        "Switch the table to on-demand",
+        "Spread the item over several keys (write sharding) and sum them on read; one key lives in one partition, capped at 1,000 WCU",
+        "Wait for adaptive capacity to split the item"
+      ],
+      "answer": 2,
+      "why": "The table's capacity is a sum of partition ceilings, and one item can't be split. Adaptive capacity can give the item a partition of its own, but that partition still tops out at 1,000 WCU, in either capacity mode. A `KeyRange` reason means a key design problem, not a capacity setting."
+    },
+    {
+      "q": "An OpenSearch index has 3 primaries and 1 replica on 3 nodes. Two nodes fail together, before any copy is rebuilt. What is the most likely state?",
+      "options": [
+        "Green: replicas are promoted",
+        "Yellow: every primary is assigned and some replicas aren't",
+        "Red: with two copies per shard on three nodes, some shard had both copies on the two failed nodes, so its documents can't be searched",
+        "Searches return everything, but writes fail"
+      ],
+      "answer": 2,
+      "why": "One node failing is yellow: the manager promotes replicas and every document stays searchable. With one replica, each shard's two copies sit on two of the three nodes, so any pair of failed nodes covers both copies of some shard: red until a node with the data returns or a snapshot is restored. A second replica would survive two failures."
+    }
+  ]
+}

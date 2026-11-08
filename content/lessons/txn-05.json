@@ -1,0 +1,558 @@
+{
+  "id": "txn-05",
+  "title": "Concurrency control: locks, deadlocks and SSI",
+  "minutes": 40,
+  "goal": "By the end you can explain how a lock manager makes writers take turns under strict two-phase locking, read `pg_locks` to see who waits for whom, find a deadlock as a cycle in a waits-for graph, say how PostgreSQL's SERIALIZABLE catches write skew without blocking readers and what that costs in throughput and retries, and build a lock manager that detects deadlocks.",
+  "warmup": {
+    "q": "Two withdrawals run under PostgreSQL's SERIALIZABLE. Each reads both cards of account acct-17 (75.00 each, 150.00 in total), then takes 100.00 from a different card. Withdrawal A runs its UPDATE first. What happens to B's UPDATE of the other card?",
+    "options": [
+      "It waits until A commits, because A's read locked both cards",
+      "It runs at once; nothing waits, but one of the two COMMITs fails with a serialization error",
+      "It runs at once and both commit, since they changed different rows",
+      "It fails at once with a deadlock error"
+    ],
+    "answer": 1,
+    "why": "PostgreSQL's SERIALIZABLE is serializable snapshot isolation: a read leaves a note that blocks nobody, so neither UPDATE waits. At COMMIT it finds that each withdrawal read a row the other changed, which no serial order can explain, and aborts one with SQLSTATE 40001. Waiting on read locks is what two-phase locking does, the other road to serializability, which MySQL's SERIALIZABLE takes. Both committing is what REPEATABLE READ allows: lesson 3's write skew."
+  },
+  "sections": [
+    {
+      "h": "Writers queue for locks, even under MVCC",
+      "body": "Lesson 4 ended on a rule: under MVCC readers don't block writers, but writers block writers. Lesson 2 used that rule every day: row locks, `FOR UPDATE`, `SKIP LOCKED`, and a deadlock broken by locking rows in a fixed order. This lesson opens the machinery underneath, the lock manager and its waits-for graph, and then the general question lessons 1 to 4 kept circling: how does a database make transactions serializable, so they behave as if they ran one at a time, and what does that cost?\n\nStart with writers. A refund and a capture that both change account 1 must take turns, or one change is lost. Lesson 4's store handled this bluntly: it failed the second writer with `WriteConflict` and left the retry to the application. That is wasteful when the first writer will be done in 2 ms. Waiting is better, and a **lock** is how a database makes a transaction wait for its turn.\n\nVersion 1 is one lock for the whole database, so only one transaction writes at a time. SQLite works like this: one writer at a time, while readers carry on in WAL mode. It is correct, but on a payments database with 300 transfers a second it makes every transfer wait for every other one, although two transfers rarely touch the same account.\n\nVersion 2 is a lock per row. A transfer locks the two accounts it changes, and transfers on other accounts never notice. Now a lock needs a mode. A transaction that only needs a row to stay unchanged while it checks something can share it with others doing the same: a shared lock (S), which `SELECT ... FOR SHARE` takes. A transaction that changes the row needs it alone: an exclusive lock (X), which every UPDATE and DELETE takes, and `SELECT ... FOR UPDATE` too. S is compatible with S. X is compatible with nothing.\n\nA **lock manager** keeps, for every locked thing, who holds it and a queue of who waits for it. That is the figure, and the lab builds it. A request is granted if it is compatible with every holder and nobody is waiting ahead of it. The second condition is about fairness: without it, a steady stream of S requests could keep an X request waiting forever. When a holder releases, the lock manager grants waiting requests from the front of the queue, in order.\n\nPostgreSQL has such a lock manager in shared memory, for tables and other objects. Row locks work differently, as lessons 2 and 4 showed: the lock is the locker's transaction id in the row's `t_xmax`, so locking a million rows costs no memory. To wait for a row, a transaction waits on the lock that every transaction holds on its own id until it ends. In the Try it, the second UPDATE of account 1 appears in `pg_locks` as a `ShareLock` request on transaction 858, not granted. It also holds a `tuple` lock on `(0,1)`, which marks its place in line for that row: a third writer would queue behind it.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"A lock table: row acct-1 is held by T1 in X mode with T2 (X) and T3 (S) waiting; row acct-2 is held by T2 in S mode with T1 (X) waiting. The waits-for graph has edges T1 to T2, T2 to T1, and T3 to both: T1 and T2 form a cycle.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">the lock manager: one queue per locked row</text><rect class=\"box\" x=\"16\" y=\"36\" width=\"110\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"71\" y=\"69\" text-anchor=\"middle\">row acct-1</text><text class=\"t-s t-m\" x=\"150\" y=\"48\" text-anchor=\"start\">granted</text><rect class=\"box-a\" x=\"146\" y=\"54\" width=\"70\" height=\"38\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"181\" y=\"78\" text-anchor=\"middle\">T1 X</text><text class=\"t-s t-m\" x=\"236\" y=\"48\" text-anchor=\"start\">waiting, in arrival order</text><rect class=\"box-b\" x=\"232\" y=\"54\" width=\"70\" height=\"38\" rx=\"8\"/><text class=\"t-s t-code t-b\" x=\"267\" y=\"78\" text-anchor=\"middle\">T2 X</text><rect class=\"box-b\" x=\"310\" y=\"54\" width=\"70\" height=\"38\" rx=\"8\"/><text class=\"t-s t-code t-b\" x=\"345\" y=\"78\" text-anchor=\"middle\">T3 S</text><rect class=\"box\" x=\"16\" y=\"116\" width=\"110\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"71\" y=\"149\" text-anchor=\"middle\">row acct-2</text><rect class=\"box-a\" x=\"146\" y=\"134\" width=\"70\" height=\"38\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"181\" y=\"158\" text-anchor=\"middle\">T2 S</text><rect class=\"box-b\" x=\"232\" y=\"134\" width=\"70\" height=\"38\" rx=\"8\"/><text class=\"t-s t-code t-b\" x=\"267\" y=\"158\" text-anchor=\"middle\">T1 X</text><text class=\"t-s\" x=\"16\" y=\"200\" text-anchor=\"start\">S is compatible with S; X with nothing.</text><text class=\"t-s\" x=\"16\" y=\"220\" text-anchor=\"start\">A request waits if it conflicts with a holder</text><text class=\"t-s\" x=\"16\" y=\"240\" text-anchor=\"start\">or if anyone is already waiting ahead of it.</text><text class=\"t-s\" x=\"16\" y=\"260\" text-anchor=\"start\">T3&#x27;s S lock waits behind T2, though T1 is</text><text class=\"t-s\" x=\"16\" y=\"280\" text-anchor=\"start\">the only holder.</text><line class=\"ln-d\" x1=\"412\" y1=\"30\" x2=\"412\" y2=\"292\"/><text class=\"t-s t-m\" x=\"430\" y=\"22\" text-anchor=\"start\">the waits-for graph drawn from it</text><rect class=\"box-bad\" x=\"450\" y=\"60\" width=\"70\" height=\"40\" rx=\"8\"/><text class=\"t t-bad\" x=\"485\" y=\"85\" text-anchor=\"middle\">T1</text><rect class=\"box-bad\" x=\"610\" y=\"60\" width=\"70\" height=\"40\" rx=\"8\"/><text class=\"t t-bad\" x=\"645\" y=\"85\" text-anchor=\"middle\">T2</text><rect class=\"box\" x=\"530\" y=\"196\" width=\"70\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"565\" y=\"221\" text-anchor=\"middle\">T3</text><path class=\"ln-bad\" d=\"M522 70 C555 48 575 48 608 70\" marker-end=\"url(#arr)\"/><path class=\"ln-bad\" d=\"M608 92 C575 114 555 114 522 92\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"565\" y=\"44\" text-anchor=\"middle\">T1 waits for T2</text><text class=\"t-s t-bad\" x=\"565\" y=\"126\" text-anchor=\"middle\">T2 waits for T1</text><line class=\"ln\" x1=\"545\" y1=\"194\" x2=\"490\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"585\" y1=\"194\" x2=\"640\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"430\" y=\"268\" text-anchor=\"start\">T1 and T2 wait for each other: a cycle,</text><text class=\"t-s t-bad\" x=\"430\" y=\"288\" text-anchor=\"start\">a deadlock. T3 only waits on it.</text></svg>",
+        "caption": "The picture for this lesson: per row, who holds the lock and who waits in line, and the waits-for graph drawn from the queues. T1 and T2 wait for each other."
+      },
+      "try": {
+        "title": "Find the waiting transaction in pg_locks",
+        "minutes": 5,
+        "steps": [
+          "From `labs/`, start PostgreSQL with `docker compose -f env/postgres.yml up -d --wait`, then open two terminals in `labs/` and run `docker compose -f env/postgres.yml exec db psql -U sfz` in each: terminal 1 and terminal 2 below.",
+          "Terminal 1: create `accounts`, start a transaction that debits account 1, and note its pid and transaction id. Terminal 2: update account 1 too. It hangs.",
+          "Terminal 1: list the locks. Predict which row has `granted = f`, and which transaction id it names. Then commit and watch terminal 2 return."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "two psql sessions",
+          "src": "-- terminal 1\nCREATE TABLE accounts (id int PRIMARY KEY, holder text, balance_cents bigint);\nINSERT INTO accounts VALUES (1, 'merchant', 100000), (2, 'customer', 20000);\nBEGIN;\nUPDATE accounts SET balance_cents = balance_cents - 5000 WHERE id = 1;\nSELECT pg_backend_pid(), pg_current_xact_id();\n\n-- terminal 2\nSELECT pg_backend_pid();\nUPDATE accounts SET balance_cents = balance_cents + 5000 WHERE id = 1;   -- waits\n\n-- terminal 1\nSELECT pid, locktype, relation::regclass AS rel, page, tuple, transactionid AS xid, mode, granted\nFROM pg_locks\nWHERE locktype IN ('transactionid', 'tuple') OR relation = 'accounts'::regclass\nORDER BY pid, locktype;\nSELECT pid, pg_blocking_pids(pid) AS blocked_by, wait_event_type, wait_event\nFROM pg_stat_activity WHERE wait_event_type = 'Lock';\nCOMMIT;"
+        },
+        "expect": "Terminal 1 is pid 128 with transaction 858, terminal 2 is pid 142:\n\n```text\n pid |   locktype    |   rel    | page | tuple | xid |       mode       | granted\n-----+---------------+----------+------+-------+-----+------------------+---------\n 128 | relation      | accounts |      |       |     | RowExclusiveLock | t\n 128 | transactionid |          |      |       | 858 | ExclusiveLock    | t\n 142 | relation      | accounts |      |       |     | RowExclusiveLock | t\n 142 | transactionid |          |      |       | 859 | ExclusiveLock    | t\n 142 | transactionid |          |      |       | 858 | ShareLock        | f\n 142 | tuple         | accounts |    0 |     1 |     | ExclusiveLock    | t\n\n pid | blocked_by | wait_event_type |  wait_event\n-----+------------+-----------------+---------------\n 142 | {128}      | Lock            | transactionid\n```\n\nEach transaction holds an ExclusiveLock on its own id. Terminal 2 found 858 in the row's `t_xmax`, so it asks for a ShareLock on transaction 858, which it gets only when 858 ends: `granted = f`. The `tuple` lock on `(0,1)` is its place in line for the row. Both hold RowExclusiveLock on the table, the mode every UPDATE takes; it doesn't conflict with itself, which is why two UPDATEs of different rows never wait for each other. When terminal 1 commits, terminal 2's UPDATE returns at once. Your pids and ids differ."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Explicit locking (lock modes and row locks)",
+          "url": "https://www.postgresql.org/docs/18/explicit-locking.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: pg_locks",
+          "url": "https://www.postgresql.org/docs/18/view-pg-locks.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Locks are held until commit: two-phase locking",
+      "body": "When should a transaction let go of a lock? The obvious answer is as soon as it's done with the row. Take transfer A: it debits account 1, releases the lock, then credits account 2. Between those two steps, refund B locks account 1 and writes its change on top of A's debit. Then A fails on account 2, a timeout or a broken check, and rolls back. Undoing A's debit would wipe out B's change too, because B built on it. B used a value that, as it turns out, never existed, and B may already have committed.\n\nThe rule that prevents this is **two-phase locking** (2PL). A transaction takes locks while it runs, the growing phase, and starts giving them up only once it will take no more, the shrinking phase. It never takes a lock after releasing one. If every transaction follows the rule and locks everything it reads and writes, the outcome equals some serial order of the transactions. PostgreSQL, InnoDB and Oracle use the strict form for row locks: a transaction holds every lock until COMMIT or ROLLBACK and then releases all of them at once, so nobody can build on a change that might still be rolled back. In the lab, that moment is `release(tx)`. Don't confuse it with two-phase commit, lesson 7's protocol for committing on several machines: the names are an accident.\n\nStrict 2PL explains the most common lock outage in production, because tables have locks too. Every SELECT takes an ACCESS SHARE lock on the table, which conflicts only with ACCESS EXCLUSIVE. ALTER TABLE, DROP TABLE and TRUNCATE take ACCESS EXCLUSIVE. Both are held to the end of the transaction. So a migration that runs `ALTER TABLE accounts ADD COLUMN note text` waits for every open transaction that has touched `accounts`, including one that ran a SELECT and has sat `idle in transaction` since. That alone is fine. The queue is the problem: every query that arrives after the ALTER waits behind it, even a plain SELECT that is compatible with every lock already granted. One forgotten transaction plus one migration stops all traffic to the table. In the Try it, a one-row SELECT waits with `blocked_by` pointing at the ALTER, not at the open transaction.\n\nThe fix is to let the migration give up instead of queueing: run `SET lock_timeout = '2s'` before the ALTER and retry it later. The statement fails with `canceling statement due to lock timeout`, and the queue behind it moves again.",
+      "try": {
+        "title": "Watch a migration block every reader",
+        "minutes": 5,
+        "steps": [
+          "Open a third terminal in `labs/` and run the same psql command.",
+          "Terminal 1: read `accounts` in a transaction and leave it open. Terminal 2: run the ALTER. Terminal 3: read one row. Predict which of the three return.",
+          "Terminal 1: list the table's locks, then commit and watch terminals 2 and 3. Repeat with `SET lock_timeout = '2s'` in terminal 2 and a second ALTER, while terminal 1 holds a transaction open again."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "three psql sessions",
+          "src": "-- terminal 1: a transaction that read accounts and was left open\nBEGIN;\nSELECT count(*) FROM accounts;\n\n-- terminal 2: a migration\nALTER TABLE accounts ADD COLUMN note text;   -- waits\n\n-- terminal 3: an ordinary query\nSELECT holder FROM accounts WHERE id = 2;    -- waits too\n\n-- terminal 1\nSELECT pid, mode, granted, pg_blocking_pids(pid) AS blocked_by\nFROM pg_locks WHERE relation = 'accounts'::regclass ORDER BY granted DESC, pid;\nCOMMIT;\n\n-- the same with a lock timeout: terminal 1 first runs BEGIN and the count again\n-- terminal 2\nSET lock_timeout = '2s';\nALTER TABLE accounts ADD COLUMN memo text;\n-- terminal 1\nCOMMIT;"
+        },
+        "expect": "While terminal 1's transaction is open:\n\n```text\n pid |        mode         | granted | blocked_by\n-----+---------------------+---------+------------\n 176 | AccessShareLock     | t       | {}\n 166 | AccessExclusiveLock | f       | {176}\n 173 | AccessShareLock     | f       | {166}\n```\n\nPid 176 is terminal 1, 166 the ALTER and 173 the one-row SELECT. The SELECT asks for AccessShareLock, which is compatible with the only granted lock, and still waits: it is blocked by the ALTER queued ahead of it. When terminal 1 commits, the ALTER runs, then the SELECT returns `customer`. With `lock_timeout` set, the second ALTER gives up after 2 seconds instead of holding the line:\n\n```text\nERROR:  canceling statement due to lock timeout\n```\n\nYour pids differ."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Lock management settings (lock_timeout, deadlock_timeout)",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-locks.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A deadlock is a cycle of waits, and one transaction has to lose",
+      "body": "Lesson 2 met the failure that locks bring. Transfer A moves 12 euros from account 1 to account 2 while transfer B moves 8 euros from account 2 to account 1. A locks account 1 and B locks account 2. Then A asks for account 2 and waits for B, and B asks for account 1 and waits for A. Neither can ever move on, and strict 2PL forbids either from letting go early. That is a **deadlock**. Make one in the simulator again: you are the scheduler.\n\nLesson 2 prevented it: every transaction takes its locks in one global order, lowest account id first, so the transfer from 2 to 1 waits at account 1 while holding nothing A needs. That is the right fix in your own code. A database can't impose it, because it can't know which rows your next statement will touch, so it has to find the deadlocks you didn't prevent.\n\nIt draws a **waits-for graph**: one node per transaction, and an edge from each waiting transaction to each transaction it waits for. That includes one queued ahead of it in the same line, as the figure's T3 shows. A chain, C waiting for B waiting for A, ends by itself: A finishes, then B, then C. A cycle never does. Finding one is a depth-first search that follows edges until it comes back to a transaction already on its path. The database then picks a victim, aborts it, releases its locks, and the others carry on. The lab picks the youngest transaction on the cycle, the highest id, which has probably done the least work.\n\nPostgreSQL doesn't search on every wait, because the search is expensive and most waits end quickly. A waiting backend sets a timer of `deadlock_timeout`, 1 second by default. When it fires, that backend searches the graph, and if it finds a cycle through itself it usually aborts its own transaction, with `ERROR: deadlock detected`, SQLSTATE 40P01. The docs warn that which transaction loses is hard to predict. In the Try it, terminal 1 waited first, but its check ran before terminal 2 closed the cycle, so terminal 2's check found it and terminal 2 lost.\n\nUnder load, a deadlock is a normal outcome, like a serialization failure. The application retries the losing transaction from the start.",
+      "sim": {
+        "title": "Two transfers lock the same two rows",
+        "intro": "Lesson 2's two transfers, and you are the scheduler. Tx A moves 12 from account 1 to account 2; Tx B moves 8 from account 2 to account 1. Each UPDATE locks its row until COMMIT. First make both get stuck. Then reset and get both to commit, with account 1 at 996.",
+        "vars": {
+          "acct1": 1000,
+          "acct2": 200
+        },
+        "locks": [
+          "row 1",
+          "row 2"
+        ],
+        "threads": [
+          {
+            "name": "Tx A",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "row 1",
+                "code": "UPDATE accounts ... WHERE id = 1   -- locks row 1"
+              },
+              {
+                "op": "read",
+                "var": "acct1",
+                "reg": "a",
+                "code": "  a = balance of account 1"
+              },
+              {
+                "op": "add",
+                "reg": "a",
+                "n": -12,
+                "code": "  a = a - 12"
+              },
+              {
+                "op": "write",
+                "var": "acct1",
+                "reg": "a",
+                "code": "  new version of account 1"
+              },
+              {
+                "op": "lock",
+                "lock": "row 2",
+                "code": "UPDATE accounts ... WHERE id = 2   -- locks row 2"
+              },
+              {
+                "op": "read",
+                "var": "acct2",
+                "reg": "b",
+                "code": "  b = balance of account 2"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": 12,
+                "code": "  b = b + 12"
+              },
+              {
+                "op": "write",
+                "var": "acct2",
+                "reg": "b",
+                "code": "  new version of account 2"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 1",
+                "code": "COMMIT   -- releases row 1 ..."
+              },
+              {
+                "op": "unlock",
+                "lock": "row 2",
+                "code": "         -- ... and row 2"
+              }
+            ]
+          },
+          {
+            "name": "Tx B",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "row 2",
+                "code": "UPDATE accounts ... WHERE id = 2   -- locks row 2"
+              },
+              {
+                "op": "read",
+                "var": "acct2",
+                "reg": "a",
+                "code": "  a = balance of account 2"
+              },
+              {
+                "op": "add",
+                "reg": "a",
+                "n": -8,
+                "code": "  a = a - 8"
+              },
+              {
+                "op": "write",
+                "var": "acct2",
+                "reg": "a",
+                "code": "  new version of account 2"
+              },
+              {
+                "op": "lock",
+                "lock": "row 1",
+                "code": "UPDATE accounts ... WHERE id = 1   -- locks row 1"
+              },
+              {
+                "op": "read",
+                "var": "acct1",
+                "reg": "b",
+                "code": "  b = balance of account 1"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": 8,
+                "code": "  b = b + 8"
+              },
+              {
+                "op": "write",
+                "var": "acct1",
+                "reg": "b",
+                "code": "  new version of account 1"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 2",
+                "code": "COMMIT   -- releases row 2 ..."
+              },
+              {
+                "op": "unlock",
+                "lock": "row 1",
+                "code": "         -- ... and row 1"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "acct1",
+          "eq": 996,
+          "say": "Both committed: account 1 lost 12 and got 8 back. Whoever reached a row second waited there, and nothing was lost. When you ran the two first UPDATEs before either second one, each held the row the other needed: that cycle is the deadlock PostgreSQL breaks by aborting one transaction."
+        }
+      },
+      "try": {
+        "title": "Make PostgreSQL break a deadlock",
+        "minutes": 4,
+        "steps": [
+          "Terminal 1: begin transfer A and debit account 1. Terminal 2: begin transfer B and debit account 2.",
+          "Terminal 1: credit account 2; it waits. Wait a couple of seconds, then in terminal 2 credit account 1. Predict which terminal gets an error, and when.",
+          "Commit in both terminals and read the balances."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "two psql sessions",
+          "src": "-- terminal 1: transfer A, 12 euros from account 1 to account 2\nBEGIN;\nUPDATE accounts SET balance_cents = balance_cents - 1200 WHERE id = 1;\n\n-- terminal 2: transfer B, 8 euros from account 2 to account 1\nBEGIN;\nUPDATE accounts SET balance_cents = balance_cents - 800 WHERE id = 2;\n\n-- terminal 1\nUPDATE accounts SET balance_cents = balance_cents + 1200 WHERE id = 2;   -- waits\n\n-- terminal 2\nUPDATE accounts SET balance_cents = balance_cents + 800 WHERE id = 1;    -- waits, then?\n\n-- both terminals: COMMIT, then in either one\nSELECT id, balance_cents FROM accounts ORDER BY id;"
+        },
+        "expect": "About a second after terminal 2's second UPDATE, terminal 2 gets:\n\n```text\nERROR:  deadlock detected\nDETAIL:  Process 246 waits for ShareLock on transaction 870; blocked by process 249.\nProcess 249 waits for ShareLock on transaction 871; blocked by process 246.\nHINT:  See server log for query details.\nCONTEXT:  while updating tuple (0,4) in relation \"accounts\"\n```\n\nand at the same moment terminal 1's UPDATE returns. Terminal 2's COMMIT answers `ROLLBACK`, because its transaction was aborted. The balances show A's transfer and nothing of B's:\n\n```text\n id | balance_cents\n----+---------------\n  1 |         98800\n  2 |         21200\n```\n\nThe DETAIL lines are the cycle in the waits-for graph: each process waits for the other's transaction. Your pids and ids differ. If you wait more than a second between the two second UPDATEs, terminal 2 loses, as here; run them within a second and either may lose."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL source: lock manager README (deadlock detection)",
+          "url": "https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/README",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Serializable snapshot isolation catches what row locks miss",
+      "body": "Row locks order the writers of one row. They can't see write skew, lesson 3's anomaly, where two transactions read the same rows and write different ones. Account acct-17 has two cards with 75 euros each, and the rule is that the account's total must not go below zero. Withdrawal A checks the total, 150, and takes 100 from card 1. Withdrawal B checks the total, 150, and takes 100 from card 2. They write different rows, so no row lock and no `t_xmax` ever conflict. Both commit and the total is -50. Run one after the other, the second would have seen 50 and refused.\n\nVersion 1 makes reads lock too. Under strict 2PL every row a transaction reads gets an S lock, held until commit. A's S locks on both cards block B's X lock on card 2, and B's block A's on card 1, so they deadlock and one is retried. That is correct, and it is how MySQL's InnoDB implements SERIALIZABLE: with autocommit off, it turns plain SELECTs into `SELECT ... FOR SHARE`. But it brings back what MVCC removed. Lesson 4's month-end report would lock 2 million rows and stall every transfer. And a third card inserted during the check would slip past row locks, so the database must also lock ranges of keys.\n\nVersion 2 is **serializable snapshot isolation** (SSI), PostgreSQL's SERIALIZABLE level since 9.1. Transactions keep their snapshots and never wait to read. Each read leaves a note, an SIREAD lock, saying \"this transaction read this row\", or this page, or the whole table after a sequential scan. A note blocks nothing. When a transaction writes a version that a concurrent transaction read, PostgreSQL records a read-write dependency from the reader to the writer. The reader didn't see that write, so in any serial order that explains what happened, the reader must come first. In the cards example, B read card 1 before A changed it, so B must come before A. A read card 2 before B changed it, so A must come before B. Both can't be true.\n\nSearching the whole graph for cycles after every write would be slow. The theory behind SSI, from Alan Fekete and colleagues, shows that every such cycle contains two read-write edges in a row, T1 to T2 to T3, where T3 is the first to commit. So PostgreSQL only watches for a transaction with a read-write edge coming in and another going out, a **pivot**, and aborts one transaction of the pattern with SQLSTATE 40001. The stepper follows the cards. The pattern can appear without a real cycle, and coarse SIREAD locks make that more likely, so SSI has false positives. Under SERIALIZABLE every transaction needs a retry loop. In exchange you get correctness without analysing every pair of transactions yourself. The next section asks what it costs.",
+      "stepper": {
+        "title": "Two withdrawals under SERIALIZABLE",
+        "intro": "The two cards of acct-17, the SIREAD notes and the read-write edges between A and B. Use Next and Back, or the arrow keys.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Withdrawals A and B each read both cards and leave SIREAD notes.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: 75.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">SIREAD: A, B</text><rect class=\"box\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: 75.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">SIREAD: A, B</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">A and B each read both cards: total 150.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">read 150</text><rect class=\"box\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">read 150</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">Two SERIALIZABLE withdrawals of 100 start and read both cards.</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">Each read leaves an SIREAD note. Notes block nobody.</text></svg>",
+            "say": "Withdrawals A and B start under SERIALIZABLE and both read the two cards: 75 + 75 = 150, enough for 100. Each read leaves an **SIREAD lock**, a note that this transaction read this row. The notes block nothing; they are only there for the check that comes later."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"A writes card 1; B had read it, giving a read-write edge from B to A.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box-a\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t t-a\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">new version by A</text><rect class=\"box\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: 75.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">SIREAD: A, B</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">A writes card 1, which B has read.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">wrote card 1</text><rect class=\"box\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">read 150</text><path class=\"ln-a\" d=\"M558 104 C520 64 500 64 462 104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"510\" y=\"58\" text-anchor=\"middle\">B read card 1, A wrote it</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">A takes 100 from card 1. B read card 1 and can&#x27;t see this write,</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">so in any serial order B must come before A: an edge B to A.</text></svg>",
+            "say": "A takes 100 from card 1, writing a new version. The lock manager finds B's SIREAD note on card 1. B read the old version and will never see A's change, so if the two are to look like they ran one after the other, B must come first. That is a **read-write dependency**, an edge from B to A."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"B writes card 2; A had read it, so there is also an edge from A to B, closing a cycle.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">new version by A</text><rect class=\"box-a\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t t-a\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">new version by B</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">B writes card 2, which A has read.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box-bad\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">edge in and out</text><rect class=\"box-bad\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">edge in and out</text><path class=\"ln-bad\" d=\"M558 104 C520 64 500 64 462 104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"510\" y=\"58\" text-anchor=\"middle\">B read card 1, A wrote it</text><path class=\"ln-bad\" d=\"M462 140 C500 180 520 180 558 140\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"510\" y=\"198\" text-anchor=\"middle\">A read card 2, B wrote it</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">B takes 100 from card 2, which A read: an edge A to B. No row lock</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">conflicted. But A must precede B and B must precede A: a cycle.</text></svg>",
+            "say": "B takes 100 from card 2, which A had read: an edge from A to B. The two writes touched different rows, so no row lock ever conflicted. But now A must come before B and B before A, which no serial order can do. Each transaction has a read-write edge coming in and one going out: each is a **pivot**, the pattern the theory says every anomaly contains."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"A commits first; B is now a pivot whose outgoing edge points at a committed transaction.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box-ok\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t t-ok\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">committed</text><rect class=\"box\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">new version by B</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">A commits first.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box-ok\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">committed</text><rect class=\"box-bad\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">edge in and out</text><path class=\"ln-bad\" d=\"M558 104 C520 64 500 64 462 104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"510\" y=\"58\" text-anchor=\"middle\">B read card 1, A wrote it</text><path class=\"ln-bad\" d=\"M462 140 C500 180 520 180 558 140\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"510\" y=\"198\" text-anchor=\"middle\">A read card 2, B wrote it</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">A commits. In the theory&#x27;s terms A is T3, the first to commit,</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">and B is the pivot whose outgoing edge points at it.</text></svg>",
+            "say": "A commits first. PostgreSQL lets it: aborting A now would not help B anyway. B is the pivot of a dangerous structure whose transaction on the far side, A, has committed, so B can no longer commit safely."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"B&#x27;s commit fails with a serialization failure; its version of card 2 is discarded.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">committed</text><rect class=\"box-bad\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t t-bad\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: 75.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">B&#x27;s version thrown away</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">B&#x27;s COMMIT fails with SQLSTATE 40001.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box-ok\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">committed</text><rect class=\"box-bad\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">40001</text><path class=\"ln-a\" d=\"M558 104 C520 64 500 64 462 104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"510\" y=\"58\" text-anchor=\"middle\">B read card 1, A wrote it</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">B&#x27;s COMMIT fails: could not serialize access due to read/write</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">dependencies. Its write to card 2 is rolled back. Total: 50.</text></svg>",
+            "say": "B's COMMIT fails with `could not serialize access due to read/write dependencies among transactions`, SQLSTATE 40001, reason \"identification as a pivot, during commit attempt\". B's new version of card 2 belongs to an aborted transaction, so nobody will ever see it. The total is 50, as if A had run alone."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"B is retried, sees a total of 50 and refuses the withdrawal.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"20\" text-anchor=\"start\">acct-17: two cards, total must stay &gt;= 0</text><rect class=\"box\" x=\"16\" y=\"32\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"60\" text-anchor=\"middle\">card 1: -25.00</text><text class=\"t-s t-m\" x=\"141\" y=\"84\" text-anchor=\"middle\">committed</text><rect class=\"box\" x=\"16\" y=\"118\" width=\"250\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"141\" y=\"146\" text-anchor=\"middle\">card 2: 75.00</text><text class=\"t-s t-m\" x=\"141\" y=\"170\" text-anchor=\"middle\">SIREAD: B (retry)</text><text class=\"t-s t-m\" x=\"16\" y=\"216\" text-anchor=\"start\">B retries with a new snapshot: total 50.</text><line class=\"ln-d\" x1=\"296\" y1=\"30\" x2=\"296\" y2=\"236\"/><text class=\"t-s t-m\" x=\"316\" y=\"20\" text-anchor=\"start\">read-write dependencies</text><rect class=\"box-ok\" x=\"340\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"400\" y=\"118\" text-anchor=\"middle\">A</text><text class=\"t-s t-m\" x=\"400\" y=\"138\" text-anchor=\"middle\">committed</text><rect class=\"box-a\" x=\"560\" y=\"96\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"620\" y=\"118\" text-anchor=\"middle\">B</text><text class=\"t-s t-m\" x=\"620\" y=\"138\" text-anchor=\"middle\">refuses</text><line class=\"ln-d\" x1=\"16\" y1=\"244\" x2=\"684\" y2=\"244\"/><text class=\"t-s\" x=\"16\" y=\"268\" text-anchor=\"start\">The application retries B from the start. Its new snapshot sees A&#x27;s</text><text class=\"t-s\" x=\"16\" y=\"288\" text-anchor=\"start\">withdrawal: 50 is less than 100, so B refuses. Same result as A, then B.</text></svg>",
+            "say": "The application's retry loop runs B again from the start. Its new snapshot includes A's commit, the total is 50, and B refuses the withdrawal. The end state equals running A, then B, one after the other, which is the promise SERIALIZABLE makes."
+          }
+        ]
+      },
+      "try": {
+        "title": "Get a serialization failure",
+        "minutes": 5,
+        "steps": [
+          "Run the block below in the order of its comments. Predict: does either UPDATE wait? Which COMMIT fails?",
+          "Then run it once more with `REPEATABLE READ` instead of `SERIALIZABLE` in both terminals, after resetting the cards with `UPDATE cards SET balance_cents = 7500;`. Predict the final balances."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "two psql sessions",
+          "src": "-- terminal 1\nCREATE TABLE cards (id int PRIMARY KEY, account text, balance_cents bigint);\nINSERT INTO cards VALUES (1, 'acct-17', 7500), (2, 'acct-17', 7500);\n\\set VERBOSITY verbose\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance_cents) FROM cards WHERE account = 'acct-17';\n\n-- terminal 2\n\\set VERBOSITY verbose\nBEGIN ISOLATION LEVEL SERIALIZABLE;\nSELECT sum(balance_cents) FROM cards WHERE account = 'acct-17';\n\n-- terminal 1\nUPDATE cards SET balance_cents = balance_cents - 10000 WHERE id = 1;\n\n-- terminal 2\nUPDATE cards SET balance_cents = balance_cents - 10000 WHERE id = 2;\nSELECT locktype, relation::regclass AS rel, page, mode, pid\nFROM pg_locks WHERE mode = 'SIReadLock' ORDER BY pid, locktype;\n\n-- terminal 1\nCOMMIT;\n\n-- terminal 2\nCOMMIT;\nSELECT id, balance_cents FROM cards ORDER BY id;"
+        },
+        "expect": "With REPEATABLE READ both commit and both cards end at -2,500: the account is 50 euros overdrawn. With SERIALIZABLE, both reads return 15,000, both UPDATEs succeed without waiting, and terminal 2 sees the SIREAD notes:\n\n```text\n locktype |    rel     | page |    mode    | pid\n----------+------------+------+------------+-----\n page     | cards_pkey |    1 | SIReadLock | 287\n relation | cards      |      | SIReadLock | 287\n page     | cards_pkey |    1 | SIReadLock | 297\n relation | cards      |      | SIReadLock | 297\n```\n\nTerminal 1's COMMIT succeeds. Terminal 2's fails:\n\n```text\nERROR:  40001: could not serialize access due to read/write dependencies among transactions\nDETAIL:  Reason code: Canceled on identification as a pivot, during commit attempt.\nHINT:  The transaction might succeed if retried.\n\n id | balance_cents\n----+---------------\n  1 |         -2500\n  2 |          7500\n```\n\n(LOCATION line trimmed.) The sum read the whole table with a sequential scan, so each transaction holds a SIREAD lock on the table `cards`, plus one on the index page its UPDATE searched. Only one withdrawal happened, and a retry of terminal 2's would now see a total of 50 euros and refuse. Your pids differ. When you are done with this lesson, stop and delete the database: `docker compose -f env/postgres.yml down -v`."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Transaction isolation (Serializable isolation level)",
+          "url": "https://www.postgresql.org/docs/18/transaction-iso.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Ports and Grittner: Serializable Snapshot Isolation in PostgreSQL (VLDB 2012)",
+          "url": "https://vldb.org/pvldb/vol5/p1850_danrkports_vldb2012.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "What serializable costs, measured, and why it still gets tested",
+      "body": "Is SERIALIZABLE too slow to use? Measure it on your workload, but start from real numbers rather than folklore. When Dan Ports and Kevin Grittner shipped SSI in PostgreSQL 9.1, they compared the three ways of running transactions on the same server. RUBiS, an auction-site benchmark modeled on eBay (6 GB of data, 85% of transactions read-only), gave this:\n\n| | Throughput | Transactions that failed and were retried |\n|---|---|---|\n| Snapshot isolation (REPEATABLE READ) | 435 requests/s | 0.004% |\n| SSI (SERIALIZABLE) | 422 requests/s | 0.03% |\n| Strict two-phase locking | 208 requests/s | 0.76% |\n\nSSI cost 3% against snapshot isolation and ran twice as fast as two-phase locking, because its readers never wait. On an in-memory TPC-C-style benchmark the SSI bookkeeping cost about 5% in CPU; when the data didn't fit in memory and the disk was the bottleneck, the difference disappeared. Their summary: under 7% against snapshot isolation in every test. The failure column is the part your code feels. Under SSI, 3 transactions in 10,000 had to be retried, about seven times as many as under snapshot isolation, so the retry loop from lesson 1 is not optional. These numbers come from 2012 hardware and PostgreSQL 9.1. Rerun the idea on PostgreSQL 18 with your own transactions: compare throughput and the rate of SQLSTATE 40001 under REPEATABLE READ and SERIALIZABLE before you decide.\n\nThere is a second cost: a guarantee is code, and code has bugs. In 2020 Jepsen tested PostgreSQL 12.3 with Elle, a checker that records what concurrent transactions read and wrote and searches the history for the dependency cycles behind every anomaly. Under SERIALIZABLE, on a healthy single server, a two-minute run found 6 cases of write skew. Each involved a read-write conflict on a freshly inserted row: when three transactions overlapped, SSI's conflict tracking could record the updater against both versions of the row and miss the dangerous structure. The code had barely changed since 2011, so every supported version had the bug; it was fixed in the August 2020 minor releases. The same test under REPEATABLE READ found about 140 write-skew cycles a minute, which is snapshot isolation working as designed.\n\nSo choose SERIALIZABLE when your rule needs it, keep minor versions current, and test the invariant your business cares about under real concurrency, as this track's labs do. The next lesson takes the opposite road: no locks and no dependency tracking at all, just one thread that runs one transaction at a time.",
+      "refs": [
+        {
+          "title": "Ports and Grittner: Serializable Snapshot Isolation in PostgreSQL (VLDB 2012, arXiv)",
+          "url": "https://arxiv.org/abs/1208.4179",
+          "kind": "read"
+        },
+        {
+          "title": "Jepsen: PostgreSQL 12.3 (2020)",
+          "url": "https://jepsen.io/analyses/postgresql-12.3",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A lock manager works like the reference desk of a library. Several readers can study the same rare book at once (shared), but the conservator who wants to rebind it needs it alone (exclusive), and once she is waiting, readers who arrive later queue behind her so she isn't kept waiting all day. Strict two-phase locking is the house rule that you hand back every book only when you leave the building. A deadlock is two readers each holding a volume the other needs before they can finish. The analogy breaks there: people would notice and one would step aside, while a database only finds out by drawing the waits-for graph, and then it throws one reader out and makes them start their research over.",
+  "in_your_world": "Most deadlocks in payment services come from transfers and refunds that touch the same two accounts in different orders. Lock the rows in a fixed order (`SELECT ... FROM accounts WHERE id IN (:a, :b) ORDER BY id FOR UPDATE`, then the updates) and those deadlocks disappear. Oracle detects deadlocks automatically too and raises ORA-00060; its SERIALIZABLE is snapshot isolation, so it allows write skew. In PostgreSQL, if you choose SERIALIZABLE for a ledger, wrap each transaction in a retry loop on SQLSTATE 40001 and 40P01 (in Quarkus, a retry policy around the `@Transactional` method, or a Temporal activity retry that re-runs the whole unit). Don't retry inside the failed transaction: it is dead. Before you switch a service to SERIALIZABLE, load-test it and watch the 40001 rate as well as throughput, and keep PostgreSQL on the latest minor release: the SSI bug Jepsen found in 2020 was fixed only in minor releases. Every schema migration in CI/CD should set `lock_timeout`.",
+  "mistake": "The common mistake is believing MVCC means no locks, and then reaching for SERIALIZABLE, or for nothing, without a retry loop. A team sees `could not serialize access` or `deadlock detected` in the logs, treats it as a database bug, and either drops back to READ COMMITTED, which silently lets write skew through, or catches the exception and carries on, losing the payment. Both errors are the database working as designed: it aborted a transaction to keep the result equal to some serial order. The fix is to make every transaction safe to retry from the start (idempotency keys help), retry on SQLSTATE 40001 and 40P01 a few times with a short jittered backoff, and keep transactions short so conflicts stay rare.",
+  "compare": {
+    "title": "Two ways to make transactions serializable",
+    "a": {
+      "label": "Strict 2PL",
+      "lang": "text",
+      "title": "MySQL InnoDB SERIALIZABLE, autocommit off",
+      "src": "A: SELECT sum(...) FROM cards   -- S locks card 1, card 2\nB: SELECT sum(...) FROM cards   -- S locks card 1, card 2\nA: UPDATE card 1                -- needs X: waits for B's S\nB: UPDATE card 2                -- needs X: waits for A's S\n   -> deadlock: one is aborted, the other commits\n\nreaders block writers: yes\nphantoms: blocked by locks on key ranges\nfailure: deadlock (or a lock wait timeout)"
+    },
+    "b": {
+      "label": "SSI",
+      "lang": "text",
+      "title": "PostgreSQL SERIALIZABLE",
+      "src": "A: SELECT sum(...) FROM cards   -- SIREAD notes, no blocking\nB: SELECT sum(...) FROM cards   -- SIREAD notes, no blocking\nA: UPDATE card 1                -- edge B -> A, no wait\nB: UPDATE card 2                -- edge A -> B, no wait\nA: COMMIT                       -- ok\nB: COMMIT                       -- 40001: pivot\n\nreaders block writers: no\nphantoms: SIREAD notes on index pages\nfailure: serialization failure, sometimes false"
+    },
+    "note": "Both abort one of the two withdrawals, and both need a retry loop in the application. 2PL finds out by making the transactions wait for each other until they deadlock, and every reader on the way blocks writers. SSI lets everything run, records who read what, and aborts at the pattern every anomaly must contain, at the price of an occasional abort that wasn't strictly needed."
+  },
+  "worked": {
+    "title": "Find the deadlock in a lock table",
+    "steps": [
+      {
+        "say": "Four transactions and two rows. Read the queues: granted requests first, then waiters in arrival order. Each transaction waits for at most one lock.",
+        "code": "acct-1:  T1 X (granted)        | T2 X, T4 S waiting\nacct-2:  T2 S, T3 S (granted)  | T1 X waiting",
+        "lang": "text"
+      },
+      {
+        "say": "Draw the waits-for edges: each waiter to every other request ahead of it in its queue whose mode conflicts with its own. T4's S request conflicts with T1's X and with T2's waiting X, so T4 has two edges. T1 conflicts with both S holders of acct-2.",
+        "code": "T2 -> T1            (acct-1: the holder)\nT4 -> T1, T2        (acct-1: the holder and the waiter ahead)\nT1 -> T2, T3        (acct-2: both S holders)",
+        "lang": "text"
+      },
+      {
+        "say": "Search depth-first from the lowest id, following edges in increasing order. From T1 go to T2; from T2 the only edge goes back to T1, which is on the path: a cycle.",
+        "code": "fun visit(t: Long): List<Long>? {\n    path += t\n    for (next in g[t].orEmpty().sorted()) {\n        val at = path.indexOf(next)\n        if (at >= 0) return path.subList(at, path.size).toList()   // back onto the path\n        if (next !in done) visit(next)?.let { return it }\n    }\n    path.removeAt(path.size - 1); done += t\n    return null\n}\n// visit(1): path [1] -> 2: path [1, 2] -> 1 is at index 0 -> cycle [1, 2]",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Pick the victim: the youngest on the cycle, T2, not T4, which waits on the cycle but isn't on it. Aborting T2 removes its S on acct-2 and its waiting X on acct-1. T1 now gets acct-2 once T3 releases it, which is a chain, not a cycle, and T4 gets acct-1 after T1. Nobody else has to die.",
+        "code": "victim = cycle.max() = T2\nafter abort(T2):\n  acct-1:  T1 X  | T4 S waiting            T4 -> T1\n  acct-2:  T3 S  | T1 X waiting            T1 -> T3\nno cycle: T3 commits, then T1, then T4",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a lock manager with deadlock detection",
+    "minutes": 15,
+    "files": [
+      "labs/internals/src/main/kotlin/sfz/txn/l05/LockManager.kt"
+    ],
+    "run": "./gradlew :internals:test --tests 'sfz.txn.l05.*'",
+    "steps": [
+      "Read the class comment of `LockManager.kt`: the queue rules, upgrades, and how `acquire` answers true or false instead of blocking a thread. Then read the provided `grantWaiters`.",
+      "Run the tests once. All 14 fail.",
+      "Write `acquire`, then `release` (remove the transaction's requests and call `grantWaiters`). The tests about compatibility, queue order, fairness and upgrades pass.",
+      "Write `waitsFor` and `findCycle`. Check them against the graph test and the chain test.",
+      "Write `detectDeadlocks`, and run the tests until all 14 pass."
+    ],
+    "hints": [
+      "A new request is granted when `q.all { it.granted && compatible(it.mode, mode) }`: that one test covers both \"compatible with every holder\" and \"nobody waiting ahead\".",
+      "For an upgrade from S to X while others hold S, insert the waiting X request at index `q.count { it.granted }`, right after the granted requests, so it goes ahead of other waiters. `grantWaiters` already merges it into the S request when it is granted.",
+      "In `waitsFor`, look at every entry before the waiter in its queue, granted or not, skip the waiter's own transaction, and add an edge when the modes conflict. The T3 in the figure, waiting behind another waiter, needs that.",
+      "In `findCycle`, keep the current path as a list: when an edge leads to a transaction already on the path, the cycle is the part of the path from that transaction to the end."
+    ],
+    "done_when": "All 14 tests in `LockManagerTest` pass."
+  },
+  "drill": {
+    "title": "Write deadlock detection from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. Given `waitsFor(): Map<Long, Set<Long>>` and `abort(tx)`, write `findCycle()` (a depth-first search that returns the transactions on a cycle) and `detectDeadlocks()` (abort the youngest on each cycle until none is left). Then answer: why does aborting one transaction always break the cycle it is on?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun findCycle(): List<Long>? {\n    val g = waitsFor()\n    val done = HashSet<Long>()\n    val path = ArrayList<Long>()\n    fun visit(t: Long): List<Long>? {\n        path += t\n        for (next in g[t].orEmpty().sorted()) {\n            val at = path.indexOf(next)\n            if (at >= 0) return path.subList(at, path.size).toList()\n            if (next !in done) visit(next)?.let { return it }\n        }\n        path.removeAt(path.size - 1)\n        done += t                     // no cycle goes through t\n        return null\n    }\n    for (t in g.keys.sorted()) if (t !in done) visit(t)?.let { return it }\n    return null\n}\n\nfun detectDeadlocks(): List<Long> {\n    val victims = mutableListOf<Long>()\n    while (true) {\n        val cycle = findCycle() ?: return victims\n        val victim = cycle.max()      // the youngest: started last, least work lost\n        abort(victim)                 // releases its locks and drops its waiting request\n        victims += victim\n    }\n}\n\n// Aborting removes the victim's node: its locks are released (no edges into it) and its\n// waiting request is dropped (no edge out of it), so the cycle loses a link."
+    }
+  },
+  "recap": [
+    "Under MVCC readers don't lock, but writers do: a shared lock (S) shares with S, an exclusive lock (X) shares with nothing. A request waits if it conflicts with a holder or if anyone waits ahead of it, so one queued ALTER TABLE makes every later SELECT wait. Set `lock_timeout` on migrations.",
+    "Strict two-phase locking holds every lock until COMMIT or ROLLBACK, so nobody builds on a change that might be rolled back. It is not two-phase commit.",
+    "A deadlock is a cycle in the waits-for graph. PostgreSQL searches for one after `deadlock_timeout` (1 s) and aborts a transaction with 40P01; lock rows in a fixed order to avoid it.",
+    "SERIALIZABLE in PostgreSQL is SSI: reads leave non-blocking SIREAD notes, read-write dependencies are tracked, and a pivot with an edge in and an edge out is aborted with 40001.",
+    "Measured cost: on RUBiS, SSI ran at 422 requests/s against 435 for snapshot isolation and 208 for two-phase locking, with 0.03% of transactions retried. Every transaction needs a retry loop.",
+    "Serializability is code that can be wrong: Jepsen found write skew under PostgreSQL 12.3's SERIALIZABLE, a bug from 2011 fixed in August 2020. Keep minor versions current and test your invariants."
+  ],
+  "quiz": [
+    {
+      "q": "A team moves its ledger from REPEATABLE READ to SERIALIZABLE on PostgreSQL. Based on Ports and Grittner's measurements, what should they expect, and what must their code already do?",
+      "options": [
+        "Throughput roughly halves, as with two-phase locking, so they need more database servers",
+        "No change at all: SSI only adds checks, never failures",
+        "A small throughput cost (a few percent in the paper's tests) and more transactions failing with 40001, so every transaction must be safe to retry",
+        "Fewer serialization failures, because SSI detects conflicts earlier than snapshot isolation"
+      ],
+      "answer": 2,
+      "why": "On RUBiS, SSI ran at 422 requests/s against 435 for snapshot isolation, and under 7% slower in all their tests, while strict 2PL managed 208. But SSI aborts more often: 0.03% of transactions against 0.004%, because it also aborts on read-write patterns that snapshot isolation lets through. Halving is the 2PL number, the tempting misremembering. The 2012 hardware means they should measure on their own workload too."
+    },
+    {
+      "q": "A transaction releases its lock on account 1 right after debiting it, then locks account 2 to credit it, and finally fails and rolls back. Meanwhile another transaction updated account 1 and committed. What went wrong?",
+      "options": [
+        "Nothing: the rollback restores account 1 and keeps the other change",
+        "A deadlock, which the database resolves",
+        "The other transaction built on a debit that was rolled back; locks must be held until commit (strict two-phase locking)",
+        "A write-skew anomaly, which only SERIALIZABLE catches"
+      ],
+      "answer": 2,
+      "why": "Releasing a lock early lets other transactions see and build on a change that may still be undone. Rolling back the debit would then also erase or contradict the committed change. Strict 2PL avoids this by releasing everything only at COMMIT or ROLLBACK. Nothing here waits in a cycle, so it isn't a deadlock."
+    },
+    {
+      "q": "The waits-for graph has edges T1 -> T2, T2 -> T3, T3 -> T1 and T4 -> T1. Which transactions does the lab's detector abort?",
+      "options": [
+        "T4, the youngest overall",
+        "All four",
+        "None: the detector only handles cycles of two",
+        "T3, the youngest on the cycle; T4 just waits for T1"
+      ],
+      "answer": 3,
+      "why": "Only T1, T2 and T3 form a cycle; T4 waits on it but isn't part of it, so aborting T4 would break nothing. Aborting T3 releases its locks and removes its waiting request, so T2 can proceed, then T1, then T4. Picking the highest id overall is the tempting mistake, and one of the lab's tests catches it."
+    },
+    {
+      "q": "Under PostgreSQL's SERIALIZABLE, a report runs `SELECT sum(amount_cents) FROM settlements` for 20 seconds while 1,000 inserts into `settlements` commit. What happens to the inserts during those 20 seconds?",
+      "options": [
+        "They run without waiting; SIREAD locks never block, though the report or a writer may later fail with 40001 if a dangerous pattern appears",
+        "They wait until the report commits, because the report's read locks block writers",
+        "They fail at once with 40001",
+        "They run, and the report sees each one as it commits"
+      ],
+      "answer": 0,
+      "why": "SSI's SIREAD locks only record what was read; the docs say they never block and can't cause a deadlock. The writers proceed, and the check for read-write dependencies decides at write or commit time whether someone must be aborted. Waiting for readers is what strict 2PL would do. The report never sees the inserts: it reads from its snapshot."
+    },
+    {
+      "q": "From lesson 4: two transactions under REPEATABLE READ update the same row. The first commits. What happens to the second, and what does this lesson's lock manager add to that picture?",
+      "options": [
+        "Both commit; the second overwrites the first",
+        "The second waits for the first (on its transaction id) and then fails with 40001; the waiting is the lock manager's queue, the failure is the snapshot rule",
+        "The second fails at once with a deadlock error",
+        "The second waits, then applies its change on top of the first"
+      ],
+      "answer": 1,
+      "why": "The first writer's id in `t_xmax` is the row lock, so the second writer waits for that transaction to end. Once it commits, a REPEATABLE READ transaction can't update a version it can't see, so it gets `could not serialize access due to concurrent update`. Applying on top of the new version is what READ COMMITTED does, which is the tempting answer.",
+      "from": "txn-04"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Which lock modes are compatible: S with S, S with X, X with X?",
+      "back": "Only S with S. An exclusive lock is compatible with nothing."
+    },
+    {
+      "front": "Where does PostgreSQL keep a row lock, and what does a waiter wait on?",
+      "back": "In the row's `t_xmax`, as the locker's transaction id. The waiter waits for a ShareLock on that transaction id, which it gets when the transaction ends."
+    },
+    {
+      "front": "What is strict two-phase locking?",
+      "back": "Take locks as you go and release all of them only at COMMIT or ROLLBACK, so nobody builds on a change that might be rolled back."
+    },
+    {
+      "front": "Why can a plain SELECT wait behind an ALTER TABLE?",
+      "back": "The ALTER waits for ACCESS EXCLUSIVE, and the lock queue is fair: a later request waits behind anyone queued ahead with a conflicting mode."
+    },
+    {
+      "front": "What is a deadlock, and how does PostgreSQL find one?",
+      "back": "A cycle in the waits-for graph. A backend that has waited `deadlock_timeout` (1 s) searches the graph and, on a cycle, usually aborts its own transaction with SQLSTATE 40P01."
+    },
+    {
+      "front": "What is a pivot in SSI?",
+      "back": "A transaction with a read-write dependency coming in and another going out. Every serialization anomaly contains one, so PostgreSQL aborts when it sees one (SQLSTATE 40001)."
+    },
+    {
+      "front": "What did SSI cost in Ports and Grittner's RUBiS benchmark?",
+      "back": "422 requests/s against 435 for snapshot isolation and 208 for strict two-phase locking, with 0.03% of transactions retried (0.004% under snapshot isolation)."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Shared / exclusive lock",
+      "plain": "S lets other S holders in; X lets nobody else in. Reads that need stability take S, writes take X."
+    },
+    {
+      "term": "Lock manager",
+      "plain": "The component that records, per locked object, who holds it in which mode and who waits in line."
+    },
+    {
+      "term": "Two-phase locking (2PL)",
+      "plain": "Never take a lock after releasing one. The strict form releases everything at commit or rollback."
+    },
+    {
+      "term": "Deadlock",
+      "plain": "Transactions waiting for each other in a cycle, so none can ever proceed."
+    },
+    {
+      "term": "Waits-for graph",
+      "plain": "A graph with an edge from each waiting transaction to each transaction it waits for; a cycle is a deadlock."
+    },
+    {
+      "term": "SIREAD lock",
+      "plain": "A non-blocking note that a SERIALIZABLE transaction read a row, page or table."
+    },
+    {
+      "term": "Read-write dependency",
+      "plain": "T1 read a version that a concurrent T2 then replaced, so T1 must come before T2 in any equivalent serial order."
+    },
+    {
+      "term": "Serializable snapshot isolation (SSI)",
+      "plain": "Snapshot isolation plus tracking of read-write dependencies, aborting a transaction when a dangerous pattern appears."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks: \"Our refunds run under SERIALIZABLE now and we see `could not serialize access` errors a few times an hour. Is PostgreSQL broken, and should we switch back to READ COMMITTED?\" Explain what the error means and what to do.",
+    "answer": "PostgreSQL's SERIALIZABLE runs every transaction on a snapshot and records what each one read, with SIREAD locks that never block. When one transaction writes something a concurrent one read, it records a read-write dependency between them. If a transaction ends up with such a dependency coming in and another going out, the transactions might not match any order of running them one at a time, so PostgreSQL aborts one with SQLSTATE 40001. It is the database keeping its promise, sometimes a little too carefully. Switching to READ COMMITTED would make the errors go away by letting anomalies like write skew through silently. The right fix is a retry loop that re-runs the whole refund transaction from the start on 40001, with idempotency keys so a retry can't refund twice, and short transactions so conflicts stay rare."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Soft edges.** PostgreSQL's lock manager README calls an edge to a holder a hard edge and an edge to someone queued ahead a soft edge. A cycle that contains soft edges can sometimes be broken by reordering the wait queue instead of aborting anyone; only a cycle of hard edges is a real deadlock. The lab aborts in both cases, which is simpler and still correct.\n\n**Prevention with timestamps.** Instead of detecting cycles, some systems prevent them using transaction start times. Under wait-die, an older transaction may wait for a younger one, but a younger one that would wait for an older one aborts itself. Under wound-wait, an older transaction aborts (wounds) the younger holder instead of waiting. Either way, edges only point one direction in age, so no cycle can form; the price is aborts that a detector would not have needed.\n\n**Optimistic concurrency control.** OCC takes no locks at all while a transaction runs: it records what it read, and at commit it validates that none of it changed, aborting if it did. That is what a `version` column with `UPDATE ... WHERE id = :id AND version = :v` does in your own code, and what JPA's `@Version` automates. It wins when conflicts are rare and loses when they are common, because every conflict costs a whole retry.\n\n**Testing isolation yourself.** Jepsen's Elle and Martin Kleppmann's Hermitage scripts both turn isolation levels into tests: Hermitage runs fixed two-session interleavings and records which anomalies each database allows, and Elle checks long random histories for dependency cycles. The PostgreSQL 12.3 report is a good first read.\n\n**Read-only transactions under SSI.** A transaction declared `SERIALIZABLE READ ONLY DEFERRABLE` waits at its start until it can get a snapshot that is guaranteed safe, then runs with no SIREAD bookkeeping and can never fail with 40001. It is a good fit for long reports. The PostgreSQL docs note it is the only case where SERIALIZABLE transactions block but REPEATABLE READ ones don't."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18: Explicit locking",
+      "url": "https://www.postgresql.org/docs/18/explicit-locking.html"
+    },
+    {
+      "title": "PostgreSQL 18: Transaction isolation",
+      "url": "https://www.postgresql.org/docs/18/transaction-iso.html"
+    },
+    {
+      "title": "PostgreSQL source: lock manager README",
+      "url": "https://github.com/postgres/postgres/blob/master/src/backend/storage/lmgr/README"
+    },
+    {
+      "title": "Ports and Grittner: Serializable Snapshot Isolation in PostgreSQL (PVLDB 5(12), 2012)",
+      "url": "https://arxiv.org/abs/1208.4179"
+    },
+    {
+      "title": "Jepsen: PostgreSQL 12.3",
+      "url": "https://jepsen.io/analyses/postgresql-12.3"
+    }
+  ]
+}

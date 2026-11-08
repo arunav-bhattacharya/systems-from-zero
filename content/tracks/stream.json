@@ -1,0 +1,128 @@
+{
+  "id": "stream",
+  "intro": "By the end of this track you can keep several stores in step with one source of truth, and build the processors that derive new data from a stream of events without losing or doubling any of it. Lessons 1 to 3 are about keeping systems in sync. A dual write to a database and a search index fails silently; change data capture makes every other store a follower of the database's log (lesson 1), Kafka Connect, Debezium, a schema registry and the transactional outbox run that in production (lesson 2), and event sourcing makes the log itself the source of truth (lesson 3). Lesson 4 is the theory of time that every stream processor needs: event time against processing time, windows, watermarks and late data. Lessons 5 to 8 process streams: Kafka Streams' tables, state and windows; joins and complex event processing; fault tolerance with checkpoints and exactly-once; and Spark's Structured Streaming as the closing case study.\n\nThe track builds on the Messaging and logs track (partitions, offsets, consumer groups, compaction, Kafka transactions) and repeats each idea in a line when it needs it, along with replication logs (Replication), two-phase commit (Transactions), materialized views (Storage engines) and unreliable clocks (Faults, time and truth). It assumes Kafka and Kafka Streams 4.4, Debezium 3.7, PostgreSQL 18, Flink 2.3 for the engine comparisons, and Spark 4.3, with the labs pinned to Spark 4.1. Lessons 2 and 5 show Java and Kotlin side by side; the others use Kotlin, with Java and SQL where the engine speaks them.\n\nThe labs live in four modules, one package per lesson: `labs/sql` for lesson 1 (`sfz.stream.l01`, PostgreSQL through Testcontainers, so Docker), `labs/kafka` for lessons 2, 3, 5 and 6 (Kafka Streams in `TopologyTestDriver` where no broker is needed), `labs/sim` for lessons 4 and 7 (plain Kotlin on virtual time, deterministic, no Docker), and `labs/bigdata` for lesson 8 (Spark and Iceberg in the test JVM on a JDK 21 toolchain). Run `./gradlew :kafka:test --tests 'sfz.stream.l06.*'` from the `labs` folder, with the module and package of the lesson. The Try-its run demos with `./gradlew :<module>:demo -Pmain=...`, and the broker-backed ones use `labs/env/kafka.yml`.",
+  "cheatsheet": "## Keeping systems in sync (lessons 1 to 3)\n\n| Approach | How it works | What still goes wrong |\n|---|---|---|\n| Dual write | the service writes the database, then the index | two clients race and leave the stores different with no error; a crash between the writes loses one |\n| Change data capture | every other store follows the database's log: a PostgreSQL logical slot, MySQL's row binlog, MongoDB change streams, DynamoDB Streams | asynchronous (followers lag); at-least-once after a crash; an unread slot keeps WAL until the disk fills |\n| Outbox | the business row and an event row in one transaction; Debezium's outbox router publishes it keyed by `aggregateid` | still at-least-once: consumers dedupe on the event id |\n| Event sourcing | the log of events is the source of truth; state is a fold of it; projections are rebuilt by replay | never compact the event topic; old events must stay readable; deletion needs a design (keep PII out, or crypto-shred) |\n\nA new follower creates its slot first, copies a snapshot second, then skips changes at or before its bookmark. Kafka Connect runs this for whole databases: workers, connectors split into tasks, converters, offsets in `connect-offsets`. A registry-aware serializer prefixes each record with a 0 byte and a 4-byte schema id. Pick the compatibility mode by who upgrades first: BACKWARD when consumers move first, FORWARD or FULL for CDC topics, `_TRANSITIVE` for compacted topics, and `auto.register.schemas=false` in production.\n\n## Time (lesson 4)\n\n| Idea | Rule |\n|---|---|\n| Event time, processing time | when it happened (in the record) vs when the processor read it; count by processing time and a redeploy's catch-up looks like a spike |\n| Tumbling window | fixed size, no overlap, aligned to time 0, start included, end excluded |\n| Hopping window | size plus a smaller advance, so windows overlap; Flink and Beam call this \"sliding\" |\n| Sliding window (Kafka Streams) | a window around each record, both ends included |\n| Session window | per key, ends after a gap with no events; a late event can merge two sessions |\n| Watermark | a claim that no earlier event is still coming; too fast drops late data, too slow delays every result and one idle source can hold it back |\n| Grace, allowed lateness | how long after its end a window still accepts records |\n| Emit final vs early | once when the window closes (append, `suppress`), or every change (update), which downstream must treat as upserts |\n\nThe same watermark in three engines: Kafka Streams uses stream time (the largest timestamp a task has seen) minus the grace period; Flink uses explicit watermarks from a `WatermarkStrategy`; Spark uses the latest event time minus the `withWatermark` delay, applied from the next micro-batch, and drops an event only when its window has closed.\n\n## Kafka Streams (lesson 5)\n\n| Piece | What to remember |\n|---|---|\n| `KStream`, `KTable` | events vs the latest value per key; aggregate a stream to get a table, `toStream()` to get its changes |\n| `GlobalKTable` | a full copy on every instance, loaded before processing starts; no co-partitioning; no notion of time |\n| State store | RocksDB under `state.dir`, one slice per task (one task per input partition) |\n| Changelog | `<application.id>-<store>-changelog`, compacted; a moved task replays it before processing |\n| Standby | `num.standby.replicas=1` keeps a warm copy and cuts failover to seconds |\n| Windows | `TimeWindows.ofSizeAndGrace`, `SlidingWindows`, `SessionWindows`; late records go to `dropped-records-total` |\n| Exactly-once | `processing.guarantee=exactly_once_v2`: output, changelog writes and offsets in one transaction, commits every 100 ms; readers need `read_committed`; 3 brokers |\n| New in 4.x | `group.protocol=streams` (KIP-1071, production-ready in 4.2); a dead-letter topic for bad records (KIP-1034, 4.2) |\n\n## Joins and patterns (lesson 6)\n\n| Join | State kept | Output when | Notes |\n|---|---|---|---|\n| Stream-stream | a window of both sides | a record finds a partner; left/outer misses after window plus grace | `JoinWindows.ofTimeDifferenceAndGrace` |\n| Stream-table | the table | stream records only | unversioned: latest row by arrival, so results depend on arrival order; versioned store (3.5+): the version at the record's time; `Joined.withGracePeriod` waits for late table updates |\n| Table-table | both tables | either side changes | incremental view maintenance; one change fans out; deletes come out as tombstones; foreign-key joins since 2.4 |\n| Flink SQL | | | regular join keeps both sides forever; interval join is windowed; `FOR SYSTEM_TIME AS OF` is the event-time temporal join |\n\nCo-partitioning: same partition count and same partitioner. Kafka Streams checks the count at start-up and can't see the partitioner. librdkafka defaults to CRC32 (`consistent_random`); set `partitioner=murmur2_random` to match Java. Going from 6 to 12 partitions moves about half the keys. Fixes: `repartition(...)`, a foreign-key join, a `GlobalKTable`. CEP compiles a pattern into a small state machine per key (FlinkCEP: `next` is strict, `followedBy` relaxed, `within` drops old partial matches); a percolator stores queries and matches each document against them.\n\n## Fault tolerance (lesson 7)\n\n| Mechanism | Used by | After a crash | Cost |\n|---|---|---|---|\n| Micro-batch | Spark | the uncommitted batch runs again | latency floor of about a batch (about 100 ms) |\n| Aligned barrier checkpoints | Flink | restore the last checkpoint, rewind sources | alignment blocks inputs under backpressure |\n| Unaligned checkpoints | Flink | same, plus the saved in-flight records | bigger snapshots, more I/O |\n| No alignment (`AT_LEAST_ONCE`) | Flink | records counted twice | none at checkpoint time |\n| Transactions | Kafka Streams | open transaction aborted, store rebuilt from the changelog | 15 to 30% throughput at a 100 ms commit interval (Confluent, 2017) |\n\nExactly-once means effectively once: records are processed again, their effects show once. Output needs an idempotent sink (upsert, offset or id dedupe) or a transactional one that commits when the checkpoint completes. Side effects inside the job (emails, HTTP calls) repeat; KIP-939 isn't in Kafka 4.4. Flink checkpointing is off by default. Recovery time: a 50 GB changelog at 100 MB/s is about 500 s; Flink 2.0's disaggregated state reported up to 94% shorter checkpoints and up to 49x faster recovery (VLDB 2025).\n\n## Spark Structured Streaming (lesson 8)\n\n| Output mode | Writes | Fits |\n|---|---|---|\n| Append | each row once, when the watermark closes its window | files, Iceberg; needs a watermark for aggregations |\n| Update | rows changed in this batch | upsert sinks, `MERGE` in `foreachBatch` |\n| Complete | the whole result every batch; never drops state | small results |\n\nExactly-once needs a replayable source, the checkpoint folder (`offsets/`, `commits/`, `state/`) and an idempotent or transactional sink; Iceberg skips a replayed batch by its id, and Spark's Kafka sink is at-least-once. Real-time mode (4.1, stateful since 4.3): long-running tasks, one per input partition, millisecond latency; `Trigger.RealTime(...)` is a checkpoint interval (5 minutes by default); `update` mode only; Kafka source; Kafka, `foreach`, console and memory sinks; state exactly-once, Kafka sink at-least-once.\n\n## Choosing an engine\n\n| Engine | Unit of work | Event-time progress | Fault tolerance | Exactly-once into Kafka |\n|---|---|---|---|---|\n| Kafka Streams | record, inside your service | stream time minus grace | changelogs and transactions | yes |\n| Flink | record | watermarks | barrier checkpoints | yes, transactional sink |\n| Spark micro-batch | batch | watermark per batch | checkpoint folder, batch replay | no, consumers dedupe |\n| Spark real-time mode | record, long-running tasks | watermark | commit per long batch | no, at-least-once sink |",
+  "recap": [
+    "Two stores written by the application drift apart with no error. Make one system the leader and let the others follow its log: change data capture from the database's own log, with a snapshot lined up to the log and a bookmark to skip repeats.",
+    "Kafka Connect and Debezium run CDC for whole databases; a schema registry turns column changes into checked versions; the transactional outbox publishes events you designed, in commit order, at least once.",
+    "Event sourcing keeps every change as an immutable event and computes state by folding them. Projections are rebuilt by replay if they stay deterministic, and event topics must never be compacted.",
+    "Count by event time, not processing time. A window is final only when a watermark says so; a watermark that runs too fast drops late data and one that runs too slow delays everything. Kafka Streams uses stream time minus grace, Flink explicit watermarks, Spark the latest event time minus a delay.",
+    "Kafka Streams keeps tables in local RocksDB stores backed by compacted changelog topics, one slice per task; a `GlobalKTable` gives every instance a full copy.",
+    "Every stream join keeps state from one side and probes it with the other. Joining with the latest table row depends on arrival order; versioned tables and temporal joins use the version in force at the event's time. Partitioned joins need co-partitioned inputs, and Kafka can only check the count.",
+    "Exactly-once means effectively once. Micro-batches, aligned barrier snapshots and Kafka transactions each make state, input position and output agree after a crash, but only inside the engine: sinks must be idempotent or transactional, and side effects inside the job repeat.",
+    "Recovery time depends on where state lives: changelog replay (standbys help), snapshot downloads, or Flink 2.x's remote state.",
+    "Spark's Structured Streaming is micro-batching on a batch engine: a watermark closes windows, output modes decide what each batch writes, and real-time mode trades the batch floor for milliseconds with an at-least-once Kafka sink."
+  ],
+  "quiz": [
+    {
+      "q": "Two services update a merchant's name: each writes PostgreSQL, then the search index. Both calls succeed, nothing is logged, and a day later the index shows the old name. What happened, and what fixes it?",
+      "options": [
+        "The index dropped a write under load; retry index writes",
+        "The two clients' writes reached the two stores in different orders; make the index follow the database's change log",
+        "PostgreSQL lost the write; use synchronous replication",
+        "Wrap both writes in a two-phase commit across PostgreSQL and the index"
+      ],
+      "answer": 1,
+      "why": "Two writers each pick an order, so client A can reach the database first and the index last. No error is raised. Change data capture gives the index one ordered source, the database's own log, and the index applies changes in commit order. Two-phase commit would need the index to take part, which it can't, and would make every write wait for both systems."
+    },
+    {
+      "q": "A team publishes payment events with a transactional outbox and Debezium. A consumer sees the same event twice after a Kafka Connect restart. What should the consumer do?",
+      "options": [
+        "Nothing: the outbox guarantees exactly-once delivery",
+        "Report it as a Debezium bug",
+        "Deduplicate on the outbox event id, because CDC is at-least-once after a crash",
+        "Switch the topic to `cleanup.policy=compact`"
+      ],
+      "answer": 2,
+      "why": "The outbox makes the business write and the event one atomic write, but delivery from the log to Kafka is at-least-once: after a restart the connector repeats events since its last saved offset, with the same ids. Compaction keeps the latest record per key eventually; it doesn't stop a consumer from reading a repeat."
+    },
+    {
+      "q": "An event-sourced account topic is switched to `cleanup.policy=compact` to save disk. A new projection then rebuilds every balance from offset 0. What does it get?",
+      "options": [
+        "The right balances, faster",
+        "The right balances, but only for active accounts",
+        "An error: compacted topics can't be replayed",
+        "Wrong balances: compaction kept only the last event per account, so most deposits and withdrawals are gone"
+      ],
+      "answer": 3,
+      "why": "Compaction keeps the latest record per key. That's fine for a topic of full states, such as a CDC topic, but an event topic holds changes, and the balance is the fold of all of them. Keep event topics on time-based retention (or forever) and use snapshots for speed."
+    },
+    {
+      "q": "A dashboard counts authorizations per minute by the time the consumer reads them. After a 10-minute outage, the consumer drains the backlog in one minute. What does the dashboard show, and what fixes it?",
+      "options": [
+        "Ten empty minutes and one huge spike; count by the event's own timestamp",
+        "The right counts, a little late",
+        "A gap, then normal counts; increase the consumer's poll size",
+        "Duplicate counts; enable idempotence"
+      ],
+      "answer": 0,
+      "why": "Counting by processing time puts all 10 minutes of authorizations into the minute they were read. Counting by event time puts each one back in the minute it happened, and the windows show the true, flat rate. The new question is when a window is final, which is the watermark's job."
+    },
+    {
+      "q": "A Kafka Streams fraud rule uses one-minute windows with a 30-second grace. In one task, debits arrive stamped 10:00:20, 10:01:40 (another account) and 10:00:50. What happens to the last one?",
+      "options": [
+        "Counted: it is less than 30 seconds late on the wall clock",
+        "Counted: each account has its own stream time",
+        "Dropped: stream time is 10:01:40, past the window's close at 10:01:30",
+        "The window is reopened and its final count is corrected"
+      ],
+      "answer": 2,
+      "why": "Stream time is the largest timestamp the task has seen, from any key. The window [10:00, 10:01) accepted records until stream time reached 10:01:30. The record is dropped and counted in `dropped-records-total`."
+    },
+    {
+      "q": "A Kafka Streams app joins orders with a `KTable` of customer tiers. Orders from a lagging partition sometimes get a tier that started after the order was placed. Which change fixes it?",
+      "options": [
+        "Materialize the tiers in a versioned store, so each order gets the version in force at its timestamp",
+        "Increase the commit interval",
+        "Turn on `exactly_once_v2`",
+        "Make the table a `GlobalKTable`"
+      ],
+      "answer": 0,
+      "why": "An unversioned table holds the latest row by arrival, so a late order sees a newer tier. A versioned table keeps each version with its timestamp, and the join picks the latest at or before the order's time. Exactly-once doesn't change which row a lookup returns, and a `GlobalKTable` has no notion of time at all."
+    },
+    {
+      "q": "A Kafka Streams join reads `orders` (6 partitions, Java producer) and `customer-tiers` (6 partitions, a Python producer on librdkafka defaults). It starts fine. What do you expect?",
+      "options": [
+        "Correct joins: the partition counts match",
+        "A start-up exception about mismatched partitioners",
+        "Correct joins, because Kafka Streams repartitions automatically",
+        "Most orders find no tier, because the two producers hash keys differently"
+      ],
+      "answer": 3,
+      "why": "Co-partitioning needs the same count and the same partitioner. librdkafka's default hashes with CRC32, the Java producer with murmur2, so most keys land on different partition numbers. Kafka Streams checks only the counts. Set `partitioner=murmur2_random` in the Python producer, or repartition one side."
+    },
+    {
+      "q": "A Flink job has two-input operators and runs aligned exactly-once checkpoints. Under heavy backpressure, checkpoints take minutes and time out. Which change keeps exactly-once and makes checkpoints fast?",
+      "options": [
+        "Switch to the `AT_LEAST_ONCE` checkpointing mode",
+        "Turn on unaligned checkpoints, which save the overtaken in-flight records in the snapshot",
+        "Turn checkpointing off and rely on Kafka offsets",
+        "Lower the checkpoint interval"
+      ],
+      "answer": 1,
+      "why": "Unaligned checkpoints let barriers overtake buffered records and store those records as channel state, so a checkpoint doesn't wait for the backlog and a restore replays them first: still exactly-once, with bigger snapshots. Skipping alignment gives at-least-once state. Without checkpoints a restart begins with empty state."
+    },
+    {
+      "q": "A Kafka Streams app with `exactly_once_v2` calls the card issuer's API from a `peek` to block cards. After a crash, an issuer reports some cards blocked twice. Why, and what's the fix?",
+      "options": [
+        "The transaction failed; raise the commit interval",
+        "The issuer is wrong: exactly-once means each record is processed once",
+        "Records since the last commit were processed again, and the call is outside the transaction; send a command record with an idempotency key instead",
+        "The `peek` ran on a standby replica; set `num.standby.replicas=0`"
+      ],
+      "answer": 2,
+      "why": "Exactly-once covers what the app writes to Kafka in its transaction: output, changelog and offsets. A crash aborts the open transaction and its records are processed again, so any call made while processing them happens again. Emit the command as output, and let a consumer call the issuer with an idempotency key it checks."
+    },
+    {
+      "q": "A Spark query counts authorizations in 5-minute windows with `withWatermark(\"event_time\", \"10 minutes\")` and appends to Iceberg. The latest event seen is 11:38, and the watermark has taken effect. Which window was written last, and is an event stamped 11:26 that arrives now counted?",
+      "options": [
+        "[11:25, 11:30) was written; the 11:26 event is dropped",
+        "[11:20, 11:25) was written; the 11:26 event is counted, because its window ends at 11:30, after the watermark of 11:28",
+        "Nothing is written in append mode until the query stops",
+        "[11:20, 11:25) was written; the 11:26 event is dropped, because it is 12 minutes behind the latest event"
+      ],
+      "answer": 1,
+      "why": "The watermark is 11:38 minus 10 minutes, 11:28. A window is final once the watermark reaches its end: [11:20, 11:25) is, [11:25, 11:30) isn't. Spark drops a late event only when its window has closed, not when the event is older than the delay, so the 11:26 event is counted although it is 12 minutes behind."
+    }
+  ]
+}

@@ -334,8 +334,8 @@ One Gradle subproject per track: `net`, `os`, `sql`, `nosql`, `internals`, `kafk
 
 Package per lesson: lesson `net-03` uses package `sfz.net.l03` (track lab name, then `l` and the
 two-digit lesson number) in main, solution, test and demo (demos may add `.demo`). Lesson
-`dbi-04` uses the `internals` lab, so its package is `sfz.internals.l04`; lesson `data-04` uses
-`sfz.bigdata.l04`.
+`store-04` uses the `internals` lab, so its package is `sfz.store.l04`; lesson `batch-05` uses
+`sfz.batch.l05`.
 
 Rules for lab code:
 

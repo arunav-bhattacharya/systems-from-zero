@@ -52,7 +52,7 @@ class Sessions internal constructor() : AutoCloseable {
     private val extra = mutableListOf<Session>()
 
     /**
-     * One more session besides [a] and [b], for tests with several workers (lesson 13's job queue).
+     * One more session besides [a] and [b], for tests with several workers (txn-02's job queue).
      * It is closed with the others. Its application_name is [name], so pg_stat_activity shows it
      * and SQL can read it with current_setting('application_name').
      */

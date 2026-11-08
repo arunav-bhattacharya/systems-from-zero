@@ -17,7 +17,7 @@ import java.time.OffsetDateTime
  * ```
  * @Test
  * fun `finds the five largest March payments`() = rollback {
- *     val rows = exercise(1, "march_top_payments")
+ *     val rows = exercise("sql/l01", "march_top_payments")
  *     rows.assertColumns("payment_id", "amount_minor")
  *     rows.assertRowsInOrder(row(13, 64000), row(22, 52000))
  * }
@@ -44,23 +44,23 @@ fun rollback(block: Tx.() -> Unit): Unit =
         }
     }
 
-/** The SQL text of an exercise file, `sfz/sql/lNN/<name>.sql`, from the classpath. */
-fun exerciseSql(lesson: Int, name: String): String =
-    CourseDb.resource("sfz/sql/l%02d/%s.sql".format(lesson, name))
+/** The SQL text of an exercise file, `sfz/<lesson>/<name>.sql` (lesson is a package path such as "txn/l02"), from the classpath. */
+fun exerciseSql(lesson: String, name: String): String =
+    CourseDb.resource("sfz/%s/%s.sql".format(lesson, name))
 
 /** One open, uncommitted transaction. Everything it does is rolled back by [rollback]. */
 class Tx(val conn: Connection) {
 
     /** Runs the exercise file (all its statements) and returns the rows of the last query in it. */
-    fun exercise(lesson: Int, name: String): Rows {
-        val label = "sfz/sql/l%02d/%s.sql".format(lesson, name)
+    fun exercise(lesson: String, name: String): Rows {
+        val label = "sfz/%s/%s.sql".format(lesson, name)
         return script(exerciseSql(lesson, name), label)
             ?: throw AssertionFailedError("$label ran, but it has no query that returns rows")
     }
 
     /** Runs the exercise file for its side effects (DDL, for example). */
-    fun runExercise(lesson: Int, name: String) {
-        script(exerciseSql(lesson, name), "sfz/sql/l%02d/%s.sql".format(lesson, name))
+    fun runExercise(lesson: String, name: String) {
+        script(exerciseSql(lesson, name), "sfz/%s/%s.sql".format(lesson, name))
     }
 
     /**

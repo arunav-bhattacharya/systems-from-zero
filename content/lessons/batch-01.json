@@ -1,0 +1,374 @@
+{
+  "id": "batch-01",
+  "title": "Why big data systems exist, and when you don't need one",
+  "minutes": 40,
+  "goal": "By the end you can say what kind of work batch systems exist for, estimate how long a full scan takes from bytes and bandwidth, name the two levers that make it faster (more readers, fewer bytes), and decide whether a workload needs a cluster at all.",
+  "warmup": {
+    "q": "A finance report needs a full scan of a 1 TB CSV export that sits on one SSD reading 500 MB/s. About how long does the scan take?",
+    "options": [
+      "About 2 seconds",
+      "About 33 minutes",
+      "About 6 hours",
+      "It depends mostly on how clever the SQL is"
+    ],
+    "answer": 1,
+    "why": "1 TB is 1,000,000 MB. At 500 MB/s that is 2,000 seconds, about 33 minutes. A report that needs every row has to read every byte, so the SQL can't make the scan smaller. Only fewer bytes or more bandwidth can."
+  },
+  "sections": [
+    {
+      "h": "A full scan costs bytes divided by bandwidth",
+      "body": "This track is about **batch processing**: jobs that read a large, fixed input from start to end and compute a result from it, such as a settlement report, a reconciliation or a backfill. The Stream processing track dealt with input that never ends. A batch job's input is complete before the job starts, so the first question is how long reading all of it takes.\n\nFinance asks for one number per merchant: total settled volume for last quarter. Think about what a program has to do to answer that. It has to look at every payment in the quarter, take its merchant and its amount, and add the amount to that merchant's total. Every row, once. Reading every row of a table, or of the slice a query asks about, is called a **full scan**.\n\nHere is one row, as a line in a CSV file of made-up payments that you'll generate in a minute:\n\n```text\n0,2026-10-01 00:00:00,3352,FR,GBP,191136,AUTHORIZED,5037,0.3146,cfcd208495d565ef\n```\n\nThat line is about 85 bytes. Ten million such lines make an 846 MB file. A scan has to move all 846 MB from the disk into memory and through the CPU, so its main cost is easy to write down:\n\n```text\nscan time = bytes read / bandwidth\n```\n\n**Bandwidth** is how many bytes per second one stage of the trip can move. A scan passes through several stages: the disk, sometimes a network link, and the CPU, which has to turn bytes into numbers and strings. The slowest stage sets the speed of the whole trip, like the narrowest pipe in a line of pipes. Here are round numbers worth remembering. Vendors count in decimal, so 1 MB is 1,000,000 bytes, 1 GB is 1,000 MB and 1 TB is 1,000,000 MB.\n\n| Reader | Streams about | 1 TB takes |\n|---|---|---|\n| A hard disk | 200 MB/s | 83 minutes |\n| A SATA SSD | 500 MB/s | 33 minutes |\n| A laptop NVMe SSD | 3 GB/s | 6 minutes |\n| A 10 Gb/s network link | 1.25 GB/s | 13 minutes |\n| One CPU core parsing CSV | 0.7 GB/s (you'll measure it) | 24 minutes |\n\nYour payment services rarely meet this formula. When a service loads one authorization by its id, the database uses an index. An index is a sorted lookup structure, like the index at the back of a book, that lets the database jump straight to the page holding that row. That takes about a millisecond however big the table is. Finance's question needs every row of the quarter, and no index makes \"every row\" smaller. So its cost grows with the data: 846 MB takes a second or two, 1 TB takes 33 minutes on a SATA SSD.\n\nThat growth is the problem big data systems were built for, and Google hit it first. Its 2004 MapReduce paper mentions disks that read about 30 MB/s. At that speed one disk needs more than 9 hours to read 1 TB once, and the paper says a typical job processed many terabytes.\n\nThe figure below is the picture for the whole track: bytes to read on the left, the readers that move them in the middle, the time on the right. There are only two ways to make the time smaller. Add readers (section 2), or shrink the bytes (section 3).\n\nTo measure the formula on your laptop you'll use DuckDB. DuckDB is a query engine (a program that runs SQL over data) that lives inside your own process on one machine, much like SQLite but built for scans. It reads CSV files directly, and also Parquet, a file format that stores data column by column, which section 3 explains.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 210\" role=\"img\" aria-label=\"The track's base model: bytes to read flow through readers, and the time is bytes divided by bandwidth\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"50\" width=\"180\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"110\" y=\"81.5\" text-anchor=\"middle\">bytes to read</text><text class=\"t-s\" x=\"110\" y=\"97.5\" text-anchor=\"middle\">1 TB of payments</text><rect class=\"box\" x=\"250\" y=\"50\" width=\"180\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"81.5\" text-anchor=\"middle\">readers</text><text class=\"t-s\" x=\"340\" y=\"97.5\" text-anchor=\"middle\">1 disk at 500 MB/s</text><rect class=\"box-a\" x=\"480\" y=\"50\" width=\"180\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"570\" y=\"81.5\" text-anchor=\"middle\">time</text><text class=\"t-s\" x=\"570\" y=\"97.5\" text-anchor=\"middle\">2,000 s</text><line class=\"ln\" x1=\"200\" y1=\"85\" x2=\"248\" y2=\"85\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"85\" x2=\"478\" y2=\"85\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"110\" y=\"150\" text-anchor=\"middle\">fewer bytes: section 3</text><text class=\"t-s t-a\" x=\"340\" y=\"150\" text-anchor=\"middle\">more readers: section 2</text><text class=\"t-s t-m\" x=\"570\" y=\"150\" text-anchor=\"middle\">bytes / bandwidth</text><text class=\"t-s t-m\" x=\"340\" y=\"192\" text-anchor=\"middle\">every lesson in this track pulls one of these two levers</text></svg>",
+        "caption": "The model for the whole track: a scan's time is the bytes it reads divided by the bandwidth of its readers. You can shrink the bytes or add readers."
+      },
+      "try": {
+        "title": "Time one core reading a CSV file",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, run the command below. The first run writes 10 million made-up payments to `bigdata/build/l01/`, as CSV (846 MB) and as Parquet (393 MB). That takes about 10 seconds. Later runs reuse the files.",
+          "Before you read the output, guess: does one CPU core read the CSV faster or slower than a SATA SSD's 500 MB/s?",
+          "Read the speed it prints and the 1 TB estimate. Run it twice more and see how much the number moves."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ScanDemo.kt",
+          "src": "package sfz.batch.l01.demo\n\n/** Times one CPU core scanning a CSV file, then turns that speed into \"how long for 1 TB\". */\nfun main() {\n    PaymentFiles.open().use { c ->\n        c.createStatement().use { it.execute(\"SET threads = 1\") }        // one reader, like one disk\n        val csv = PaymentFiles.csv\n        val sql = \"SELECT count(*), sum(amount_cents) FROM read_csv('${csv.absolutePath}')\"\n        val seconds = PaymentFiles.bestSeconds(c, sql)\n        val bytesPerSecond = csv.length() / seconds\n        println(\"file:      ${csv.name}, ${PaymentFiles.mb(csv.length())}, %,d rows\".format(PaymentFiles.ROWS))\n        println(\"one core:  %.2f s, so about %s per second\".format(seconds, PaymentFiles.mb(bytesPerSecond.toLong())))\n        println(\"1 TB at that speed: about %.0f minutes\".format(1e12 / bytesPerSecond / 60))\n    }\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l01.demo.ScanDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l01/demo/ScanDemo.kt"
+        },
+        "expect": "On a 12-core Apple Silicon laptop it printed:\n\n```text\nfile:      payments.csv, 846 MB, 10,000,000 rows\none core:  1.19 s, so about 713 MB per second\n1 TB at that speed: about 23 minutes\n```\n\nYour speed will differ with your CPU. The file was written seconds ago, so the operating system still holds it in RAM, in its page cache (the Operating systems track's lesson on the page cache), and the SSD barely works. What you measured is how fast one core splits CSV text into fields. The CPU is the slowest stage here, so the CPU sets the bandwidth."
+      },
+      "refs": [
+        {
+          "title": "MapReduce: Simplified Data Processing on Large Clusters (Dean and Ghemawat, OSDI 2004)",
+          "url": "https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Split the bytes across many machines",
+      "body": "If one disk needs 2,000 seconds for 1 TB, the obvious fix is more disks. Put half the table on a second disk, read both at once, and the scan takes 1,000 seconds. One machine only holds a few disks, so to go further you need more machines. A group of machines that work on one job together is a **cluster**. Spread the table over 100 machines, 10 GB each, and every machine reads its share in 20 seconds, all at the same time.\n\nGrowing by adding machines is called scale-out. The other option, scale-up, means buying one bigger machine. In the early 2000s a bigger machine cost far more and still had only a few disks, so Google built on racks (cabinets) full of cheap PCs. The MapReduce paper describes them: dual-processor x86 boxes with 2 to 4 GB of memory, cheap IDE disks, and network links of 100 Mb/s or 1 Gb/s.\n\nFor finance's question, each machine computes a partial answer, the totals per merchant for its own 10 GB, and then someone adds up the 100 partial answers. That someone is a **coordinator**: a program that cuts the work into pieces, starts one task (one piece of work, here \"scan this share and total it\") on each machine, and combines the results. Now look at what breaks on the way from one machine to a hundred. The stepper below walks through it with the same 1 TB table.\n\nThe first problem is startup. The coordinator has to plan the job, start 100 tasks and collect 100 results, and that time doesn't shrink as you add machines. In the paper, a grep (a search for a text pattern) over 1 TB on about 1,800 machines took about 150 seconds, and about a minute of that was startup.\n\nThe second problem is the slowest machine. The job is done only when the last share is done. The paper describes a machine whose bad disk slowed its reads from 30 MB/s to 1 MB/s. One machine like that, called a straggler, holds up the other 99.\n\nThe third is failure. On one machine a dead disk is rare. With hundreds of cheap machines, says the paper on GFS (Google's file system), component failures are the norm. If a machine dies halfway through, its share must be read again somewhere else, so every share must exist on more than one machine. Lesson 3 of this track shows how Google, and later Hadoop (the open-source copy of Google's design), stored those copies.\n\nSplitting also has a floor. The coordinator doesn't hand out slivers of any size. It hands out fixed-size pieces of a file called blocks. In HDFS (Hadoop's distributed file system) and in Spark (the engine most of this track uses) a block is 128 MiB. MiB means binary megabytes: 128 x 1,048,576 = 134,217,728 bytes. 1 TB is 7,451 such blocks, so a 7,452nd machine has nothing to read. You'll compute all of this in the lab.",
+      "stepper": {
+        "title": "Scanning 1 TB: more readers, or fewer bytes",
+        "intro": "Step through the two levers. Watch the time box.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"One machine with one 500 MB/s disk scans 1 TB in 2,000 seconds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95\" y=\"151.5\" text-anchor=\"middle\">1 TB</text><text class=\"t-s\" x=\"95\" y=\"167.5\" text-anchor=\"middle\">row format</text><rect class=\"box-a\" x=\"230\" y=\"120\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"151.5\" text-anchor=\"middle\">1 machine</text><text class=\"t-s\" x=\"330\" y=\"167.5\" text-anchor=\"middle\">1 disk, 500 MB/s</text><rect class=\"box-a\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">2,000 s</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">about 33 min</text><line class=\"ln\" x1=\"170\" y1=\"155\" x2=\"228\" y2=\"155\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"155\" x2=\"488\" y2=\"155\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">time = 1,000,000 MB / 500 MB/s = 2,000 s</text></svg>",
+            "say": "One machine, one disk at 500 MB/s, a 1 TB table in a row format. A full scan moves every byte once: **2,000 seconds**, about 33 minutes. Nothing about the query changes that number."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"The 1 TB table split into 100 shares of 10 GB, each read by its own machine in 20 seconds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"20\" y=\"86\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"105.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"86\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"105.5\" text-anchor=\"middle\">machine 1</text><line class=\"ln\" x1=\"170\" y1=\"102\" x2=\"228\" y2=\"102\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"102\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"128\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"147.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"128\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"147.5\" text-anchor=\"middle\">machine 2</text><line class=\"ln\" x1=\"170\" y1=\"144\" x2=\"228\" y2=\"144\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"144\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"206\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"225.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"206\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"225.5\" text-anchor=\"middle\">machine 100</text><line class=\"ln\" x1=\"170\" y1=\"222\" x2=\"228\" y2=\"222\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"222\" x2=\"488\" y2=\"155\"/><text class=\"t t-m\" x=\"95\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t t-m\" x=\"330\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"95\" y=\"262\" text-anchor=\"middle\">100 shares</text><text class=\"t-s t-m\" x=\"330\" y=\"262\" text-anchor=\"middle\">100 machines</text><rect class=\"box-a\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">20 s</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">each reads 10 GB</text><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">each machine: 10,000 MB / 500 MB/s = 20 s, all at once</text></svg>",
+            "say": "Cut the table into 100 shares of 10 GB and give each share to its own machine. Every machine reads 10 GB at 500 MB/s, and they all read at the same time. The scan takes **20 seconds**. This is scale-out."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A coordinator starts 100 tasks and combines their answers; startup is paid once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box-b\" x=\"230\" y=\"38\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"57.5\" text-anchor=\"middle\">coordinator</text><line class=\"ln-d\" x1=\"330\" y1=\"70\" x2=\"330\" y2=\"84\"/><rect class=\"box\" x=\"20\" y=\"86\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"105.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"86\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"105.5\" text-anchor=\"middle\">machine 1</text><line class=\"ln\" x1=\"170\" y1=\"102\" x2=\"228\" y2=\"102\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"102\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"128\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"147.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"128\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"147.5\" text-anchor=\"middle\">machine 2</text><line class=\"ln\" x1=\"170\" y1=\"144\" x2=\"228\" y2=\"144\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"144\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"206\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"225.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"206\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"225.5\" text-anchor=\"middle\">machine 100</text><line class=\"ln\" x1=\"170\" y1=\"222\" x2=\"228\" y2=\"222\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"222\" x2=\"488\" y2=\"155\"/><text class=\"t t-m\" x=\"95\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t t-m\" x=\"330\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"95\" y=\"262\" text-anchor=\"middle\">100 shares</text><text class=\"t-s t-m\" x=\"330\" y=\"262\" text-anchor=\"middle\">100 machines</text><rect class=\"box-a\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">20 s + startup</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">paid once</text><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">startup does not shrink when you add machines</text></svg>",
+            "say": "Someone has to hand out the shares, start 100 tasks and add up 100 partial answers. That **coordinator** costs time that doesn't shrink as you add machines. Google's 2004 grep read 1 TB on about 1,800 machines in about 150 seconds, and about a minute of that was startup."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Machine 2 runs ten times slower, so the whole job waits 200 seconds for it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box-b\" x=\"230\" y=\"38\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"57.5\" text-anchor=\"middle\">coordinator</text><line class=\"ln-d\" x1=\"330\" y1=\"70\" x2=\"330\" y2=\"84\"/><rect class=\"box\" x=\"20\" y=\"86\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"105.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"86\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"105.5\" text-anchor=\"middle\">machine 1</text><line class=\"ln\" x1=\"170\" y1=\"102\" x2=\"228\" y2=\"102\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"102\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"128\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"147.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-bad\" x=\"230\" y=\"128\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"147.5\" text-anchor=\"middle\">machine 2: 10x slower</text><line class=\"ln\" x1=\"170\" y1=\"144\" x2=\"228\" y2=\"144\" marker-end=\"url(#arr)\"/><line class=\"ln-bad\" x1=\"430\" y1=\"144\" x2=\"488\" y2=\"155\"/><rect class=\"box\" x=\"20\" y=\"206\" width=\"150\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"95\" y=\"225.5\" text-anchor=\"middle\">10 GB</text><rect class=\"box-a\" x=\"230\" y=\"206\" width=\"200\" height=\"32\" rx=\"8\"/><text class=\"t-s\" x=\"330\" y=\"225.5\" text-anchor=\"middle\">machine 100</text><line class=\"ln\" x1=\"170\" y1=\"222\" x2=\"228\" y2=\"222\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"222\" x2=\"488\" y2=\"155\"/><text class=\"t t-m\" x=\"95\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t t-m\" x=\"330\" y=\"184\" text-anchor=\"middle\">...</text><text class=\"t-s t-m\" x=\"95\" y=\"262\" text-anchor=\"middle\">100 shares</text><text class=\"t-s t-m\" x=\"330\" y=\"262\" text-anchor=\"middle\">100 machines</text><rect class=\"box-bad\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">200 s</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">waits for machine 2</text><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">the job ends when the slowest machine ends</text></svg>",
+            "say": "Machine 2 has a failing disk and reads at a tenth of the speed. Its share takes 200 seconds, and the job can't finish without it. **The slowest machine sets the time.** With a thousand machines, one is always slow or broken, so the system must notice and re-run that share elsewhere."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Reading only 3 of 30 columns cuts the scan to 100 GB and 200 seconds on one machine\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95\" y=\"151.5\" text-anchor=\"middle\">100 GB</text><text class=\"t-s\" x=\"95\" y=\"167.5\" text-anchor=\"middle\">3 of 30 columns</text><rect class=\"box\" x=\"230\" y=\"120\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"151.5\" text-anchor=\"middle\">1 machine</text><text class=\"t-s\" x=\"330\" y=\"167.5\" text-anchor=\"middle\">1 disk, 500 MB/s</text><rect class=\"box-a\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">200 s</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">about 3 min</text><line class=\"ln\" x1=\"170\" y1=\"155\" x2=\"228\" y2=\"155\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"155\" x2=\"488\" y2=\"155\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">a column layout reads only the columns the query names</text></svg>",
+            "say": "Now the other lever. Back to **one** machine, but store the table by column. The settlement report needs 3 of the 30 columns, a tenth of each row. It reads **100 GB**: 200 seconds."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Compressed 5 times, the three columns are 20 GB: 40 seconds on one machine\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95\" y=\"151.5\" text-anchor=\"middle\">20 GB</text><text class=\"t-s\" x=\"95\" y=\"167.5\" text-anchor=\"middle\">compressed 5x</text><rect class=\"box\" x=\"230\" y=\"120\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"151.5\" text-anchor=\"middle\">1 machine</text><text class=\"t-s\" x=\"330\" y=\"167.5\" text-anchor=\"middle\">1 disk, 500 MB/s</text><rect class=\"box-a\" x=\"490\" y=\"120\" width=\"170\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"151.5\" text-anchor=\"middle\">40 s</text><text class=\"t-s\" x=\"575\" y=\"167.5\" text-anchor=\"middle\">7 s on a 3 GB/s NVMe</text><line class=\"ln\" x1=\"170\" y1=\"155\" x2=\"228\" y2=\"155\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"155\" x2=\"488\" y2=\"155\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">20,000 MB / 500 MB/s = 40 s on one machine</text></svg>",
+            "say": "Values in one column look alike, so they compress well. At 5x the three columns take **20 GB**: 40 seconds at 500 MB/s, or about 7 seconds on a laptop NVMe SSD at 3 GB/s."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Comparison: 100 machines reading 1 TB of rows take 20 s plus startup; one machine reading 20 GB of compressed columns takes 40 s\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"95\" y=\"30\" text-anchor=\"middle\">data</text><text class=\"t-s t-m\" x=\"330\" y=\"30\" text-anchor=\"middle\">readers</text><text class=\"t-s t-m\" x=\"575\" y=\"30\" text-anchor=\"middle\">time</text><rect class=\"box\" x=\"20\" y=\"60\" width=\"150\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"95\" y=\"88.5\" text-anchor=\"middle\">1 TB</text><text class=\"t-s\" x=\"95\" y=\"104.5\" text-anchor=\"middle\">row format</text><rect class=\"box\" x=\"230\" y=\"60\" width=\"200\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"88.5\" text-anchor=\"middle\">100 machines</text><text class=\"t-s\" x=\"330\" y=\"104.5\" text-anchor=\"middle\">500 MB/s each</text><rect class=\"box\" x=\"490\" y=\"60\" width=\"170\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"88.5\" text-anchor=\"middle\">20 s</text><text class=\"t-s\" x=\"575\" y=\"104.5\" text-anchor=\"middle\">+ startup + slowest</text><rect class=\"box-ok\" x=\"20\" y=\"170\" width=\"150\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"95\" y=\"198.5\" text-anchor=\"middle\">20 GB</text><text class=\"t-s\" x=\"95\" y=\"214.5\" text-anchor=\"middle\">compressed columns</text><rect class=\"box-ok\" x=\"230\" y=\"170\" width=\"200\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"198.5\" text-anchor=\"middle\">1 machine</text><text class=\"t-s\" x=\"330\" y=\"214.5\" text-anchor=\"middle\">500 MB/s</text><rect class=\"box-ok\" x=\"490\" y=\"170\" width=\"170\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"198.5\" text-anchor=\"middle\">40 s</text><text class=\"t-s\" x=\"575\" y=\"214.5\" text-anchor=\"middle\">7 s on NVMe</text><line class=\"ln\" x1=\"170\" y1=\"92\" x2=\"228\" y2=\"92\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"92\" x2=\"488\" y2=\"92\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"170\" y1=\"202\" x2=\"228\" y2=\"202\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"202\" x2=\"488\" y2=\"202\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"296\" text-anchor=\"middle\">shrink the bytes first, then decide whether you need more readers</text></svg>",
+            "say": "Side by side: 100 machines reading rows finish in 20 seconds plus startup, if none of them is slow. One machine reading compressed columns finishes in 40 seconds, or 7 on NVMe. Read fewer bytes first, then decide whether you need more readers."
+          }
+        ]
+      },
+      "try": {
+        "title": "Add readers on your laptop",
+        "minutes": 3,
+        "steps": [
+          "Run `ThreadsDemo`. It runs the same CSV scan with DuckDB limited to 1, 2, 4 and 8 threads, then all your cores. A thread is one line of execution inside a program, and each one can run on its own CPU core. Here each thread scans its own chunks of the file, like machines scanning their own blocks.",
+          "Predict first: with 8 threads, is it 8 times faster than with 1?",
+          "Compare the speedup column with your core count."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ThreadsDemo.kt",
+          "src": "package sfz.batch.l01.demo\n\n/** Splits the same CSV scan across 1, 2, 4, 8 and all cores, and prints the speedup. */\nfun main() {\n    PaymentFiles.open().use { c ->\n        val sql = \"SELECT count(*), sum(amount_cents) FROM read_csv('${PaymentFiles.csv.absolutePath}')\"\n        val cores = Runtime.getRuntime().availableProcessors()\n        var oneThread = 0.0\n        for (threads in listOf(1, 2, 4, 8, cores).distinct().sorted()) {\n            c.createStatement().use { it.execute(\"SET threads = $threads\") }   // DuckDB splits the file into chunks per thread\n            val seconds = PaymentFiles.bestSeconds(c, sql)\n            if (threads == 1) oneThread = seconds\n            println(\"%2d threads: %.2f s   speedup %.1fx\".format(threads, seconds, oneThread / seconds))\n        }\n    }\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l01.demo.ThreadsDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l01/demo/ThreadsDemo.kt"
+        },
+        "expect": "On the same 12-core laptop:\n\n```text\n 1 threads: 1.18 s   speedup 1.0x\n 2 threads: 0.63 s   speedup 1.9x\n 4 threads: 0.34 s   speedup 3.4x\n 8 threads: 0.20 s   speedup 5.8x\n12 threads: 0.18 s   speedup 6.4x\n```\n\nThe speedup grows, but slower than the thread count. DuckDB still has to split the file and combine the partial sums, many laptop chips mix fast and slow cores, and every thread shares one memory bus. A cluster flattens out the same way, with the network in place of the memory bus."
+      }
+    },
+    {
+      "h": "Read fewer bytes before you add machines",
+      "body": "Look at the CSV line again. Finance needs two of its ten fields: the merchant (`3352`) and the amount (`191136`). The scan still reads all 85 bytes. In a CSV file the fields of one row sit next to each other, and the next row starts only after the last field of this one. So the reader can't jump from one amount to the next. It has to walk through every byte of every line. Storing each row's values together like this is a **row layout**.\n\nThe fix is to store the table the other way round: all payment ids first, then all timestamps, then all merchants, and so on. (The comparison box after the sections shows the same three rows both ways.) Now a query that needs two columns reads two runs of values and skips the other eight. Storing each column's values together is a columnar layout. The Storage track's lesson on column stores built it inside one database; Parquet, the format most of this track uses, is the same idea as a file that any engine can read.\n\nColumns also compress well, because the values in one column look alike. The `currency` column in the demo data holds only four different values. Instead of writing `EUR` ten million times, a file can keep the list `EUR, USD, GBP, INR` once and store a tiny number per row that points into it. The `status` column works the same way. Lesson 5 shows the encodings Parquet uses.\n\nThe third way to read less is to skip data that can't match. If the table is stored in one folder per day, a question about last week opens seven folders and ignores the rest (lesson 4). If each file records the smallest and largest timestamp inside it, a reader can skip whole files whose range can't match (lesson 5).\n\nPut the three together on the 1 TB table. Say it has 30 columns and finance needs 3 of them, which make up a tenth of each row. Stored by column, the query reads 100 GB. If those columns compress 5 times, it reads 20 GB. At 500 MB/s that is 40 seconds on one machine. On a laptop NVMe SSD at 3 GB/s it is about 7 seconds.\n\n| Plan | Bytes read | Time |\n|---|---|---|\n| One machine, row layout | 1 TB | 2,000 s |\n| 100 machines, row layout | 10 GB each | 20 s plus startup |\n| One machine, columns, compressed | 20 GB | 40 s (7 s on NVMe) |\n\nAgainst SATA SSDs the hundred machines still win on paper, 20 seconds to 40. Against a laptop NVMe they lose. And they cost a hundred machines, while the columnar plan costs a file format. **Shrink the bytes first, then decide whether you need more readers.** Every engine in this track, Spark included, works hard to read less before it reads faster.",
+      "try": {
+        "title": "Count the bytes each format reads",
+        "minutes": 4,
+        "steps": [
+          "Run `FewerBytesDemo`. It asks for `count(*)` and `sum(amount_cents)` from the CSV, then reads all ten columns of the Parquet file, then asks the first question of the Parquet file.",
+          "Predict the bytes read for each line before you look. Does the CSV query read only two columns' worth?",
+          "Compare the `read` column with the file sizes on the first line."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "FewerBytesDemo.kt",
+          "src": "package sfz.batch.l01.demo\n\nimport java.sql.Connection\n\n/** Runs one question three ways and prints how many bytes DuckDB actually read for each. */\nfun main() {\n    PaymentFiles.open().use { c ->\n        val csv = PaymentFiles.csv.absolutePath\n        val parquet = PaymentFiles.parquet.absolutePath\n        println(\"files: csv ${PaymentFiles.mb(PaymentFiles.csv.length())}, parquet ${PaymentFiles.mb(PaymentFiles.parquet.length())}\")\n        report(c, \"csv, 2 columns    \", \"SELECT count(*), sum(amount_cents) FROM read_csv('$csv')\")\n        // hash(COLUMNS(*)) touches every value of every column, like SELECT * would\n        report(c, \"parquet, all 10   \", \"SELECT sum(hash(COLUMNS(*))) FROM read_parquet('$parquet')\")\n        report(c, \"parquet, 2 columns\", \"SELECT count(*), sum(amount_cents) FROM read_parquet('$parquet')\")\n    }\n}\n\n/** EXPLAIN ANALYZE runs the query and prints a profile; we keep its timing and \"Data Read\" lines. */\nprivate fun report(c: Connection, label: String, sql: String) {\n    PaymentFiles.bestSeconds(c, sql, times = 1)                       // warm the OS page cache first\n    val profile = c.createStatement().use { s ->\n        s.executeQuery(\"EXPLAIN ANALYZE $sql\").use { rs -> buildString { while (rs.next()) append(rs.getString(2)) } }\n    }\n    val read = Regex(\"\"\"Data Read:\\s*([\\d.]+ [kMG]?B)\"\"\").find(profile)?.groupValues?.get(1) ?: \"?\"\n    val time = Regex(\"\"\"Total Time:\\s*([\\d.]+s)\"\"\").find(profile)?.groupValues?.get(1) ?: \"?\"\n    println(\"$label  read $read in $time\")\n}\n",
+          "run": "./gradlew :bigdata:demo -Pmain=sfz.batch.l01.demo.FewerBytesDemoKt",
+          "file": "labs/bigdata/src/demo/kotlin/sfz/batch/l01/demo/FewerBytesDemo.kt"
+        },
+        "expect": "```text\nfiles: csv 846 MB, parquet 393 MB\ncsv, 2 columns      read 988.2 MB in 0.194s\nparquet, all 10     read 390.7 MB in 0.120s\nparquet, 2 columns  read 47.7 MB in 0.0089s\n```\n\nThe CSV query reads the whole file, and DuckDB even counts a little more than its size. It needs two columns, but in a row layout the other eight columns sit between the values you want, so the reader has to go through them. Parquet with all ten columns reads about its file size. The two-column Parquet query reads 48 MB, about 5% of the CSV. DuckDB answers `count(*)` from the row counts Parquet stores inside the file, and reads only the compressed `amount_cents` column. The times are tiny because both files sit in the page cache. From a cold SSD or from S3, the bytes decide the time."
+      },
+      "refs": [
+        {
+          "title": "Parquet file format",
+          "url": "https://parquet.apache.org/docs/file-format/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Most data fits on one machine",
+      "body": "So how big is \"big\"? The What data systems are for track's lesson on growing past one machine made the general case with the COST paper: a cluster first has to beat one good single-threaded program on the same problem, and published systems often needed hundreds of cores to do that, or never managed it. Here is the same question in this lesson's terms.\n\nJordan Tigani was a founding engineer on Google BigQuery, a cloud data warehouse that runs SQL over very large tables. In his 2023 post \"Big Data is Dead\" he looked at how customers actually used it. Most customers had less than 1 TB of data in total. Among customers spending more than $1,000 a year, 90% of queries processed less than 100 MB. His figures come from one product, and he calls them approximate. They still match what most backend teams see: your ledger might hold a few hundred GB, and the queries people run read last week's slice of it.\n\nPut his numbers into this lesson's formula. 100 MB at the 0.7 GB/s that one core parses CSV is about a seventh of a second. Even the 1 TB table from section 3, read as 3 compressed columns out of 30, is 20 GB: under 10 seconds on one NVMe disk. For most questions most companies ask, one machine is enough.\n\nSo when do you need a cluster? When the bytes a job must read, after skipping everything it can, are more than one machine can scan in your time budget. Think multi-terabyte daily loads, backfills (recomputing results over years of past events), joins between two huge tables, and feature pipelines for fraud models. You also need one when a job runs for hours and has to survive a machine failing halfway, or when many teams and tools share one copy of the data. Spark, the engine most of this track uses, exists for those cases. Even Spark agrees about the rest: Spark 4.3 added an opt-in setting, `spark.sql.optimizer.singleTaskExecution.enabled`, that runs small queries as a single task instead of spreading them over the cluster.\n\nThe track follows the same order. Lesson 2 runs a whole batch job on one machine with Unix tools and shows the two ways any engine groups data: hashing and sorting. Lessons 3 to 8 spread that job over many machines: a distributed file system and MapReduce, SQL tables over directories of files, columnar files, then Spark's execution model, its shuffle and its optimizer. Lessons 9 to 12 cover Spark 4 from the JVM, warehouses and star schemas, and lakehouse tables. The last three cover orchestration, what batch output is for, and how to choose an engine, with DuckDB on one machine as a real option every time.",
+      "refs": [
+        {
+          "title": "Big Data is Dead (Jordan Tigani, MotherDuck)",
+          "url": "https://motherduck.com/blog/big-data-is-dead/",
+          "kind": "read"
+        },
+        {
+          "title": "Scalability! But at what COST? (McSherry, Isard and Murray, HotOS 2015)",
+          "url": "https://www.usenix.org/system/files/conference/hotos15/hotos15-paper-mcsherry.pdf",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Picture a warehouse inventory: count every red shirt. One person walking every aisle takes all day. A hundred people taking one aisle each finish in minutes. Add the time for a foreman to hand out aisles and add up a hundred notes, and the count still waits for whoever got the messiest aisle. Or you store shirts by colour, and one person walks only the red aisle. The analogy breaks in one place: in a warehouse you can see where the red shirts are. A data file has to be built that way on purpose (by column, by date, with statistics), or the engine must read everything to find out.",
+  "in_your_world": "Every night a Temporal workflow in your settlement service reads yesterday's captured authorizations from Oracle and builds files per acquirer. Say that's 4 million rows at 200 bytes: 800 MB. A full scan at a few hundred MB/s takes seconds, so this is not a big data problem, even when it fails at 2 a.m. The problem appears when finance asks for the same report over three years: about 4.4 billion rows, close to 900 GB in Oracle's row format. That is the moment to export the needed columns to Parquet once and query them on one machine. It is not yet the moment to buy a cluster. (All numbers here are made up for the example.)",
+  "mistake": "The common mistake is sizing a job by the size of the table instead of the bytes the query reads. A team hears \"the ledger is 4 TB\" and asks for a Spark cluster. But the ledger covers three years, and the reports read 4 of its 60 columns for the last 30 days: about 7 GB before compression. The opposite mistake is just as common: timing a query twice on a laptop, getting the fast second run from the page cache, and assuming production storage reads that fast. Both have the same fix. Write down the bytes read after skipping columns and partitions, take the bandwidth of the slowest stage on the real hardware, and divide.",
+  "compare": {
+    "title": "The same three payments, by row and by column",
+    "a": {
+      "label": "Row layout (CSV)",
+      "lang": "text",
+      "title": "payments.csv",
+      "src": "payment_id,created_at,merchant_id,card_country,currency,amount_cents,status,mcc,fraud_score,idempotency_key\n0,2026-10-01 00:00:00,3352,FR,GBP,191136,AUTHORIZED,5037,0.3146,cfcd208495d565ef\n1,2026-10-17 08:52:32,3834,BR,EUR,170792,CAPTURED,5446,0.5569,c4ca4238a0b92382\n2,2026-10-08 21:40:34,3982,US,EUR,178237,DECLINED,5369,0.7361,c81e728d9d4c2f63"
+    },
+    "b": {
+      "label": "Column layout (Parquet, simplified)",
+      "lang": "text",
+      "title": "payments.parquet",
+      "src": "payment_id       0 | 1 | 2\ncreated_at       2026-10-01 00:00:00 | 2026-10-17 08:52:32 | 2026-10-08 21:40:34\nmerchant_id      3352 | 3834 | 3982\ncard_country     FR | BR | US\ncurrency         GBP | EUR | EUR\namount_cents     191136 | 170792 | 178237\nstatus           AUTHORIZED | CAPTURED | DECLINED\nmcc              5037 | 5446 | 5369\nfraud_score      0.3146 | 0.5569 | 0.7361\nidempotency_key  cfcd208495d565ef | c4ca4238a0b92382 | c81e728d9d4c2f63"
+    },
+    "note": "Both hold the same payments from the demo files. To compute `sum(amount_cents)` from the CSV, the reader goes through every line and splits out the sixth field. In the column layout, all amounts sit together, so the reader fetches that one run of values and skips the other nine. Values in a column also look alike (the same three currencies, statuses from a short list), which is why columns compress so well. Real Parquet first cuts the rows into chunks called row groups and stores each chunk column by column. At the end of the file, in the footer, it keeps an index of where every column starts. Lesson 5 opens one up."
+  },
+  "worked": {
+    "title": "Size a fraud backfill before you book a cluster",
+    "steps": [
+      {
+        "say": "A fraud analyst wants a velocity feature recomputed over 18 months of authorizations: about 2.2 billion rows in Oracle, roughly 200 bytes each. First, describe the data as it sits today. The backfill needs four columns; lump the rest together.",
+        "code": "// 1. the table as it is: rows, 200 bytes each\nval columns = listOf(\n    Column(\"card_id\", 8), Column(\"merchant_id\", 4), Column(\"amount_cents\", 8), Column(\"created_at\", 8),\n    Column(\"everything_else\", 172),\n)\nval asRows = Table(rows = 2_200_000_000L, columns = columns, layout = Layout.ROW)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Next, work out the bytes the job reads, as rows and as compressed columns. Assume Parquet compresses these columns 4 times; you'll check real ratios in lesson 5.",
+        "code": "// 2. bytes read: the row store drags all 200 bytes along\nval need = setOf(\"card_id\", \"merchant_id\", \"amount_cents\", \"created_at\")\nval rowBytes = ScanMath.bytesRead(asRows, need)                         // 440 GB\nval asParquet = asRows.copy(layout = Layout.COLUMNAR, compressionRatio = 4.0)\nval columnBytes = ScanMath.bytesRead(asParquet, need)                   // 15.4 GB",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Then time both plans on hardware you could actually get: one VM with a 3 GB/s NVMe disk, or a 20-node cluster of 500 MB/s SATA SSDs with 30 seconds of startup.",
+        "code": "// 3. one machine on the small input, a cluster on the big one\nval oneMachine = ScanMath.scanSeconds(columnBytes, 3 * GB)              // about 5 s\nval cluster = ScanMath.clusterSeconds(\n    rowBytes, 128 * MiB, 500 * MB, machines = 20, startupSeconds = 30.0,\n)                                                                       // about 74 s",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Decide. The single machine wins by an order of magnitude because it reads 28 times fewer bytes. The expensive step is the one-time export of 440 GB out of Oracle, so do that once, keep the Parquet files, and run every later backfill against them.",
+        "code": "",
+        "lang": ""
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a back-of-the-envelope scan calculator",
+    "minutes": 15,
+    "needs": [
+      "JDK 21"
+    ],
+    "files": [
+      "labs/bigdata/src/main/kotlin/sfz/batch/l01/ScanMath.kt"
+    ],
+    "run": "./gradlew :bigdata:test --tests 'sfz.batch.l01.*'",
+    "steps": [
+      "From the `labs` folder, run the tests once. All nine fail with `NotImplementedError`. The first run downloads Spark and DuckDB for the whole track, so give it a minute.",
+      "Write `scanSeconds` and `blockCount`. Keep `blockCount` in `Long` arithmetic: one test feeds it 10 PB in 1-byte blocks.",
+      "Write `clusterSeconds`. The busiest machine gets `ceil(blocks / machines)` blocks, but never more bytes than the file has. Startup is added once.",
+      "Write `bytesRead`. A `ROW` table reads every column whatever the query needs. Reject unknown columns first.",
+      "Write `machinesNeeded` with a plain loop over machine counts. Return `null` when even one block per machine is too slow.",
+      "Run the tests until all nine pass. Then read the test names from top to bottom: together they are this lesson's argument."
+    ],
+    "hints": [
+      "Ceiling division with integers is `(a + b - 1) / b`. It stays exact for any `Long` this lab uses.",
+      "In `bytesRead`, multiply before you divide: `Math.round(rows.toDouble() * bytesPerRow / compressionRatio)`.",
+      "More machines than blocks can't help, so the loop in `machinesNeeded` can stop at `blockCount(bytes, blockSize)`."
+    ],
+    "done_when": "All nine tests in `ScanMathTest` pass."
+  },
+  "drill": {
+    "title": "Estimate a cluster scan from memory",
+    "minutes": 5,
+    "prompt": "Close the lab. A 5 TB table of settlement events sits as CSV on 40 machines with 200 MB/s disks, in 128 MiB blocks, and the job has 45 seconds of startup. On paper, how long does a full scan take? Then write `clusterSeconds` from memory and check your number with it.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun clusterSeconds(bytes: Long, blockSize: Long, bytesPerSecond: Long, machines: Int, startupSeconds: Double = 0.0): Double {\n    val blocks = (bytes + blockSize - 1) / blockSize        // 37,253 blocks for 5 TB\n    val busiest = (blocks + machines - 1) / machines        // 932 blocks on the busiest machine\n    val busiestBytes = minOf(bytes, busiest * blockSize)    // never more than the file\n    return startupSeconds + busiestBytes.toDouble() / bytesPerSecond\n}\n\n// 45 + 932 x 134,217,728 / 200,000,000 = 45 + 625 = about 670 s, a little over 11 minutes"
+    }
+  },
+  "recap": [
+    "A full scan costs the bytes read divided by the bandwidth of the slowest stage: disk, network or CPU decoding. 1 TB at 500 MB/s is 2,000 seconds.",
+    "Scale-out splits the bytes across machines. It adds startup, waits for the slowest machine, and has to survive failures.",
+    "Parallelism stops at the number of pieces: 1 TB in 128 MiB blocks is at most 7,451 tasks.",
+    "Reading fewer bytes (columns, compression, skipping files) is the cheaper lever. Pull it before you add machines.",
+    "Most companies' data, and most queries, fit on one machine. Do the arithmetic before you pick Spark."
+  ],
+  "quiz": [
+    {
+      "q": "A nightly job reads 600 GB of Parquet files from object storage (a file service reached over the network, such as Amazon S3). The VM pulls 1.5 GB/s from storage and decodes Parquet at 4 GB/s. Roughly how long does the scan take?",
+      "options": [
+        "About 2.5 minutes",
+        "About 7 minutes",
+        "About 10 minutes",
+        "About 40 minutes"
+      ],
+      "answer": 1,
+      "why": "The slowest stage sets the bandwidth, and here that's storage: 600 GB at 1.5 GB/s is 400 seconds, about 7 minutes. The tempting 2.5 minutes uses the decode speed, but the CPU can only decode bytes that have arrived."
+    },
+    {
+      "q": "A 2 GB file is stored in 128 MiB blocks, one task per block. You run a scan on a cluster with 50 idle machines. How many machines do any work?",
+      "options": [
+        "50",
+        "16",
+        "15",
+        "1"
+      ],
+      "answer": 2,
+      "why": "2,000,000,000 / 134,217,728 = 14.9, so the file has 15 blocks and the scan has 15 tasks. The other 35 machines wait. The tempting 16 comes from dividing by 128,000,000 instead of 128 MiB, and 50 assumes work splits as finely as you like."
+    },
+    {
+      "q": "A table has 40 columns of similar width. A query needs 4 of them. You move the table from CSV to a columnar format that compresses 4 times. Roughly how many fewer bytes does the query read?",
+      "options": [
+        "4 times fewer",
+        "10 times fewer",
+        "40 times fewer",
+        "No change, because a query reads whole rows either way"
+      ],
+      "answer": 2,
+      "why": "Reading 4 of 40 columns cuts the bytes 10 times, and compression cuts them 4 times more: 40 times fewer. \"10 times\" forgets compression. A columnar format exists exactly so that a query doesn't read whole rows."
+    },
+    {
+      "q": "You double the machines on a scan job and the run time barely changes. Which explanation fits best?",
+      "options": [
+        "Startup or one slow machine already dominated the time",
+        "The data is compressed",
+        "The files are in a columnar format",
+        "Each machine now reads fewer blocks"
+      ],
+      "answer": 0,
+      "why": "Doubling machines halves only the part of the job that splits: the reading. Startup is paid once, and the job waits for its slowest machine, so if those dominate, more machines don't help. Fewer blocks per machine is what should have made it faster; it just wasn't the bottleneck."
+    },
+    {
+      "q": "A team stores 300 GB of payment events. Analysts query the last 7 days, about 6 GB, a few times an hour. What should they try first?",
+      "options": [
+        "A 20-node Spark cluster, so queries stay fast as the data grows",
+        "Keep the CSV files and buy a machine with more cores",
+        "Load everything into a Kafka topic with long retention",
+        "Partition by day in a columnar format and query it with a single-machine engine such as DuckDB"
+      ],
+      "answer": 3,
+      "why": "The queries read about 6 GB, less after column pruning and compression. One machine scans that in seconds. A cluster adds startup, cost and operations for a problem that isn't there yet. More cores help CSV a little, but reading fewer bytes helps far more."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is your first estimate for a full scan's time?",
+      "back": "Bytes read divided by the bandwidth of the slowest stage (disk, network or CPU decoding). 1 TB at 500 MB/s is 2,000 s."
+    },
+    {
+      "front": "Why can't 10,000 machines scan a 1 TB HDFS file faster than 7,451 machines can?",
+      "back": "Work comes in 128 MiB blocks, one task each. 1 TB is 7,451 blocks, so extra machines have nothing to read."
+    },
+    {
+      "front": "What does scale-out cost besides the extra machines?",
+      "back": "Startup and coordination that don't shrink, waiting for the slowest machine, and re-running work when a machine fails."
+    },
+    {
+      "front": "A query needs 3 of 30 equally wide columns and the format compresses 5x. What fraction of a 1 TB row scan does it read?",
+      "back": "1/10 x 1/5 = 1/50, about 20 GB."
+    },
+    {
+      "front": "Why is the second run of a scan on your laptop often much faster than the first?",
+      "back": "The OS page cache keeps the file in RAM, so the second run reads memory instead of the SSD."
+    },
+    {
+      "front": "What did Tigani report about BigQuery query sizes?",
+      "back": "Among customers spending over $1,000 a year, 90% of queries processed less than 100 MB."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Full scan",
+      "plain": "Reading every row of a table (or of the part a query needs), as analytics queries do."
+    },
+    {
+      "term": "Bandwidth",
+      "plain": "How many bytes per second a stage can move: a disk, a network link, or a CPU decoding a file."
+    },
+    {
+      "term": "Scale-up",
+      "plain": "Making one machine bigger: more cores, memory and disks."
+    },
+    {
+      "term": "Scale-out",
+      "plain": "Adding machines and splitting the work between them."
+    },
+    {
+      "term": "Straggler",
+      "plain": "The slowest machine or task in a parallel job. The job can't finish before it does."
+    },
+    {
+      "term": "Columnar layout",
+      "plain": "Storing each column's values together, so a query reads only the columns it names."
+    },
+    {
+      "term": "Page cache",
+      "plain": "Memory where the operating system keeps recently read file data, so the next read skips the disk."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your manager asks whether the payments team needs a Spark cluster for a new reporting store: 2 TB today, growing 50 GB a month, with dashboards that read the last 30 days. Answer with numbers.",
+    "answer": "Not yet. The size that matters is what the dashboards read, not what we store. Thirty days is about 50 GB at today's rate. Stored in a columnar format and split by day, a dashboard that needs 5 of 40 columns reads about an eighth of that, roughly 6 GB. With 4x compression that's about 1.5 GB. One machine with an NVMe disk streams that in under a second. A cluster would add startup time, a slowest-machine problem and operations work, and buy us nothing at this size. I'd revisit if a single query must read many terabytes, or if jobs run for hours and need to survive machine failures."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Why did a minute of startup matter so much for Google's grep? Because the part of a job that doesn't split puts a ceiling on the speedup. This is Amdahl's law, and the scan formula makes it concrete.\n\nTake the 1 TB scan at 500 MB/s with 60 seconds of fixed startup. On one machine it takes 60 + 2,000 = 2,060 seconds. On *n* machines it takes 60 + 2,000 / *n*. However large *n* gets, it never drops below 60 seconds, so the speedup can never beat 2,060 / 60, about 34 times. With 100 machines you already get 2,060 / 80, about 26 times. The other 1,700 machines buy the last few times.\n\nObject storage adds a twist. Amazon S3, and services like it, keep files as named objects that you fetch over HTTP. Reading a file from S3 is a series of HTTP requests, and each request has latency (tens of milliseconds) before the first byte arrives. One request at a time gives poor throughput, so engines issue many range requests at once and keep many requests in flight per file. That is why DuckDB 2.0 added asynchronous I/O for Parquet and CSV reads aimed at object storage. The formula still holds; the bandwidth term just depends on how many requests you keep busy."
+  },
+  "sources": [
+    {
+      "title": "MapReduce: Simplified Data Processing on Large Clusters (Dean and Ghemawat, OSDI 2004)",
+      "url": "https://research.google/pubs/mapreduce-simplified-data-processing-on-large-clusters/"
+    },
+    {
+      "title": "Big Data is Dead (Jordan Tigani, MotherDuck)",
+      "url": "https://motherduck.com/blog/big-data-is-dead/"
+    },
+    {
+      "title": "Spark 4.3.0 release notes",
+      "url": "https://spark.apache.org/releases/spark-release-4-3-0.html"
+    },
+    {
+      "title": "Announcing DuckDB 2.0",
+      "url": "https://duckdb.org/2026/10/21/announcing-duckdb-200"
+    }
+  ]
+}

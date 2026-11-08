@@ -1,19 +1,28 @@
 # Systems from Zero
 
-A 105-lesson course on the systems under a backend service: networks, operating systems, SQL databases, how a database works inside, NoSQL databases, Kafka, Redis and big data. One lesson a day, about 40 minutes each, with a lab you run on your laptop and tests that tell you when it works.
+A 158-lesson course on the systems under a backend service, organized by concept rather than by product. It starts with what we ask of a data system and the network and operating system underneath, then works up from one machine (data models, SQL, storage engines, caches, encodings) to many (replication, partitioning, transactions, faults and clocks, consensus) and to data in motion (logs, streams, batch, derived data and the ethics of it). Products such as PostgreSQL, Cassandra, DynamoDB, MongoDB, Redis, Kafka, Spark and Iceberg appear inside the concept they illustrate, with a few lessons that take one system apart end to end. One lesson a day, about 40 minutes each, with a lab you run on your laptop and tests that tell you when it works.
 
-| # | Track | Lessons | Lab project |
-|---|---|---|---|
-| 1 | Computer networking | 12 | `labs/net` |
-| 2 | Operating systems | 12 | `labs/os` |
-| 3 | Relational databases and SQL (including running PostgreSQL: configuration, roles, replication, backups) | 16 | `labs/sql` |
-| 4 | Database internals | 12 | `labs/internals` |
-| 5 | NoSQL databases (then inside each store: Cassandra's ring and gossip, MongoDB sharding, DynamoDB, Neo4j, OpenSearch, and how to set each up) | 18 | `labs/nosql` |
-| 6 | Kafka with Java and Kotlin | 12 | `labs/kafka` |
-| 7 | Redis with Java and Kotlin | 11 | `labs/redis` |
-| 8 | Big data: Spark and the lakehouse | 12 | `labs/bigdata` |
+| # | Part | Track | Lessons | Lab modules |
+|---|---|---|---|---|
+| 1 | Foundations | What data systems are for | 6 | `sim` |
+| 2 | Foundations | Computer networking | 12 | `net` |
+| 3 | Foundations | Operating systems | 12 | `os` |
+| 4 | Data on one machine | The relational model and SQL | 10 | `sql` |
+| 5 | Data on one machine | Data models beyond tables | 9 | `nosql`, `sql` |
+| 6 | Data on one machine | Storage engines and query execution | 14 | `internals`, `sql`, `nosql` |
+| 7 | Data on one machine | Caching and in-memory data | 10 | `redis` |
+| 8 | Data on one machine | Encoding, APIs and workflows | 5 | `flow` |
+| 9 | Data across machines | Replication | 8 | `sim`, `sql`, `nosql` |
+| 10 | Data across machines | Partitioning | 9 | `sim`, `nosql` |
+| 11 | Data across machines | Transactions | 8 | `sql`, `internals`, `redis`, `nosql` |
+| 12 | Data across machines | Faults, time and truth | 8 | `sim`, `redis` |
+| 13 | Data across machines | Consistency and consensus | 6 | `sim`, `internals` |
+| 14 | Moving and deriving data | Messaging and logs | 12 | `kafka`, `redis` |
+| 15 | Moving and deriving data | Stream processing | 8 | `sql`, `kafka`, `sim`, `bigdata` |
+| 16 | Moving and deriving data | Batch processing and analytics | 15 | `bigdata`, `sim` |
+| 17 | Moving and deriving data | Derived data and doing right | 6 | `sim` |
 
-Each lesson has a warm-up question to answer before reading, 3 to 5 short sections that each end in a "Try it" you run on your own machine, at least one interactive diagram (a step-through of the mechanism, or a scheduler you drive by hand), a worked example, a lab with tests, a from-memory drill, and a 5-question quiz. One quiz question always comes from an earlier lesson of the same track.
+Each lesson has a warm-up question to answer before reading, 3 to 5 short sections that each end in a "Try it" you run on your own machine, at least one interactive diagram (a step-through of the mechanism, or a scheduler you drive by hand), a worked example, a lab with tests, a from-memory drill, and a 5-question quiz. One quiz question always comes from an earlier lesson.
 
 The site also has:
 
@@ -34,12 +43,12 @@ You need JDK 25 (plus JDK 21 for the big data labs, which run Spark 4.1) and Doc
 cd labs
 ./gradlew :os:solutionTest                                  # proves the setup works (no Docker needed)
 ./gradlew :sql:test --tests 'sfz.sql.l03.*'                 # lesson sql-03's lab, against your code
-./gradlew :kafka:solutionTest --tests 'sfz.kafka.l06.*'     # the same tests against the reference answers
+./gradlew :kafka:solutionTest --tests 'sfz.msg.l07.*'     # the same tests against the reference answers
 docker compose -f env/labbox.yml run --rm box               # a Linux shell with strace, tcpdump, ss, tc, dig
 docker compose -f env/postgres.yml up -d                    # Postgres 18 for the SQL Try-its
 ```
 
-Every track module has `src/main` (exercises), `src/test` (the tests), `src/demo` (Try-it programs) and `src/solution` (reference answers with the same names). `test` runs the tests against your code; `solutionTest` runs the same tests against the answers. Labs that need a real Postgres, Kafka, Redis, MongoDB or Cassandra start it with Testcontainers. `labs/env/` holds the Compose files the Try-it steps use.
+Each lab module is one toolchain (`sim` is plain-Kotlin simulations, `flow` is encodings, gRPC and Temporal, the others are named for what they run), and a lesson's code lives in package `sfz.<track>.l<NN>` of the module it needs. Every module has `src/main` (exercises), `src/test` (the tests), `src/demo` (Try-it programs) and `src/solution` (reference answers with the same names). `test` runs the tests against your code; `solutionTest` runs the same tests against the answers. Labs that need a real Postgres, Kafka, Redis, MongoDB or Cassandra start it with Testcontainers. `labs/env/` holds the Compose files the Try-it steps use.
 
 ## Build the site
 
@@ -59,7 +68,7 @@ Step-by-step instructions are in [DEPLOY.md](DEPLOY.md). In short, the site is a
 
 | Folder | What it holds |
 |---|---|
-| `content/course.json` | Tracks and lesson order |
+| `content/course.json` | Parts, tracks, lesson order and redirects from the old lesson ids |
 | `content/lessons/` | One JSON file per lesson |
 | `content/tracks/` | Track intro, cheat sheet, recap and track quiz |
 | `labs/` | The Gradle project with every exercise, test, demo and solution, plus `env/` Compose files and the lab box image |
@@ -67,7 +76,7 @@ Step-by-step instructions are in [DEPLOY.md](DEPLOY.md). In short, the site is a
 | `web/` | The built site that Cloudflare serves |
 | `videos/` | Manim scenes, the narration kit (Kokoro voice) and the render and audio-check scripts; see `videos/README.md` |
 | `content/videos.json` | Which video sits in which lesson section |
-| `brief/` | The writing brief every lesson follows |
+| `brief/` | The writing brief every lesson follows, the concept-rewrite addendum and the concept map (where each lesson came from) |
 | `research_notes/`, `reports/` | Fact-checked research behind the lessons (versions as of November 2026) |
 
 All company names, people and numbers in examples are made up.

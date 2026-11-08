@@ -1,0 +1,420 @@
+{
+ "id": "cache-04",
+ "title": "Bitmaps, HyperLogLog, geo and the Redis 8 built-ins",
+ "minutes": 40,
+ "goal": "By the end you can trade exactness or generality for memory on purpose: count active cards with bitmaps, count distinct cards in 12 KB with HyperLogLog and say how wrong it can be, find nearby terminals with a geo index, and say which Redis 8 built-ins are worth using.",
+ "warmup": {
+  "q": "A dashboard needs the number of distinct cards that paid at merchant m-17 today, about 2 million cards, refreshed every minute. Within 1% is good enough. Which Redis structure does it in the least memory?",
+  "options": [
+   "A set of card ids, read with `SCARD`",
+   "A HyperLogLog (a fixed-size sketch that estimates distinct counts), read with `PFCOUNT`",
+   "A list of card ids, read with `LLEN`",
+   "A sorted set scored by payment time, read with `ZCARD`"
+  ],
+  "answer": 1,
+  "why": "A HyperLogLog never takes more than about 12 KB and has a standard error of 0.81%. A set is exact but stores every id: on the lab server 100,000 ids took about 4.4 MB, so 2 million would take tens of megabytes per merchant per day. A list counts payments, not distinct cards. A sorted set is exact and bigger than a set. This lesson is about that trade: structures that answer one narrow question in a small, fixed amount of memory, some of them by giving up exactness."
+ },
+ "sections": [
+  {
+   "h": "A bitmap is a string you address bit by bit",
+   "body": "Lesson 3 showed that in memory, layout decides cost. This lesson goes a step further, to structures that answer one narrow question in a small, fixed amount of memory, some of them by giving up exactness. Start with an exact one. Which of our million cards made a payment today? The answer from lesson 3 is a set of card ids, `SADD cards:active:day1 card:417`. It works, and it is big: on the lab server a set of a million card ids took about 30 MB, every day.\n\nLook at what the set stores: the id of every active card, as text. But if every card already has a number from 0 to 999,999, the number is a position, and all you need per card is one yes or no. One bit. A million bits is 125,000 bytes, about 240 times less than the set, whether 10 cards paid or all of them did. Each structure in this lesson makes a trade like that: it gives something up to answer one narrow question in a small, fixed amount of memory.\n\nThat one-bit-per-card array is a **bitmap**, and Redis doesn't need a new type for it. A bitmap is a string plus commands that treat the string's bytes as an array of bits. `SETBIT cards:active:day1 417 1` sets bit 417, growing the string with zero bits if it is too short. `GETBIT` reads one bit. `BITCOUNT` counts the 1 bits, which is the number of active cards. `BITOP` combines whole bitmaps bit by bit and writes the result to a new key:\n\n- cards active on all of the last 7 days: `BITOP AND` over the 7 day keys, then `BITCOUNT`,\n- cards active on any of them: the same with `OR`.\n\nEach is one command over 125 KB per day, with no loop in your code.\n\nThe trade is the index. The offset is a position, so it must be a small, dense number. Use a database id if it comes from a sequence, or assign one. A sparse id, such as a 16-digit card number or a hash, would need a bitmap as long as the biggest id. Offsets stop at 2^32 - 1, which caps a bitmap at 512 MB. And setting a bit near the top of an empty key makes Redis allocate everything below it in one go, blocking the server while it does. Redis 8.12, a release candidate in November 2026, adds compressed (roaring) bitmaps to the core, which store sparse positions compactly; check its final release notes before you design around them.\n\nRedis 8.2 added four `BITOP` operators: `DIFF`, `DIFF1`, `ANDOR` and `ONE`. `BITOP DIFF dest day1 day2` keeps the cards active on day 1 but not on day 2, in one command. Before 8.2, combine `NOT` and `AND` instead.",
+   "try": {
+    "title": "Track active cards for two days",
+    "minutes": 4,
+    "steps": [
+     "At the redis-cli prompt (`docker compose -f env/redis.yml exec redis redis-cli`), run the commands below.",
+     "Before each `BITCOUNT`, predict the number. Cards 7 and 42 paid on day 1; cards 42 and 99 on day 2.",
+     "Before the last `STRLEN`, predict the size of a bitmap whose highest card index is 999,999."
+    ],
+    "code": {
+     "lang": "text",
+     "title": "at the redis-cli prompt",
+     "src": "SETBIT cards:active:day1 7 1\nSETBIT cards:active:day1 42 1\nSETBIT cards:active:day1 42 1\nBITCOUNT cards:active:day1\nSETBIT cards:active:day2 42 1\nSETBIT cards:active:day2 99 1\nBITOP AND cards:active:both cards:active:day1 cards:active:day2\nBITCOUNT cards:active:both\nBITOP OR cards:active:either cards:active:day1 cards:active:day2\nBITCOUNT cards:active:either\nBITOP DIFF cards:active:only1 cards:active:day1 cards:active:day2\nBITCOUNT cards:active:only1\nSTRLEN cards:active:day1\nSETBIT cards:active:day3 999999 1\nSTRLEN cards:active:day3\nTYPE cards:active:day3"
+    },
+    "expect": "`SETBIT` returns the bit's old value: `(integer) 0` the first time for card 42, `(integer) 1` the second time. Day 1 counts 2 cards, not 3 payments. `AND` gives 1 card (42), `OR` gives 3 (7, 42, 99), and `DIFF` gives 1 (card 7, active on day 1 only). `BITOP` itself returns the length of the string it wrote, `(integer) 13`: bit 99 lives in byte 12. Day 1 is 6 bytes long, and day 3 is `(integer) 125000` bytes for a single set bit. `TYPE` says `string`."
+   },
+   "refs": [
+    {
+     "title": "SETBIT (size limit and the allocation warning)",
+     "url": "https://redis.io/docs/latest/commands/setbit/",
+     "kind": "docs"
+    },
+    {
+     "title": "Redis 8.2.0 release notes (new BITOP operators)",
+     "url": "https://github.com/redis/redis/releases/tag/8.2.0",
+     "kind": "read"
+    }
+   ]
+  },
+  {
+   "h": "HyperLogLog counts distinct cards in 12 KB",
+   "body": "A harder question: how many distinct cards paid at each merchant this hour? There are 20,000 merchants, and card ids are not dense numbers, so a bitmap is out. A set per merchant per hour is exact and expensive: 100,000 card ids took about 4.4 MB.\n\nTry the simplest counter first: `INCR` on every payment. It counts payments, not cards: a card that pays three times counts three times. To skip repeats you must remember which cards you have seen, and that is the set again. Exact distinct counting needs memory that grows with the count.\n\nSo give up exactness. Hash each card id to 64 bits. A good hash looks random: each bit is 0 or 1 with even odds. Look at the lowest bits. Half of all hashes end in a 1, a quarter end in `10`, an eighth in `100`. Call the number of zeros before that first 1, plus one, the hash's **rank**: 1, 2 and 3 in those examples. A hash of rank r turns up about once in 2^r distinct cards. So if the highest rank you have seen is 10, you have probably seen about 2^10, a thousand, distinct cards. A card that pays again has the same hash and the same rank, so it can't push the record up: repeats are free.\n\nOne record like that is a wild guess. A single lucky card with 20 zeros would make you believe in a million cards. The fix is many records, averaged: split the cards into groups by a few bits of the hash, keep the highest rank per group, and combine the groups. Redis uses the low 14 bits to pick one of 16,384 groups, called registers, and takes the rank from the other 50 bits. A rank is at most 51, which fits in 6 bits: 16,384 × 6 bits = 12,288 bytes.\n\nThat structure is a HyperLogLog. It takes at most 12 KB and has a standard error of 0.81%, which means about two times in three the estimate is within 0.81% of the truth, whether you add a thousand cards or a billion. It can't list the cards, and it can't tell you whether one card is in it. It only counts. A small HyperLogLog starts in a sparse encoding of a few dozen bytes and switches to the dense 12 KB form as it fills. It is stored as a string that starts with the bytes `HYLL`, so `TYPE` says `string`.\n\n`PFADD key element ...` adds elements and returns 1 if any register changed. `PFCOUNT key` estimates. `PFMERGE dest key ...` keeps the maximum of each register across keys, which gives exactly the HyperLogLog of the union, so 24 hourly counters merge into a day. `PFCOUNT` with several keys does the same merge on the fly. The PF is for Philippe Flajolet, who invented the algorithm.",
+   "stepper": {
+    "title": "A HyperLogLog's registers fill up",
+    "intro": "A toy version with 8 registers and made-up 8-bit hashes. Redis uses 16,384 registers and 64-bit hashes.",
+    "frames": [
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"PFADD card:A: index bits 011 pick register 3, the rest has one trailing zero, so register 3 becomes 2\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFADD visitors card:A</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"86\" text-anchor=\"start\">hash(card:A) =</text><rect class=\"box-b\" x=\"150\" y=\"64\" width=\"110\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"205\" y=\"86\" text-anchor=\"middle\">10110</text><rect class=\"box-a\" x=\"268\" y=\"64\" width=\"62\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"299\" y=\"86\" text-anchor=\"middle\">011</text><text class=\"t-s t-m\" x=\"205\" y=\"116\" text-anchor=\"middle\">rest</text><text class=\"t-s t-m\" x=\"299\" y=\"116\" text-anchor=\"middle\">index</text><text class=\"t-s\" x=\"360\" y=\"80\" text-anchor=\"start\">index 011 = register 3</text><text class=\"t-s\" x=\"360\" y=\"102\" text-anchor=\"start\">rest ends in one 0, then a 1: rank 2</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box-a\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">0</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">PFADD returns 1: register 3 went from 0 to 2</text></svg>",
+      "say": "A toy HyperLogLog with 8 registers and made-up 8-bit hashes. Hash `card:A`. The low 3 bits, `011`, pick register 3. In the other bits, count the zeros before the first 1, starting from the right: one zero, so the rank is 2. The register keeps the larger of its value and the rank."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"PFADD card:B: register 5 becomes 1\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFADD visitors card:B</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"86\" text-anchor=\"start\">hash(card:B) =</text><rect class=\"box-b\" x=\"150\" y=\"64\" width=\"110\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"205\" y=\"86\" text-anchor=\"middle\">00111</text><rect class=\"box-a\" x=\"268\" y=\"64\" width=\"62\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"299\" y=\"86\" text-anchor=\"middle\">101</text><text class=\"t-s t-m\" x=\"205\" y=\"116\" text-anchor=\"middle\">rest</text><text class=\"t-s t-m\" x=\"299\" y=\"116\" text-anchor=\"middle\">index</text><text class=\"t-s\" x=\"360\" y=\"80\" text-anchor=\"start\">index 101 = register 5</text><text class=\"t-s\" x=\"360\" y=\"102\" text-anchor=\"start\">rest ends in a 1 at once: rank 1</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box-a\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">0</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">PFADD returns 1: register 5 went from 0 to 1</text></svg>",
+      "say": "`card:B` lands in register 5. Its rest ends in a 1 straight away, so its rank is 1. Half of all hashes look like this, which is why a rank of 1 says almost nothing."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"PFADD card:C: register 3 rises from 2 to 4 because of a run of three zeros\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFADD visitors card:C</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"86\" text-anchor=\"start\">hash(card:C) =</text><rect class=\"box-b\" x=\"150\" y=\"64\" width=\"110\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"205\" y=\"86\" text-anchor=\"middle\">01000</text><rect class=\"box-a\" x=\"268\" y=\"64\" width=\"62\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"299\" y=\"86\" text-anchor=\"middle\">011</text><text class=\"t-s t-m\" x=\"205\" y=\"116\" text-anchor=\"middle\">rest</text><text class=\"t-s t-m\" x=\"299\" y=\"116\" text-anchor=\"middle\">index</text><text class=\"t-s\" x=\"360\" y=\"80\" text-anchor=\"start\">index 011 = register 3 again</text><text class=\"t-s\" x=\"360\" y=\"102\" text-anchor=\"start\">rest ends in three 0s: rank 4</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box-a\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">0</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">PFADD returns 1: register 3 went from 2 to 4</text></svg>",
+      "say": "`card:C` also lands in register 3, with three zeros before its first 1: rank 4. A run of three zeros turns up in about one hash in 16, so a register at 4 hints that roughly 16 distinct cards passed through it. Register 3 now holds 4. It never goes down."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"PFADD card:A again: same hash, rank 2 is not above 4, nothing changes\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFADD visitors card:A</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"86\" text-anchor=\"start\">hash(card:A) =</text><rect class=\"box-b\" x=\"150\" y=\"64\" width=\"110\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"205\" y=\"86\" text-anchor=\"middle\">10110</text><rect class=\"box-a\" x=\"268\" y=\"64\" width=\"62\" height=\"34\" rx=\"8\"/><text class=\"t t-code\" x=\"299\" y=\"86\" text-anchor=\"middle\">011</text><text class=\"t-s t-m\" x=\"205\" y=\"116\" text-anchor=\"middle\">rest</text><text class=\"t-s t-m\" x=\"299\" y=\"116\" text-anchor=\"middle\">index</text><text class=\"t-s\" x=\"360\" y=\"80\" text-anchor=\"start\">same element, same hash, same register</text><text class=\"t-s\" x=\"360\" y=\"102\" text-anchor=\"start\">rank 2 is not above 4: no change</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">0</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">0</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s t-m\" x=\"20\" y=\"276\" text-anchor=\"start\">PFADD returns 0: no register changed</text></svg>",
+      "say": "`card:A` pays again. Same element, same hash, same register, same rank, and 2 is not above 4. Nothing changes and `PFADD` returns 0. This is why duplicates never inflate the count, with no list of seen cards anywhere."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"After many cards every register holds the longest run it has seen\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFCOUNT visitors</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"80\" text-anchor=\"start\">after thousands of cards, each register holds the longest run it saw</text><text class=\"t-s t-m\" x=\"20\" y=\"104\" text-anchor=\"start\">one register is a noisy guess; averaging all of them is a steady one</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">estimate: built on the harmonic mean of 2^register, scaled by the register count</text></svg>",
+      "say": "After many cards, each register holds the longest run it has seen. Any one register is a wild guess: one lucky hash can push it far up. `PFCOUNT` combines all of them with a formula built on the harmonic mean of 2^register, which damps the lucky ones, and scales by the number of registers. More registers, steadier answer."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"PFMERGE takes the maximum of each register from two HyperLogLogs\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; PFMERGE visitors:both visitors:day1 visitors:day2</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s t-m\" x=\"20\" y=\"77.0\" text-anchor=\"start\">day 1</text><rect class=\"box\" x=\"110\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"77.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"178\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"77.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"246\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"77.0\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"314\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"77.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"382\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"77.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"450\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"77.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"518\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"77.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"586\" y=\"56\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"77.0\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"20\" y=\"123.0\" text-anchor=\"start\">day 2</text><rect class=\"box\" x=\"110\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"123.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"178\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"123.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"246\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"123.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"314\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"123.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"382\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"123.0\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"450\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"123.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"518\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"123.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"586\" y=\"102\" width=\"60\" height=\"32\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"123.0\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">union</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box-a\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">5</text><rect class=\"box-a\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box-a\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">6</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box-a\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t t-a\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">3</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\">r4</text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r5</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r6</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r7</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">each register: the larger of the two, so the result is the HyperLogLog of the union</text></svg>",
+      "say": "`PFMERGE` takes the larger value of each register. Every card behind either input would have produced exactly these registers, so the merge is the HyperLogLog of the union, with no double counting of cards that paid on both days. Highlighted registers came from the second key."
+     },
+     {
+      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Real Redis: 16,384 registers of 6 bits, 12,288 bytes, standard error 0.81 percent\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; STRLEN visitors   (integer) 12304</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"76\" text-anchor=\"start\">real Redis: 64-bit hash = 14 index bits + 50 bits for the run</text><text class=\"t-s\" x=\"20\" y=\"98\" text-anchor=\"start\">16,384 registers x 6 bits = 12,288 bytes, plus a 16-byte header</text><text class=\"t-s t-a\" x=\"20\" y=\"120\" text-anchor=\"start\">standard error = 1.04 / sqrt(16,384) = 0.81%</text><text class=\"t-s t-m\" x=\"20\" y=\"185.0\" text-anchor=\"start\">registers</text><rect class=\"box\" x=\"110\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"178\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"208.0\" y=\"185.0\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"246\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"276.0\" y=\"185.0\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"314\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"344.0\" y=\"185.0\" text-anchor=\"middle\">3</text><rect class=\"box\" x=\"382\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"412.0\" y=\"185.0\" text-anchor=\"middle\">...</text><rect class=\"box\" x=\"450\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"480.0\" y=\"185.0\" text-anchor=\"middle\">4</text><rect class=\"box\" x=\"518\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"548.0\" y=\"185.0\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"586\" y=\"160\" width=\"60\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"616.0\" y=\"185.0\" text-anchor=\"middle\">6</text><text class=\"t-s t-m\" x=\"140.0\" y=\"216\" text-anchor=\"middle\">r0</text><text class=\"t-s t-m\" x=\"208.0\" y=\"216\" text-anchor=\"middle\">r1</text><text class=\"t-s t-m\" x=\"276.0\" y=\"216\" text-anchor=\"middle\">r2</text><text class=\"t-s t-m\" x=\"344.0\" y=\"216\" text-anchor=\"middle\">r3</text><text class=\"t-s t-m\" x=\"412.0\" y=\"216\" text-anchor=\"middle\"></text><text class=\"t-s t-m\" x=\"480.0\" y=\"216\" text-anchor=\"middle\">r16381</text><text class=\"t-s t-m\" x=\"548.0\" y=\"216\" text-anchor=\"middle\">r16382</text><text class=\"t-s t-m\" x=\"616.0\" y=\"216\" text-anchor=\"middle\">r16383</text><text class=\"t-s\" x=\"20\" y=\"276\" text-anchor=\"start\">the same 12 KB whether you add a thousand cards or a billion</text></svg>",
+      "say": "Redis does exactly this with 16,384 registers of 6 bits each: 12,288 bytes plus a 16-byte header, which is why `STRLEN` of a full HyperLogLog says 12304. The standard error is 1.04 divided by the square root of the register count: 0.81%. A small HyperLogLog starts in a sparse encoding of a few dozen bytes and switches to this dense form as it fills."
+     }
+    ]
+   },
+   "try": {
+    "title": "Count 100,000 cards two ways",
+    "minutes": 5,
+    "steps": [
+     "At the redis-cli prompt, run the first four commands on a tiny HyperLogLog. Predict what the second `PFADD` returns.",
+     "Run the `EVAL`. It adds the same 100,000 card ids to a HyperLogLog and to a set.",
+     "Predict how far `PFCOUNT` is from 100,000, then compare the memory of the two keys."
+    ],
+    "code": {
+     "lang": "text",
+     "title": "at the redis-cli prompt",
+     "src": "PFADD visitors:today card:1 card:2 card:3\nPFADD visitors:today card:1\nPFCOUNT visitors:today\nSTRLEN visitors:today\nEVAL \"for i = 1, 100000 do redis.call('PFADD', KEYS[1], 'card:' .. i) redis.call('SADD', KEYS[2], 'card:' .. i) end return 1\" 2 hll:cards set:cards\nPFCOUNT hll:cards\nSCARD set:cards\nSTRLEN hll:cards\nMEMORY USAGE hll:cards\nMEMORY USAGE set:cards\nGETRANGE hll:cards 0 3"
+    },
+    "expect": "The second `PFADD` returns `(integer) 0`: `card:1` changed no register. `PFCOUNT` says 3, and the sparse HyperLogLog is only 27 bytes. After the `EVAL`, `PFCOUNT hll:cards` says `(integer) 101058`, 1.06% high, while `SCARD` says exactly 100000. The HyperLogLog is now dense: `STRLEN` 12304 (12,288 bytes of registers plus a 16-byte header), `MEMORY USAGE` 14364. The set takes 4361843 bytes, about 300 times more. `GETRANGE` shows the header starts with `\"HYLL\"`. Redis hashes with a fixed seed, so you get the same estimate every time."
+   },
+   "refs": [
+    {
+     "title": "Redis HyperLogLog",
+     "url": "https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/",
+     "kind": "docs"
+    },
+    {
+     "title": "antirez: Redis new data structure, the HyperLogLog",
+     "url": "https://antirez.com/news/75",
+     "kind": "read"
+    }
+   ]
+  },
+  {
+   "h": "Geo indexes are sorted sets with a geohash score",
+   "body": "Find the terminals within 5 km of a point, among 100,000 terminals. The simplest version computes the distance to every terminal on every query. Fine for 50 terminals. For 100,000, each query holds lesson 2's single thread while it works through the whole list.\n\nYou want nearby points stored near each other in one sorted order, so a search reads a short range instead of everything. Lesson 3's sorted set already reads ranges fast. What it needs is a score that keeps neighbours close. Split the world by longitude: west of the middle is 0, east is 1. Split by latitude: south is 0, north is 1. Halve each half again, and again, alternating one longitude bit and one latitude bit. After 52 bits the cell is under a metre across, and its 52-bit number is a **geohash**. Two points in the same small cell share the first bits of their geohash, so their numbers are close.\n\nThat is all a Redis geo index is: a sorted set whose scores are 52-bit geohashes. A double holds a 52-bit integer exactly, so nothing is lost in the score. `GEOADD terminals 4.8932 52.3731 t-dam` stores a point, longitude first. `GEOSEARCH terminals FROMLONLAT 4.8952 52.3702 BYRADIUS 5 km ASC WITHDIST` finds the cells that cover the circle (the center cell and its 8 neighbours), reads those score ranges through the skip list, drops the points outside the circle, and returns the rest nearest first, with distances. `GEODIST` gives the distance between two members. `TYPE terminals` says `zset`, and to delete a point you use `ZREM`.\n\nTwo limits matter. Distances come from the Haversine formula, which treats the Earth as a sphere, and the docs put the worst-case error at 0.5%. That is fine for \"nearest ATM\" and wrong where the exact distance has legal or money consequences. And latitudes stop at about 85.05 degrees north and south, so the poles can't be indexed.\n\nIn a payment service, geo fits a fraud rule. A card-present payment at a terminal in Utrecht, 12 minutes after one in Amsterdam, implies a 35 km trip. `GEODIST` gives you the 35 km in one call. Your rule decides whether 175 km/h is suspicious.",
+   "try": {
+    "title": "Find terminals near the Dam",
+    "minutes": 4,
+    "steps": [
+     "Add five made-up payment terminals: four in Amsterdam, one in Utrecht.",
+     "Search within 5 km of a point near the Dam. Predict which terminals come back and in what order.",
+     "Run the rest. What type is the key, and what is the score of `t-dam`? Then try to index a point at latitude 89."
+    ],
+    "code": {
+     "lang": "text",
+     "title": "at the redis-cli prompt",
+     "src": "GEOADD terminals 4.9003 52.3789 t-centraal 4.8932 52.3731 t-dam 4.8723 52.3389 t-zuid 4.7634 52.3105 t-schiphol 5.1214 52.0907 t-utrecht\nGEOSEARCH terminals FROMLONLAT 4.8952 52.3702 BYRADIUS 5 km ASC WITHDIST\nGEODIST terminals t-dam t-utrecht km\nTYPE terminals\nZSCORE terminals t-dam\nGEOPOS terminals t-dam\nGEOADD terminals 0 89 t-pole"
+    },
+    "expect": "`GEOSEARCH` returns `t-dam` at `\"0.3499\"` km, `t-centraal` at `\"1.0277\"` and `t-zuid` at `\"3.8131\"`, nearest first. Schiphol and Utrecht are outside 5 km. `GEODIST` says `\"35.0466\"` km to Utrecht. `TYPE` says `zset`, and `ZSCORE terminals t-dam` is `\"3665667493069480\"`: the 52-bit geohash. `GEOPOS` gives back `4.8931995034217834` and `52.37309930577733`, a few centimeters from what you stored, because the geohash keeps 26 bits per coordinate. Latitude 89 fails with `ERR invalid longitude,latitude pair 0.000000,89.000000`."
+   },
+   "refs": [
+    {
+     "title": "GEOADD (how geo indexes are stored)",
+     "url": "https://redis.io/docs/latest/commands/geoadd/",
+     "kind": "docs"
+    },
+    {
+     "title": "Redis geospatial",
+     "url": "https://redis.io/docs/latest/develop/data-types/geospatial/",
+     "kind": "docs"
+    }
+   ]
+  },
+  {
+   "h": "Redis 8 ships JSON, Bloom filters, time series and search in the core",
+   "body": "On every authorization, a fraud check asks: is this card on the list of breached cards? The list has a million card fingerprints (a fingerprint is a hash of the card number, never the number itself). Nearly every card you check is not on it. What you need is a cheap, certain \"no\", and you can afford a slow exact lookup for the rare \"maybe\".\n\nThe simplest version is a bit array and one hash function. To add a fingerprint, hash it to a position and set that bit. To check one, look at its bit: 0 means it was never added. 1 means maybe, because another fingerprint may have set the same bit. With a million items in 10 million bits, about one bit in ten is set, so about one check in ten says a false \"maybe\". Use several hash functions instead, set all their bits on add, and answer \"maybe\" only if every one of them is 1, and the false answers drop fast. For a million items at 0.1% false answers, you need about 14.4 million bits (1.8 MB) and 10 hash functions. That is a **Bloom filter**, the same structure the Storage track's lesson on LSM trees used to skip files that can't hold a key. \"No\" is always right. \"Yes\" is wrong at about the rate you chose. You can't remove an item, because clearing its bits could erase other items.\n\nBefore Redis 8 a Bloom filter needed a separate module. Redis 8.0 moved several modules into the main distribution: the Query Engine, JSON, time series, five probabilistic structures (Bloom filter, Cuckoo filter, Count-min sketch, Top-k and t-digest) and vector sets, then in beta. The official Docker image loads them all, and `MODULE LIST` on the lab server shows `search`, `ReJSON`, `bf`, `timeseries` and `vectorset`. Everything in this section needs Redis 8.0 or later. If you run Valkey or a managed service, check which of these it offers before you design around them.\n\n`BF.RESERVE breached:cards 0.001 1000000` sizes a filter for a million items at a 0.1% false positive rate, and on the lab server it took about 1.9 MB. `BF.ADD` adds, and `BF.EXISTS` checks.\n\nJSON stores a document you read and change by path: `JSON.SET payment:44 $ '{...}'`, `JSON.GET payment:44 $.card.bin`, `JSON.NUMINCRBY payment:44 $.amount 50`. Use it when a record is nested and you update parts of it. A flat record is still a hash.\n\nThe rest you should know exist. Time series (`TS.ADD`, `TS.RANGE`) store timestamped samples with retention. The Query Engine (`FT.CREATE`, `FT.SEARCH`) indexes hashes and JSON for search and vector similarity. Count-min sketch and Top-k answer \"how often\" and \"which are most frequent\", approximately; lesson 5 meets a Count-min sketch again, inside Caffeine's eviction policy. Redis 8.8 added an Array type, marked as a preview that may change. None of them is needed for the rest of this track.",
+   "try": {
+    "title": "Check a breach list and patch a JSON payment",
+    "minutes": 4,
+    "steps": [
+     "At the redis-cli prompt, run `MODULE LIST` and find the five built-in modules.",
+     "Run the Bloom filter commands. Predict the two `BF.EXISTS` answers, and what a second `BF.RESERVE` does.",
+     "Run the JSON commands. Notice that `$` paths return arrays."
+    ],
+    "code": {
+     "lang": "text",
+     "title": "at the redis-cli prompt (Redis 8.0+)",
+     "src": "MODULE LIST\nBF.RESERVE breached:cards 0.001 1000000\nBF.ADD breached:cards fp:9f2c41d7\nBF.EXISTS breached:cards fp:9f2c41d7\nBF.EXISTS breached:cards fp:0b77e310\nMEMORY USAGE breached:cards\nBF.RESERVE breached:cards 0.001 1000000\nJSON.SET payment:44 $ '{\"status\":\"approved\",\"amount\":1250,\"card\":{\"bin\":\"411111\",\"last4\":\"4242\"}}'\nJSON.GET payment:44 $.card.bin\nJSON.NUMINCRBY payment:44 $.amount 50\nJSON.GET payment:44"
+    },
+    "expect": "`MODULE LIST` names `timeseries`, `vectorset`, `bf`, `search` and `ReJSON`. `BF.EXISTS` says `(integer) 1` for the fingerprint you added and `(integer) 0` for the other: a 0 is always right. The filter takes `(integer) 1977672` bytes, about 1.9 MB, sized up front for a million items. The second `BF.RESERVE` fails with `(error) ERR item exists`, so create filters once, at deploy time. `JSON.GET ... $.card.bin` returns `\"[\\\"411111\\\"]\"`, a JSON array, because a `$` path can match many places. `JSON.NUMINCRBY` returns `\"[1300]\"`, and the last `JSON.GET` shows the whole document with `\"amount\":1300`."
+   },
+   "refs": [
+    {
+     "title": "Redis 8.0.0 release notes",
+     "url": "https://github.com/redis/redis/releases/tag/8.0.0",
+     "kind": "read"
+    },
+    {
+     "title": "Redis data types (includes JSON and probabilistic types)",
+     "url": "https://redis.io/docs/latest/develop/data-types/",
+     "kind": "docs"
+    },
+    {
+     "title": "Redis Bloom filter (sizing formulas and memory per item)",
+     "url": "https://redis.io/docs/latest/develop/data-types/probabilistic/bloom-filter/",
+     "kind": "docs"
+    }
+   ]
+  }
+ ],
+ "analogy": "A HyperLogLog works like guessing how many people came to a fair by asking each visitor to flip a coin until it lands heads, and writing down only the longest run of tails anyone reports. Ten tails in a row happens about once in a thousand tries, so a record of 10 suggests about a thousand visitors. One record is luck-prone, so you split the visitors into many queues by name, keep one record per queue and average them. The analogy breaks on repeat visitors: a person flipping again would get a new run, but a hash gives the same card the same run every time, which is why a card that pays twice is counted once.",
+ "in_your_world": "These four structures replace batch jobs you may already run against Oracle. A merchant dashboard wants distinct cards per day: one HyperLogLog per merchant per hour, at most 12 KB each, merged into days and weeks with `PFMERGE`. A loyalty rule wants cards that paid on each of the last 7 days: one bitmap per day over a dense card index, combined with `BITOP AND`. A fraud rule wants to know whether a card fingerprint is on a breach list: a Bloom filter in front of the exact lookup, so 999 of 1,000 checks never leave Redis. An impossible-travel rule wants the distance between the last two terminals a card used: `GEODIST`. None of them replaces your system of record. They keep live answers in memory for a few kilobytes per key.",
+ "mistake": "The most common mistake is using an approximate structure where the business needs an exact answer, or the other way round. A HyperLogLog is wrong for \"how many distinct cards did we charge\" on an invoice: 0.81% of a million is about 8,000 cards. A Bloom filter is wrong as the only check for \"is this card blocked\": a false positive declines an innocent customer, and you can't remove an item once it is in. The reverse mistake is keeping a set of 50 million ids only to read its size once an hour, which a HyperLogLog does in 12 KB. Decide first whether the answer must be exact. Then pick the structure.",
+ "compare": {
+  "title": "A Bloom filter in front of the breach database, in Java and Kotlin",
+  "java": {
+   "title": "BreachCheck.java",
+   "src": "// once, at deploy time: a filter for 1,000,000 fingerprints at a 0.1% false positive rate\nredis.bfReserve(\"breached:cards\", 0.001, 1_000_000);\n\nboolean maybeBreached(String fingerprint) {\n    if (!redis.bfExists(\"breached:cards\", fingerprint)) return false;   // \"no\" is always right\n    return breachDb.contains(fingerprint);                             // \"yes\" needs the exact check\n}"
+  },
+  "kotlin": {
+   "title": "BreachCheck.kt",
+   "src": "// once, at deploy time: a filter for 1,000,000 fingerprints at a 0.1% false positive rate\nredis.bfReserve(\"breached:cards\", 0.001, 1_000_000)\n\nfun maybeBreached(fingerprint: String): Boolean =\n    redis.bfExists(\"breached:cards\", fingerprint) &&   // \"no\" is always right\n        breachDb.contains(fingerprint)                 // \"yes\" needs the exact check"
+  },
+  "note": "The Jedis calls are identical. Kotlin's `&&` keeps the same short circuit that the Java early return spells out: the database is asked only when the filter says yes. `bfReserve` fails with `ERR item exists` if the key is already there, so call it from a deploy step, not on every service start. Jedis 8 has the Bloom, JSON and time series commands built in, so neither version needs a raw command."
+ },
+ "worked": {
+  "title": "Count distinct cards per merchant, by hour and by day",
+  "steps": [
+   {
+    "say": "Product wants \"distinct cards this hour\" and \"distinct cards today\" for each merchant, live. On every approved payment, add the card's fingerprint to the merchant's HyperLogLog for the current hour, and let old hours expire.",
+    "code": "String hourKey = \"cards:\" + merchant + \":h\" + hour;       // cards:m-17:h14\nredis.pfadd(hourKey, fingerprint);                        // one fingerprint per approved payment\nredis.expire(hourKey, 172_800);                           // keep two days of hours",
+    "lang": "java",
+    "alt_lang": "kotlin",
+    "alt_code": "val hourKey = \"cards:$merchant:h$hour\"                // cards:m-17:h14\nredis.pfadd(hourKey, fingerprint)                     // one fingerprint per approved payment\nredis.expire(hourKey, 172_800)                        // keep two days of hours"
+   },
+   {
+    "say": "The hourly number is one `PFCOUNT`. For the day, don't add up the 24 hourly counts: a card that paid at 9:00 and at 15:00 would count twice. Count the union. `PFCOUNT` with several keys merges them on the fly, and `PFMERGE` stores the merged HyperLogLog if you want to reuse it for a week view.",
+    "code": "long thisHour = redis.pfcount(hourKey);\nString[] hours = IntStream.range(0, 24).mapToObj(h -> \"cards:\" + merchant + \":h\" + h).toArray(String[]::new);\nlong today = redis.pfcount(hours);                        // the union of 24 HyperLogLogs\nredis.pfmerge(\"cards:\" + merchant + \":day\", hours);       // or store the union for the week view",
+    "lang": "java",
+    "alt_lang": "kotlin",
+    "alt_code": "val thisHour = redis.pfcount(hourKey)\nval hours = (0 until 24).map { \"cards:$merchant:h$it\" }.toTypedArray()\nval today = redis.pfcount(*hours)                     // the union of 24 HyperLogLogs\nredis.pfmerge(\"cards:$merchant:day\", *hours)          // or store the union for the week view"
+   },
+   {
+    "say": "Check the cost. A busy merchant has 24 dense hourly keys of about 12 KB, under 300 KB a day; a quiet one stays sparse at a few hundred bytes. A set per hour would grow with every card. The answer is off by about 0.81% (one standard error), which is fine on a dashboard and not fine on an invoice.",
+    "code": "",
+    "lang": ""
+   },
+   {
+    "say": "One thing it can't do: forget a card. A refunded payment stays counted, because a HyperLogLog has no remove. If the product needs \"distinct cards with a net purchase\", that is a different, exact question. Keep the HyperLogLog for the live view and compute the exact number from your ledger.",
+    "code": "",
+    "lang": ""
+   }
+  ]
+ },
+ "lab": {
+  "title": "Build a HyperLogLog, then count active cards with bitmaps",
+  "minutes": 15,
+  "needs": [
+   "Docker"
+  ],
+  "files": [
+   "labs/redis/src/main/java/sfz/cache/l04/TinyHyperLogLog.java",
+   "labs/redis/src/main/kotlin/sfz/cache/l04/CardActivity.kt"
+  ],
+  "run": "./gradlew :redis:test --tests 'sfz.cache.l04.*'",
+  "steps": [
+   "Run the tests. All 13 fail: seven in `TinyHyperLogLogTest`, a model that needs no Docker, and six in `CardActivityTest`, which use the shared Redis container.",
+   "In `TinyHyperLogLog.java`, write `add`. Its javadoc lists the four steps: hash, take the low p bits as the index, count the trailing zeros of the rest and add 1, keep the larger value. Return true only if the register changed.",
+   "Write `merge`: register by register, keep the larger value. Run `./gradlew :redis:test --tests 'sfz.cache.l04.TinyHyperLogLogTest'`. One test checks that merging two counters gives exactly the registers of a counter that saw both sets of cards.",
+   "In `CardActivity.kt`, write `markActive`, `wasActive` and `activeCount` with `setbit`, `getbit` and `bitcount`. Each is one line.",
+   "Write `activeOnAllDays` and `activeOnAnyDay`: `bitop` into a temporary key under the prefix, `bitcount` it, and delete it in a `finally`. Run all 13 tests."
+  ],
+  "hints": [
+   "Index: `(int) (h & ((1 << p) - 1))`. Rest: `(h >>> p) | (1L << (64 - p))`. The extra bit stops the count when the rest is all zeros. Rank: `Long.numberOfTrailingZeros(rest) + 1`.",
+   "Registers are `byte`s. Compare with `rank <= registers[index]`, and cast when you store: `registers[index] = (byte) rank`.",
+   "Jedis's `bitop` takes `BitOP.AND` or `BitOP.OR`, the destination key, then the source keys as varargs: `redis.bitop(BitOP.AND, tmp, *days.map(::keyFor).toTypedArray())`. A day with no key counts as all zeros.",
+   "Make the temporary key unique, for example with a `UUID`, so two callers combining days at the same time don't overwrite each other's result."
+  ],
+  "done_when": "All 13 tests in `sfz.cache.l04` pass."
+ },
+ "drill": {
+  "title": "Write HyperLogLog's add from memory",
+  "minutes": 5,
+  "prompt": "Close the lab. Given `p`, a `byte[] registers` of size 2^p and a `hash64(String)` function, write `boolean add(String element)` that updates the right register the way Redis does and returns whether anything changed. Then compare. Which bits pick the register, and why is there a stop bit?",
+  "answer": {
+   "lang": "java",
+   "src": "boolean add(String element) {\n    long h = hash64(element);\n    int index = (int) (h & ((1 << p) - 1));              // low p bits pick the register\n    long rest = (h >>> p) | (1L << (64 - p));           // the other bits, with a stop bit on top\n    int rank = Long.numberOfTrailingZeros(rest) + 1;    // zeros before the first 1, plus one\n    if (rank <= registers[index]) return false;         // a run this long was seen already\n    registers[index] = (byte) rank;\n    return true;\n}",
+   "alt": {
+    "lang": "kotlin",
+    "src": "fun add(element: String): Boolean {\n    val h = hash64(element)\n    val index = (h and ((1L shl p) - 1)).toInt()          // low p bits pick the register\n    val rest = (h ushr p) or (1L shl (64 - p))           // the other bits, with a stop bit on top\n    val rank = rest.countTrailingZeroBits() + 1          // zeros before the first 1, plus one\n    if (rank <= registers[index]) return false           // a run this long was seen already\n    registers[index] = rank.toByte()\n    return true\n}"
+   }
+  }
+ },
+ "recap": [
+  "A bitmap is a string addressed by bit. With a dense card index, one bit per card per day gives exact daily counts (`BITCOUNT`) and day combinations (`BITOP`) for 125 KB per million cards.",
+  "A HyperLogLog estimates distinct counts in at most 12 KB with a 0.81% standard error. It can't list or remove elements, and `PFMERGE` gives exactly the union.",
+  "HyperLogLog works by keeping, in each of 16,384 registers, the longest run of zero bits seen in the hashes that land there.",
+  "A geo index is a sorted set whose scores are 52-bit geohashes. Distances assume a spherical Earth, with up to 0.5% error.",
+  "Redis 8.0 ships JSON, Bloom and other probabilistic filters, time series, the Query Engine and vector sets in the core. A Bloom filter's \"no\" is always right; its \"yes\" needs checking."
+ ],
+ "quiz": [
+  {
+   "q": "Card ids in your system are random 64-bit numbers. Why is `SETBIT cards:active:day1 <card id> 1` a bad idea?",
+   "options": [
+    "A bitmap can't hold more than a million bits",
+    "The offset is a position: a huge id needs a huge string, and offsets stop at 2^32 - 1 anyway",
+    "`SETBIT` is O(N) in the number of set bits",
+    "Bitmaps are not saved to disk"
+   ],
+   "answer": 1,
+   "why": "`SETBIT` grows the string to reach the offset, so the id is the size. Random 64-bit ids are mostly past the 2^32 - 1 limit, and the ones below it would still need up to 512 MB. Map each card to a dense index (0, 1, 2, ...) first. `SETBIT` itself is O(1), and bitmaps are strings, saved like any other key."
+  },
+  {
+   "q": "A merchant's HyperLogLog for the day says 1,000,000 distinct cards. What should you expect the true count to be?",
+   "options": [
+    "Exactly 1,000,000",
+    "Anywhere from 900,000 to 1,100,000, all equally likely",
+    "Usually within about 1% of it: 0.81% is one standard error",
+    "Always below 1,000,000, because HyperLogLog only undercounts"
+   ],
+   "answer": 2,
+   "why": "Redis's HyperLogLog has a standard error of 0.81%, so about two times in three the true count is within roughly 8,100 of the estimate, and it is rarely off by more than 2 to 3%. Errors go both ways: on the lab server 100,000 cards came out as 101,058."
+  },
+  {
+   "q": "You keep one HyperLogLog per merchant per hour. How do you get distinct cards for the whole day?",
+   "options": [
+    "Add up the 24 `PFCOUNT` results",
+    "Take the biggest hourly count",
+    "You can't without keeping a set of card ids",
+    "`PFMERGE` the 24 keys into one (or `PFCOUNT` them together) and count that"
+   ],
+   "answer": 3,
+   "why": "Merging keeps the maximum of each register, which is exactly the HyperLogLog of the union, so a card seen in several hours counts once. Adding the hourly counts counts that card once per hour. The biggest hour ignores every card that only paid in other hours."
+  },
+  {
+   "q": "A Bloom filter of breached card fingerprints says \"no\" (`BF.EXISTS` returns 0) for a card. What do you know?",
+   "options": [
+    "The fingerprint was never added: the card is not on the list",
+    "The card is probably not on the list, about 99.9% sure",
+    "The card might be on the list; check the database",
+    "Nothing: a Bloom filter is approximate in both directions"
+   ],
+   "answer": 0,
+   "why": "An added item always sets all its bits, so a 0 in any of them proves it was never added. Only \"yes\" can be wrong, at about the false positive rate you reserved. That asymmetry is the whole point: most checks end at Redis, and only the rare \"yes\" goes to the exact lookup."
+  },
+  {
+   "q": "From lesson 3: why can `GEOSEARCH` on a geo index of 100,000 terminals answer without looking at every point?",
+   "options": [
+    "Redis keeps a separate spatial tree for each geo key",
+    "A geo key is a sorted set, so Redis reads a few score ranges through its skip list instead of every point",
+    "`GEOSEARCH` results are cached after the first call",
+    "Geo keys always stay listpacks, which are fast to scan"
+   ],
+   "answer": 1,
+   "why": "Scores are geohashes, and nearby points mostly share score ranges. A sorted set past 128 members is a skip list, which finds the start of each range in O(log N) and reads M members from there. There is no separate tree, and a 100,000-member sorted set is far past the listpack limit.",
+   "from": "cache-03"
+  }
+ ],
+ "flashcards": [
+  {
+   "front": "How much memory does a bitmap for a million cards take, and why?",
+   "back": "About 125,000 bytes: one bit per card index up to 999,999, however many bits are set."
+  },
+  {
+   "front": "What does a HyperLogLog register store?",
+   "back": "The longest run of zero bits (plus one) seen in the hashes that landed in that register. It only ever goes up."
+  },
+  {
+   "front": "Size and error of a Redis HyperLogLog?",
+   "back": "At most 12 KB (16,384 registers of 6 bits, plus a 16-byte header) and a standard error of 0.81%."
+  },
+  {
+   "front": "What does `PFMERGE` compute?",
+   "back": "The register-by-register maximum, which is exactly the HyperLogLog of the union of the inputs."
+  },
+  {
+   "front": "What is a geo index underneath?",
+   "back": "A sorted set. Each member's score is a 52-bit geohash of its longitude and latitude, so `ZREM` deletes a point."
+  },
+  {
+   "front": "Which Bloom filter answer can you trust?",
+   "back": "\"No\". If any of the item's bits is 0, it was never added. \"Yes\" is wrong at about the false positive rate you reserved."
+  },
+  {
+   "front": "Which Redis version put JSON, Bloom, time series and the Query Engine in the core?",
+   "back": "Redis 8.0. Before that they were separate modules, shipped as Redis Stack."
+  }
+ ],
+ "terms": [
+  {
+   "term": "Bitmap",
+   "plain": "A string treated as an array of bits, read and written with SETBIT, GETBIT, BITCOUNT and BITOP."
+  },
+  {
+   "term": "Cardinality",
+   "plain": "The number of distinct elements in a collection."
+  },
+  {
+   "term": "HyperLogLog",
+   "plain": "A fixed-size sketch that estimates cardinality from the longest runs of zero bits in hashed elements."
+  },
+  {
+   "term": "Register",
+   "plain": "One small counter inside a HyperLogLog that keeps the highest rank (zero run plus one) it has seen. Redis has 16,384 of them, 6 bits each."
+  },
+  {
+   "term": "Geohash",
+   "plain": "A number made by interleaving the bits of latitude and longitude, so nearby points get nearby numbers."
+  },
+  {
+   "term": "Bloom filter",
+   "plain": "A bit array plus several hash functions that answers \"definitely not seen\" or \"probably seen\"."
+  },
+  {
+   "term": "False positive",
+   "plain": "A \"yes\" that is wrong: the filter says it saw an item that was never added."
+  }
+ ],
+ "explain_back": {
+  "prompt": "A product manager asks why the \"distinct cards today\" number on the merchant dashboard doesn't match the finance report exactly, and whether you can fix it by adding up the hourly numbers instead. Explain.",
+  "answer": "The dashboard uses a HyperLogLog, which estimates distinct cards in a fixed 12 KB per key instead of storing every card. It hashes each card, and for each of 16,384 registers remembers the longest run of zero bits it has seen. That gives an estimate with a standard error of about 0.81%, so on a million cards it can be off by several thousand, up or down. Finance counts every card from the ledger, so it is exact. Adding up the hourly numbers would make it worse: a card that paid in three different hours would count three times. The right way to get a day from hours is to merge the hourly HyperLogLogs, which keeps each card once. If the dashboard must match finance to the card, we need an exact count from the ledger, and we accept the cost."
+ },
+ "deeper": {
+  "minutes": 10,
+  "body": "How much do the registers matter? The lab's `TinyHyperLogLog` with the classic estimate gave these errors on the same card ids:\n\n| Registers | 100,000 cards | 1,000,000 cards |\n|---|---|---|\n| 16 | +66% | +38% |\n| 256 | -0.4% | -9.1% |\n| 4,096 | +0.1% | -1.0% |\n| 16,384 | +0.8% | -0.3% |\n\nThe standard error is about 1.04 divided by the square root of the register count: 26% for 16 registers, 6.5% for 256, 1.6% for 4,096, 0.81% for 16,384. Single runs scatter around that, as the table shows. Redis picks 16,384 because 12 KB is small and under 1% is good enough for most dashboards. Since Redis 4.0, `PFCOUNT` uses an improved estimator by Otmar Ertl instead of the classic formula with its switch to linear counting, which removes a bias in the middle range.\n\nThe sparse encoding stores runs of empty registers compactly. Redis converts a HyperLogLog to dense once its sparse form passes `hll-sparse-max-bytes` (3,000 bytes by default). Sparse adds are slower, which is the trade for the small size.\n\nThe Bloom filter numbers in this lesson come from two formulas. For n items and a false positive rate p, the best bit array has about `-n × ln(p) / (ln 2)^2` bits and uses about `-log2(p)` hash functions. For a million items at 0.1% that is about 14.4 million bits (1.8 MB) and 10 hash functions, close to the 1.9 MB the lab server reported. RedisBloom's filters also grow: when one fills to capacity, `BF.ADD` stacks a new, larger filter on top (the `Expansion rate` in `BF.INFO`), so reserve the size you expect rather than relying on that.\n\nA geohash's precision comes from its 52 bits: 26 for longitude, 26 for latitude. 26 bits split the indexable latitudes, about 170 degrees, into cells about 0.3 m tall, which is why `GEOPOS` returns your point a few centimeters off."
+ },
+ "sources": [
+  {
+   "title": "Redis HyperLogLog (Redis docs)",
+   "url": "https://redis.io/docs/latest/develop/data-types/probabilistic/hyperloglogs/"
+  },
+  {
+   "title": "GEOADD (Redis docs)",
+   "url": "https://redis.io/docs/latest/commands/geoadd/"
+  },
+  {
+   "title": "SETBIT (Redis docs)",
+   "url": "https://redis.io/docs/latest/commands/setbit/"
+  },
+  {
+   "title": "Redis 8.0.0 release notes",
+   "url": "https://github.com/redis/redis/releases/tag/8.0.0"
+  },
+  {
+   "title": "antirez: Redis new data structure, the HyperLogLog",
+   "url": "https://antirez.com/news/75"
+  }
+ ]
+}

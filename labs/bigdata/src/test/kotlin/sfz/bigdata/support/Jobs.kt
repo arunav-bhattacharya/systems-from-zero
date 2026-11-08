@@ -22,7 +22,7 @@ data class RunStats(
     val shuffleBytesWritten: Long,
     /**
      * For every completed stage, in stage id order, the shuffle records each of its tasks fetched
-     * (sorted, largest last). A stage that reads no shuffle has all zeros. Lesson 7 uses it to spot
+     * (sorted, largest last). A stage that reads no shuffle has all zeros. Lesson 8 uses it to spot
      * one task that reads far more than the others: skew.
      */
     val shuffleReadPerTask: List<List<Long>> = emptyList(),

@@ -1,0 +1,494 @@
+{
+  "id": "stream-01",
+  "title": "Two systems, one truth: dual writes and change data capture",
+  "minutes": 40,
+  "goal": "By the end you can show on a timeline how two clients that write a database and then a search index leave them different with no error, say why two-phase commit is the wrong fix, make the index a follower of the database's log with change data capture, build its first copy without losing a write, and explain how a replication slot nobody reads fills the database's disk.",
+  "warmup": {
+    "q": "The payment service writes each status change to PostgreSQL and then to the search index the support team uses. Every write returns success and the error rate is zero. Two requests change payment pay-981 in the same millisecond. What can you say about the index afterwards?",
+    "options": [
+      "It matches the database: both stores got both updates",
+      "It may hold a different status from the database, for good, with nothing logged",
+      "It may be stale for a moment, and the next write to anything fixes it",
+      "It may be wrong, but the index would refuse the write that came out of order"
+    ],
+    "answer": 1,
+    "why": "Each store applies the writes in the order they reach it, and nothing makes the two orders the same. If PostgreSQL applies CAPTURED then REFUNDED and the index applies REFUNDED then CAPTURED, every write succeeded and the stores now disagree until pay-981 is written again. \"Stale for a moment\" describes lag, which a follower has and then recovers from; here no later write is coming to fix it. A plain index has no idea which write is newer, so it refuses nothing."
+  },
+  "sections": [
+    {
+      "h": "Two writes that both succeed can leave two different answers",
+      "body": "The support team doesn't search payments in PostgreSQL. They search an index (OpenSearch, say) that answers \"every REFUNDED payment for acct-17\" in a few milliseconds. The payment service keeps the index up to date the obvious way: after it updates the `payment` row, it sends the same change to the index.\n\n```kotlin\nfun setStatus(id: String, status: String) {\n    db.update(\"UPDATE payment SET status = ? WHERE id = ?\", status, id)   // committed here\n    index.update(id, mapOf(\"status\" to status))                         // then the copy\n}\n```\n\nThat is a **dual write**: the application writes the same fact to two systems, one after the other. It passes every test. Now two requests for payment pay-981 arrive within a millisecond: the capture job sets CAPTURED and a refund sets REFUNDED, each on its own thread. Here is one order the scheduler may pick:\n\n| Time | Capture client | Refund client | PostgreSQL | Index |\n|---|---|---|---|---|\n| t1 | UPDATE to CAPTURED | | CAPTURED | AUTHORIZED |\n| t2 | | UPDATE to REFUNDED | REFUNDED | AUTHORIZED |\n| t3 | | index to REFUNDED | REFUNDED | REFUNDED |\n| t4 | index to CAPTURED | | REFUNDED | CAPTURED |\n\nEvery call returned success. There is no exception, no retry and no log line. The database says the payment was refunded, the index says it was captured, and it will keep saying so until someone writes pay-981 again, which for a refunded payment may be never. All it took was a pause of a couple of milliseconds between the capture client's two writes: a GC pause, a TCP retransmit, a busy connection pool.\n\nThe race needs no failure at all. Failures open a second door. The database commit succeeds and the index call times out. Should the service retry? It may have crashed between the two writes and not know there was a second one to make. Or the index applied the write and only the response got lost. Either way one store has the change and the other doesn't.\n\nBoth problems have the same root. Two systems each decide the order of writes, and neither one follows the other. In the Replication track's terms, that's two leaders and no followers, and nothing reconciles them. Play the scheduler below and find the orders that break it.",
+      "sim": {
+        "title": "Two clients, two writes each, two stores",
+        "intro": "Statuses are numbers here: 0 is AUTHORIZED, 1 CAPTURED, 2 REFUNDED. Each client writes PostgreSQL, then the index. You pick who runs next. Run the audit last. Can you make it report pay-981?",
+        "vars": {
+          "db": 0,
+          "index": 0,
+          "mismatch": 0
+        },
+        "threads": [
+          {
+            "name": "Capture",
+            "steps": [
+              {
+                "op": "set",
+                "var": "db",
+                "n": 1,
+                "code": "UPDATE payment SET status = 'CAPTURED'  (db = 1)"
+              },
+              {
+                "op": "set",
+                "var": "index",
+                "n": 1,
+                "code": "index.update(pay-981, CAPTURED)  (index = 1)"
+              }
+            ]
+          },
+          {
+            "name": "Refund",
+            "steps": [
+              {
+                "op": "set",
+                "var": "db",
+                "n": 2,
+                "code": "UPDATE payment SET status = 'REFUNDED'  (db = 2)"
+              },
+              {
+                "op": "set",
+                "var": "index",
+                "n": 2,
+                "code": "index.update(pay-981, REFUNDED)  (index = 2)"
+              }
+            ]
+          },
+          {
+            "name": "Nightly audit",
+            "steps": [
+              {
+                "op": "check",
+                "var": "db",
+                "eq": 2,
+                "code": "does PostgreSQL say REFUNDED (2)?"
+              },
+              {
+                "op": "check",
+                "var": "index",
+                "eq": 1,
+                "code": "does the index say CAPTURED (1)?"
+              },
+              {
+                "op": "set",
+                "var": "mismatch",
+                "n": 1,
+                "code": "report pay-981: the stores disagree"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "mismatch",
+          "eq": 1,
+          "say": "PostgreSQL says REFUNDED, the index says CAPTURED. Both clients got success for both writes, nothing threw, nothing was logged. Without this audit, nobody would ever know."
+        }
+      },
+      "try": {
+        "title": "Count the orders that break it",
+        "minutes": 3,
+        "steps": [
+          "In the simulator, each client makes two writes, database first. Keeping each client's own order, the four writes can interleave in 6 ways. Predict how many of the 6 leave PostgreSQL and the index different.",
+          "Run all 6 (Reset between them; run the audit last each time). Write down `db` and `index` at the end of each."
+        ],
+        "expect": "Two of the six. Capture-db, refund-db, refund-index, capture-index ends with `db = 2` and `index = 1`, and the audit reports it. Refund-db, capture-db, capture-index, refund-index ends with `db = 1` and `index = 2`; this audit misses it because it only checks one pattern. In the other four orders, whichever client wrote the database last also wrote the index last. Nothing in the code makes that true. The scheduler makes it true most of the time, which is why the bug survives testing."
+      },
+      "refs": [
+        {
+          "title": "Kleppmann: Using logs to build a solid data infrastructure (or: why dual writes are a bad idea)",
+          "url": "https://www.confluent.io/blog/using-logs-to-build-a-solid-data-infrastructure-or-why-dual-writes-are-a-bad-idea/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Make one system the leader and the others follow its log",
+      "body": "The first fix people reach for is a distributed transaction around both writes. The Transactions track's lesson on two-phase commit built one: every participant prepares, the coordinator logs the decision, then everyone commits. That fixes the partial failure, since both writes happen or neither does. It fixes the race only if both systems keep a lock on pay-981 from the first write until the commit, so the refund waits for the capture in both places. Count what that costs:\n\n1. The index has to be a participant. OpenSearch, Elasticsearch, Redis and most caches have no prepare step and don't speak XA.\n2. Every status change holds the row lock across a network round trip to the index, and waits for the slower of the two.\n3. Availability multiplies. With PostgreSQL up 99.95% of the time and the index up 99.9%, a write that needs both succeeds at most 99.85% of the time. An index outage now stops payments.\n4. A coordinator that dies leaves participants in doubt, holding their locks, as that lesson showed.\n\nSo step back and ask why one database never has this problem with its own replicas. It has one leader. The leader picks the order of writes, writes that order to its log, and every follower applies the log in that order (the Replication track's first two lessons). Two followers that apply the same log in the same order end in the same state.\n\nDo the same across products. Pick one **system of record**, here PostgreSQL. The services write only to it. Every other store, the index, a cache, the warehouse, is a follower: it reads the log of committed changes and applies them in log order. It also keeps a bookmark, the position of the last change it applied, so it can stop and continue where it was.\n\nTwo clients can still race to the database, but the database settles it: the refund's UPDATE waits for the capture's row lock, and the outcome goes into the log once. The index can't disagree about the order, because it no longer picks one.\n\nThe price is time. The index is now asynchronous. It trails the database by milliseconds when things are quiet, and by more when the follower is slow, so a merchant who refunds and searches at once may not see the refund yet. That is replication lag, and the Replication track's lesson on lag has the fixes, such as reading your own writes from the leader. The stepper walks through the new design.",
+      "stepper": {
+        "title": "The index follows the database's log",
+        "intro": "Two clients race again. This time only PostgreSQL decides the order.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">sets CAPTURED</text><rect class=\"box\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">sets REFUNDED</text><rect class=\"box\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">AUTHORIZED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"ln-d\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><rect class=\"ln-d\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><rect class=\"box\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">follower</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">at 0/1C0CC88</text><rect class=\"box\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">AUTHORIZED</text><line class=\"ln-a\" x1=\"170\" y1=\"63\" x2=\"206\" y2=\"63\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"170\" y1=\"153\" x2=\"206\" y2=\"100\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"525\" y=\"262\" text-anchor=\"middle\">the services no longer write the index</text></svg>",
+            "say": "Same two requests as before, but the services now write **only** PostgreSQL. The search index has one writer left: a follower that reads the database's log. It starts at the slot's position, 0/1C0CC88."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">holds the row</text><rect class=\"box-b\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">waits for the lock</text><rect class=\"box-a\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">CAPTURED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"box-a\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"262.0\" y=\"193.0\" text-anchor=\"middle\">commit 768</text><text class=\"t-code\" x=\"262.0\" y=\"211.0\" text-anchor=\"middle\">CAPTURED</text><rect class=\"ln-d\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><rect class=\"box\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">follower</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">at 0/1C0CC88</text><rect class=\"box\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">AUTHORIZED</text><line class=\"ln-a\" x1=\"170\" y1=\"63\" x2=\"206\" y2=\"63\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"170\" y1=\"153\" x2=\"206\" y2=\"100\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"262\" y1=\"120\" x2=\"262\" y2=\"168\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "PostgreSQL settles the race. The capture's UPDATE locks pay-981's row; the refund's UPDATE waits for that lock. The capture commits first, and its commit record, transaction 768, goes into the WAL."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">done</text><rect class=\"box-a\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">commits</text><rect class=\"box-a\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"box\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"262.0\" y=\"193.0\" text-anchor=\"middle\">commit 768</text><text class=\"t-code\" x=\"262.0\" y=\"211.0\" text-anchor=\"middle\">CAPTURED</text><rect class=\"box-a\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"368.0\" y=\"193.0\" text-anchor=\"middle\">commit 769</text><text class=\"t-code\" x=\"368.0\" y=\"211.0\" text-anchor=\"middle\">REFUNDED</text><rect class=\"box\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">follower</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">at 0/1C0CC88</text><rect class=\"box\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">AUTHORIZED</text><line class=\"ln-a\" x1=\"170\" y1=\"153\" x2=\"206\" y2=\"100\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"368\" y1=\"120\" x2=\"368\" y2=\"168\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The lock is free, the refund's UPDATE runs and commits as transaction 769. The WAL now holds the one order the database chose: CAPTURED, then REFUNDED. Nobody else gets a say in that order."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">done</text><rect class=\"box\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">done</text><rect class=\"box\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"box-a\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"262.0\" y=\"193.0\" text-anchor=\"middle\">commit 768</text><text class=\"t-code\" x=\"262.0\" y=\"211.0\" text-anchor=\"middle\">CAPTURED</text><rect class=\"box\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"368.0\" y=\"193.0\" text-anchor=\"middle\">commit 769</text><text class=\"t-code\" x=\"368.0\" y=\"211.0\" text-anchor=\"middle\">REFUNDED</text><rect class=\"box-a\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">follower</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">at 0/1C0CD30</text><rect class=\"box-a\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">CAPTURED</text><line class=\"ln-a\" x1=\"420\" y1=\"197\" x2=\"446\" y2=\"197\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"525\" y1=\"172\" x2=\"525\" y2=\"124\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "The follower reads the slot and applies transaction 768: the index says CAPTURED. It records 768's commit position, 0/1C0CD30, as its bookmark. For a moment the index is behind the database. That's lag, and it will pass."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">done</text><rect class=\"box\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">done</text><rect class=\"box-ok\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"box\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"262.0\" y=\"193.0\" text-anchor=\"middle\">commit 768</text><text class=\"t-code\" x=\"262.0\" y=\"211.0\" text-anchor=\"middle\">CAPTURED</text><rect class=\"box-a\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"368.0\" y=\"193.0\" text-anchor=\"middle\">commit 769</text><text class=\"t-code\" x=\"368.0\" y=\"211.0\" text-anchor=\"middle\">REFUNDED</text><rect class=\"box-a\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">follower</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">at 0/1C0CE10</text><rect class=\"box-ok\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><line class=\"ln-a\" x1=\"420\" y1=\"197\" x2=\"446\" y2=\"197\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"525\" y1=\"172\" x2=\"525\" y2=\"124\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Then 769: the index says REFUNDED, the same as the table, and the bookmark moves to 0/1C0CE10. The follower confirms that position to the slot, and PostgreSQL may now recycle that WAL."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Two clients write only PostgreSQL; its WAL holds the commits in order; a follower applies them to the search index.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"59.0\" text-anchor=\"middle\">capture</text><text class=\"t-s t-m\" x=\"95.0\" y=\"77.0\" text-anchor=\"middle\">done</text><rect class=\"box\" x=\"20\" y=\"130\" width=\"150\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"149.0\" text-anchor=\"middle\">refund</text><text class=\"t-s t-m\" x=\"95.0\" y=\"167.0\" text-anchor=\"middle\">done</text><rect class=\"box-ok\" x=\"210\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"315.0\" y=\"62.0\" text-anchor=\"middle\">PostgreSQL</text><text class=\"t-s t-m\" x=\"315.0\" y=\"80.0\" text-anchor=\"middle\">payment pay-981</text><text class=\"t-code\" x=\"315.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><text class=\"t-s t-m\" x=\"210\" y=\"242\" text-anchor=\"start\">WAL, in commit order</text><rect class=\"box-b\" x=\"210\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"262.0\" y=\"193.0\" text-anchor=\"middle\">commit 768</text><text class=\"t-code\" x=\"262.0\" y=\"211.0\" text-anchor=\"middle\">CAPTURED</text><rect class=\"box-b\" x=\"316\" y=\"172\" width=\"104\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"368.0\" y=\"193.0\" text-anchor=\"middle\">commit 769</text><text class=\"t-code\" x=\"368.0\" y=\"211.0\" text-anchor=\"middle\">REFUNDED</text><rect class=\"box-b\" x=\"450\" y=\"172\" width=\"150\" height=\"50\" rx=\"8\"/><text class=\"t\" x=\"525.0\" y=\"193.0\" text-anchor=\"middle\">restarted</text><text class=\"t-s t-m\" x=\"525.0\" y=\"211.0\" text-anchor=\"middle\">skips up to CE10</text><rect class=\"box-ok\" x=\"450\" y=\"30\" width=\"210\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"555.0\" y=\"62.0\" text-anchor=\"middle\">search index</text><text class=\"t-s t-m\" x=\"555.0\" y=\"80.0\" text-anchor=\"middle\">pay-981</text><text class=\"t-code\" x=\"555.0\" y=\"98.0\" text-anchor=\"middle\">REFUNDED</text><line class=\"ln-a\" x1=\"420\" y1=\"197\" x2=\"446\" y2=\"197\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"525\" y=\"262\" text-anchor=\"middle\">sent again after a crash, applied once</text></svg>",
+            "say": "Suppose the follower had crashed after applying 769 and before confirming. The slot would send 768 and 769 again. The restarted follower compares each commit position with its bookmark, finds both at or before 0/1C0CE10, and skips them. Delivery is at-least-once; the bookmark makes applying exactly once."
+          }
+        ]
+      },
+      "refs": [
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition, chapter 12",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Change data capture reads the log the database already keeps",
+      "body": "You don't need a new log for this. Every database already keeps one, for crash recovery and for its own replicas. **Change data capture** (CDC) means reading that log from the outside and turning it into a stream of row changes for other systems.\n\nIn PostgreSQL that log is the write-ahead log (WAL). The Replication track's lesson on replication logs decoded it into rows: with `wal_level = logical`, a logical replication slot remembers how far one consumer has read, and an output plugin turns WAL records into changes. `test_decoding` prints text you can read; `pgoutput` is the binary format that built-in logical replication and Debezium use. Two properties make it a good log to follow. A transaction comes out only once it has committed, all of its rows together, so a rolled-back transaction never appears. And transactions come out in commit order, even when they ran at the same time. The Try it below shows both on the race from section 1: the refund waited two seconds for the capture's lock, and the slot lists 768 (CAPTURED) before 769 (REFUNDED).\n\nThe other databases you will meet expose the same idea under other names:\n\n| Database | The change log | A consumer's position | Watch out for |\n|---|---|---|---|\n| PostgreSQL 18 | WAL, read through a logical slot | LSN, a WAL position | a slot nobody reads keeps WAL forever (section 5) |\n| MySQL 8.4 | the binary log, with `binlog_format = ROW` and `binlog_row_image = FULL` | binlog file and offset, or a GTID set | `binlog_expire_logs_seconds` (default 30 days) purges the binlog under a slow consumer |\n| MongoDB 9.0 | change streams on a replica set or sharded cluster | a resume token | only majority-committed changes appear; `updateLookup` returns the document as it is *now*, not as the update left it |\n| DynamoDB | DynamoDB Streams | a sequence number per shard | records live 24 hours; order is per item, not per table |\n\n**Debezium** is the common layer on top. It's an open source project with connectors for PostgreSQL, MySQL, MongoDB, Oracle, SQL Server, Db2 and more, and each one turns its database's log into the same shape of change event: the row before, the row after, the operation and the source position. The current stable series is 3.7 (3.7.1.Final). It usually runs inside Kafka Connect, which the next lesson sets up; Debezium Server runs it on its own and sends the events elsewhere.\n\nOne thing changes when you do this. Your table's columns become what other teams read, so renaming a column can break a consumer in production. The next lesson deals with that through schemas and the outbox.",
+      "try": {
+        "title": "Race two sessions and read the slot",
+        "minutes": 6,
+        "steps": [
+          "From the `labs` folder, start only the database from the next lesson's file: `docker compose -f env/kafka.yml --profile cdc up -d --wait postgres`. It runs PostgreSQL 18 with `wal_level = logical` on port 5433, with an empty `payment` table.",
+          "Open psql: `docker compose -f env/kafka.yml exec postgres psql -U sfz -d payments`, and run the setup block below.",
+          "Open a second terminal with the same psql command. In terminal 1, run the capture block. In terminal 2, run the refund UPDATE: it hangs. Back in terminal 1, run `COMMIT;` and watch terminal 2 finish.",
+          "Predict, then run the last two queries: which status does the table hold, and in which order does the slot list the two transactions?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two terminals",
+          "src": "-- setup, terminal 1\nINSERT INTO payment (id, account, amount, status) VALUES\n  ('pay-981', 'acct-17', 4000, 'AUTHORIZED'),\n  ('pay-982', 'acct-42', 1250, 'AUTHORIZED');\nSELECT * FROM pg_create_logical_replication_slot('search_index', 'test_decoding');\n\n-- terminal 1: the capture client\nBEGIN;\nUPDATE payment SET status = 'CAPTURED' WHERE id = 'pay-981';\n\n-- terminal 2: the refund client (it waits for the row lock)\n\\timing on\nUPDATE payment SET status = 'REFUNDED' WHERE id = 'pay-981';\n\n-- terminal 1\nCOMMIT;\n\n-- either terminal\nSELECT id, status FROM payment ORDER BY id;\nSELECT lsn, xid, data FROM pg_logical_slot_peek_changes('search_index', NULL, NULL);\n"
+        },
+        "expect": "```text\n  slot_name   |    lsn\n--------------+-----------\n search_index | 0/1C0CC88\n\nUPDATE 1\nTime: 1996.387 ms (00:01.996)\n\n   id    |   status\n---------+------------\n pay-981 | REFUNDED\n pay-982 | AUTHORIZED\n\n    lsn    | xid |  data\n-----------+-----+-------------------------------------------------------------------\n 0/1C0CC88 | 768 | BEGIN 768\n 0/1C0CC88 | 768 | table public.payment: UPDATE: id[text]:'pay-981' account[text]:'acct-17' amount[bigint]:4000 status[text]:'CAPTURED' created_at[...]\n 0/1C0CD30 | 768 | COMMIT 768\n 0/1C0CD30 | 769 | BEGIN 769\n 0/1C0CD68 | 769 | table public.payment: UPDATE: id[text]:'pay-981' account[text]:'acct-17' amount[bigint]:4000 status[text]:'REFUNDED' created_at[...]\n 0/1C0CE10 | 769 | COMMIT 769\n(6 rows)\n```\n(Output trimmed; your LSNs, xids and wait time differ.) The refund's UPDATE waited about as long as you took to type `COMMIT` in terminal 1: that's the row lock settling the race. The slot lists the capture's transaction, then the refund's, each as BEGIN, its row and COMMIT, in commit order. Each row carries every column, so a follower that applies them in this order ends at REFUNDED, like the table. Leave everything running for the next two Try its."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: logical decoding concepts",
+          "url": "https://www.postgresql.org/docs/18/logicaldecoding-explanation.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Debezium 3.7: MySQL connector (binlog setup)",
+          "url": "https://debezium.io/documentation/reference/stable/connectors/mysql.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MongoDB 9.0: change streams",
+          "url": "https://www.mongodb.com/docs/manual/changeStreams/",
+          "kind": "docs"
+        },
+        {
+          "title": "DynamoDB Streams",
+          "url": "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Streams.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A new copy starts from a snapshot that lines up with the log",
+      "body": "A follower that starts today needs every row, not only today's changes. The log doesn't go back to the beginning, because PostgreSQL recycles old WAL. So a new follower copies the table first and applies the log after the copy. The hard word is \"after\": a write that commits while the copy runs must still end up in the index.\n\nGet the order wrong and you lose it. Copy at 10:00:00, create the slot at 10:00:05, and a refund that commits at 10:00:02 is in neither. The copy started before it, and the slot didn't exist yet, so PostgreSQL never kept it for you. The index shows the old status until that payment changes again.\n\nCreate the slot first, then copy. From the moment the slot exists, PostgreSQL keeps every committed change for it, so a write that lands during the copy is in the slot for sure, and maybe in the copy too. Getting it twice is harmless because each change carries the whole row: \"pay-981 is REFUNDED, account acct-17, amount 4000\", not \"change the status\". The index may show an older version for a moment while the follower catches up, then it converges. Created over the replication protocol, a slot can also export a snapshot that matches its start exactly, so the copy sees precisely the database the slot begins after.\n\nDebezium does this on first start (`snapshot.mode = initial`): it reads each captured table, emits every row as a read event (`op` is `r`), then streams from the slot. One long copy of a 2 TB table takes hours and keeps a transaction open the whole time. So Debezium also offers incremental snapshots, built on Netflix's DBLog design: copy the table in primary-key chunks while the log keeps flowing, with markers in the log around each chunk, so a row that changed during its chunk is taken from the log instead. No table locks, and a snapshot can pause and resume.\n\nThe slot has one more property to plan for. PostgreSQL saves a slot's confirmed position only at checkpoints, so after a database crash the slot may step back and send recent changes again. Your follower can crash too, after applying and before confirming. Either way some changes arrive twice. That makes CDC at-least-once, and the fix is the bookmark: store the commit position of the last transaction you applied next to the data, and skip anything at or before it. The Try it shows that nothing leaves the slot until you confirm it.",
+      "try": {
+        "title": "Nothing leaves the slot until you confirm it",
+        "minutes": 3,
+        "steps": [
+          "In psql, peek at the slot again. Predict: are the two transactions from the last Try it still there?",
+          "Confirm them by advancing the slot to the last COMMIT's LSN, then peek once more. Then commit one more change and peek."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "SELECT lsn, xid, left(data, 60) AS data FROM pg_logical_slot_peek_changes('search_index', NULL, NULL);\nSELECT slot_name, confirmed_flush_lsn FROM pg_replication_slots;\n\nSELECT * FROM pg_replication_slot_advance('search_index',\n  (SELECT max(lsn) FROM pg_logical_slot_peek_changes('search_index', NULL, NULL)));\nSELECT count(*) FROM pg_logical_slot_peek_changes('search_index', NULL, NULL);\n\nUPDATE payment SET amount = 1300 WHERE id = 'pay-982';\nSELECT lsn, xid, left(data, 60) AS data FROM pg_logical_slot_peek_changes('search_index', NULL, NULL);\n"
+        },
+        "expect": "```text\n    lsn    | xid |                             data\n-----------+-----+--------------------------------------------------------------\n 0/1C0CC88 | 768 | BEGIN 768\n 0/1C0CC88 | 768 | table public.payment: UPDATE: id[text]:'pay-981' account[tex\n 0/1C0CD30 | 768 | COMMIT 768\n 0/1C0CD30 | 769 | BEGIN 769\n 0/1C0CD68 | 769 | table public.payment: UPDATE: id[text]:'pay-981' account[tex\n 0/1C0CE10 | 769 | COMMIT 769\n(6 rows)\n\n  slot_name   | confirmed_flush_lsn\n--------------+---------------------\n search_index | 0/1C0CC88\n\n  slot_name   |  end_lsn\n--------------+-----------\n search_index | 0/1C0CE10\n\n count\n-------\n     0\n\nUPDATE 1\n    lsn    | xid |                             data\n-----------+-----+--------------------------------------------------------------\n 0/1C0CE48 | 770 | BEGIN 770\n 0/1C0CE48 | 770 | table public.payment: UPDATE: id[text]:'pay-982' account[tex\n 0/1C0CEF0 | 770 | COMMIT 770\n(3 rows)\n```\nPeeking consumed nothing: the same six rows came back, and the confirmed position was still where the slot started. That is what a follower sees after crashing before it confirmed, so it must skip what it already applied. Advancing to the last COMMIT's LSN told PostgreSQL the follower has everything up to there; the slot then held nothing until the next transaction."
+      },
+      "refs": [
+        {
+          "title": "Andreakis and Papapanagiotou: DBLog, a watermark-based change-data-capture framework (Netflix)",
+          "url": "https://arxiv.org/abs/2010.12597",
+          "kind": "read"
+        },
+        {
+          "title": "Debezium: incremental snapshots",
+          "url": "https://debezium.io/blog/2021/10/07/incremental-snapshots",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "A slot nobody reads fills the database's disk",
+      "body": "A slot is a promise: PostgreSQL won't remove WAL the consumer hasn't confirmed. It keeps that promise when the consumer is gone. A connector paused for a long weekend, a test slot someone forgot to drop, a follower stuck on a change it can't parse: the slot stays, and every write to the database adds WAL that can't be recycled.\n\nGunnar Morling described the version of this that surprises people. An inactive Debezium slot on Amazon RDS filled a 200 GiB disk in under two weeks, about 18 GB a day, and the captured tables were idle. RDS writes a heartbeat into its own `rdsadmin` database every 5 minutes, `archive_timeout` then forces a switch to a new WAL segment, RDS segments are 64 MB, and the slot holds every one: 64 MB × 12 an hour × 24 hours is about 18 GB a day. The database's own housekeeping filled its disk. A full `pg_wal` stops the server, and with it the payments.\n\nA slot also holds back VACUUM on the system catalogs, and in extreme cases PostgreSQL shuts down to avoid transaction ID wraparound. Run a slot like part of the database, because it is:\n\n1. Measure it. Retained WAL per slot is `pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)` from `pg_replication_slots`. Alert when it passes a threshold you choose (Morling suggests starting around 100 MB) and when `active` is false for long.\n2. Keep quiet slots moving. Debezium's heartbeat, or a periodic `SELECT pg_logical_emit_message(false, 'heartbeat', now()::text)`, writes a tiny change the connector reads and confirms, so the slot's position advances even when the captured tables are idle. `pgoutput` carries these messages since PostgreSQL 14.\n3. Cap it. `max_slot_wal_keep_size` (default -1, no limit) lets PostgreSQL invalidate a slot that falls too far behind instead of filling the disk, and PostgreSQL 18's `idle_replication_slot_timeout` invalidates slots unused for longer than the timeout (default 0, off). Both trade a full disk for a dead slot, and the consumer then needs a new snapshot (section 4).\n4. Drop slots you no longer need.\n\nThe Try it makes 200,000 inserts with the slot unread and watches the retained WAL grow to tens of megabytes, then drop to almost nothing once the slot is advanced. The next lesson carries these changes through Kafka with Debezium and Kafka Connect, and adds the outbox: a table you write on purpose, so consumers read events you designed rather than your table's columns.",
+      "try": {
+        "title": "Watch an unread slot hold WAL",
+        "minutes": 4,
+        "steps": [
+          "In psql, insert 200,000 rows while nobody reads the slot, then look at how much WAL the slot holds (`unconfirmed` is what the consumer hasn't confirmed; `retained` is what PostgreSQL must keep on disk).",
+          "Advance the slot, as a consumer that caught up would, then run `CHECKPOINT` and advance once more: PostgreSQL moves `restart_lsn` only to a point where it has written a list of running transactions, and a checkpoint writes one. Look again.",
+          "Clean up: `SELECT pg_drop_replication_slot('search_index');`, then from the `labs` folder `docker compose -f env/kafka.yml --profile cdc down -v`."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "INSERT INTO payment (id, account, amount, status)\nSELECT 'bulk-' || g, 'acct-' || (g % 500), g, 'AUTHORIZED' FROM generate_series(1, 200000) g;\n\nSELECT slot_name, active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots;\n\nSELECT * FROM pg_replication_slot_advance('search_index', pg_current_wal_lsn());\nCHECKPOINT;\nSELECT * FROM pg_replication_slot_advance('search_index', pg_current_wal_lsn());\n\nSELECT slot_name, active, wal_status,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS unconfirmed,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots;\n"
+        },
+        "expect": "```text\nINSERT 0 200000\n  slot_name   | active | wal_status | unconfirmed | retained\n--------------+--------+------------+-------------+----------\n search_index | f      | reserved   | 58 MB       | 58 MB\n\n  slot_name   |  end_lsn\n--------------+-----------\n search_index | 0/9B545F0\nCHECKPOINT\n  slot_name   |  end_lsn\n--------------+-----------\n search_index | 0/9B546C0\n\n  slot_name   | active | wal_status | unconfirmed | retained\n--------------+--------+------------+-------------+-----------\n search_index | f      | reserved   | 0 bytes     | 176 bytes\n```\n(Output trimmed; the retained size varies between runs, about 40 to 60 MB here, depending on what the last checkpoint left.) The slot has no consumer (`active` is f) and holds every byte of WAL written since its position: 200,000 small rows cost tens of megabytes, and an idle RDS instance's heartbeats cost about 18 GB a day. Once the slot was advanced past a checkpoint's running-transactions record, the retained WAL dropped to a few hundred bytes. `wal_status = reserved` means nothing caps it: `max_slot_wal_keep_size` is -1 by default."
+      },
+      "refs": [
+        {
+          "title": "Morling: The insatiable Postgres replication slot",
+          "url": "https://morling.dev/blog/insatiable-postgres-replication-slot",
+          "kind": "read"
+        },
+        {
+          "title": "PostgreSQL 18: replication settings (max_slot_wal_keep_size, idle_replication_slot_timeout)",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-replication.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A shop keeps its prices in the till and on a board by the door. Today two clerks each change a price on the till and then walk over and change the board, and when they both change the same price at once, the board can end up with the price the till overwrote. Change data capture keeps one writer: clerks change only the till, the till prints a numbered receipt for every change, and a runner copies the receipts onto the board in number order, noting the last number copied. If the runner gets interrupted, they start again from their note and skip receipts already on the board. The analogy breaks at the paper: the till keeps every receipt the runner hasn't collected, so a runner who goes home for the weekend leaves the till buried in paper, and a real database stops when that paper fills its disk.",
+  "in_your_world": "Look for two writes to two systems in a row: an Oracle insert followed by `producer.send`, a PostgreSQL update followed by a Redis `SET` or an Elasticsearch index call, a Temporal activity that commits to the ledger and then calls a search service. Each one is a dual write with the race and the partial failure above, and a retry policy fixes neither. With Oracle, Debezium's connector reads the redo log through LogMiner, and its position is an SCN instead of an LSN; the archived redo logs play the slot's role, so a connector that is down longer than you keep them needs a new snapshot. In a Quarkus service, make the database write the only write, and let a CDC follower or the outbox from the next lesson carry it to everything else.",
+  "mistake": "Fixing a dual write with retries and a nightly reconciliation job. Retries don't touch the race: both writes succeeded, so there is nothing to retry, and a retried index write can even land after a newer one and make things worse. The reconciliation job finds some mismatches a day later, and only the patterns it was written to look for, like the audit in the simulator. The fix is structural: write only the system of record, and make every other store follow its log in order, with a bookmark that turns redelivery into a no-op. The second mistake follows from the first fix: creating a slot for a consumer and never watching it. Alert on retained WAL and inactive slots from the day you create one.",
+  "compare": {
+    "title": "A dual write, and the same change as a follower",
+    "a": {
+      "label": "Dual write",
+      "lang": "kotlin",
+      "title": "the service writes both stores",
+      "src": "fun setStatus(id: String, status: String) {\n    db.update(\"UPDATE payment SET status = ? WHERE id = ?\", status, id)\n    // a pause here lets another client's two writes slip in between\n    index.update(id, mapOf(\"status\" to status))\n}\n"
+    },
+    "b": {
+      "label": "Follower of the log",
+      "lang": "kotlin",
+      "title": "the service writes PostgreSQL; a follower writes the index",
+      "src": "fun setStatus(id: String, status: String) {\n    db.update(\"UPDATE payment SET status = ? WHERE id = ?\", status, id)   // the only write\n}\n\n// elsewhere, one follower per index\nfun poll() {\n    for (tx in slot.committedTransactions()) {          // commit order, whole transactions\n        if (tx.commitLsn <= index.appliedLsn) continue   // sent again after a crash\n        tx.rows.forEach(index::apply)\n        index.markApplied(tx.commitLsn)\n    }\n    slot.confirm(index.appliedLsn)\n}\n"
+    },
+    "note": "The left side has two writers that each pick an order; nothing ties them together, so the stores can disagree with no error. On the right, PostgreSQL is the only writer that picks an order, and the follower replays that order. The follower adds two things the dual write never had: a position in a log, so it can stop and continue, and a rule for duplicates. What it gives up is freshness: the index trails the table by however long the follower takes."
+  },
+  "worked": {
+    "title": "Turn a refund service's dual write into a follower",
+    "steps": [
+      {
+        "say": "Find the dual write. The refund handler saves the refund and then indexes it. Two writers, two orders, and a crash between the lines loses the index write.",
+        "code": "refundRepository.save(refund)                       // PostgreSQL, committed\nsearchClient.index(\"refunds\", refund.id, refund.toDoc())   // OpenSearch, a separate system",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Delete the second line. The handler now writes only PostgreSQL, the system of record. Nothing else changes in the handler.",
+        "code": "refundRepository.save(refund)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Give the new follower its first copy without losing a write: create the slot first, then copy. Anything committed in between is in both, which is harmless because each change carries the whole row.",
+        "code": "SELECT * FROM pg_create_logical_replication_slot('refund_index', 'pgoutput');\n-- then, in one query:\nSELECT id, payment_id, amount_minor, reason FROM refunds;",
+        "lang": "sql"
+      },
+      {
+        "say": "Follow the slot: apply each committed transaction once, in commit order, and keep the bookmark with the index. Confirm only after applying, so a crash costs a replay, never a loss.",
+        "code": "for (tx in slot.committedTransactions()) {\n    if (tx.commitLsn <= index.appliedLsn) continue\n    tx.rows.forEach(index::apply)\n    index.markApplied(tx.commitLsn)\n}\nslot.confirm(index.appliedLsn)",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Watch the slot from day one: alert when it holds too much WAL or has had no consumer for a while, and set `max_slot_wal_keep_size` so the worst case is a re-snapshot, not a full disk.",
+        "code": "SELECT slot_name, active,\n       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained\nFROM pg_replication_slots\nWHERE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 100 * 1024 * 1024;",
+        "lang": "sql"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Race a dual write, then make the index follow the log",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/kotlin/sfz/stream/l01/DualWrite.kt",
+      "labs/sql/src/main/kotlin/sfz/stream/l01/ChangeFollower.kt"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.stream.l01.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. All 11 fail. They start one PostgreSQL 18 container with `wal_level = logical` (shared by every test of this lesson) holding the `payment` table. `Given.kt` has the `SearchIndex`, the `Slot` helpers (create, peek, confirm, lag) and a parser for `test_decoding` lines.",
+      "In `DualWrite.kt`, write `race`: run the capture and refund clients on two threads with two `CountDownLatch`es so the writes happen in the order the KDoc lists. The test checks that the database says REFUNDED, the index CAPTURED, and nothing threw.",
+      "In `ChangeFollower.kt`, write `poll`: peek the slot, collect `public.payment` rows between BEGIN and COMMIT, apply a transaction only if its COMMIT LSN is after `index.appliedLsn`, mark it applied, and confirm the last COMMIT LSN at the end.",
+      "Write `bootstrap`: create the slot, call the hook, then copy the table with one SELECT. Run the tests until all 11 pass. The test with `poll(confirm = false)` is the crash between applying and confirming."
+    ],
+    "hints": [
+      "In `race`, the capture client calls `setStatus` with a `between` lambda that counts down the first latch and waits on the second; the refund client waits on the first latch, calls `setStatus`, then counts down the second.",
+      "`TestDecoding.parse(change.data)` returns `Decoded.Begin`, `Decoded.Row` or `Decoded.Commit`; the COMMIT row's `change.lsn` is the transaction's position.",
+      "Build a payment from a row with `Payment(c.getValue(\"id\")!!, c.getValue(\"account\")!!, c.getValue(\"amount\")!!.toLong(), c.getValue(\"status\")!!)`. A DELETE row carries only `id`."
+    ],
+    "done_when": "All 11 tests in `DualWriteTest` and `ChangeFollowerTest` pass."
+  },
+  "drill": {
+    "title": "The follower loop from memory",
+    "minutes": 4,
+    "prompt": "Write, from memory, a follower's `poll()` over a slot that returns BEGIN, row and COMMIT entries in commit order. It must apply each committed transaction exactly once even if the slot sends some again, and it must never lose a change if it crashes. Then answer: when should it confirm, before or after applying?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun poll(): Int {\n    val rows = mutableListOf<Row>()\n    var applied = 0\n    var last = 0L\n    for (c in slot.peek()) when (val d = parse(c.data)) {\n        is Begin -> rows.clear()\n        is Row -> rows += d\n        is Commit -> {\n            if (c.lsn > index.appliedLsn) {          // not seen before\n                rows.forEach(index::apply)\n                index.markApplied(c.lsn)             // bookmark stored with the data\n                applied++\n            }\n            last = c.lsn\n            rows.clear()\n        }\n    }\n    if (last > 0) slot.confirm(last)                 // after applying: a crash means a replay, not a loss\n    return applied\n}\n// Confirm after applying. Confirming first would let PostgreSQL drop changes the index never got."
+    }
+  },
+  "recap": [
+    "A dual write (database, then index) has two writers that each pick an order. Two racing clients can leave the stores different for good, with every call successful and nothing logged; a crash between the writes loses one of them.",
+    "Two-phase commit could make both writes atomic, but the index can't take part, every write waits for both systems, and an index outage stops payments.",
+    "Make one system of record the leader. Every other store follows its log of committed changes in log order and keeps a bookmark.",
+    "Change data capture reads the database's own log: PostgreSQL's WAL through a logical slot, MySQL's row binlog, MongoDB change streams, DynamoDB Streams. Debezium 3.7 wraps them in one event shape.",
+    "A new follower creates the slot first and copies second. CDC is at-least-once, so the follower skips commits at or before its bookmark.",
+    "An unread slot keeps WAL until the disk is full (about 18 GB a day on an idle RDS instance). Alert on retained WAL, send heartbeats, set `max_slot_wal_keep_size`, drop unused slots."
+  ],
+  "quiz": [
+    {
+      "q": "Which of these is a dual write?",
+      "options": [
+        "Inserting a payment row and an event row into the same PostgreSQL transaction",
+        "Updating the payment row, then calling `producer.send` with the new status",
+        "A Debezium connector reading the payment table's changes from the WAL",
+        "A PostgreSQL standby replaying the primary's WAL"
+      ],
+      "answer": 1,
+      "why": "Two writes to two systems, one after the other, with nothing tying them together: the database and Kafka can see racing updates in different orders, and a crash between them loses the send. Two rows in one transaction is one write to one system. Debezium and the standby are followers of a single log, which is the fix."
+    },
+    {
+      "q": "Your team proposes XA across PostgreSQL and the search index to fix the dual-write race. What's the strongest objection?",
+      "options": [
+        "XA can't make two writes atomic",
+        "XA would order the writes by wall-clock time, which drifts",
+        "The search index doesn't support a prepare phase, and even if it did, every payment write would wait for and depend on the index",
+        "XA only works within one database"
+      ],
+      "answer": 2,
+      "why": "Two-phase commit does make writes atomic, and with locks held to the end it would even serialize the race. But OpenSearch, Elasticsearch and caches don't take part in XA, and if they did, each write would hold locks across a round trip and fail whenever the index is down. XA is built for several products; ordering has nothing to do with wall clocks."
+    },
+    {
+      "q": "From the Replication track's lesson on replication logs: a follower crashes after applying a decoded UPDATE and gets it again on restart. Why is applying `status[text]:'REFUNDED' amount[bigint]:4000` twice harmless, when replaying `UPDATE ... SET amount = amount + 50` twice is not?",
+      "options": [
+        "PostgreSQL deduplicates the second delivery for you",
+        "The decoded entry carries the row's resulting values, so applying it again sets the same values",
+        "Decoded entries are sent only once, so the case can't happen",
+        "The search index rejects a document it has already seen"
+      ],
+      "answer": 1,
+      "why": "A logical log records results, not the statement that produced them, so applying an entry twice leaves the row the same. A statement like `amount + 50` changes the value each time it runs. PostgreSQL does resend after a crash (a slot's position is saved only at checkpoints), and nothing in the index deduplicates for you; that's what the bookmark is for.",
+      "from": "repl-02"
+    },
+    {
+      "q": "You build a new index: you copy the `payment` table at 10:00:00 and create the slot at 10:00:05. A refund commits at 10:00:02. Where is the refund?",
+      "options": [
+        "In the copy, because the copy took a while",
+        "In the slot, because slots start from the oldest WAL",
+        "In both, which is harmless",
+        "In neither: the index shows the old status until that payment changes again"
+      ],
+      "answer": 3,
+      "why": "The copy's snapshot was taken before the refund committed, and the slot keeps only changes committed after it was created. Create the slot first and copy second: then a change in between is in the slot for sure, and maybe also in the copy, which is harmless because each change carries the whole row."
+    },
+    {
+      "q": "A Debezium connector on an RDS PostgreSQL instance is stopped for 10 days. The captured tables get no writes at all. What happens on the database?",
+      "options": [
+        "Nothing: no writes means no new WAL for the slot to hold",
+        "The slot is dropped automatically after 24 hours",
+        "WAL keeps piling up from RDS's own heartbeat writes, about 18 GB a day, because the slot holds every segment",
+        "PostgreSQL pauses the slot and frees its WAL until the connector returns"
+      ],
+      "answer": 2,
+      "why": "RDS writes a heartbeat every 5 minutes and forces a 64 MB segment switch, and the slot holds all of them: about 180 GB in 10 days. `max_slot_wal_keep_size` is -1 (no limit) and `idle_replication_slot_timeout` is 0 (off) by default, so nothing drops or invalidates the slot unless you configure it. Heartbeats the connector reads and confirms keep the slot moving."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is a dual write?",
+      "back": "The application writes the same fact to two systems one after the other, such as PostgreSQL and then a search index. Racing clients can leave them different, and a crash between the writes loses one."
+    },
+    {
+      "front": "Why can a dual-write race leave the stores different with no error?",
+      "back": "Each store applies writes in the order they arrive, and the two orders can differ. Every write succeeds; the stores just end with different last writers."
+    },
+    {
+      "front": "What does change data capture do?",
+      "back": "It reads the database's own log of committed changes and turns it into a stream of row changes, in commit order, for other systems to follow."
+    },
+    {
+      "front": "In what order does PostgreSQL logical decoding emit transactions?",
+      "back": "Commit order, each transaction whole (BEGIN, its rows, COMMIT). Rolled-back transactions never appear."
+    },
+    {
+      "front": "A new follower: slot first or copy first?",
+      "back": "Slot first, then copy. A change committed in between is in the slot, maybe also in the copy, which is harmless because each change carries the whole row."
+    },
+    {
+      "front": "Why is CDC at-least-once, and what fixes duplicates?",
+      "back": "A slot's position is saved only at checkpoints, and a follower can crash before confirming. Store the last applied commit LSN with the data and skip anything at or before it."
+    },
+    {
+      "front": "What happens to WAL held by a slot nobody reads?",
+      "back": "PostgreSQL keeps it until the disk fills (default `max_slot_wal_keep_size = -1`). Alert on retained WAL, send heartbeats, cap it, drop unused slots."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Dual write",
+      "plain": "Writing the same change to two systems from the application, one after the other, with nothing tying the two writes together."
+    },
+    {
+      "term": "System of record",
+      "plain": "The one store whose data counts as the truth; every other copy is derived from it."
+    },
+    {
+      "term": "Change data capture (CDC)",
+      "plain": "Reading a database's log of committed changes and turning it into a stream that other systems apply."
+    },
+    {
+      "term": "Logical replication slot",
+      "plain": "PostgreSQL's record of how far one consumer has read the decoded WAL; it keeps WAL until the consumer confirms it."
+    },
+    {
+      "term": "LSN",
+      "plain": "Log sequence number: a position in PostgreSQL's WAL, written like 0/1C0CD30."
+    },
+    {
+      "term": "Initial snapshot",
+      "plain": "The first full copy a new follower takes of the data, lined up with a log position so changes after it can be applied."
+    },
+    {
+      "term": "Retained WAL",
+      "plain": "WAL that PostgreSQL can't recycle because a slot hasn't confirmed it: the current LSN minus the slot's restart_lsn."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague's service updates PostgreSQL and then the search index, with retries on failure. Explain how the index can end up wrong for good with no error, why a distributed transaction is the wrong fix, and what you'd do instead, including the one thing to monitor.",
+    "answer": "Each store applies writes in the order they reach it. If two requests change the same payment at once, PostgreSQL can apply A then B while the index applies B then A, because one client paused between its two writes. Every call succeeds, so the retries never run, and the index keeps the wrong value until that payment is written again. A crash between the two writes is a second way to lose one of them. Two-phase commit would make the writes atomic, but the index can't take part in it, each write would wait for both systems, and an index outage would stop payments. Instead, make PostgreSQL the only writer and the index a follower: read the committed changes from a logical replication slot, apply them in commit order, and keep the last applied commit LSN next to the index so duplicates after a crash are skipped. Start a new index by creating the slot first and then copying the table. And monitor the slot's retained WAL, because a slot nobody reads keeps WAL until the database's disk is full."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Snapshots that match the slot exactly.** Over the replication protocol, `CREATE_REPLICATION_SLOT name LOGICAL pgoutput (SNAPSHOT 'export')` returns a snapshot name along with the slot. A second session runs `BEGIN ISOLATION LEVEL REPEATABLE READ; SET TRANSACTION SNAPSHOT '<name>';` and copies the tables, seeing exactly the database as of the slot's start, so not even a harmless overlap remains. The export lives only until the creating session runs its next command.\n\n**DBLog's watermarks.** For each chunk, DBLog writes a low watermark into the log, selects the chunk by primary key, then writes a high watermark. While the log between the two watermarks streams past, any key that changed in that window is removed from the chunk's result, and the rest of the chunk is emitted at the high watermark. The log's version always wins over the copy's, with no locks.\n\n**Failover.** A logical slot lives on the primary. If the primary fails over, a slot that didn't exist on the standby is gone, and the consumer needs a new snapshot. PostgreSQL 18's documentation describes failover slots: create the slot with `failover = true`, set `sync_replication_slots` on the standby, and the standby keeps a synchronized copy.\n\n**Quorum databases.** Cassandra has no single log to follow: each node writes its own commit log, so its CDC hands out per-node segments, and a consumer has to merge them and drop the duplicates that replication creates, much like a quorum read.\n\n**An outbox without a table.** `pg_logical_emit_message(true, 'payments', '{...}')` writes a message into the WAL inside your transaction, and decoding hands it out at commit with the transaction's rows. It is an event with no table to bloat, a variant of the next lesson's outbox.\n\nDesigning Data-Intensive Applications, 2nd edition, chapter 12, covers the same ground under \"Databases and Streams\"."
+  },
+  "sources": [
+    {
+      "title": "Kleppmann: Using logs to build a solid data infrastructure (or: why dual writes are a bad idea)",
+      "url": "https://www.confluent.io/blog/using-logs-to-build-a-solid-data-infrastructure-or-why-dual-writes-are-a-bad-idea/"
+    },
+    {
+      "title": "PostgreSQL 18: logical decoding concepts",
+      "url": "https://www.postgresql.org/docs/18/logicaldecoding-explanation.html"
+    },
+    {
+      "title": "Morling: The insatiable Postgres replication slot",
+      "url": "https://morling.dev/blog/insatiable-postgres-replication-slot"
+    },
+    {
+      "title": "Debezium releases (3.7 stable)",
+      "url": "https://debezium.io/releases/"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 12",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

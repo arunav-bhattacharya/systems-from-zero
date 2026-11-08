@@ -1,0 +1,453 @@
+{
+  "id": "store-03",
+  "title": "The buffer pool",
+  "minutes": 40,
+  "goal": "By the end you can explain how a buffer pool caches pages with pins, dirty flags and a clock sweep, read PostgreSQL's buffer cache with pg_buffercache and EXPLAIN, say why PostgreSQL caches pages twice while InnoDB uses O_DIRECT and what PostgreSQL 18's asynchronous reads change, and build a pool that never evicts a page in use.",
+  "warmup": {
+    "q": "A PostgreSQL server has 128 MB of shared_buffers. A nightly report does a sequential scan of a 60 GB settlements table. What happens to the pages of the hot `payments` table that were in the cache?",
+    "options": [
+      "They are all evicted, because the scan touches far more pages than the cache holds",
+      "Most stay cached: a big sequential scan recycles a small ring of buffers instead of filling the whole cache",
+      "They stay because PostgreSQL never evicts a page that was used in the last hour",
+      "The scan fails because the table is bigger than shared_buffers"
+    ],
+    "answer": 1,
+    "why": "A plain LRU cache would lose everything to a scan like that. PostgreSQL gives sequential scans of tables bigger than a quarter of shared_buffers their own small ring of buffers, so the scan keeps reusing the same few hundred kilobytes. The last Try it of this lesson measures it. There is no time-based protection, and scans never fail for being bigger than the cache."
+  },
+  "sections": [
+    {
+      "h": "The buffer pool is a cache of pages that the database runs itself",
+      "body": "Lesson 2 gave the engine pages, and every query reads them. Looking up one payment by id reads a few index pages and one table page; a monthly report reads thousands. Reading an 8 KB page from an NVMe SSD takes about 100 microseconds. Reading it from RAM takes well under one. And queries keep coming back to the same pages: the top of every index, today's authorizations, the card-limits table. So a database keeps copies of pages in memory and serves repeat reads from there.\n\nVersion 1 is a `HashMap<Int, ByteArray>` from page id to the page's bytes, filled on every read. It works until the database is bigger than RAM, which most are: a 2 TB ledger doesn't fit in 64 GB. The cache needs a fixed size, and once it is full, something has to leave.\n\nVersion 2 is the **buffer pool**: a fixed number of page-sized slots in memory, called **frames**, plus a hash map from page id to frame, called the **page table**. To read page 42, look it up in the page table. If it's there, that is a **hit**, and no I/O happens. If not, it is a **miss**: the pool picks a frame, reads page 42 from disk into it, and records it in the page table. When every frame already holds a page, the pool first picks a **victim**, a page to throw out. The figure shows the picture this whole lesson builds on.\n\nIn PostgreSQL the buffer pool is `shared_buffers`, one block of shared memory (memory that several processes can all read and write) used by every **backend**, the process PostgreSQL starts for each client connection. The default is 128 MB: 16,384 frames of 8 KB. `EXPLAIN (ANALYZE)` (lesson 7 reads it in full) reports, for each step of a plan, `shared hit` for pages found in the pool and `shared read` for misses. PostgreSQL 18 shows these by default.\n\nWhy not skip all this and let the operating system cache the file? The kernel already has a page cache (lesson 9 of the OS track), and `mmap` (lesson 7 of the OS track) can map a file straight into memory so that the kernel loads pages on demand. Some systems lean on that: Bitcask from lesson 1 does, and PostgreSQL partly does, as the last section shows. But the database knows things the kernel doesn't. It knows which pages a query is using right now. It knows that a changed page must not reach the disk before the log record describing the change (lesson 6). It knows that a big scan's pages won't be read again. A 2022 paper by Crotty, Leis and Pavlo lists what goes wrong when a database leaves these decisions to the kernel through `mmap`: the kernel can write a changed page back at any moment, any memory access can stall on a page fault (the CPU stopping the thread while the kernel loads the missing page), I/O errors arrive as signals, and eviction slows down under pressure. In their tests `mmap` was 2 to 20 times slower than direct I/O (reading files without the kernel's page cache) once memory filled up.\n\nSo the database runs its own pool, and each frame carries a little bookkeeping: a pin count, a dirty flag and a usage count. The next three sections add them one at a time.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"A buffer pool: a page table maps page ids to four frames; each frame holds one page with a pin count, a dirty flag and a usage count; misses read pages in from disk and dirty victims are written back.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"120\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"42\" text-anchor=\"middle\">page table</text><text class=\"t-s t-code\" x=\"105\" y=\"66\" text-anchor=\"middle\">page 10: frame 0</text><text class=\"t-s t-code\" x=\"105\" y=\"86\" text-anchor=\"middle\">page 11: frame 1</text><text class=\"t-s t-code\" x=\"105\" y=\"106\" text-anchor=\"middle\">page 12: frame 2</text><text class=\"t-s t-code\" x=\"105\" y=\"126\" text-anchor=\"middle\">page 13: frame 3</text><line class=\"ln\" x1=\"192\" y1=\"80\" x2=\"226\" y2=\"80\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"230\" y=\"20\" width=\"100\" height=\"120\" rx=\"8\"/><text class=\"t-s t-m\" x=\"280\" y=\"40\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"280\" y=\"62\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"280\" y=\"84\" text-anchor=\"middle\">pin 0</text><text class=\"t-s t-code t-b\" x=\"280\" y=\"104\" text-anchor=\"middle\">dirty yes</text><text class=\"t-s t-code\" x=\"280\" y=\"124\" text-anchor=\"middle\">usage 1</text><rect class=\"box\" x=\"340\" y=\"20\" width=\"100\" height=\"120\" rx=\"8\"/><text class=\"t-s t-m\" x=\"390\" y=\"40\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"390\" y=\"62\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"390\" y=\"84\" text-anchor=\"middle\">pin 1</text><text class=\"t-s t-code\" x=\"390\" y=\"104\" text-anchor=\"middle\">dirty no</text><text class=\"t-s t-code\" x=\"390\" y=\"124\" text-anchor=\"middle\">usage 0</text><rect class=\"box\" x=\"450\" y=\"20\" width=\"100\" height=\"120\" rx=\"8\"/><text class=\"t-s t-m\" x=\"500\" y=\"40\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"500\" y=\"62\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"500\" y=\"84\" text-anchor=\"middle\">pin 0</text><text class=\"t-s t-code\" x=\"500\" y=\"104\" text-anchor=\"middle\">dirty no</text><text class=\"t-s t-code\" x=\"500\" y=\"124\" text-anchor=\"middle\">usage 2</text><rect class=\"box\" x=\"560\" y=\"20\" width=\"100\" height=\"120\" rx=\"8\"/><text class=\"t-s t-m\" x=\"610\" y=\"40\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"610\" y=\"62\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"610\" y=\"84\" text-anchor=\"middle\">pin 0</text><text class=\"t-s t-code\" x=\"610\" y=\"104\" text-anchor=\"middle\">dirty no</text><text class=\"t-s t-code\" x=\"610\" y=\"124\" text-anchor=\"middle\">usage 1</text><rect class=\"box\" x=\"230\" y=\"186\" width=\"430\" height=\"40\" rx=\"8\"/><text class=\"t-s\" x=\"445\" y=\"211\" text-anchor=\"middle\">disk: the table&#x27;s file, pages 0, 1, 2 ... 42 ...</text><line class=\"ln\" x1=\"560\" y1=\"184\" x2=\"560\" y2=\"144\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"290\" y1=\"144\" x2=\"290\" y2=\"184\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"300\" y=\"168\" text-anchor=\"start\">dirty victim: write back</text><text class=\"t-s t-m\" x=\"572\" y=\"168\" text-anchor=\"start\">miss: read in</text></svg>",
+        "caption": "The picture for this lesson: a page table, a fixed row of frames, and per frame a pin count, a dirty flag and a usage count."
+      },
+      "try": {
+        "title": "Count hits and reads",
+        "minutes": 4,
+        "steps": [
+          "From `labs/`, start PostgreSQL with `docker compose -f env/postgres.yml up -d --wait` and open psql with `docker compose -f env/postgres.yml exec db psql -U sfz`.",
+          "Create a 200,000-row `payments` table (1,280 pages) and VACUUM it. Otherwise the first scan also writes a few status bits into every page, which PostgreSQL does the first time it reads freshly inserted rows, and the numbers get noisy.",
+          "Evict the table's pages from shared_buffers with `pg_buffercache_evict_relation` (new in PostgreSQL 18), then run the same count twice. Predict the Buffers line of each run."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "CREATE TABLE payments AS\n  SELECT g AS id, 'card-' || (g % 5000) AS card, (g % 997) * 100 AS amount_cents\n  FROM generate_series(1, 200000) g;\nVACUUM payments;\nSELECT pg_relation_size('payments') / 8192 AS pages;\n\nSELECT buffers_evicted FROM pg_buffercache_evict_relation('payments');\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM payments;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM payments;"
+        },
+        "expect": "The first run misses on every page, the second hits on every page:\n\n```text\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared read=1280\n   I/O Timings: shared read=0.151\n   ->  Seq Scan on payments (actual rows=200000.00 loops=1)\n         Buffers: shared read=1280\n...\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared hit=1280\n   ->  Seq Scan on payments (actual rows=200000.00 loops=1)\n         Buffers: shared hit=1280\n```\n\n(output trimmed). The I/O Timings line is there because the course's Compose file turns on `track_io_timing`. Notice how small the read time is: 1,280 \"reads\" in about 0.15 ms. Those pages were still in the Linux page cache inside the VM, so no SSD was involved. The last section comes back to that."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: pg_buffercache",
+          "url": "https://www.postgresql.org/docs/18/pgbuffercache.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Crotty, Leis, Pavlo: Are You Sure You Want to Use MMAP in Your DBMS? (CIDR 2022)",
+          "url": "https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "A pinned page cannot be evicted",
+      "body": "A miss can evict any frame, and that is dangerous. Query A fetches page 12 and starts reading a row at byte 8,144 of its frame. Query B misses on page 99, the pool picks page 12's frame as the victim, and reads page 99 over it. Query A's next read returns page 99's bytes as if they were its row.\n\nVersion 1 adds an `inUse` flag to each frame: set it on fetch, clear it when done, never evict a frame with the flag set. It breaks as soon as two queries use one page. A and B both fetch page 12, A finishes and clears the flag, and the frame is evicted while B is still reading it.\n\nVersion 2 is a count. `fetch` adds one to the frame's **pin count** and `unpin` takes one away. The rule is absolute: **a frame with a pin count above zero is never a victim.** Two queries reading the same hot page each hold a pin, and the page stays until both are done.\n\nThe second problem is changes. An UPDATE changes bytes in the frame, not on disk. Writing the page to disk on every change is safe and slow: a card's daily-total row updated 500 times a minute would cost 500 page writes a minute. So the pool marks the frame **dirty**, meaning it differs from disk, and writes it once, when the frame is about to be reused (lesson 6 adds the other moment, the checkpoint). The caller reports the change through `unpin(pageId, dirty = true)`. The flag is sticky: a later caller that unpins without changes must not clear it, or the earlier change is lost when the frame is reused.\n\nA pin is a lease, and leases leak. A code path that fetches a page and returns early on an error without unpinning leaves that frame pinned forever. Leak enough and every frame is pinned, so a miss has nowhere to go: your lab throws `NoFreeFrameException`, and PostgreSQL raises `no unpinned buffers available`. It is the same failure as leaking connections from a pool of 20, where nothing breaks until the 21st borrower. PostgreSQL releases a backend's pins when a query ends or fails, which is one reason you rarely see that error.\n\nA pin is not a lock. It only says \"keep this page in memory\". PostgreSQL also takes a short **content lock** on the page while it reads or changes bytes in it (shared for reading, exclusive for writing), and it must hold a pin before it may take the lock. Compacting a page, as VACUUM did in lesson 2, needs an exclusive lock and must be the only pin on the page, because compaction moves row bytes that another pinner may be reading.",
+      "try": {
+        "title": "Catch a pin in the act",
+        "minutes": 3,
+        "steps": [
+          "A cursor stops a query in the middle of its scan. Open one on `payments` and fetch three rows.",
+          "While the cursor is open, ask `pg_buffercache` which pages of `payments` are pinned. Predict: how many?",
+          "Move the cursor 300 rows on (a page holds 157 of these rows) and ask again. Then COMMIT, which closes the cursor, and count the pins once more."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "BEGIN;\nDECLARE c CURSOR FOR SELECT * FROM payments;\nFETCH 3 FROM c;\nSELECT relblocknumber, pinning_backends FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') AND pinning_backends > 0;\n\nMOVE 300 IN c;\nSELECT relblocknumber, pinning_backends FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') AND pinning_backends > 0;\nCOMMIT;\n\nSELECT count(*) AS pinned FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') AND pinning_backends > 0;"
+        },
+        "expect": "```text\n relblocknumber | pinning_backends\n----------------+------------------\n              0 |                1\n              1 |                1\n...\n relblocknumber | pinning_backends\n----------------+------------------\n              1 |                1\n              2 |                1\n...\n pinned\n--------\n      0\n```\n\nWhile the cursor sits on row 3, your backend pins page 0, which it is reading, and page 1, which PostgreSQL 18's scan has already read ahead. After 300 more rows the pins have moved to pages 1 and 2. COMMIT closes the cursor and every pin is released."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL source: the buffer manager README (pins, content locks, clock sweep)",
+          "url": "https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/buffer/README",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "CLOCK picks a victim without tracking exact recency",
+      "body": "When a miss finds no free frame, which page should leave? A good choice keeps the pages that will be read again soon. A bad one throws out the top page of an index that every query reads, and the next query reads it straight back.\n\nVersion 1 picks a random unpinned frame. It is cheap and, sooner or later, evicts the hottest page in the pool. Version 2 is first in, first out: evict the page that was loaded longest ago. That is exactly the index's top page, loaded at startup and used ever since.\n\nVersion 3 is **LRU**, least recently used: evict the page whose last use is oldest. That is the right idea and an expensive implementation. A real LRU keeps all frames in a list ordered by last use, so every hit moves a frame to the front of the list. Every read becomes a write to one shared structure, and with dozens of cores hitting the cache, the lock on that list is where they all queue.\n\nVersion 4, **CLOCK**, gets most of LRU's benefit at a fraction of the cost. Picture the frames on a clock face with one hand. A hit only marks its own frame as recently used. When a victim is needed, the hand moves frame by frame: a marked frame gets its mark removed and a second chance, and the first unmarked frame is the victim. PostgreSQL's **clock sweep** replaces the single mark with a small counter:\n\n- Each frame has a **usage count**. Loading a page sets it to 1, and every pin adds 1, up to a cap of 5.\n- To find a victim, the hand moves on from where it last stopped. It skips pinned frames without touching them. An unpinned frame with a count above 0 loses one, and the hand moves on. The first unpinned frame at 0 is the victim, and the hand stops just past it.\n- If the hand passes every frame and finds only pinned ones, PostgreSQL gives up with `no unpinned buffers available`.\n\nA hit costs one counter update on the frame itself. PostgreSQL packs a buffer's pin count, usage count and flags into one 32-bit word and updates it with a compare-and-swap, the same operation as `AtomicInteger.compareAndSet`, so a hit takes no lock at all. Pages used often build up credits and survive several sweeps; pages touched once drain to 0 and leave first. The cap keeps that fair: without it, a page read a million times this morning would need a million sweeps to leave this afternoon.\n\nBefore the victim's frame is reused, a dirty page is written back to disk, exactly once. A clean one is simply dropped, since the disk already has the same bytes. The stepper runs one sweep with PostgreSQL's rules, and the lab asks you to build it.",
+      "stepper": {
+        "title": "The clock hand finds a victim",
+        "intro": "Four frames, PostgreSQL's rules: usage counts, pins and one hand. Use Next and Back, or the arrow keys.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Four frames hold pages 10 to 13; the hand points at frame 0.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">miss: page 50 is not in the page table</text><rect class=\"box\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 2  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><path class=\"box-a\" d=\"M100 74 L91 58 L109 58 Z\"/><text class=\"t-s t-a\" x=\"100\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s\" x=\"30\" y=\"210\" text-anchor=\"start\">every frame holds a page, so the clock hand has to find a victim</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "`fetch(50)` misses: page 50 is not in the page table, and there is no free frame. The clock hand points at frame 0, where it stopped last time. Frame 1 is pinned: someone is reading page 11 right now."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Frame 0&#x27;s usage count drops from 1 to 0 and the hand moves to frame 1.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">sweeping</text><rect class=\"box-a\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code t-a\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 2  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><path class=\"box-a\" d=\"M260 74 L251 58 L269 58 Z\"/><text class=\"t-s t-a\" x=\"260\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 0: unpinned, usage 1, so take one credit (1 to 0) and move on</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "Frame 0 is unpinned but its usage count is 1, so it gets a second chance: the hand lowers the count to 0 and moves on."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Frame 1 is pinned, so the hand skips it without touching it.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">sweeping</text><rect class=\"box\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box-b\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 2  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><path class=\"box-a\" d=\"M420 74 L411 58 L429 58 Z\"/><text class=\"t-s t-a\" x=\"420\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 1: pinned, so skip it and leave its usage count alone</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "Frame 1 is pinned. The hand skips it and does not touch its usage count. A pinned page can never be the victim, however long ago it was used."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Frame 2&#x27;s usage count drops from 2 to 1.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">sweeping</text><rect class=\"box\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box-a\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code t-a\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><path class=\"box-a\" d=\"M580 74 L571 58 L589 58 Z\"/><text class=\"t-s t-a\" x=\"580\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 2: usage 2, so 2 to 1, move on</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "Frame 2 holds page 12, which has been used more often. Its count drops from 2 to 1. It will survive this sweep and the next pass too."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Frame 3&#x27;s usage count drops to 0 and the hand wraps back to frame 0.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">sweeping</text><rect class=\"box\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><rect class=\"box-a\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code t-a\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><path class=\"box-a\" d=\"M100 74 L91 58 L109 58 Z\"/><text class=\"t-s t-a\" x=\"100\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 3: usage 1, so 1 to 0, and the hand wraps around</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "Frame 3 drops from 1 to 0, and the hand wraps around to frame 0. Notice what the hand needs at each step: one frame and one counter. It never sorts anything."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Frame 0 is unpinned with usage 0, so it is the victim; its dirty page 10 is written to disk first.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">victim found</text><rect class=\"box-bad\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 10</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><text class=\"t-s t-b\" x=\"100\" y=\"168\" text-anchor=\"middle\">dirty</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><path class=\"box-a\" d=\"M260 74 L251 58 L269 58 Z\"/><text class=\"t-s t-a\" x=\"260\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s t-bad\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 0: unpinned, usage 0: the victim. It is dirty, so write page 10 to disk first</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  10:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "Back at frame 0: unpinned and usage 0, so it is the victim. Page 10 is dirty (someone changed it in memory), so the pool writes it to disk before reusing the frame. A clean page would just be dropped. The hand moves on to frame 1."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"Page 50 is read into frame 0 with pin 1 and usage 1, and the page table now maps 50 to frame 0.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(50)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">loaded</text><rect class=\"box-a\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t t-a\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 50</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 1  pin 1</text><text class=\"t-s t-m\" x=\"100\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 1  pin 0</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><path class=\"box-a\" d=\"M260 74 L251 58 L269 58 Z\"/><text class=\"t-s t-a\" x=\"260\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s t-a\" x=\"30\" y=\"210\" text-anchor=\"start\">read page 50 from disk into frame 0: pin 1, usage 1, clean</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  50:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "The pool reads page 50 into frame 0, pins it for the caller, sets its usage count to 1 and updates the page table: 10 is gone, 50 maps to frame 0. `fetch` returns the frame. The caller must `unpin` it when done."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 248\" role=\"img\" aria-label=\"fetch(12) is a hit: frame 2&#x27;s pin and usage count go up by one and the hand does not move.\"><text class=\"t t-code\" x=\"30\" y=\"26\" text-anchor=\"start\">fetch(12)</text><text class=\"t-s t-m\" x=\"150\" y=\"26\" text-anchor=\"start\">hit: no disk I/O</text><rect class=\"box\" x=\"30\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"100\" text-anchor=\"middle\">frame 0</text><text class=\"t\" x=\"100\" y=\"124\" text-anchor=\"middle\">page 50</text><text class=\"t-s t-code\" x=\"100\" y=\"146\" text-anchor=\"middle\">usage 1  pin 1</text><text class=\"t-s t-m\" x=\"100\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"190\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"260\" y=\"100\" text-anchor=\"middle\">frame 1</text><text class=\"t\" x=\"260\" y=\"124\" text-anchor=\"middle\">page 11</text><text class=\"t-s t-code\" x=\"260\" y=\"146\" text-anchor=\"middle\">usage 0  pin 1</text><text class=\"t-s t-m\" x=\"260\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box-ok\" x=\"350\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"420\" y=\"100\" text-anchor=\"middle\">frame 2</text><text class=\"t\" x=\"420\" y=\"124\" text-anchor=\"middle\">page 12</text><text class=\"t-s t-code t-ok\" x=\"420\" y=\"146\" text-anchor=\"middle\">usage 2  pin 1</text><text class=\"t-s t-m\" x=\"420\" y=\"168\" text-anchor=\"middle\">pinned</text><rect class=\"box\" x=\"510\" y=\"80\" width=\"140\" height=\"100\" rx=\"8\"/><text class=\"t-s t-m\" x=\"580\" y=\"100\" text-anchor=\"middle\">frame 3</text><text class=\"t\" x=\"580\" y=\"124\" text-anchor=\"middle\">page 13</text><text class=\"t-s t-code\" x=\"580\" y=\"146\" text-anchor=\"middle\">usage 0  pin 0</text><path class=\"box-a\" d=\"M260 74 L251 58 L269 58 Z\"/><text class=\"t-s t-a\" x=\"260\" y=\"50\" text-anchor=\"middle\">hand</text><text class=\"t-s t-ok\" x=\"30\" y=\"210\" text-anchor=\"start\">frame 2 already holds page 12: pin it and add one to its usage count</text><text class=\"t-s t-code\" x=\"30\" y=\"234\" text-anchor=\"start\">page table:  50:f0  11:f1  12:f2  13:f3</text></svg>",
+            "say": "`fetch(12)` is a hit. The page table finds frame 2, the pool adds a pin and one usage credit, and no disk I/O happens. The hand doesn't move: it only sweeps when a frame is needed. That cheap hit path is why databases use CLOCK instead of a strict LRU list."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch usage counts climb to 5",
+        "minutes": 4,
+        "steps": [
+          "Look at the usage counts of the `payments` pages now. Predict: what number, after one read and one hit?",
+          "Run the count once more and look again. Then run it four more times and look a third time.",
+          "Look at the whole pool with `pg_buffercache_usage_counts()`. How many of the 16,384 buffers are still unused (usage 0, not dirty, not pinned)?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "SELECT usagecount, count(*) AS buffers FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') GROUP BY 1 ORDER BY 1;\n\nSELECT count(*) FROM payments \\g /dev/null\nSELECT usagecount, count(*) AS buffers FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') GROUP BY 1 ORDER BY 1;\n\n-- four more times, then look again\nSELECT count(*) FROM payments \\g /dev/null\nSELECT count(*) FROM payments \\g /dev/null\nSELECT count(*) FROM payments \\g /dev/null\nSELECT count(*) FROM payments \\g /dev/null\nSELECT usagecount, count(*) AS buffers FROM pg_buffercache\nWHERE relfilenode = pg_relation_filenode('payments') GROUP BY 1 ORDER BY 1;\n\nSELECT * FROM pg_buffercache_usage_counts();"
+        },
+        "expect": "```text\n usagecount | buffers\n------------+---------\n          2 |    1277\n          3 |       3\n\n usagecount | buffers\n------------+---------\n          3 |    1277\n          4 |       3\n\n usagecount | buffers\n------------+---------\n          5 |    1280\n```\n\nOne read set each count to 1, the hit made it 2, and each scan adds 1 until the cap of 5. The three pages at one higher are the ones the cursor in the previous Try it pinned again. In `pg_buffercache_usage_counts()` most of the pool shows usage 0 (about 14,800 buffers here): unused frames that a miss can take without evicting anything. Your exact numbers depend on what else ran."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL source: buf_internals.h (the 32-bit buffer state, BM_MAX_USAGE_COUNT = 5)",
+          "url": "https://github.com/postgres/postgres/blob/REL_18_STABLE/src/include/storage/buf_internals.h",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Big scans get a small ring of buffers",
+      "body": "One sequential scan can wreck all of this. A report that reads a 60 GB settlements table touches 7.8 million pages exactly once each. Under LRU, every one of them is briefly the most recently used page in the pool, so within seconds the pages your payment API reads all day are gone, and every API call misses. This is **sequential flooding**. CLOCK alone doesn't stop it: millions of misses push the hand round the pool again and again, a page at the full count of 5 is gone after five passes, and a big scan makes those passes quickly.\n\nPostgreSQL's answer is a **ring buffer**. A sequential scan of a table bigger than a quarter of `shared_buffers` doesn't take frames from the whole pool. It gets a small private ring of buffers and keeps reusing them, so the rest of the pool doesn't notice the scan. The buffer manager's README gives 256 KB for scans. In PostgreSQL 18 the code starts there and enlarges the ring to fit the asynchronous reads it keeps in flight, up to a per-backend limit on pins; in the Try it the ring comes to 94 pages, about 750 KB, for a 7,680-page scan. VACUUM gets its own ring (sized by `vacuum_buffer_usage_limit`), and bulk writes such as `COPY` get 16 MB. Only these operations use a ring. An index scan that walks a huge range goes through the normal pool and can still push hot pages out.",
+      "try": {
+        "title": "Scan 60 MB without flushing the cache",
+        "minutes": 5,
+        "steps": [
+          "Create a 60 MB `settlements` table (7,680 pages, nearly half of the 128 MB pool and well over a quarter of it). Evict its pages so the scan starts cold.",
+          "Turn off parallel workers for this session, so one process does the scan with one ring. Make sure `payments` is fully cached by counting it once.",
+          "Scan `settlements`, then count how many pages of each table are in the pool. Predict both numbers first."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "CREATE TABLE settlements AS\n  SELECT g AS id, 'batch-' || (g % 365) AS batch, g % 100000 AS amount_cents\n  FROM generate_series(1, 1200000) g;\nVACUUM settlements;\nSELECT pg_size_pretty(pg_relation_size('settlements')) AS size, pg_relation_size('settlements') / 8192 AS pages;\nSELECT buffers_evicted FROM pg_buffercache_evict_relation('settlements');\n\nSET max_parallel_workers_per_gather = 0;\nSELECT count(*) FROM payments;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM settlements;\n\nSELECT c.relname, count(b.bufferid) AS cached_pages\nFROM pg_class c\nLEFT JOIN pg_buffercache b ON b.relfilenode = pg_relation_filenode(c.oid) AND b.relforknumber = 0\nWHERE c.relname IN ('payments', 'settlements')\nGROUP BY c.relname ORDER BY c.relname;"
+        },
+        "expect": "The scan reads all 7,680 pages, yet almost none of them stay, and `payments` loses nothing:\n\n```text\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared read=7680\n...\n   relname   | cached_pages\n-------------+--------------\n payments    |         1280\n settlements |           94\n```\n\n(output trimmed). 94 pages is the ring. With parallel workers on, each of the three processes gets its own ring, and about 280 pages stay. Try the same scan on a table under a quarter of the pool, like `payments`, and every page stays cached. Leave the database running for the last Try it."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL source: the buffer manager README (ring buffers for scans, VACUUM and bulk writes)",
+          "url": "https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/buffer/README",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "The OS caches the same pages again, and PostgreSQL 18 starts reading ahead itself",
+      "body": "PostgreSQL reads its files with ordinary system calls, so every page passes through the kernel's page cache (lesson 9 of the OS track) on its way into `shared_buffers`, as the figure shows. One page can sit in both caches. That is deliberate. The docs suggest about 25% of RAM for `shared_buffers` and say more than 40% is unlikely to help, because PostgreSQL also relies on the OS cache. It also means a `shared read` in EXPLAIN is a system call, not necessarily a trip to the SSD: in the first Try it, 1,280 \"reads\" took 0.15 ms in total.\n\nMost engines skip the kernel's copy. They open their data files with `O_DIRECT`, from the same OS lesson, so reads go straight from the device into the buffer pool and the page cache never holds them. MySQL 8.4 does this for InnoDB by default on Linux (`innodb_flush_method` is `O_DIRECT` where the system supports it). The pool can then take most of the RAM, and nothing is cached twice. Facebook's MyRocks paper gives another reason: with buffered I/O, the Linux kernel spent 2 to 3 GB of its own memory per terabyte of RocksDB files, and direct I/O cut that by over 80%. The price is that the engine must now do what the kernel did for it: read ahead, merge neighbouring reads, and keep many reads waiting on the drive at once.\n\nPostgreSQL 18 (September 2025) took the first step. Its asynchronous I/O lets a backend queue reads for the pages it will need soon and work on the ones that have arrived. `io_method` picks who performs them. `worker`, the default, hands them to I/O worker processes (`io_workers`, 3 by default). `io_uring` uses Linux's io_uring (lesson 11 of the OS track) when PostgreSQL is built with it, as the Docker image is. `sync` is the old path, one read at a time. It covers reads only, such as sequential scans, bitmap heap scans and VACUUM; writes stay synchronous. PostgreSQL does have an `O_DIRECT` switch, `debug_io_direct`, but its docs say it currently reduces performance and is meant for developer testing. Andy Pavlo's review of 2025 calls PostgreSQL the only major database system still relying on the OS page cache, and the new subsystem the start of its path away from it.\n\nHow much it helps depends on how long each read waits. pganalyze timed a cold `SELECT count(*)` of a 3.5 GB table on AWS network storage (io2 EBS at 20,000 IOPS): 15.1 s with `sync`, 10.1 s with `worker` and 5.7 s with `io_uring`. On a laptop the gap is smaller, because the scan is mostly CPU work: in the Try it, `worker` beat `sync` by about a fifth. And in Docker you can't try `io_uring` at all. Docker's default seccomp profile blocks its system calls, and PostgreSQL refuses to start with `FATAL: could not setup io_uring queue: Operation not permitted`.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 290\" role=\"img\" aria-label=\"A page read travels from the SSD into the OS page cache and then into shared_buffers, so it can be cached twice.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"220\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"47\" text-anchor=\"middle\">your query</text><text class=\"t-s t-m\" x=\"262\" y=\"47\" text-anchor=\"start\">SELECT count(*) FROM payments</text><rect class=\"box-a\" x=\"20\" y=\"84\" width=\"220\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"111\" text-anchor=\"middle\">shared_buffers</text><text class=\"t-s t-m\" x=\"262\" y=\"111\" text-anchor=\"start\">hit: no system call at all</text><rect class=\"box-b\" x=\"20\" y=\"148\" width=\"220\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"175\" text-anchor=\"middle\">OS page cache</text><text class=\"t-s t-m\" x=\"262\" y=\"175\" text-anchor=\"start\">&quot;read&quot; in EXPLAIN: a pread() the kernel may serve from here</text><rect class=\"box\" x=\"20\" y=\"212\" width=\"220\" height=\"44\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"239\" text-anchor=\"middle\">SSD</text><text class=\"t-s t-m\" x=\"262\" y=\"239\" text-anchor=\"start\">a real device read, about 100 µs on NVMe</text><line class=\"ln\" x1=\"130\" y1=\"82\" x2=\"130\" y2=\"66\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"130\" y1=\"146\" x2=\"130\" y2=\"130\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"130\" y1=\"210\" x2=\"130\" y2=\"194\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"130\" y=\"278\" text-anchor=\"middle\">a page read once can sit in both caches</text></svg>",
+        "caption": "A page read travels from the SSD through the OS page cache into shared_buffers, so PostgreSQL can hold one page in two caches."
+      },
+      "try": {
+        "title": "Scan cold with worker, then with sync",
+        "minutes": 6,
+        "steps": [
+          "In the same psql session, create a 731 MB table of 10 million rows (about 15 seconds), VACUUM it and run a CHECKPOINT so its pages are clean on disk.",
+          "Run the rest of the block. It checks `io_method`, drops the table from shared_buffers, asks the kernel to drop the file from its page cache (`dd ... iflag=nocache count=0`, run inside the container through `\\!`), then scans twice: cold, and with the kernel's copy warm. Note `I/O Timings` and `Execution Time`.",
+          "Switch to `sync`: run `ALTER SYSTEM SET io_method = 'sync';`, quit psql, restart with `docker compose -f env/postgres.yml restart db`, open psql again and run the block from `SHOW io_method` on. Predict which cold scan is slower, and what happens to `I/O Timings`.",
+          "Put the default back with `ALTER SYSTEM RESET io_method;` and one more restart. When you are done with this lesson, stop and delete the database: `docker compose -f env/postgres.yml down -v`."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql",
+          "src": "CREATE TABLE scan_me AS\n  SELECT g AS id, g % 1000 AS merchant_id, (g % 997) * 100 AS amount_cents, md5(g::text) AS ref\n  FROM generate_series(1, 10000000) g;\nVACUUM scan_me;\nCHECKPOINT;\n\nSHOW io_method;\nSET max_parallel_workers_per_gather = 0;\nSELECT pg_relation_filepath('scan_me') AS f \\gset\n\\setenv F :f\nSELECT buffers_evicted FROM pg_buffercache_evict_relation('scan_me');\n\\! dd if=/var/lib/postgresql/18/docker/$F iflag=nocache count=0 status=none\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM scan_me;\nEXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*) FROM scan_me;"
+        },
+        "expect": "With the default, `worker` (output trimmed):\n\n```text\n io_method\n-----------\n worker\n\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared read=93504\n   I/O Timings: shared read=17.256\n   ->  Seq Scan on scan_me (actual rows=10000000.00 loops=1)\n Execution Time: 410.554 ms\n\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared hit=94 read=93410\n   I/O Timings: shared read=2.927\n Execution Time: 359.428 ms\n```\n\nAfter the switch to `sync`:\n\n```text\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared read=93504\n   I/O Timings: shared read=167.578\n Execution Time: 497.747 ms\n\n Aggregate (actual rows=1.00 loops=1)\n   Buffers: shared hit=94 read=93410\n   I/O Timings: shared read=83.308\n Execution Time: 378.184 ms\n```\n\nCold, `worker` took 370 to 410 ms in our runs and `sync` 460 to 500 ms. Under `sync` the backend waits for every read itself, 130 to 170 ms in all. Under `worker` its own I/O time is a few milliseconds, because the I/O workers did the waiting ahead of it, so under asynchronous I/O EXPLAIN understates how much reading happened. Warm, the kernel serves every read from its cache and the scan is CPU work, counting 10 million rows. The 94 hits are the ring left by the previous scan. Docker's virtual disk on a laptop is fast; on network storage the cold gap grows, as pganalyze measured. Your times differ."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Resource consumption (shared_buffers, io_method, io_workers)",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-resource.html",
+          "kind": "docs"
+        },
+        {
+          "title": "pganalyze: PostgreSQL 18 asynchronous I/O, measured",
+          "url": "https://pganalyze.com/blog/postgres-18-async-io",
+          "kind": "read"
+        },
+        {
+          "title": "Matsunobu, Dong, Lee: MyRocks, LSM-tree database storage engine serving Facebook's social graph (PVLDB 2020)",
+          "url": "https://www.vldb.org/pvldb/vol13/p3217-matsunobu.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Andy Pavlo: Databases in 2025, a year in review",
+          "url": "https://www.cs.cmu.edu/~pavlo/blog/2026/01/2025-databases-retrospective.html",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Think of a car park with a fixed number of spaces and an attendant who walks the rows in a loop. Each car carries a few stamps on its windscreen: one when it arrives, one more each time its owner comes back, never more than five. When a new car arrives and the park is full, the attendant walks on from where he last stopped, scrapes one stamp off each car he passes, and tows the first car with no stamps left. He skips any car with its owner sitting inside (a pin), and if a car has shopping in the boot (dirty), the shopping goes into storage before the car leaves. The analogy breaks at the tow: losing a car is a loss, but evicting a clean page loses nothing, because the disk still holds the same bytes.",
+  "in_your_world": "You already manage a pool with these rules: HikariCP with 20 connections. Borrowing a connection is a pin, returning it is an unpin, and a code path that forgets to close one leaks it until the 21st borrower times out. HikariCP's `leakDetectionThreshold` exists for the same reason PostgreSQL releases a backend's pins when a query ends. Oracle's buffer cache (sized by `DB_CACHE_SIZE`) is the same structure as `shared_buffers`. For the payment database, the lesson says where cache trouble comes from: the hot set is today's authorizations and card limits, and the month-end settlement job is the flood. If that job does a sequential scan, the ring protects you. If it walks a huge index range instead, it goes through the normal pool and can push today's pages out, which shows up as a sudden rise in `shared read` on the authorization queries.",
+  "mistake": "The common mistake is giving `shared_buffers` most of the machine's RAM on the theory that a bigger cache is always faster. PostgreSQL reads through the OS page cache, so a 48 GB pool on a 64 GB server leaves little room for the OS cache, for `work_mem` sorts and for connections, and many pages end up cached twice anyway. The docs suggest starting at about 25% of RAM and say more than 40% is unlikely to work better. Measure the hit ratio and the `shared read` counts in EXPLAIN before you change it.",
+  "compare": {
+    "title": "LRU vs CLOCK on a cache hit",
+    "a": {
+      "label": "LRU",
+      "lang": "kotlin",
+      "title": "every hit reorders a list",
+      "src": "// accessOrder = true: get() moves the entry to the end\nval lru = LinkedHashMap<Int, Frame>(16, 0.75f, true)\n\nfun hit(pageId: Int): Frame? = synchronized(lru) {\n    lru[pageId]                      // a write to the shared list on every read\n}\n\nfun victim(): Frame = synchronized(lru) {\n    lru.values.first { it.pinCount == 0 }   // least recently used, unpinned\n}"
+    },
+    "b": {
+      "label": "CLOCK",
+      "lang": "kotlin",
+      "title": "a hit bumps one counter",
+      "src": "fun hit(f: Frame) {\n    f.pinCount++\n    f.usageCount = minOf(f.usageCount + 1, 5)   // touches only this frame\n}\n\nfun victim(): Frame {                        // the lab adds a give-up rule\n    while (true) {\n        val f = frames[hand]\n        hand = (hand + 1) % frames.size\n        if (f.pinCount > 0) continue\n        if (f.usageCount == 0) return f\n        f.usageCount--\n    }\n}"
+    },
+    "note": "LRU evicts by exact recency, but it pays for that on every hit: the shared list changes on each read, under one lock. CLOCK pays on misses instead: the hand does a little work only when a frame is needed, and a hit touches nothing but its own frame. Databases read far more often than they evict, so that trade wins. PostgreSQL goes further and updates the pin and usage counts with one atomic compare-and-swap, so a hit takes no lock at all."
+  },
+  "worked": {
+    "title": "Find out what is in shared_buffers and how well it works",
+    "steps": [
+      {
+        "say": "Start with what the pool holds. This query from the pg_buffercache docs counts buffers per relation in the current database. Here, `payments` fills 1,280 buffers (all its pages) and `settlements` holds only its 94-page ring.",
+        "code": "SELECT n.nspname, c.relname, count(*) AS buffers\nFROM pg_buffercache b JOIN pg_class c\n     ON b.relfilenode = pg_relation_filenode(c.oid) AND\n        b.reldatabase IN (0, (SELECT oid FROM pg_database WHERE datname = current_database()))\nJOIN pg_namespace n ON n.oid = c.relnamespace\nGROUP BY n.nspname, c.relname\nORDER BY 3 DESC\nLIMIT 5;",
+        "lang": "postgresql"
+      },
+      {
+        "say": "Then measure how often reads hit. `pg_statio_user_tables` counts heap pages found in the pool (`heap_blks_hit`) and pages that had to be read (`heap_blks_read`) since the statistics were last reset.",
+        "code": "SELECT relname, heap_blks_read, heap_blks_hit,\n       round(100.0 * heap_blks_hit / nullif(heap_blks_hit + heap_blks_read, 0), 1) AS hit_pct\nFROM pg_statio_user_tables ORDER BY heap_blks_read + heap_blks_hit DESC;",
+        "lang": "postgresql"
+      },
+      {
+        "say": "Read the result with the lesson in mind. `payments` hits about 91% after one cold read and a few warm scans. `settlements` sits at about 57% here, and that number includes building and vacuuming the table; its big scans read through a ring, so its own pages are expected to miss.",
+        "code": "   relname   | heap_blks_read | heap_blks_hit | hit_pct\n-------------+----------------+---------------+---------\n settlements |          13312 |         17286 |    56.5\n payments    |           1280 |         12781 |    90.9",
+        "lang": "text"
+      },
+      {
+        "say": "Decide what a low ratio means before you touch `shared_buffers`. A low ratio on a table your API reads by key means its working set doesn't fit, or something keeps flushing it (look for big index range scans). A low ratio on a table that is mostly scanned in bulk is normal. And a \"read\" may still have come from the OS page cache, so check the I/O timings in `EXPLAIN (ANALYZE)` before you conclude the disk is slow.",
+        "code": "",
+        "lang": ""
+      }
+    ]
+  },
+  "lab": {
+    "title": "Build a buffer pool with pins and a clock sweep",
+    "minutes": 15,
+    "files": [
+      "labs/internals/src/main/kotlin/sfz/store/l03/BufferPool.kt",
+      "labs/internals/src/main/kotlin/sfz/store/l03/DiskManager.kt"
+    ],
+    "run": "./gradlew :internals:test --tests 'sfz.store.l03.*'",
+    "steps": [
+      "Read `DiskManager.kt`: it is complete, with an interface the tests fake in memory and a `FileDiskManager` over a real file. Then read the `Frame` class at the top of `BufferPool.kt`.",
+      "Run the tests once. All 13 fail.",
+      "Write `victim()`: take a frame from `free` if there is one; otherwise sweep with `hand` using PostgreSQL's rules from the stepper, giving up after `capacity` pinned frames in a row.",
+      "Write `fetch`: on a hit, pin and add one usage (cap `MAX_USAGE`). On a miss, get a victim, write its old page back if dirty, remove it from the page table, read the new page and load the frame (pin 1, usage 1, clean).",
+      "Write `unpin` (dirty is sticky), `newPage` (victim first, then `disk.allocatePage()`, zeroed, pinned, dirty) and `flushAll`.",
+      "Run the tests until all 13 pass. The CLOCK tests check exact victims, so trace the stepper if one fails."
+    ],
+    "hints": [
+      "A private `evict(frame)` helper that writes back a dirty page and removes it from the page table keeps `fetch` and `newPage` short.",
+      "Move the hand forward on every step, including the step that picks the victim, so the next sweep starts just past it. The test \"pattern 1,2,3,1,4 evicts page 2\" also checks where the next sweep starts.",
+      "In `newPage`, call `victim()` before `disk.allocatePage()`. If every frame is pinned, the exception must leave the disk untouched.",
+      "`DiskManager` always copies all 4,096 bytes regardless of the buffer's position, so pass `frame.data` as it is. To zero a frame, fill `frame.data.array()` with 0."
+    ],
+    "done_when": "All 13 tests in `BufferPoolTest` pass."
+  },
+  "drill": {
+    "title": "Write the clock sweep from memory",
+    "minutes": 4,
+    "prompt": "Close the lab. Write `fun victim(): Frame` for a pool with `frames`, `hand` and per-frame `pinCount` and `usageCount`, following PostgreSQL's rules, including the rule that gives up when every frame is pinned. Then answer: why does a pinned frame keep its usage count?",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun victim(): Frame {\n    var tries = frames.size                  // pinned frames we may pass in a row\n    while (true) {\n        val f = frames[hand]\n        hand = (hand + 1) % frames.size      // always move on, even past the victim\n        if (f.pinCount == 0) {\n            if (f.usageCount == 0) return f  // unpinned and out of credit: evict it\n            f.usageCount--                   // second chance, one credit less\n            tries = frames.size\n        } else if (--tries == 0) {\n            throw NoFreeFrameException()     // a whole lap of pinned frames\n        }\n    }\n}\n\n// A pinned page is in use right now, so it is the opposite of a good victim.\n// Taking its credits away would make it leave sooner the moment it is unpinned."
+    }
+  },
+  "recap": [
+    "A buffer pool is a fixed set of page-sized frames plus a page table. A hit costs no I/O; a miss reads the page into a frame chosen by the eviction policy.",
+    "`fetch` pins and `unpin` releases. A pinned frame is never evicted, and leaked pins exhaust the pool the way leaked connections exhaust a connection pool.",
+    "`unpin(dirty = true)` marks the page dirty, and the flag is sticky. A dirty victim is written back exactly once before its frame is reused; a clean one is dropped.",
+    "PostgreSQL's clock sweep keeps a usage count per buffer (1 on load, +1 per pin, capped at 5). The hand skips pinned buffers, decrements the others, and evicts the first unpinned buffer at 0.",
+    "Sequential scans of tables bigger than a quarter of `shared_buffers` use a small ring, so they don't flush the hot set. Index range scans don't get a ring.",
+    "PostgreSQL reads through the OS page cache, so pages can be cached twice: start `shared_buffers` near 25% of RAM. InnoDB and RocksDB use `O_DIRECT` instead, and PostgreSQL 18's asynchronous reads (`io_method = worker` by default; Docker blocks `io_uring`) are its first step that way."
+  ],
+  "quiz": [
+    {
+      "q": "A pool has three frames holding page 7 (usage 3, unpinned), page 8 (usage 0, pinned) and page 9 (usage 1, unpinned), in that order, and the hand points at page 7's frame. `fetch(20)` misses. Which page is evicted?",
+      "options": [
+        "Page 7, because the hand starts there",
+        "Page 8, because its usage count is already 0",
+        "Page 9, on the hand's second pass",
+        "None: the pool throws because one frame is pinned"
+      ],
+      "answer": 2,
+      "why": "Pass 1: page 7 goes 3 to 2, page 8 is skipped because it is pinned, page 9 goes 1 to 0. Pass 2: page 7 goes 2 to 1, page 8 is skipped again, page 9 is unpinned at 0, so it is the victim. Page 8's count of 0 doesn't matter while it is pinned, and the pool only gives up when every frame it passes is pinned."
+    },
+    {
+      "q": "A handler fetches a page, and on a validation error it returns early without calling `unpin`. It works in every test. What happens in production?",
+      "options": [
+        "Nothing: the pool evicts the page anyway when it needs the frame",
+        "Each error leaves one more frame pinned, until a miss finds no unpinned frame and fails",
+        "The page is marked dirty and written to disk on every sweep",
+        "The usage count overflows and the page is evicted first"
+      ],
+      "answer": 1,
+      "why": "A pinned frame is never a victim, so every leaked pin removes a frame from the pool for good. Under a steady trickle of errors the pool shrinks until a miss can't get a frame: `NoFreeFrameException` in the lab, `no unpinned buffers available` in PostgreSQL. It is the connection-leak pattern, and tests with few errors never reach the limit."
+    },
+    {
+      "q": "On PostgreSQL 18 with the default `io_method = worker`, a cold sequential scan shows `Buffers: shared read=93504` and `I/O Timings: shared read=17.3` (milliseconds), and takes 410 ms. With `io_method = sync`, the same cold scan shows 168 ms of I/O time. Why is the I/O time so small under `worker`?",
+      "options": [
+        "The pages came from the OS page cache, so no device read happened",
+        "The scan used io_uring, which reports no I/O time",
+        "The ring buffer kept the table's pages in shared_buffers",
+        "I/O worker processes read the pages ahead of the scan, and EXPLAIN counts only the time the backend itself waited"
+      ],
+      "answer": 3,
+      "why": "Under asynchronous I/O the backend queues reads and the I/O workers carry them out, so a page has usually arrived by the time the scan needs it. The backend waited 17 ms in all, and EXPLAIN reports only that wait, which understates the reading done. The OS cache is the tempting answer, but the scan was cold, as the sync run's 168 ms shows. The default is worker, not io_uring, and `shared read=93504` says every page missed shared_buffers."
+    },
+    {
+      "q": "shared_buffers is 16 GB. A nightly job runs `SELECT sum(amount_cents) FROM settlements` with a sequential scan over a 300 GB table. What happens to the hot pages of the payments table?",
+      "options": [
+        "Almost all stay cached: the scan reuses a small ring of buffers",
+        "All of them are evicted, because the scan reads 300 GB through a 16 GB cache",
+        "Half of them are evicted, because the scan may use half of shared_buffers",
+        "The scan bypasses shared_buffers and reads straight from the OS page cache"
+      ],
+      "answer": 0,
+      "why": "The table is bigger than a quarter of shared_buffers, so the sequential scan gets a ring buffer and keeps recycling the same few hundred pages. It still goes through shared_buffers, just a tiny part of it. Without the ring, the second option is what LRU-style eviction would do."
+    },
+    {
+      "q": "From lesson 2: VACUUM wants to compact a heap page while another backend has the page pinned and is reading a row from it. Why must VACUUM wait until it holds the only pin?",
+      "options": [
+        "Because compaction renumbers the slots, so the reader would find the wrong row id",
+        "Because compaction moves row bytes inside the page, and the reader may hold a pointer straight into the old position",
+        "Because the reader's pin marks the page dirty",
+        "It doesn't need to wait: compaction only changes the free space map"
+      ],
+      "answer": 1,
+      "why": "Compaction keeps every slot number but moves row bytes and updates their offsets. A backend that pinned the page may be holding a pointer to a row's bytes in shared memory, which would suddenly point at another row or at free space. So PostgreSQL requires a cleanup lock: an exclusive lock while being the only pinner. The slot numbers never change, which is why the first option is wrong.",
+      "from": "store-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does PostgreSQL 18's `io_method` choose, and what is the default?",
+      "back": "Who carries out asynchronous reads: `worker` (the default, I/O worker processes), `io_uring` (Linux's ring interface, blocked by Docker's default seccomp) or `sync` (one read at a time, as before 18)."
+    },
+    {
+      "front": "What does a pin count protect against?",
+      "back": "Eviction while in use: a frame with pin count > 0 is never chosen as a victim, because callers are reading or writing its memory."
+    },
+    {
+      "front": "What must happen before a dirty victim's frame is reused?",
+      "back": "Its page is written back to disk, exactly once. A clean victim is just dropped."
+    },
+    {
+      "front": "PostgreSQL clock sweep: what does the hand do at each buffer?",
+      "back": "Skip it if pinned. If unpinned with usage count > 0, decrement and move on. If unpinned with usage 0, evict it."
+    },
+    {
+      "front": "What is PostgreSQL's maximum buffer usage count, and why cap it?",
+      "back": "5 (BM_MAX_USAGE_COUNT). The cap lets a once-hot page leave after a few sweeps instead of millions."
+    },
+    {
+      "front": "When does a PostgreSQL sequential scan use a ring buffer?",
+      "back": "When the table is bigger than a quarter of shared_buffers. The scan recycles a small ring instead of flooding the cache."
+    },
+    {
+      "front": "Why can a page be cached twice in PostgreSQL?",
+      "back": "PostgreSQL reads files through the kernel, so a page sits in the OS page cache and in shared_buffers. That's why the docs suggest about 25% of RAM for shared_buffers."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Buffer pool",
+      "plain": "The database's own cache of disk pages in memory (shared_buffers in PostgreSQL)."
+    },
+    {
+      "term": "Frame",
+      "plain": "One page-sized slot in the buffer pool."
+    },
+    {
+      "term": "Page table",
+      "plain": "The hash map from page id to the frame that holds that page."
+    },
+    {
+      "term": "Pin",
+      "plain": "A count of current users of a frame. A pinned frame cannot be evicted."
+    },
+    {
+      "term": "Dirty page",
+      "plain": "A page changed in memory that must be written to disk before its frame is reused."
+    },
+    {
+      "term": "Clock sweep",
+      "plain": "PostgreSQL's CLOCK eviction: a hand moves round the buffers, lowering usage counts until it finds an unpinned buffer at 0."
+    },
+    {
+      "term": "Sequential flooding",
+      "plain": "A big scan pushing every useful page out of a cache by reading many pages once."
+    },
+    {
+      "term": "Ring buffer",
+      "plain": "A small private set of buffers a big scan, VACUUM or bulk write reuses, so it can't flood the pool."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks why PostgreSQL doesn't simply use an LRU list for shared_buffers, since LRU is \"the best\" policy. Explain what PostgreSQL does instead and why, including what protects the cache from a giant nightly scan.",
+    "answer": "An exact LRU has to move a page to the front of a shared list on every hit, so every read becomes a write to one structure under a lock, and with many backends that lock becomes the bottleneck. PostgreSQL uses a clock sweep instead. Each buffer has a usage count that goes up by one on each pin, up to 5. When it needs a buffer, a hand walks round the pool, skips pinned buffers, lowers the count of the others and takes the first unpinned buffer at zero. A hit only updates the buffer's own counter with an atomic operation. For the nightly scan, neither LRU nor CLOCK would be enough on its own, because a scan touches millions of pages once. PostgreSQL gives sequential scans of tables bigger than a quarter of shared_buffers a small ring of buffers, so the scan keeps reusing those and the hot pages stay."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Smarter policies.** CLOCK and LRU both look only at recency, roughly. Two classic refinements look at frequency too. LRU-K (O'Neil, O'Neil and Weikum, 1993) evicts the page whose K-th most recent use is oldest, so a page touched once by a scan, with no second use, goes first. 2Q (Johnson and Shasha, 1994) puts new pages in a small probation queue and only promotes pages that are used again. Both resist sequential flooding without special cases. PostgreSQL's usage count, which a page earns by being pinned repeatedly, gets part of the same effect, and the ring buffers handle the rest.\n\n**Why not mmap?** Mapping the data file into memory and letting the kernel page it in looks like a free buffer pool. The CIDR 2022 paper by Crotty, Leis and Pavlo explains why databases that tried it backed off. The kernel can write a dirty page back at any time, which breaks the rule that the WAL record must reach disk first. A page fault blocks the thread with no way to issue the read asynchronously. An I/O error arrives as a SIGBUS signal instead of an error code. And under memory pressure the kernel's eviction (a single `kswapd` thread, plus TLB shootdowns across cores) becomes the bottleneck. MongoDB's original MMAPv1 storage engine was deprecated in 2015 and removed in 2019. The paper's advice is to use mmap only when the data fits in memory and is read-only.\n\n**Asynchronous I/O in more detail.** With `io_method = worker`, backends put read requests in shared memory and the I/O workers pick them up, so one scan keeps many reads in flight and merges neighbouring blocks into one larger read (`io_combine_limit`, 128 kB by default). `effective_io_concurrency` limits how many reads one backend keeps in flight; PostgreSQL 18 raised its default from 1 to 16. The `pg_aios` view lists the I/Os in flight. This is also why the ring for a sequential scan grew in PostgreSQL 18: buffers that are still being read can't be reused yet, so the ring needs room for them. PostgreSQL 19, at release candidate as this is written, scales the number of I/O workers between `io_min_workers` and `io_max_workers` and adds an `IO` option to `EXPLAIN ANALYZE`."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL source: buffer manager README",
+      "url": "https://github.com/postgres/postgres/blob/REL_18_STABLE/src/backend/storage/buffer/README"
+    },
+    {
+      "title": "PostgreSQL 18: pg_buffercache",
+      "url": "https://www.postgresql.org/docs/18/pgbuffercache.html"
+    },
+    {
+      "title": "PostgreSQL 18: Resource consumption",
+      "url": "https://www.postgresql.org/docs/18/runtime-config-resource.html"
+    },
+    {
+      "title": "Crotty, Leis, Pavlo: Are You Sure You Want to Use MMAP in Your Database Management System? (CIDR 2022)",
+      "url": "https://www.cidrdb.org/cidr2022/papers/p13-crotty.pdf"
+    },
+    {
+      "title": "pganalyze: PostgreSQL 18 asynchronous I/O, measured",
+      "url": "https://pganalyze.com/blog/postgres-18-async-io"
+    }
+  ]
+}

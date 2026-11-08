@@ -1,0 +1,409 @@
+{
+  "id": "enc-02",
+  "title": "Schemas that evolve: Protobuf, Avro and compatibility",
+  "minutes": 40,
+  "goal": "By the end you can encode and decode a Protobuf record by hand from its field numbers, wire types and varints, explain how old code skips new fields and how Avro resolves a writer's schema against a reader's, and pick the compatibility mode (and deploy order) that keeps every reader working, including the transitive case.",
+  "warmup": {
+    "q": "Version 1 of a Protobuf message has `int64 amount_minor = 3`. Version 2 deletes it, and a year later version 3 adds `int64 fee_minor = 3`. An old service still on version 1 reads a version 3 message with a fee of 150. What does it see?",
+    "options": [
+      "A parse error, because the field names don't match",
+      "`amount_minor = 150`, with no error",
+      "`amount_minor = 0`, because the field was deleted",
+      "An unknown field 3, which it skips"
+    ],
+    "answer": 1,
+    "why": "Names never reach the wire: the bytes say \"field 3, varint, 150\". The old reader's schema says field 3 is `amount_minor`, so it reads 150 as the amount. Same number, same wire type, new meaning, and nothing notices. The fourth option is what happens for a field number the reader doesn't have, which is why `reserved 3;` exists."
+  },
+  "sections": [
+    {
+      "h": "Put a number on each field: Protobuf's wire format",
+      "body": "Lesson 1 ended with the authorization as a MessagePack array: 39 bytes, against 84 with the field names. An array works only if the writer and the reader agreed beforehand on what the first, second and third values are. Write that agreement down, give it to both sides, and you have a **schema**. Protocol Buffers (Protobuf), which Google built for its own services and published in 2008, is the most common way to do this on the JVM. You describe the record in a `.proto` file:\n\n```text\nsyntax = \"proto3\";\n\nmessage Authorization {\n  int64  payment_id   = 1;\n  string merchant     = 2;\n  int64  amount_minor = 3;   // 4000 means 40.00\n  string currency     = 4;\n  repeated string tags = 5;\n}\n```\n\nThe `= 1` and `= 2` are not default values. They are **field numbers**, and they go on the wire instead of the names. Each field becomes a key and a value. The key is one number: the field number shifted left by three bits, with a **wire type** in the low three bits. The wire type tells a reader how to find the end of the value, even for a field it doesn't know. Two wire types cover most messages. Type 0 is a varint, for integers, booleans and enums. Type 2, LEN, is a length followed by that many bytes, for strings, bytes, nested messages and packed lists. (Types 1 and 5 are fixed 8-byte and 4-byte values.)\n\nA **varint** stores an integer in as few bytes as it needs. Each byte holds 7 bits of the number, lowest bits first, and its top bit says whether another byte follows. 4000 is `1111 1010 0000` in binary. The low seven bits, `010 0000`, go first with the top bit set: `a0`. The remaining bits, `1 1111` (31), go next with the top bit clear: `1f`. So 4000 is `a0 1f`. Every number below 128 takes one byte.\n\nHere is the whole authorization:\n\n```text\n08 91 80 ed 83 b4 b4 ec d4 19    field 1, varint: 1849204436731904017\n12 0b 46 65 72 6e 20 42 61 ...   field 2, length 11: \"Fern Bakery\"\n18 a0 1f                         field 3, varint: 4000\n22 03 45 55 52                   field 4, length 3: \"EUR\"\n2a 04 63 61 72 64                field 5, length 4: \"card\"\n2a 03 33 64 73                   field 5 again: \"3ds\"\n```\n\nThat's 42 bytes, against 84 for MessagePack and 116 for JSON. A repeated field is just the same key once per element. The stepper below decodes it byte by byte.\n\nVarints are cheap for small numbers and costly for large or negative ones. The 64-bit payment ID takes 9 bytes as a varint, and declared as `fixed64` it would take a flat 8. A negative `int64` is a huge number in two's complement, so -1 takes 10 bytes. For fields that are often negative, `sint64` first applies **ZigZag** (0 becomes 0, -1 becomes 1, 1 becomes 2, -2 becomes 3), and -1 takes one byte. The type you declare decides the bytes, so pick it for the values you expect.",
+      "stepper": {
+        "title": "Decode the 42 bytes, one key at a time",
+        "intro": "The reader has the `.proto` from this section, so it knows which number means which field. The bytes carry only numbers, wire types and values.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. no names in the bytes: field numbers and wire types only\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">no names in the bytes: field numbers and wire types only</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s t-m\" x=\"259\" y=\"208\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s t-m\" x=\"259\" y=\"228\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s t-m\" x=\"259\" y=\"248\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-m\" x=\"259\" y=\"268\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-m\" x=\"259\" y=\"288\" text-anchor=\"start\">?</text></svg>",
+            "say": "The message is 42 bytes. The reader walks it from the start. It never needs a field count or a table of contents, because every value announces its own size."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. key 08 = 00001 000: field 1, wire type 0 (a varint follows)\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box-a\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">key 08 = 00001 000: field 1, wire type 0 (a varint follows)</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s t-m\" x=\"259\" y=\"208\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s t-m\" x=\"259\" y=\"228\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s t-m\" x=\"259\" y=\"248\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-m\" x=\"259\" y=\"268\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-m\" x=\"259\" y=\"288\" text-anchor=\"start\">?</text></svg>",
+            "say": "The first byte is a **key**. `0x08` is `0000 1000`: the low three bits, `000`, are wire type 0, a varint. The rest, `00001`, is field number 1. The schema says field 1 is `payment_id`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. 9 varint bytes, 7 bits each, lowest group first\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box-a\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">9 varint bytes, 7 bits each, lowest group first</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s t-a\" x=\"259\" y=\"208\" text-anchor=\"start\">1849204436731904017</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s t-m\" x=\"259\" y=\"228\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s t-m\" x=\"259\" y=\"248\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-m\" x=\"259\" y=\"268\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-m\" x=\"259\" y=\"288\" text-anchor=\"start\">?</text></svg>",
+            "say": "The varint runs until a byte with its top bit clear: `91 80 ed 83 b4 b4 ec d4` all have it set, `19` doesn't. Nine bytes of 7 bits each hold the 61-bit ID. A `fixed64` field would have taken a flat 8."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. key 12: field 2, wire type 2 (LEN); 0b: 11 bytes follow\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box-a\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">key 12: field 2, wire type 2 (LEN); 0b: 11 bytes follow</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s\" x=\"259\" y=\"208\" text-anchor=\"start\">1849204436731904017</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s t-a\" x=\"259\" y=\"228\" text-anchor=\"start\">Fern Bakery</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s t-m\" x=\"259\" y=\"248\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-m\" x=\"259\" y=\"268\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-m\" x=\"259\" y=\"288\" text-anchor=\"start\">?</text></svg>",
+            "say": "`0x12` is `00010 010`: field 2, wire type 2. Wire type 2 means a varint length comes next, `0b` = 11, then exactly 11 bytes. The reader decodes them as UTF-8 because the schema says `string`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. key 18: field 3, varint; a0 1f = 0x20 + 0x1f x 128 = 4000\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box-a\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">key 18: field 3, varint; a0 1f = 0x20 + 0x1f x 128 = 4000</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s\" x=\"259\" y=\"208\" text-anchor=\"start\">1849204436731904017</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s\" x=\"259\" y=\"228\" text-anchor=\"start\">Fern Bakery</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s t-a\" x=\"259\" y=\"248\" text-anchor=\"start\">4000</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-m\" x=\"259\" y=\"268\" text-anchor=\"start\">?</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-m\" x=\"259\" y=\"288\" text-anchor=\"start\">?</text></svg>",
+            "say": "`0x18` is field 3, a varint. `a0` has its top bit set and carries `0x20`; `1f` is the last byte and carries 31, worth 31 x 128. Together: 32 + 3,968 = 4,000."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 310\" role=\"img\" aria-label=\"The 42 bytes of the Protobuf authorization split into six fields, decoded one key at a time against the reader's schema. 22: field 4, 3 bytes. 2a twice: field 5 is repeated\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"9\" y=\"22\" text-anchor=\"start\">42 bytes on the wire, one box per field</text><rect class=\"box\" x=\"9\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"65\" y=\"58\" text-anchor=\"middle\">08</text><text class=\"t-s t-code\" x=\"65\" y=\"80\" text-anchor=\"middle\">91 80 ... 19</text><text class=\"t-s t-m\" x=\"65\" y=\"102\" text-anchor=\"middle\">10 bytes</text><rect class=\"box\" x=\"127\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"183\" y=\"58\" text-anchor=\"middle\">12 0b</text><text class=\"t-s\" x=\"183\" y=\"80\" text-anchor=\"middle\">Fern Bakery</text><text class=\"t-s t-m\" x=\"183\" y=\"102\" text-anchor=\"middle\">13 bytes</text><rect class=\"box\" x=\"245\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code\" x=\"301\" y=\"58\" text-anchor=\"middle\">18</text><text class=\"t-s t-code\" x=\"301\" y=\"80\" text-anchor=\"middle\">a0 1f</text><text class=\"t-s t-m\" x=\"301\" y=\"102\" text-anchor=\"middle\">3 bytes</text><rect class=\"box-a\" x=\"363\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"419\" y=\"58\" text-anchor=\"middle\">22 03</text><text class=\"t-s\" x=\"419\" y=\"80\" text-anchor=\"middle\">EUR</text><text class=\"t-s t-m\" x=\"419\" y=\"102\" text-anchor=\"middle\">5 bytes</text><rect class=\"box-a\" x=\"481\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"537\" y=\"58\" text-anchor=\"middle\">2a 04</text><text class=\"t-s\" x=\"537\" y=\"80\" text-anchor=\"middle\">card</text><text class=\"t-s t-m\" x=\"537\" y=\"102\" text-anchor=\"middle\">6 bytes</text><rect class=\"box-a\" x=\"599\" y=\"34\" width=\"112\" height=\"84\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"655\" y=\"58\" text-anchor=\"middle\">2a 03</text><text class=\"t-s\" x=\"655\" y=\"80\" text-anchor=\"middle\">3ds</text><text class=\"t-s t-m\" x=\"655\" y=\"102\" text-anchor=\"middle\">5 bytes</text><text class=\"t-s t-a\" x=\"360\" y=\"148\" text-anchor=\"middle\">22: field 4, 3 bytes. 2a twice: field 5 is repeated</text><rect class=\"box\" x=\"9\" y=\"166\" width=\"702\" height=\"136\" rx=\"8\"/><text class=\"t-s t-m\" x=\"29\" y=\"188\" text-anchor=\"start\">the reader's schema</text><text class=\"t-s t-m\" x=\"259\" y=\"188\" text-anchor=\"start\">decoded so far</text><text class=\"t-s t-code\" x=\"29\" y=\"208\" text-anchor=\"start\">1 = payment_id</text><text class=\"t-s\" x=\"259\" y=\"208\" text-anchor=\"start\">1849204436731904017</text><text class=\"t-s t-code\" x=\"29\" y=\"228\" text-anchor=\"start\">2 = merchant</text><text class=\"t-s\" x=\"259\" y=\"228\" text-anchor=\"start\">Fern Bakery</text><text class=\"t-s t-code\" x=\"29\" y=\"248\" text-anchor=\"start\">3 = amount_minor</text><text class=\"t-s\" x=\"259\" y=\"248\" text-anchor=\"start\">4000</text><text class=\"t-s t-code\" x=\"29\" y=\"268\" text-anchor=\"start\">4 = currency</text><text class=\"t-s t-a\" x=\"259\" y=\"268\" text-anchor=\"start\">EUR</text><text class=\"t-s t-code\" x=\"29\" y=\"288\" text-anchor=\"start\">5 = tags</text><text class=\"t-s t-a\" x=\"259\" y=\"288\" text-anchor=\"start\">card, 3ds</text></svg>",
+            "say": "`22 03` is field 4 with 3 bytes, \"EUR\". Then key `2a` (field 5, LEN) appears twice, once per tag, and the reader appends both to the list. A reader that didn't know field 5 would still read each length and skip exactly that many bytes."
+          }
+        ]
+      },
+      "try": {
+        "title": "Walk the bytes with protobuf-java",
+        "minutes": 4,
+        "steps": [
+          "Open `ProtoBytesDemo.kt`. It builds the `Authorization` descriptor in code (the same thing `protoc` produces from the `.proto`), encodes the record with `DynamicMessage` and walks the bytes with `CodedInputStream`.",
+          "Predict before you run it: how many bytes does the payment ID take as `int64`, and as `fixed64`? How many does -1 take as `int64` and as `sint64`?",
+          "Run it from the `labs` folder with the command below."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "ProtoBytesDemo.kt (the walking part)",
+          "src": "val input = CodedInputStream.newInstance(bytes)\nwhile (!input.isAtEnd) {\n    val start = input.totalBytesRead\n    val key = input.readTag()\n    val field = WireFormat.getTagFieldNumber(key)   // key ushr 3\n    val type = WireFormat.getTagWireType(key)       // key and 7\n    val value = when (type) {\n        WireFormat.WIRETYPE_VARINT -> input.readInt64().toString()\n        WireFormat.WIRETYPE_LENGTH_DELIMITED -> \"\\\"\" + input.readStringRequireUtf8() + \"\\\"\"\n        else -> { input.skipField(key); \"(skipped)\" }\n    }\n    val raw = bytes.copyOfRange(start, input.totalBytesRead)\n    println(\"key %02x = field %d, wire type %d  %-24s %s\".format(key, field, type, value, hex(raw)))\n}",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l02/demo/ProtoBytesDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l02.demo.ProtoBytesDemoKt -q"
+        },
+        "expect": "```text\nProtobuf: 42 bytes\n08 91 80 ed 83 b4 b4 ec d4 19 12 0b 46 65 72 6e 20 42 61 6b 65 72 79 18 a0 1f 22 03 45 55 52 2a 04 63 61 72 64 2a 03 33 64 73\n\nkey 08 = field 1, wire type 0  1849204436731904017      08 91 80 ed 83 b4 b4 ec d4 19\nkey 12 = field 2, wire type 2  \"Fern Bakery\"            12 0b 46 65 72 6e 20 42 61 6b 65 72 79\nkey 18 = field 3, wire type 0  4000                     18 a0 1f\nkey 22 = field 4, wire type 2  \"EUR\"                    22 03 45 55 52\nkey 2a = field 5, wire type 2  \"card\"                   2a 04 63 61 72 64\nkey 2a = field 5, wire type 2  \"3ds\"                    2a 03 33 64 73\n\npayment id as int64:   10 bytes with its key\npayment id as fixed64: 9 bytes with its key\n-1 as int64:           11 bytes with its key\n-1 as sint64:          2 bytes with its key\n```\nEach size includes the one-byte key. A random-looking 64-bit ID is cheaper as `fixed64`; a small or negative number is far cheaper as a varint, and a negative one only with `sint64`."
+      },
+      "refs": [
+        {
+          "title": "Protocol Buffers: Encoding",
+          "url": "https://protobuf.dev/programming-guides/encoding/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Old code skips what it doesn't know: unknown fields and the rules for change",
+      "body": "Now the schema changes. The risk team adds a score:\n\n```text\n  int64 risk_score = 6;\n```\n\nThe payment service deploys first and starts writing field 6. The settlement service still runs last month's code, which has never heard of it. Its parser reads the key `30`, works out field 6 and wire type 0, and reads one varint. It has nowhere to put the value, so it keeps the bytes aside as an **unknown field**. Without the wire type it couldn't even tell where field 6 ends. Old code reading data written by new code is **forward compatibility**. The other direction is **backward compatibility**: new code reading old data. A record written before the change has no field 6, so the new code gets the default, 0.\n\nKeeping unknown fields matters more than it looks. When the settlement service reads an authorization, changes its amount and writes it back, protobuf-java writes field 6 back out too, and the risk score survives. Proto3 didn't always do that. Versions 3.0 to 3.4 dropped unknown fields while parsing, so every read, change and write by old code quietly erased the new data. Protobuf 3.5.0, released in November 2017, made C++, Java and Python keep them again. Java can still ask for the old behaviour with `DiscardUnknownFieldsParser`, and the Try-it shows what that costs. Lesson 3 of this track shows the same loss with JSON and data classes, where nothing keeps the bytes for you.\n\nDefaults have a catch. In proto3, a plain `int64 amount_minor` that is 0 isn't written at all, so a reader can't tell \"free\" from \"this writer has no amount field\". Declare it `optional int64 amount_minor = 3;` when the difference matters, and the generated code gets `hasAmountMinor()`.\n\nThe rules for changing a schema follow from the wire format:\n\n- Never change a field's number. On the wire, the number is the field.\n- Never reuse the number of a deleted field. Old writers, old Kafka records and old database rows still use it. Write `reserved 3;` and the old name, so the compiler stops the next person.\n- Change a type only within a group that reads the same bytes. `int32`, `int64`, `uint32`, `uint64` and `bool` are one group, but an old `int32` reader truncates a value that needs 64 bits.\n- Rename freely: names never reach the binary format. (They do reach Protobuf's JSON format, so there a rename breaks old readers.)\n\nReusing a number is the quiet one. Delete `amount_minor = 3`, add `int64 fee_minor = 3` a year later, and every old reader shows the fee as the amount. Same bits, new meaning, no error. Lesson 3 of this track tells the story of a trading firm that lost more than $460 million to the same mistake with a flag.\n\nTwo more names you'll meet. Protobuf **editions** replace the `syntax = \"proto3\"` line with `edition = \"2024\"` (protoc v32 and later) and turn the old proto2 and proto3 differences into features you set per file or per field, such as `field_presence`. The wire format doesn't change, so old data stays readable. Apache **Thrift**, from Facebook, follows the same design: numbered fields, a type on the wire, and a CompactProtocol that comes within a byte or two of Protobuf's size.",
+      "try": {
+        "title": "Keep, drop and misread a field",
+        "minutes": 4,
+        "steps": [
+          "Open `UnknownFieldsDemo.kt`. A v2 writer adds `risk_score = 6`. A v1 reader parses the bytes, changes the amount and writes them back, once with the normal parser and once with `DiscardUnknownFieldsParser`. Then a v3 writer reuses field number 3 for `fee_minor`.",
+          "Predict the three numbers the demo prints: the risk score after each update, and the amount v1 reads from v3's message.",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "UnknownFieldsDemo.kt (the middle)",
+          "src": "// a v1 service reads v2's bytes, changes the amount and writes them back\nval read = DynamicMessage.parseFrom(v1, fromV2)\nprintln(\"v1 sees unknown fields: ${read.unknownFields.asMap().keys}\")\nval updated = read.toBuilder().setField(v1.findFieldByName(\"amount_minor\"), 4500L).build().toByteArray()\nval back = DynamicMessage.parseFrom(v2, updated)\nprintln(\"after v1's update, v2 reads risk_score = ${back.getField(v2.findFieldByName(\"risk_score\"))}\")\n\n// the same with a parser that throws unknown fields away (what proto3 did before 3.5.0)\nval discarding = DiscardUnknownFieldsParser.wrap(DynamicMessage.getDefaultInstance(v1).parserForType)\nval lossy = discarding.parseFrom(fromV2).toBuilder()\n    .setField(v1.findFieldByName(\"amount_minor\"), 4500L).build().toByteArray()",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l02/demo/UnknownFieldsDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l02.demo.UnknownFieldsDemoKt -q"
+        },
+        "expect": "```text\nv2 wrote 44 bytes, ending in 30 57\nv1 sees unknown fields: [6]\nafter v1's update, v2 reads risk_score = 87\nwith DiscardUnknownFieldsParser, v2 reads risk_score = 0\nv3 wrote amount 4000 and fee 150; v1 reads amount_minor = 150\n```\nThe new field costs two bytes: key `30` (field 6, varint) and `57` (87). The normal parser keeps it through v1's update, the discarding parser loses it, and the reused number makes v1 report the fee as the amount without any error."
+      },
+      "refs": [
+        {
+          "title": "Protocol Buffers: Proto best practices (dos and don'ts)",
+          "url": "https://protobuf.dev/best-practices/dos-donts/",
+          "kind": "docs"
+        },
+        {
+          "title": "Protocol Buffers: Editions overview",
+          "url": "https://protobuf.dev/editions/overview/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Avro drops the numbers too: the writer's schema meets the reader's",
+      "body": "Avro, from the Hadoop project in 2009, goes one step further: the bytes carry neither names nor numbers. Here is the same authorization, 38 bytes:\n\n```text\na2 80 da 87 e8 e8 d8 a9 33          paymentId: 1849204436731904017 (ZigZag varint)\n16 46 65 72 6e 20 42 ...            merchant: length 11 (ZigZag of 11 is 22, 0x16), \"Fern Bakery\"\nc0 3e                               amountMinor: 4000 (ZigZag 8000)\n06 45 55 52                         currency: length 3, \"EUR\"\n04 08 63 61 72 64 06 33 64 73 00    tags: 2 items, \"card\", \"3ds\", then 0 for the end of the list\n```\n\nThe values simply follow each other in the schema's field order, and every int, long and length is a ZigZag varint. Nothing in the bytes says where `merchant` starts or that it is a string, so a reader can't even skip a field without knowing its type. A reader therefore needs **the exact schema the writer used**. Give it the wrong one and you get garbage, not an error: in the Try-it, reading these bytes with a two-field writer schema returns `amountMinor: 11`, which is really the length of \"Fern Bakery\".\n\nChange happens at read time. The reader brings two schemas: the **writer's schema**, to decode the bytes, and its own **reader's schema**, the shape its code wants. Avro matches the two by field name:\n\n- A field in both is decoded. If the types differ, only some promotions are allowed: int to long, float or double; long to float or double; float to double; string to bytes and back.\n- A field only in the writer's schema is decoded and thrown away.\n- A field only in the reader's schema gets the reader's default. With no default, the read fails.\n\nSo the rule for evolving Avro is short: only add or remove fields that have a default. A field that may be absent is usually a union with null, `[\"null\", \"string\"]` with `\"default\": null`, and the null must be the first branch for that default to be valid.\n\nWhere does the reader find the writer's schema? There are three answers, one per kind of data:\n\n- A large file of records stores the schema once, in its header. An Avro object container file starts with `Obj` and the byte 1, then the schema as JSON, then blocks of records separated by a 16-byte sync marker. A thousand authorizations took 38,336 bytes in the Try-it.\n- Records stored or sent one at a time carry a short schema ID, and a **schema registry** maps the ID to the schema. Confluent's Kafka serializers put a magic byte 0 and a 4-byte ID in front of each value. The Stream processing track's lesson on schemas and Kafka Connect covers the Kafka side.\n- Two processes talking over one connection can agree on schemas when the connection opens.\n\nWhy go without numbers at all? Because then schemas can be generated. Export an Oracle or PostgreSQL table to Avro and each column becomes a field. When someone adds a column, the export just has a new writer's schema, and nobody has to hand out field numbers and promise never to reuse them. That's why Avro is common in data pipelines, Kafka Connect and Hadoop-era storage, and Protobuf is the usual choice for hand-written service APIs such as gRPC (lesson 4 of this track).",
+      "try": {
+        "title": "Read Avro with the right, a newer and the wrong schema",
+        "minutes": 4,
+        "steps": [
+          "Open `AvroDemo.kt`. It writes the authorization with a `GenericRecord`, then reads the bytes with a reader's schema that adds `channel` with a default, one that adds it without a default, and a wrong writer's schema. Last, it writes 1,000 records to an object container file.",
+          "Predict which of the three reads fails loudly and which returns wrong data quietly.",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "AvroDemo.kt (the reads)",
+          "src": "// a newer reader adds a field with a default: Avro matches fields by name and fills the gap\nval readerWithDefault = avro(\"$V1_FIELDS, {\\\"name\\\": \\\"channel\\\", \\\"type\\\": \\\"string\\\", \\\"default\\\": \\\"card\\\"}\")\nval r = GenericDatumReader<GenericRecord>(writer, readerWithDefault)\n    .read(null, DecoderFactory.get().binaryDecoder(bytes, null))\n\n// decoding with the wrong writer schema: the bytes say nothing about their own layout\nval wrongWriter = avro(\"\"\"{\"name\": \"paymentId\", \"type\": \"long\"}, {\"name\": \"amountMinor\", \"type\": \"long\"}\"\"\")\nval garbage = GenericDatumReader<GenericRecord>(wrongWriter)\n    .read(null, DecoderFactory.get().binaryDecoder(bytes, null))",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l02/demo/AvroDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l02.demo.AvroDemoKt -q"
+        },
+        "expect": "```text\nAvro: 38 bytes\na2 80 da 87 e8 e8 d8 a9 33 16 46 65 72 6e 20 42 61 6b 65 72 79 c0 3e 06 45 55 52 04 08 63 61 72 64 06 33 64 73 00\nreader with channel (default card): {\"paymentId\": 1849204436731904017, \"merchant\": \"Fern Bakery\", \"amountMinor\": 4000, \"currency\": \"EUR\", \"tags\": [\"card\", \"3ds\"], \"channel\": \"card\"}\nreader with channel, no default: Found sfz.payments.Authorization, expecting sfz.payments.Authorization, missing required field channel\nread with the wrong writer schema: {\"paymentId\": 1849204436731904017, \"amountMinor\": 11}\ncontainer file with 1000 records: 38336 bytes, starts 4f 62 6a 01 (\"Obj\" 1), schema in header: true\n```\nThe missing default fails loudly. The wrong writer's schema fails quietly: the reader takes `16`, the length of \"Fern Bakery\", as `amountMinor` (22 un-ZigZagged is 11) and stops, with no error. In the container file the schema costs a few hundred bytes once, and each record costs its 38."
+      },
+      "refs": [
+        {
+          "title": "Apache Avro specification (schema resolution, object container files)",
+          "url": "https://avro.apache.org/docs/++version++/specification/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Compatibility has two directions, and a registry checks them before you deploy",
+      "body": "Two directions, stated once more because people swap them:\n\n- **Backward compatible**: new code can read data written by old code. Upgrading readers first is safe.\n- **Forward compatible**: old code can read data written by new code. Upgrading writers first is safe.\n\nA running system needs both, because nothing upgrades everywhere at once. Topics and tables keep old records for months, so new readers meet old data. During a rolling deploy, old consumers meet records from producers that have already upgraded.\n\nChecking this in code review doesn't hold up for long. Someone forgets that a field has no default, or that a topic still holds version 1. A **schema registry** turns the check into a gate. Each schema version is registered under a subject (by default one per topic, for keys and for values). Before the registry accepts a new version, it checks it against the older ones with the format's own rules: Avro's resolution rules from the last section, or Protobuf's wire rules. The direction of the check is the subject's **compatibility mode**. Confluent Schema Registry offers these:\n\n| Mode | The new schema must | Upgrade first |\n|---|---|---|\n| BACKWARD (the default) | read data written with the latest version | consumers |\n| FORWARD | be readable by the latest version | producers |\n| FULL | do both | either side |\n| NONE | nothing | you're on your own |\n\nEach of the first three has a `_TRANSITIVE` twin that checks every registered version, not just the latest.\n\nThe default holds a trap. BACKWARD compares a new version only with the one before it. Take a payment schema whose v1 has `amount` as an int. v2 removes `amount`, and a v2 reader skips it in old data, so v2 passes. v3 brings `amount` back as a string with a default, and a v3 reader of v2 data uses the default, so v3 passes too. But a v3 reader that meets a v1 record finds an int where it wants a string, and fails. If the topic is compacted, or the table holds five years of rows, those v1 records are still there. Use the `_TRANSITIVE` modes whenever old data is kept. Confluent recommends BACKWARD_TRANSITIVE for Protobuf. The figure shows the chain, and in the lab your registry gate rejects it.\n\nProtobuf teams usually put the gate in the build instead. Buf's `buf breaking` compares your `.proto` files with the last released ones and fails the build on, for example, a deleted field whose number isn't reserved (`FIELD_NO_DELETE_UNLESS_NUMBER_RESERVED`) or a changed type (`FIELD_SAME_TYPE`). Its default category, FILE, also protects generated source code, so it flags renames. WIRE checks only the binary format, and Buf recommends WIRE_JSON as the minimum, which protects the JSON form too.\n\nA registry checks shapes, not meaning. Change `amount` from euros to cents and keep the type `long`, and every check passes while every old reader is now wrong by a factor of 100. A change like that needs a new field and a migration, which is lesson 3.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 280\" role=\"img\" aria-label=\"Three versions of a payment schema. v2 can read v1 and v3 can read v2, but v3 cannot read v1, so BACKWARD accepts v3 and BACKWARD_TRANSITIVE rejects it.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"30\" width=\"170\" height=\"96\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"54\" text-anchor=\"middle\">v1</text><text class=\"t-s t-code\" x=\"105\" y=\"80\" text-anchor=\"middle\">paymentId: long</text><text class=\"t-s t-code\" x=\"105\" y=\"102\" text-anchor=\"middle\">amount: int</text><rect class=\"box\" x=\"265\" y=\"30\" width=\"170\" height=\"96\" rx=\"8\"/><text class=\"t\" x=\"350\" y=\"54\" text-anchor=\"middle\">v2</text><text class=\"t-s t-code\" x=\"350\" y=\"80\" text-anchor=\"middle\">paymentId: long</text><text class=\"t-s t-code\" x=\"350\" y=\"102\" text-anchor=\"middle\">(amount removed)</text><rect class=\"box\" x=\"510\" y=\"30\" width=\"170\" height=\"96\" rx=\"8\"/><text class=\"t\" x=\"595\" y=\"54\" text-anchor=\"middle\">v3</text><text class=\"t-s t-code\" x=\"595\" y=\"80\" text-anchor=\"middle\">paymentId: long</text><text class=\"t-s t-code\" x=\"595\" y=\"102\" text-anchor=\"middle\">amount: string = \"\"</text><text class=\"t-s t-m\" x=\"227\" y=\"70\" text-anchor=\"middle\">reads</text><line class=\"ln\" x1=\"263\" y1=\"82\" x2=\"192\" y2=\"82\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"227\" y=\"102\" text-anchor=\"middle\">ok</text><text class=\"t-s t-m\" x=\"472\" y=\"70\" text-anchor=\"middle\">reads</text><line class=\"ln\" x1=\"508\" y1=\"82\" x2=\"437\" y2=\"82\" marker-end=\"url(#arr)\"/><text class=\"t-s t-ok\" x=\"472\" y=\"102\" text-anchor=\"middle\">ok</text><path class=\"ln-bad\" d=\"M595 128 C595 196 105 196 105 128\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"350\" y=\"214\" text-anchor=\"middle\">v3 reads v1: fails, an int is not a string</text><text class=\"t-s t-m\" x=\"350\" y=\"244\" text-anchor=\"middle\">BACKWARD checks v3 against v2 only: accepted</text><text class=\"t-s t-a\" x=\"350\" y=\"266\" text-anchor=\"middle\">BACKWARD_TRANSITIVE checks v1 too: rejected</text></svg>",
+        "caption": "Each step passes a check against the version before it, but v3 can't read v1, which a compacted topic or an old table still holds."
+      },
+      "try": {
+        "title": "Predict the compatibility table",
+        "minutes": 3,
+        "steps": [
+          "Before you run anything, write down BACKWARD, FORWARD and FULL (yes or no) for each change: add a field with a default, add one without, remove a field that had a default, remove one that didn't, widen `int` to `long`, rename a field, rename it with an alias.",
+          "Run `CompatibilityDemo` from the `labs` folder. It asks Avro's `SchemaCompatibility` both directions for each change, then checks the v1, v2, v3 chain from the figure.",
+          "For each wrong guess, say which reader fails and why: the new reader on old data (BACKWARD) or the old reader on new data (FORWARD)."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "CompatibilityDemo.kt (the check)",
+          "src": "fun canRead(reader: Schema, writer: Schema) =\n    SchemaCompatibility.checkReaderWriterCompatibility(reader, writer).type == COMPATIBLE\n\nfor ((what, new) in changes) {\n    val backward = canRead(new, old) // new readers, old data\n    val forward = canRead(old, new)  // old readers, new data\n    println(\"%-36s %-9s %-9s %s\".format(what, yes(backward), yes(forward), yes(backward && forward)))\n}",
+          "file": "labs/flow/src/demo/kotlin/sfz/enc/l02/demo/CompatibilityDemo.kt",
+          "run": "./gradlew :flow:demo -Pmain=sfz.enc.l02.demo.CompatibilityDemoKt -q"
+        },
+        "expect": "```text\nchange                               BACKWARD  FORWARD   FULL\nadd a field with a default           yes       yes       yes\nadd a field without a default        no        yes       no\nremove a field that had a default    yes       yes       yes\nremove a field without a default     yes       no        no\nwiden amount from int to long        yes       no        no\nrename amount, no alias              no        no        no\nrename amount, with an alias         yes       no        no\n\nv2 reads v1: yes   v3 reads v2: yes   v3 reads v1: no\nreader type: STRING not compatible with writer type: INT\n```\nWidening is one-way: a new `long` reader promotes old ints, but an old `int` reader can't take a long. An alias lets the new reader find the old name, and the old reader still has no idea what `amountMinor` is. Only changes to fields with defaults pass all three."
+      },
+      "refs": [
+        {
+          "title": "Confluent: Schema evolution and compatibility",
+          "url": "https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Buf: Breaking change rules and categories",
+          "url": "https://buf.build/docs/breaking/rules/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Protobuf is a form with numbered boxes. Both sides keep a copy of the blank form, so the filled-in sheet only says \"box 3: 4000\". A clerk with an older form who finds a box 6 they don't have staples it to the back and passes it on untouched. Avro is a sheet with no box numbers at all, just answers in order, so you must read it against the exact blank form it was filled in on, then copy the answers by question onto your own newer form. Reusing a field number is reprinting the form with a different question in box 3 while old copies are still in use. The analogy breaks on size: a paper form's empty boxes take space, while Protobuf writes nothing at all for a field that is unset or zero.",
+  "in_your_world": "If your payment events go through Kafka with Avro and Confluent Schema Registry, look up each subject's compatibility mode today. It is probably the default, BACKWARD, which checks only the latest version, while the `payments` topic may be compacted or replayed from months back. Switch subjects whose data you keep to BACKWARD_TRANSITIVE, and set `auto.register.schemas=false` in production so only CI registers schemas. For gRPC services between Quarkus apps, add `buf breaking` against the main branch to the build and treat `reserved` as mandatory when a field goes. Temporal payloads deserve the same care: an activity input that changes shape mid-flight is read by the new worker code when a workflow resumes, which is lesson 5 of this track.",
+  "mistake": "Assuming \"backward compatible\" means old code can read new data, and deploying in the wrong order. Under BACKWARD the registry promises that the new schema reads old data, so consumers must upgrade first. Teams ship the producer first because it's their service, the producer starts writing the new shape, and the old consumers, which nobody promised anything, fail on the first record. The fix is to say the mode and the deploy order together every time: BACKWARD means consumers first, FORWARD means producers first, FULL means either. Put the order in the pull request template next to the schema change.",
+  "compare": {
+    "title": "The same authorization in Protobuf (42 bytes) and Avro (38 bytes)",
+    "a": {
+      "label": "Protobuf",
+      "lang": "text",
+      "title": "key, then value, per field",
+      "src": "08                              key: field 1, varint\n91 80 ed 83 b4 b4 ec d4 19      1849204436731904017\n12 0b                           key: field 2, LEN; 11 bytes\n46 65 72 6e 20 42 61 6b 65 72 79  \"Fern Bakery\"\n18 a0 1f                        field 3: 4000\n22 03 45 55 52                  field 4: \"EUR\"\n2a 04 63 61 72 64               field 5: \"card\"\n2a 03 33 64 73                  field 5: \"3ds\""
+    },
+    "b": {
+      "label": "Avro",
+      "lang": "text",
+      "title": "values only, in schema order",
+      "src": "a2 80 da 87 e8 e8 d8 a9 33       1849204436731904017 (ZigZag)\n16                              length 11 (ZigZag)\n46 65 72 6e 20 42 61 6b 65 72 79  \"Fern Bakery\"\nc0 3e                           4000 (ZigZag)\n06 45 55 52                     \"EUR\"\n04                              2 items\n08 63 61 72 64 06 33 64 73      \"card\", \"3ds\"\n00                              end of list"
+    },
+    "note": "Protobuf spends one key byte per field (seven here) so that any reader can find each field's end and skip what it doesn't know, with or without the writer's schema. Avro spends nothing on keys and ends the list with one byte instead, which makes it 4 bytes smaller but unreadable without the exact writer's schema. Protobuf pays for independence from the writer; Avro pays with a registry or a file header."
+  },
+  "worked": {
+    "title": "Replace a field in a Protobuf API without breaking anyone",
+    "steps": [
+      {
+        "say": "The fraud team wants `string channel = 6` (free text: \"card\", \"Card\", \"CARD-PRESENT\") replaced by an enum. You can't change the type of field 6: a string and an enum use different wire types, and old readers would treat the value as unknown. So add a new field with a new number, and give the enum a zero value that means \"not set\".",
+        "code": "// subgoal: add, don't change\nenum Channel {\n  CHANNEL_UNSPECIFIED = 0;   // what a reader sees when the writer didn't send it\n  CHANNEL_CARD_PRESENT = 1;\n  CHANNEL_ECOMMERCE = 2;\n}\n\nmessage Authorization {\n  // fields 1 to 5 as before\n  string channel = 6;          // still written, still read by old services\n  Channel channel_type = 7;    // new\n}",
+        "lang": "text"
+      },
+      {
+        "say": "Writers fill both fields for as long as any reader may use field 6. New readers prefer field 7 and fall back to field 6 when it is `CHANNEL_UNSPECIFIED`, which is what they see in every record written before the change.",
+        "code": "// subgoal: read the new field, fall back to the old one\nfun channelOf(a: Authorization): Channel =\n    if (a.channelType != Channel.CHANNEL_UNSPECIFIED) a.channelType\n    else when (a.channel.lowercase()) {\n        \"card\", \"card-present\" -> Channel.CHANNEL_CARD_PRESENT\n        \"web\", \"ecommerce\" -> Channel.CHANNEL_ECOMMERCE\n        else -> Channel.CHANNEL_UNSPECIFIED\n    }",
+        "lang": "kotlin"
+      },
+      {
+        "say": "When no service reads field 6 any more, and no stored data that matters still depends on it, delete it. Reserve both its number and its name, so nobody can bring back field 6 with a different meaning.",
+        "code": "// subgoal: retire the old field for good\nmessage Authorization {\n  reserved 6;\n  reserved \"channel\";\n  Channel channel_type = 7;\n}",
+        "lang": "text"
+      },
+      {
+        "say": "Make the build enforce it. A `buf.yaml` with the WIRE_JSON category checks every change against the main branch: deleting field 6 without the `reserved` line, or changing its type, fails `buf breaking --against '.git#branch=main'` before the change can be merged.",
+        "code": "# buf.yaml (subgoal: the gate runs on every pull request)\nversion: v2\nbreaking:\n  use:\n    - WIRE_JSON",
+        "lang": "yaml"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Varints by hand, a Protobuf codec that skips unknown fields, and a registry gate",
+    "minutes": 18,
+    "files": [
+      "labs/flow/src/main/kotlin/sfz/enc/l02/Varint.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l02/ProtoCodec.kt",
+      "labs/flow/src/main/kotlin/sfz/enc/l02/RegistryGate.kt"
+    ],
+    "run": "./gradlew :flow:test --tests 'sfz.enc.l02.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 21 fail with `NotImplementedError`. No Docker is needed.",
+      "In `Varint.kt`, write `encode`, `decode` and `zigzag`. `VarintTest` compares your bytes with protobuf-java's `CodedOutputStream` for 206 values, including `Long.MIN_VALUE` and -1.",
+      "In `ProtoCodec.kt`, write `key`, then `encode` for the five fields. `ProtoCodecTest` checks your 42 bytes against what protobuf-java writes for the same message, so the order of fields and the zero-skipping rule must match.",
+      "Write `decode`. It must read protobuf-java's bytes, skip the fields 6 and 7 that a version 2 writer adds, and leave defaults for fields that aren't there.",
+      "In `RegistryGate.kt`, write `canRead` with Avro's `SchemaCompatibility`, then `isCompatible` for every mode. The last tests replay the v1, v2, v3 chain from the lesson and decode a real v1 record with a v3 reader.",
+      "Run the tests until all 21 pass."
+    ],
+    "hints": [
+      "In `encode`, loop while `v ushr 7 != 0L`: write `(v and 0x7f) or 0x80`, then `v = v ushr 7`. Use `ushr`, not `shr`, or a negative number never reaches zero.",
+      "In `decode`, `bytes[i].toInt() and 0xff` turns a signed Kotlin `Byte` into 0 to 255 before you test bit 7.",
+      "ZigZag is one line: `(n shl 1) xor (n shr 63)`. Here `shr` is right: it copies the sign bit into all 64 bits.",
+      "In `ProtoCodec.decode`, split a key with `key ushr 3` (field number) and `key and 7` (wire type). Skip by wire type, never by field number: that's what lets old code read new data.",
+      "BACKWARD means `canRead(candidate, old)`, FORWARD means `canRead(old, candidate)`. The `_TRANSITIVE` modes check every element of `registered`, the others only `registered.last()`."
+    ],
+    "done_when": "All 21 tests in `VarintTest`, `ProtoCodecTest` and `RegistryGateTest` pass."
+  },
+  "drill": {
+    "title": "Write varint encode and decode from memory",
+    "minutes": 5,
+    "prompt": "Close the lesson. Write `encode(value: Long): ByteArray` and `decode(bytes: ByteArray, offset: Int): Pair<Long, Int>` for Protobuf varints. Check them on paper: 150 must give `96 01`, and -1 must take 10 bytes.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun encode(value: Long): ByteArray {\n    val out = ByteArrayOutputStream()\n    var v = value\n    while (v ushr 7 != 0L) {                   // unsigned shift: -1 takes 10 bytes\n        out.write(((v and 0x7f) or 0x80).toInt())\n        v = v ushr 7\n    }\n    out.write(v.toInt())                        // last byte: top bit clear\n    return out.toByteArray()\n}\n\nfun decode(bytes: ByteArray, offset: Int): Pair<Long, Int> {\n    var result = 0L\n    var shift = 0\n    var i = offset\n    while (true) {\n        val b = bytes[i++].toInt() and 0xff\n        result = result or ((b and 0x7f).toLong() shl shift)\n        if (b and 0x80 == 0) return result to i\n        shift += 7\n    }\n}"
+    }
+  },
+  "recap": [
+    "A schema replaces field names with something both sides agree on. Protobuf writes a key per field, `(number shl 3) or wireType`, then the value: 42 bytes for the authorization against 116 for JSON.",
+    "Varints use 7 bits per byte, low bits first: cheap for small numbers, 10 bytes for a negative `int64` unless you use `sint64` (ZigZag).",
+    "The wire type lets old code skip and keep fields it doesn't know (forward compatibility); missing fields read as defaults (backward compatibility). Never change or reuse a field number: `reserved` it.",
+    "Avro writes only values, so a reader needs the writer's exact schema and resolves it against its own by field name, using defaults. Add or remove only fields that have defaults.",
+    "A registry's mode names the check and the deploy order: BACKWARD means consumers first, FORWARD producers first. Non-transitive modes check only the latest version, so use `_TRANSITIVE` when old data is kept."
+  ],
+  "quiz": [
+    {
+      "q": "Lesson 1's MessagePack encoding took 84 bytes, 45 of them field names. Protobuf takes 42 and still lets an old reader skip a field it has never seen. What makes that possible?",
+      "options": [
+        "Protobuf compresses the field names with a shared dictionary",
+        "Each field carries a small number and a wire type, and the wire type says how long the value is",
+        "Protobuf sends the schema once per connection, like Avro",
+        "Old readers skip everything after the last field number they know"
+      ],
+      "answer": 1,
+      "why": "The key is one byte here: field number and wire type. Wire type 0 means \"a varint follows\", 2 means \"a length, then that many bytes\", so a reader can find the end of any value without the schema. There are no names on the wire at all, and Protobuf never sends a schema in the message.",
+      "from": "enc-01"
+    },
+    {
+      "q": "An Avro consumer upgrades its reader's schema to add `\"channel\": {\"type\": \"string\"}` with no default. The topic still holds records written before the change. What happens when it reads one?",
+      "options": [
+        "`channel` comes back as an empty string",
+        "`channel` comes back as null",
+        "The read fails: the field is missing from the writer's schema and has no default",
+        "Avro skips the record and moves on"
+      ],
+      "answer": 2,
+      "why": "A field only in the reader's schema is filled from its default, and without one Avro has nothing to put there, so decoding fails (`missing required field channel`). Avro never invents empty values; that's Protobuf's proto3 behaviour. This is why a registry in BACKWARD mode rejects the change."
+    },
+    {
+      "q": "Your subject runs in FORWARD mode. You're adding a field the consumers don't need yet. In which order do you deploy?",
+      "options": [
+        "Producers first, then consumers",
+        "Consumers first, then producers",
+        "Both at the same moment, with a feature flag",
+        "Order doesn't matter in FORWARD mode"
+      ],
+      "answer": 0,
+      "why": "FORWARD guarantees that readers on the old schema can read data written with the new one. So producers can switch first, and old consumers keep working. BACKWARD is the mode that requires consumers first; FULL is the one where order doesn't matter."
+    },
+    {
+      "q": "A compacted topic keeps the latest payment per account, some written two years ago with schema v1. The subject uses BACKWARD. v2 removed `amount`; now v3 adds `amount` back as a string with a default. The registry accepts v3. What happens next?",
+      "options": [
+        "Nothing bad: the registry checked v3, so all data is readable",
+        "The registry rewrites the v1 records in the topic to v3",
+        "v1 records are ignored, because compaction removes old schema versions",
+        "Consumers on v3 fail on the old v1 records, which still have `amount` as an int"
+      ],
+      "answer": 3,
+      "why": "BACKWARD checks v3 only against v2, the latest, and v3 can read v2. Against v1 it can't: an int can't be promoted to a string. Compaction keeps old records by key, not by schema version, and a registry never rewrites data. BACKWARD_TRANSITIVE would have rejected v3."
+    },
+    {
+      "q": "Which Protobuf change is safe for both old and new readers of stored data?",
+      "options": [
+        "Changing `int64 amount_minor = 3` to `string amount_minor = 3`",
+        "Deleting field 3, then adding `int64 fee_minor = 3`",
+        "Renaming `amount_minor` to `amount_in_cents` and keeping number 3 and the type",
+        "Renumbering `amount_minor` from 3 to 8 to group related fields"
+      ],
+      "answer": 2,
+      "why": "Names never appear in the binary format, so a rename changes nothing on the wire (it does matter for Protobuf's JSON form and for generated code). A type change from varint to string changes the wire type, reuse gives old bytes a new meaning, and renumbering makes every existing record's field 3 unknown."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "How is a Protobuf key computed?",
+      "back": "`(fieldNumber shl 3) or wireType`. Field 1 as a varint is `0x08`, field 2 as LEN is `0x12`."
+    },
+    {
+      "front": "What do the bytes `96 01` decode to as a varint?",
+      "back": "150: `0x96` carries 22 with the continue bit set, `0x01` carries 1 x 128."
+    },
+    {
+      "front": "Why does -1 take 10 bytes as int64 but 1 as sint64?",
+      "back": "As two's complement, -1 has all 64 bits set, so the varint needs 10 groups of 7 bits. ZigZag maps -1 to 1 first."
+    },
+    {
+      "front": "What does an Avro reader need to decode a record?",
+      "back": "The exact writer's schema (from a file header, a registry ID or the connection), plus its own reader's schema to resolve against."
+    },
+    {
+      "front": "BACKWARD compatibility: which side upgrades first?",
+      "back": "Consumers. The new schema must read data written with the old one."
+    },
+    {
+      "front": "What is the non-transitive trap?",
+      "back": "BACKWARD or FORWARD check only the latest version, so a chain of compatible steps can leave the newest schema unable to read the oldest data. Use the _TRANSITIVE modes when old data is kept."
+    },
+    {
+      "front": "What does `reserved 3;` do in a .proto file?",
+      "back": "Makes the compiler reject any future field that uses number 3, so a deleted field's number can never get a new meaning."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Field number",
+      "plain": "The small integer a .proto file assigns to each field. It goes on the wire instead of the name and must never change or be reused."
+    },
+    {
+      "term": "Wire type",
+      "plain": "The low 3 bits of a Protobuf key: how the value is laid out (varint, fixed 8 bytes, length-prefixed, fixed 4 bytes), so any reader can skip it."
+    },
+    {
+      "term": "Varint",
+      "plain": "An integer in 1 to 10 bytes, 7 bits per byte, lowest group first, top bit set on every byte except the last."
+    },
+    {
+      "term": "Unknown field",
+      "plain": "A field in the bytes that the reader's schema doesn't have. Protobuf keeps it and writes it back out."
+    },
+    {
+      "term": "Writer's and reader's schema",
+      "plain": "In Avro, the schema the data was encoded with, and the schema the reading code wants. Avro resolves them by field name."
+    },
+    {
+      "term": "Backward and forward compatibility",
+      "plain": "Backward: new code reads old data. Forward: old code reads new data."
+    },
+    {
+      "term": "Schema registry",
+      "plain": "A service that stores schema versions per subject and rejects a new version that breaks the subject's compatibility mode."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks why Protobuf needs field numbers that can never be reused, while Avro has no numbers at all. Explain what each format writes and what each reader needs.",
+    "answer": "Protobuf writes, for each field, a key made of the field number and a wire type, then the value. The wire type tells any reader how long the value is, so a reader with an older schema can skip a field it doesn't know and even keep it, without the writer's schema. That independence depends on the number meaning the same thing forever: if field 3 was the amount and is later reused for a fee, old readers decode the fee as the amount with no error, so deleted numbers get `reserved`. Avro writes only the values, in the schema's field order, so the bytes don't describe themselves at all. A reader must have the exact writer's schema, from a file header or a registry ID, and then Avro matches writer and reader fields by name, using defaults for missing ones. No numbers means nothing to reuse and schemas can be generated, for example from database tables, but every reader depends on finding the writer's schema."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Designing Data-Intensive Applications (2nd edition, chapter 5) compares Thrift, Protobuf and Avro and argues for schemas as documentation that can't go stale, because decoding needs them. Martin Kleppmann's 2012 post \"Schema evolution in Avro, Protocol Buffers and Thrift\" has the byte-level comparison that chapter grew from.\n\nThree topics worth an evening:\n\n- **ASN.1.** Protobuf and Thrift reinvent ideas from ASN.1 (1984), whose DER encoding still carries every X.509 certificate your TLS connections check (the Computer networking track's lesson on TLS). It also evolves with tag numbers, and its complexity is a warning about schema languages that try to do everything.\n- **Zero-copy formats.** FlatBuffers and Cap'n Proto keep numbered or slotted fields like Protobuf but lay them out so a reader can access a field in place without parsing the message. Apache Arrow's IPC format does it for whole columns.\n- **Confluent's header-based schema IDs.** Since Confluent Platform 8.1.1 a serializer can put the schema's ID in a Kafka header instead of the 5-byte prefix, and deserializers check the header first and fall back to the prefix, so a fleet can switch over during a rolling upgrade. The Stream processing track picks this up."
+  },
+  "sources": [
+    {
+      "title": "Protocol Buffers: Encoding",
+      "url": "https://protobuf.dev/programming-guides/encoding/"
+    },
+    {
+      "title": "Protocol Buffers: Proto best practices",
+      "url": "https://protobuf.dev/best-practices/dos-donts/"
+    },
+    {
+      "title": "Apache Avro specification",
+      "url": "https://avro.apache.org/docs/++version++/specification/"
+    },
+    {
+      "title": "Confluent: Schema evolution and compatibility",
+      "url": "https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 5",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

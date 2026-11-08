@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.net.SocketFactory
 
 /**
- * Counts network round trips between pgJDBC and the server, for lesson 14.
+ * Counts network round trips between pgJDBC and the server, for sql-10.
  *
  * A round trip is one exchange: the driver sends one or more messages, then waits for the
  * answer. The driver opens its socket through [CountingSocketFactory] (the `socketFactory`

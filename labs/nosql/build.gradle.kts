@@ -3,7 +3,7 @@ val versions = rootProject.extra["versions"] as Map<String, String>
 
 // The AWS SDK for Java 2.x moves fast; pinned here because the root versions map is not ours to edit.
 val awsSdk = "2.57.11"
-// Neo4j's Java driver (lesson 11), pinned here for the same reason
+// Neo4j's Java driver (model-08), pinned here for the same reason
 val neo4jDriver = "6.3.0"
 
 dependencies {

@@ -1,0 +1,404 @@
+{
+  "id": "found-06",
+  "title": "Systems people can live with: operability, simplicity and change",
+  "minutes": 40,
+  "goal": "By the end you can say what makes a data system easy to operate, turn an SLO into an error budget and burn-rate alerts that page only when it matters, tell essential from accidental complexity, plan changes that can be undone, and weigh cloud against self-hosting with the costs the headline numbers leave out.",
+  "warmup": {
+    "q": "Your payment API's SLO is 99.9% of requests succeeding over 30 days. Which of these incidents should wake someone up at night?",
+    "options": [
+      "3% of requests failing for 4 minutes",
+      "0.35% of requests failing for three days straight",
+      "2% of requests failing for an hour, and still going",
+      "A total outage that lasts 10 seconds"
+    ],
+    "answer": 2,
+    "why": "Price each one in budget. 2% for an hour is a burn rate of 20 and has spent 2.8% of the month's budget, and it isn't over: page. The three-day leak spends the most in total (35%), but slowly, at a burn rate of 3.5, so it can wait for a ticket and working hours, as long as someone does fix it. The 3% blip used 0.28% and the 10-second outage 0.39%: both were over before anyone could have logged in."
+  },
+  "sections": [
+    {
+      "h": "Operability: most of a system's cost comes after launch",
+      "body": "A settlement service is built in a quarter and then runs for ten years. In those years people fix its bugs, keep it running, find out why it was slow last Tuesday, move it to new hardware, add payment methods and pay off the shortcuts from the first quarter. Most of the cost of software is in that work, not in the first version, and every system that is useful enough to survive becomes somebody's legacy system. This lesson covers the three properties that keep that cost down: operability, simplicity and evolvability. It ends with the decision that shapes all three: whether you run the system yourself.\n\n**Operability** means the people on call can keep the system running. A data system helps them when it:\n\n- exposes metrics, logs and traces, so they can see what it is doing;\n- doesn't depend on any single machine, so they can take one down to patch it;\n- has an operational model you can say in one breath: \"if I do X, Y happens\";\n- ships sensible defaults that can be overridden;\n- heals itself in common cases, but lets a human take control;\n- behaves predictably, so nobody is surprised at 3 a.m.\n\nThe operators' tools are part of the system. Lesson 3 told the story of the S3 outage of February 2017, when one mistyped input to a capacity-removal command took S3 in us-east-1 down for about four hours. Read it again as an operability lesson. The engineer followed the documented procedure, and the tool let one typo remove far more servers than anyone meant to. AWS put the fix into the tool: it now removes capacity slowly and refuses to take a subsystem below its minimum. A guardrail in the tool beats a warning in the procedure, because the tool is there at 3 a.m. and the warning is in a wiki.\n\nAutomation is a tool too, and it cuts both ways. It handles the routine cases and leaves people the rare, hard ones, which they now get less practice at. An automated system that goes wrong is also harder to debug than one where a person ran each step. So automate the routine, keep a manual override for every automatic action, and make the automation say what it is doing and why.\n\nDefaults are operability as well. Most deployments never change most settings, so the default is the setting. A connection pool whose callers wait forever for a free connection, or a client that retries without limit, becomes an incident on somebody else's night.\n\nThat playbook has a common name: a **runbook**, the written procedure for one alert. A good one says what the alert means, how to confirm it, the safe first action, how to undo that action, and when to call for help. It is also how knowledge outlives the people who had it.",
+      "try": {
+        "title": "Write a runbook entry",
+        "minutes": 4,
+        "steps": [
+          "Take this alert: \"settlement batch for yesterday has not finished by 03:00\". The batch reads the ledger, writes per-merchant totals and sends a payout file to the bank at 04:00.",
+          "Write five short lines: what the alert means, how to confirm it, the safe first action, how to undo that action, and when to escalate.",
+          "Check your safe first action: could it make things worse if you're wrong about the cause? If yes, find a smaller one."
+        ],
+        "expect": "One possible entry:\n\n```text\nmeans      the payout file may miss the bank's 04:00 cut-off; merchants get paid a day late\nconfirm    batch job status and its last progress log line; is it running, stuck or failed?\nfirst      if failed: rerun for yesterday's date only (the batch is idempotent per date)\n           if running but slow: do nothing to it; check database CPU and locks, note the ETA\nundo       a rerun replaces yesterday's totals; the previous file is kept as payout-<date>.prev\nescalate   at 03:30 if no ETA before 04:00: page the payments lead, who can ask the bank to extend\n```\n\nThe important line is \"do nothing to it\" for a slow but running batch. Killing and restarting a slow job is the tempting first move, and it throws away all the progress the job has made."
+      },
+      "refs": [
+        {
+          "title": "AWS: Summary of the Amazon S3 service disruption in us-east-1 (February 2017)",
+          "url": "https://aws.amazon.com/message/41926/",
+          "kind": "read"
+        },
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition (chapter 2: maintainability)",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Error budgets in practice: alerts that page when the budget is going",
+      "body": "Lesson 2 defined the terms. An SLO is a target such as \"99.9% of authorization requests succeed, over 30 days\". The error budget is what it leaves: 0.1% of requests, or 43.2 minutes of complete outage. The burn rate is the error ratio divided by the budget ratio, so at a burn rate of 1 the budget lasts exactly 30 days, and when 2% of requests fail (a burn rate of 20) it's gone in a day and a half. This section turns those numbers into alerts and habits a team can live with, which is operability at its most daily.\n\nStart with the alert most teams write first: page when the last 10 minutes miss 99.9%. It fails in both directions. It pages for blips that barely matter: 0.6% of requests failing for 10 minutes uses 0.14% of the month's budget and still wakes someone up. And a steady leak of 0.35% keeps it firing for days, until someone mutes it, after which it catches nothing at all.\n\nSo alert on how fast the budget is going, and look at two windows at once. Here are the Google SRE Workbook's three rules for a 30-day 99.9% SLO again, with the budget each has spent by the time it fires:\n\n| Action | Long window | Short window | Burn rate | Budget spent when it fires |\n|---|---|---|---|---|\n| page | 1 hour | 5 minutes | 14.4 | 2% |\n| page | 6 hours | 30 minutes | 6 | 5% |\n| ticket | 3 days | 6 hours | 1 | 10% |\n\nThe long window decides whether enough budget has gone to be worth waking someone. The short window, which must be over the same threshold, says the problem is still happening, so the alert clears minutes after the fix instead of an hour later.\n\nReplay incidents through these rules minute by minute, which is what the lab builds, and the behaviour is easy to see. A 2% failure rate for 100 minutes pages at minute 43, with 2.04% of the budget spent, and clears one minute after the fix; the 1-hour window alone would have kept paging until minute 116. A 10-minute total outage fires the fast page in its first minute, the 6-hour page in its third and the ticket in its fifth, and uses 23% of the month. A 0.35% leak for three days never pages: it opens a ticket after about 20 hours, when 10% of the budget is gone, so someone fixes it in working hours.\n\nAlerts are half the job. The other half is an **error budget policy**, agreed before anything goes wrong: for example, \"while half the budget is left, ship as usual; when it is gone, only reliability fixes ship until it recovers\". The argument between shipping fast and staying up then has an answer before anyone has to win it at 3 a.m.",
+      "stepper": {
+        "title": "The fast-burn page over a 2% incident",
+        "intro": "The bar at the bottom is the incident. The two boxes are the windows the rule looks at, ending at the current minute (the vertical line).",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Minute 0: 1-hour window 0.03%, 5-minute window 0.40%. minute 0: 1 h window 0.03%, 5 min window 0.40%: quiet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fast-burn rule: page when BOTH windows are at least 14.4 x 0.1% = 1.44%</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"144.7\" height=\"28\" rx=\"8\"/><text class=\"t-s\" x=\"112.3529411764706\" y=\"63\" text-anchor=\"middle\">1 h window: 0.03%</text><rect class=\"box\" x=\"167.1\" y=\"92\" width=\"17.6\" height=\"28\" rx=\"8\"/><text class=\"t-s\" x=\"192.7058823529412\" y=\"111\" text-anchor=\"start\">5 min: 0.40%</text><rect class=\"box-bad\" x=\"181.2\" y=\"140\" width=\"352.9\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"357.6470588235294\" y=\"162\" text-anchor=\"middle\">2% of requests fail</text><line class=\"ln\" x1=\"40\" y1=\"190\" x2=\"640\" y2=\"190\"/><line class=\"ln\" x1=\"181.1764705882353\" y1=\"190\" x2=\"181.1764705882353\" y2=\"196\"/><text class=\"t-s t-m\" x=\"181.1764705882353\" y=\"211\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"392.94117647058823\" y1=\"190\" x2=\"392.94117647058823\" y2=\"196\"/><text class=\"t-s t-m\" x=\"392.94117647058823\" y=\"211\" text-anchor=\"middle\">60</text><line class=\"ln\" x1=\"534.1176470588235\" y1=\"190\" x2=\"534.1176470588235\" y2=\"196\"/><text class=\"t-s t-m\" x=\"534.1176470588235\" y=\"211\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"640\" y=\"211\" text-anchor=\"end\">minutes</text><line class=\"ln-d\" x1=\"184.7058823529412\" y1=\"36\" x2=\"184.7058823529412\" y2=\"130\"/><text class=\"t-s\" x=\"345\" y=\"244\" text-anchor=\"middle\">minute 0: 1 h window 0.03%, 5 min window 0.40%: quiet</text><text class=\"t-s t-m\" x=\"345\" y=\"266\" text-anchor=\"middle\">a naive \"last 10 minutes above 0.1%\" alert has already paged</text></svg>",
+            "say": "A deploy goes out and **2% of authorizations start failing**: a burn rate of 20. One minute in, the 1-hour window holds one bad minute out of sixty (0.03%) and the 5-minute window one out of five (0.40%). Both are below the 1.44% threshold. A naive 10-minute rule has already paged."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Minute 4: 1-hour window 0.17%, 5-minute window 2.00%. minute 4: the 5 min window is over 1.44%, the 1 h window isn't: quiet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fast-burn rule: page when BOTH windows are at least 14.4 x 0.1% = 1.44%</text><rect class=\"box\" x=\"40\" y=\"44\" width=\"158.8\" height=\"28\" rx=\"8\"/><text class=\"t-s\" x=\"119.41176470588235\" y=\"63\" text-anchor=\"middle\">1 h window: 0.17%</text><rect class=\"box-a\" x=\"181.2\" y=\"92\" width=\"17.6\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"206.8235294117647\" y=\"111\" text-anchor=\"start\">5 min: 2.00%</text><rect class=\"box-bad\" x=\"181.2\" y=\"140\" width=\"352.9\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"357.6470588235294\" y=\"162\" text-anchor=\"middle\">2% of requests fail</text><line class=\"ln\" x1=\"40\" y1=\"190\" x2=\"640\" y2=\"190\"/><line class=\"ln\" x1=\"181.1764705882353\" y1=\"190\" x2=\"181.1764705882353\" y2=\"196\"/><text class=\"t-s t-m\" x=\"181.1764705882353\" y=\"211\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"392.94117647058823\" y1=\"190\" x2=\"392.94117647058823\" y2=\"196\"/><text class=\"t-s t-m\" x=\"392.94117647058823\" y=\"211\" text-anchor=\"middle\">60</text><line class=\"ln\" x1=\"534.1176470588235\" y1=\"190\" x2=\"534.1176470588235\" y2=\"196\"/><text class=\"t-s t-m\" x=\"534.1176470588235\" y=\"211\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"640\" y=\"211\" text-anchor=\"end\">minutes</text><line class=\"ln-d\" x1=\"198.8235294117647\" y1=\"36\" x2=\"198.8235294117647\" y2=\"130\"/><text class=\"t-s\" x=\"345\" y=\"244\" text-anchor=\"middle\">minute 4: the 5 min window is over 1.44%, the 1 h window isn't: quiet</text><text class=\"t-s t-m\" x=\"345\" y=\"266\" text-anchor=\"middle\">the short window alone would page on every short blip</text></svg>",
+            "say": "Five minutes in, the short window is entirely inside the incident (2.00%), so on its own it would fire. The long window (0.17%) says not enough budget has been spent yet to justify waking anyone. Both must agree."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Minute 43: 1-hour window 1.47%, 5-minute window 2.00%. minute 43: 1 h window 1.47%, 5 min window 2.00%: PAGE\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fast-burn rule: page when BOTH windows are at least 14.4 x 0.1% = 1.44%</text><rect class=\"box-a\" x=\"124.7\" y=\"44\" width=\"211.8\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"230.58823529411765\" y=\"63\" text-anchor=\"middle\">1 h window: 1.47%</text><rect class=\"box-a\" x=\"318.8\" y=\"92\" width=\"17.6\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"344.47058823529414\" y=\"111\" text-anchor=\"start\">5 min: 2.00%</text><rect class=\"box-bad\" x=\"181.2\" y=\"140\" width=\"352.9\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"357.6470588235294\" y=\"162\" text-anchor=\"middle\">2% of requests fail</text><line class=\"ln\" x1=\"40\" y1=\"190\" x2=\"640\" y2=\"190\"/><line class=\"ln\" x1=\"181.1764705882353\" y1=\"190\" x2=\"181.1764705882353\" y2=\"196\"/><text class=\"t-s t-m\" x=\"181.1764705882353\" y=\"211\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"392.94117647058823\" y1=\"190\" x2=\"392.94117647058823\" y2=\"196\"/><text class=\"t-s t-m\" x=\"392.94117647058823\" y=\"211\" text-anchor=\"middle\">60</text><line class=\"ln\" x1=\"534.1176470588235\" y1=\"190\" x2=\"534.1176470588235\" y2=\"196\"/><text class=\"t-s t-m\" x=\"534.1176470588235\" y=\"211\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"640\" y=\"211\" text-anchor=\"end\">minutes</text><line class=\"ln-a\" x1=\"336.47058823529414\" y1=\"36\" x2=\"336.47058823529414\" y2=\"130\"/><text class=\"t-s t-bad\" x=\"345\" y=\"244\" text-anchor=\"middle\">minute 43: 1 h window 1.47%, 5 min window 2.00%: PAGE</text><text class=\"t-s t-m\" x=\"345\" y=\"266\" text-anchor=\"middle\">44 minutes at a burn rate of 20 have spent 2.04% of the month's budget</text></svg>",
+            "say": "At the end of minute 43, the hour holds 44 bad minutes: 44 / 60 × 2% = 1.47%, just over 1.44%. **The page fires.** By now 2.04% of the 30-day budget is gone, which is exactly what the rule was designed to catch: 2% of the budget in about an hour."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Minute 99: 1-hour window 2.00%, 5-minute window 2.00%. minute 99: both windows at 2.00%: still paging\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fast-burn rule: page when BOTH windows are at least 14.4 x 0.1% = 1.44%</text><rect class=\"box-a\" x=\"322.4\" y=\"44\" width=\"211.8\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"428.2352941176471\" y=\"63\" text-anchor=\"middle\">1 h window: 2.00%</text><rect class=\"box-a\" x=\"516.5\" y=\"92\" width=\"17.6\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"542.1176470588235\" y=\"111\" text-anchor=\"start\">5 min: 2.00%</text><rect class=\"box-bad\" x=\"181.2\" y=\"140\" width=\"352.9\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"357.6470588235294\" y=\"162\" text-anchor=\"middle\">2% of requests fail</text><line class=\"ln\" x1=\"40\" y1=\"190\" x2=\"640\" y2=\"190\"/><line class=\"ln\" x1=\"181.1764705882353\" y1=\"190\" x2=\"181.1764705882353\" y2=\"196\"/><text class=\"t-s t-m\" x=\"181.1764705882353\" y=\"211\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"392.94117647058823\" y1=\"190\" x2=\"392.94117647058823\" y2=\"196\"/><text class=\"t-s t-m\" x=\"392.94117647058823\" y=\"211\" text-anchor=\"middle\">60</text><line class=\"ln\" x1=\"534.1176470588235\" y1=\"190\" x2=\"534.1176470588235\" y2=\"196\"/><text class=\"t-s t-m\" x=\"534.1176470588235\" y=\"211\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"640\" y=\"211\" text-anchor=\"end\">minutes</text><line class=\"ln-a\" x1=\"534.1176470588235\" y1=\"36\" x2=\"534.1176470588235\" y2=\"130\"/><text class=\"t-s t-bad\" x=\"345\" y=\"244\" text-anchor=\"middle\">minute 99: both windows at 2.00%: still paging</text><text class=\"t-s t-m\" x=\"345\" y=\"266\" text-anchor=\"middle\">the on-call engineer rolls the deploy back; errors stop at minute 100</text></svg>",
+            "say": "The engineer finds the bad deploy and rolls it back. The last failing minute is minute 99. Both windows are fully inside the incident, so the alert stays up. The incident has used 4.63% of the month's budget in total."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 280\" role=\"img\" aria-label=\"Minute 101: 1-hour window 1.93%, 5-minute window 1.20%. minute 101: 5 min window 1.20%: the page clears\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">fast-burn rule: page when BOTH windows are at least 14.4 x 0.1% = 1.44%</text><rect class=\"box-a\" x=\"329.4\" y=\"44\" width=\"211.8\" height=\"28\" rx=\"8\"/><text class=\"t-s t-a\" x=\"435.2941176470589\" y=\"63\" text-anchor=\"middle\">1 h window: 1.93%</text><rect class=\"box\" x=\"523.5\" y=\"92\" width=\"17.6\" height=\"28\" rx=\"8\"/><text class=\"t-s\" x=\"549.1764705882354\" y=\"111\" text-anchor=\"start\">5 min: 1.20%</text><rect class=\"box-bad\" x=\"181.2\" y=\"140\" width=\"352.9\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"357.6470588235294\" y=\"162\" text-anchor=\"middle\">2% of requests fail</text><line class=\"ln\" x1=\"40\" y1=\"190\" x2=\"640\" y2=\"190\"/><line class=\"ln\" x1=\"181.1764705882353\" y1=\"190\" x2=\"181.1764705882353\" y2=\"196\"/><text class=\"t-s t-m\" x=\"181.1764705882353\" y=\"211\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"392.94117647058823\" y1=\"190\" x2=\"392.94117647058823\" y2=\"196\"/><text class=\"t-s t-m\" x=\"392.94117647058823\" y=\"211\" text-anchor=\"middle\">60</text><line class=\"ln\" x1=\"534.1176470588235\" y1=\"190\" x2=\"534.1176470588235\" y2=\"196\"/><text class=\"t-s t-m\" x=\"534.1176470588235\" y=\"211\" text-anchor=\"middle\">100</text><text class=\"t-s t-m\" x=\"640\" y=\"211\" text-anchor=\"end\">minutes</text><line class=\"ln-d\" x1=\"541.1764705882354\" y1=\"36\" x2=\"541.1764705882354\" y2=\"130\"/><text class=\"t-s t-ok\" x=\"345\" y=\"244\" text-anchor=\"middle\">minute 101: 5 min window 1.20%: the page clears</text><text class=\"t-s t-m\" x=\"345\" y=\"266\" text-anchor=\"middle\">the 1 h window is still at 1.93%; alone it would page until minute 116</text></svg>",
+            "say": "Two minutes after the fix, the 5-minute window holds only three bad minutes (1.20%), below the threshold, so **the alert clears**. The 1-hour window still says 1.93% and would keep the page up for another quarter of an hour. That is what the short window is for: the alert ends when the problem does."
+          }
+        ]
+      },
+      "try": {
+        "title": "Replay three incidents",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, run the demo below. It replays an incident against a 99.9% SLO: 2% of requests failing for 100 minutes, after three clean days so every window is full.",
+          "Run it again with `-Pargs='100 10'`, a 10-minute total outage. Predict first: which rules fire, and in what order?",
+          "Run it with `-Pargs='0.6 10'`, a 10-minute blip of 0.6% errors. Which alerts fire, and was any of them worth waking up for?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "BurnRateDemo.kt",
+          "src": "package sfz.found.l06.demo\n\n// Replays an incident against a 99.9% SLO and the Workbook's burn-rate alerts, in virtual time.\n// Run from the labs folder:\n//   ./gradlew :sim:demo -Pmain=sfz.found.l06.demo.BurnRateDemoKt --console=plain -q\n//   ./gradlew :sim:demo -Pmain=sfz.found.l06.demo.BurnRateDemoKt --console=plain -q -Pargs='100 10'\n// The arguments are the share of requests that fail, in percent, and how many minutes it lasts.\n// (A self-contained copy of the lab's logic: demos can't see src/main.)\n\nconst val SLO = 0.999\nconst val DAY = 1_440\nconst val PER_MINUTE = 10_000L\n\nclass Rule(val name: String, val long: Int, val short: Int, val burn: Double, val action: String)\n\nval RULES = listOf(\n    Rule(\"fast burn\", 60, 5, 14.4, \"PAGE\"),\n    Rule(\"medium burn\", 360, 30, 6.0, \"PAGE\"),\n    Rule(\"slow burn\", 3 * DAY, 360, 1.0, \"TICKET\"),\n    Rule(\"naive 10 min\", 10, 10, 1.0, \"PAGE\"),\n)\n\nfun main(args: Array<String>) {\n    val percent = args.getOrNull(0)?.toDouble() ?: 2.0\n    val minutes = args.getOrNull(1)?.toInt() ?: 100\n    val start = 3 * DAY                                   // three clean days first, so every window is full\n    val length = start + minutes + 3 * DAY\n    val bad = LongArray(length) { t -> if (t in start until start + minutes) Math.round(PER_MINUTE * percent / 100) else 0L }\n    val badSum = LongArray(length + 1).also { for (t in 0 until length) it[t + 1] = it[t] + bad[t] }\n    fun ratio(end: Int, window: Int): Double {\n        val from = maxOf(0, end - window + 1)\n        return (badSum[end + 1] - badSum[from]).toDouble() / ((end + 1 - from) * PER_MINUTE)\n    }\n\n    val budget = 1 - SLO\n    val burn = percent / 100 / budget\n    println(\"SLO 99.9%% over 30 days: the budget is %.1f minutes of full outage, or 0.1%% of requests\".format(budget * 30 * DAY))\n    println(\"incident: %.2f%% of requests fail for %d minutes, a burn rate of %.1f\".format(percent, minutes, burn))\n    println(\"the incident uses %.2f%% of the month's budget\".format(100 * burn * minutes / (30.0 * DAY)))\n    println()\n    println(\"minutes after the start of the incident:\")\n    val events = ArrayList<Pair<Int, String>>()\n    for (rule in RULES) {\n        val threshold = rule.burn * budget\n        var firing = false\n        for (t in 0 until length) {\n            val now = ratio(t, rule.long) >= threshold && ratio(t, rule.short) >= threshold\n            if (now && !firing) {\n                val spent = 100 * burn * minOf(t - start + 1, minutes) / (30.0 * DAY)\n                events += (t - start) to \"%-6s %-12s fires   (budget spent so far %.2f%%)\".format(rule.action, rule.name, spent)\n            }\n            if (!now && firing) events += (t - start) to \"       %-12s clears\".format(rule.name)\n            firing = now\n        }\n    }\n    if (events.isEmpty()) println(\"  no alert fires\")\n    events += minutes to \"       (errors stop at the start of this minute)\"\n    for ((t, text) in events.sortedBy { it.first }) println(\"%7d  %s\".format(t, text))\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.found.l06.demo.BurnRateDemoKt --console=plain -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/found/l06/demo/BurnRateDemo.kt"
+        },
+        "expect": "The default run:\n\n```text\nincident: 2.00% of requests fail for 100 minutes, a burn rate of 20.0\nthe incident uses 4.63% of the month's budget\n\nminutes after the start of the incident:\n      0  PAGE   naive 10 min fires   (budget spent so far 0.05%)\n     43  PAGE   fast burn    fires   (budget spent so far 2.04%)\n    100         (errors stop at the start of this minute)\n    101         fast burn    clears\n    109         naive 10 min clears\n```\n\nThe 10-minute outage (output trimmed): the fast-burn page and the naive alert fire in minute 0, the 6-hour page in minute 2, the 3-day ticket in minute 4, and the outage alone uses 23.15% of the month's budget. The blip fires only the naive alert, from minute 1 to minute 18, for an incident that used 0.14% of the budget. Everything runs in virtual time, so your output is identical."
+      },
+      "refs": [
+        {
+          "title": "Google SRE Workbook: Alerting on SLOs",
+          "url": "https://sre.google/workbook/alerting-on-slos/",
+          "kind": "read"
+        },
+        {
+          "title": "Google SRE book: Service Level Objectives",
+          "url": "https://sre.google/sre-book/service-level-objectives/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Simplicity: keep the complexity the problem needs, and no more",
+      "body": "Complex systems are slow to change and easy to break, because every change has effects nobody can see in advance. Fred Brooks's 1986 essay \"No Silver Bullet\" split complexity in two. **Essential complexity** belongs to the problem itself: a payment can be authorized, partly captured, refunded and charged back; currencies have different numbers of decimal places; networks deliver some requests twice, so you need idempotency. **Accidental complexity** comes from how you built it: three services that each implement idempotency keys their own way, a hand-written retry loop in every client, a cache in front of a database that was never short of capacity.\n\nDan Luu has argued that the line between the two moves: much of what looked essential in 1986 was later removed by better tools. So \"it's essential\" is not a reason to stop looking.\n\nThe main weapon against complexity is a good **abstraction**: an interface that hides a lot of mechanism and is used by many programs, so that fixing it once fixes it for all of them. SQL is one. You say what you want; the database decides how to find it on disk, keeps concurrent clients from seeing each other's half-finished work, and repairs itself after a crash. A transaction is another: a change to five rows happens completely or not at all, and you never write the code for \"the machine died after row three\". Most of this course is about abstractions like these: what each one promises, how it keeps the promise, and what that costs.\n\nThe same thinking applies to scale. A single-machine database is simpler than a distributed one, and five services are simpler than fifty. Lesson 5 showed that one machine often wins on speed as well. Choose the simpler design until a load parameter forces the other one.\n\nAbstractions leak, though. A query is fast until its plan changes. A remote call looks like a function call until it times out and you can't tell whether the payment went through. A write returns success, and the machine loses power before the data reached the disk. When that happens, you need to know what's underneath the abstraction. For every data system, that means the network it talks over and the operating system it runs on.",
+      "refs": [
+        {
+          "title": "Dan Luu: Against essential and accidental complexity",
+          "url": "https://danluu.com/essential-complexity/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Evolvability: make every change easy to undo",
+      "body": "Requirements never stop changing: a new payment method, a new regulation, ten times the merchants, a reorganized team. **Evolvability** is how easily the whole system adapts. It depends on simplicity and loose coupling, and its worst enemy is irreversibility. A change you can undo in a minute is cheap to try. A change you can't undo needs a project plan, a freeze and a lot of nerve.\n\nData is what makes changes irreversible. Code rolls back by deploying the previous version. A migration that drops a column, or rewrites every row in a new format, doesn't: the old data is gone, and the old code can't read the new. So change data in steps that each keep both directions open. Add the new column. Write to both. Backfill the old rows. Switch reads to the new column. Drop the old one only when nothing has read it for a while. The Encoding track's lesson on rolling upgrades and migrations builds this properly.\n\nCode changes need the same care. Lesson 3's Google Cloud outage of June 2025 is the case to remember: a new code path with no error handling and no feature flag met a globally replicated policy with blank fields, and crashed in every region at once. Read it for what would have made the change easy to undo. A **feature flag** turns a code path on or off at run time, so undoing it takes seconds instead of a deploy; Google's fixes included putting critical binary changes behind flags that start disabled. A staged rollout, of code and of data alike, limits how much one bad change can break before someone notices and turns it off; Google also committed to rolling out globally replicated data in stages, with time to check each stage.\n\nSome change comes from the law. The GDPR gives people the right to have their personal data erased, which is hard to honour in an append-only log, in backups, and in data already copied into a warehouse or used to train a model. The final track of this course returns to it. For now, when you design where personal data flows, ask how you would delete one person's data everywhere it went.",
+      "try": {
+        "title": "Make a migration reversible",
+        "minutes": 4,
+        "steps": [
+          "The `merchant` table has `fee_rate`, a decimal such as 0.029. You want `fee_bp`, an integer in basis points (290), and eventually no `fee_rate`. The fee service and the settlement batch both read the fee.",
+          "Write the change as a sequence of deploys and migrations. After each step, write how you would undo it.",
+          "Mark the one step that can't be undone and say what you would check before running it."
+        ],
+        "expect": "One sequence:\n\n```text\n1. add column fee_bp (nullable)                      undo: drop fee_bp\n2. deploy: writers set both fee_rate and fee_bp      undo: deploy the previous version\n3. backfill fee_bp = round(fee_rate * 10000)         undo: set fee_bp = null\n4. deploy: readers use fee_bp (behind a flag)        undo: switch the flag off\n5. deploy: writers stop setting fee_rate             undo: deploy step 2's version, rerun step 3 in reverse\n6. drop column fee_rate                              cannot be undone\n```\n\nBefore step 6, check that nothing reads `fee_rate` any more: database statistics or query logs over a full settlement cycle, a month-end included. Keep a backup or an archive copy of the column. Steps 1 to 5 can each be reversed in minutes, which is why they are cheap to try."
+      },
+      "refs": [
+        {
+          "title": "Google Cloud incident report: Service Control, 12 June 2025",
+          "url": "https://status.cloud.google.com/incidents/ow5i3PPK96RduMcb1SsW",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Cloud or your own machines: what the price comparison leaves out",
+      "body": "Every system raises a build-or-buy question: run the software yourself, or pay someone to run it. The options form a spectrum: your own code on your own machines; open-source or commercial software you install and operate, in your own racks or on cloud virtual machines; a managed service you only reach through its API. The usual rule is to run in-house what makes your business different, and to buy what is commodity.\n\nThe cloud wins when load varies. An analytics query that needs a hundred machines for two minutes and then nothing for an hour is cheap to rent and expensive to own. It also wins when you lack the skills: hiring people to run a database well can cost more than the managed service. Self-hosting wins when load is steady and you already have the people.\n\nThe price leaves out what you give up. You can't add a feature the provider lacks. During an outage you wait. When something is slow you can't see the internals. The provider can raise prices or retire a product, and with no standard API, moving is expensive. And you trust them with your data, under their country's laws. Operations don't disappear either: capacity planning becomes financial planning, someone must know the quotas before you hit them, and the services have to be wired together.\n\n37signals is the most-quoted recent case. It paid about $1.5 million a year for S3. It bought about $1.5 million of Pure Storage arrays holding 18 PB, expects them to cost under $200,000 a year to run, and reports savings of about $1.3 million a year. In 2025 it moved about 5 PB of unique data, roughly 5 billion objects, off S3 in under 10 days without downtime, and AWS waived about $250,000 of fees for transferring the data out. These are the company's own numbers. The $1.3 million compares running costs only, so the purchase still has to be paid off, and in five years or so the arrays need replacing. Spread the purchase over five years and owning costs about $500,000 a year against $1.5 million: still a large saving, for a steady storage workload and a team that already runs its own hardware. A company with spiky load and no operations team would get a different answer from the same arithmetic.\n\nCloud prices also shape architecture. AWS charges for traffic between availability zones, so a Kafka cluster spread over three zones pays for every replicated byte; that bill is why lesson 5's diskless topics exist.\n\nThat ends this track, and every number in it rests on something lower down: Bluesky's 600 µs timeline write, Aurora's commit that waits for four storage nodes in three zones, a function's cold start, the slow 1% of requests in lesson 2. When an abstraction leaks (a p99 that doubles, a call that times out without saying whether it ran, a write that wasn't on disk after all), the explanation is usually one layer down: a lost packet and its retransmission, a slow DNS lookup, a full queue in the kernel, a page fault, a thread paused by the scheduler. So the next two tracks go down there. The Computer networking track starts with one `curl` of a URL, and the Operating systems track starts with what a kernel does.",
+      "try": {
+        "title": "Run 37signals' numbers for five years",
+        "minutes": 4,
+        "steps": [
+          "Using the figures in this section, total five years of S3 against five years of owning: the purchase plus running costs.",
+          "Add something the headline leaves out: say one extra engineer at $200,000 a year to look after the hardware (an assumption, not a reported figure). Does owning still win?",
+          "Now change the workload: suppose the storage need doubled in year 3, so a second set of arrays had to be bought in a hurry. What does the cloud give you here that the comparison doesn't price?"
+        ],
+        "expect": "```text\nS3, 5 years                    5 x $1.5M                      = $7.5M\nown, 5 years                   $1.5M + 5 x $0.2M              = $2.5M\nown + one extra engineer       $2.5M + 5 x $0.2M              = $3.5M\n```\n\nOwning still wins by about $4 million over five years, for this steady workload. Doubling in year 3 adds a second purchase of about $1.5 million, plus lead time and the risk of guessing the size wrong; with S3 the bill simply grows from year 3, and nobody waits for hardware. That flexibility is exactly what the cloud sells, and it is worth most to the companies whose load is hardest to predict."
+      },
+      "refs": [
+        {
+          "title": "37signals: Moving mountains of data off S3",
+          "url": "https://dev.37signals.com/moving-mountains-of-data-off-s3/",
+          "kind": "read"
+        },
+        {
+          "title": "The Register: 37signals on its cloud storage savings (May 2025)",
+          "url": "https://www.theregister.com/2025/05/09/37signals_cloud_repatriation_storage_savings",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Running a data system is like owning a building. Construction is a small part of what it costs over its life: heating, repairs, inspections and refits are the rest. The runbook is the building's manual, so the night caretaker knows which valve to close. The error budget is the maintenance budget: spend it on purpose, and stop discretionary work when it runs out. A reversible change is moving furniture; an irreversible one is knocking down a wall, so you check the drawings first. Cloud against self-hosting is renting against owning, and depends on how long you stay and how much your needs change. The analogy breaks on speed and on undo. Buildings don't change their requirements every week or fail in milliseconds, and you can't put a demolished wall back, while with care most data changes can be designed so that you can.",
+  "in_your_world": "Give your authorization API an SLO, say 99.9% of requests succeed over 30 days, and replace the \"error rate above 1% for 5 minutes\" alert with the burn-rate pair from this lesson: the card issuer's two-minute wobble stops paging you, and a deploy that fails 2% of payments pages within the hour. Put new fee logic in your Quarkus services behind a feature flag, so turning it off takes seconds rather than a rollback deploy. Temporal's workflow versioning exists for the same reason: running workflows were started by old code, so a change must keep both paths open until they finish. On Oracle, write Flyway or Liquibase migrations as expand and contract (add, dual-write, backfill, switch, then drop) so each step has an undo. And when someone says a managed Kafka service will save the platform team's time, check both sides: what the cross-zone traffic will cost, and what you lose when you can't read the broker's logs during an incident.",
+  "mistake": "Alerting on every error spike instead of on budget. Teams page on \"error rate above X for 5 minutes\" because it's the first rule anyone writes, then get woken for blips that cost almost nothing, start ignoring pages, and miss the slow leak that spends a third of the month's budget without ever crossing X. The fix is to agree an SLO with the people who use the service, compute the error budget, and alert on burn rate with a long and a short window: page at 14.4 over an hour and 6 over six hours, open a ticket at 1 over three days.",
+  "compare": {
+    "title": "The same 99.9% SLO, as a naive alert and as a burn-rate page",
+    "a": {
+      "label": "naive",
+      "lang": "text",
+      "title": "PromQL: page on any 10-minute miss",
+      "src": "  sum(rate(http_requests_total{code=~\"5..\"}[10m]))\n/ sum(rate(http_requests_total[10m]))\n> 0.001\n"
+    },
+    "b": {
+      "label": "burn rate",
+      "lang": "text",
+      "title": "PromQL: page at 14.4x over 1 h AND over 5 min",
+      "src": "(\n    sum(rate(http_requests_total{code=~\"5..\"}[1h]))\n  / sum(rate(http_requests_total[1h]))\n  > 14.4 * 0.001\n)\nand\n(\n    sum(rate(http_requests_total{code=~\"5..\"}[5m]))\n  / sum(rate(http_requests_total[5m]))\n  > 14.4 * 0.001\n)\n"
+    },
+    "note": "Both compute an error ratio from request counters. The left one fires whenever ten minutes fall short of 99.9%, however little budget that costs, and in the lab's 2% incident it fires at once and stays up until 9 minutes after the fix. The right one fires only when the last hour burned the budget 14.4 times too fast, which means 2% of the month's budget is gone, and the 5-minute condition makes it clear as soon as the errors stop. A complete setup adds the 6-hour and 3-day rules from the table."
+  },
+  "worked": {
+    "title": "From an SLO to detection times",
+    "steps": [
+      {
+        "say": "Start from the SLO. Write down the budget as a ratio and as minutes of total outage.",
+        "code": "SLO          99.9% of requests over 30 days\nbudget       1 - 0.999 = 0.001 of requests\nas minutes   0.001 x 30 x 1,440 = 43.2 minutes of full outage",
+        "lang": "text"
+      },
+      {
+        "say": "Turn each rule's burn rate into an error-ratio threshold.",
+        "code": "fast burn    14.4 x 0.001 = 1.44% over 1 h and over 5 min\nmedium burn   6.0 x 0.001 = 0.60% over 6 h and over 30 min\nslow burn     1.0 x 0.001 = 0.10% over 3 days and over 6 h",
+        "lang": "text"
+      },
+      {
+        "say": "When does a 2% incident trip the fast rule? The 1-hour window must reach 1.44%, so it needs 1.44 / 2 of the hour to be bad: 43.2 minutes. The lab, counting whole minutes, fires at the end of the 44th. The budget spent by then:",
+        "code": "burn rate      2% / 0.1% = 20\nfires after    ceil(0.72 x 60) = 44 minutes\nbudget spent   20 x 44 / 43,200 = 2.04%",
+        "lang": "text"
+      },
+      {
+        "say": "A total outage burns at 1,000, so the hour reaches 1.44% after 0.864 minutes: the first minute. A 0.35% leak never reaches 0.60% or 1.44%, so it never pages; the 3-day window reaches 0.1% after 0.1 / 0.35 of 4,320 minutes.",
+        "code": "total outage   1.44% of 60 min = 0.864 min        -> page in minute 0\n0.35% leak     (0.1 / 0.35) x 4,320 = 1,234.3 min -> ticket after 1,235 minutes,\n               10.0% of the budget spent",
+        "lang": "text"
+      },
+      {
+        "say": "The same arithmetic in Kotlin, as the lab's functions compute it:",
+        "code": "fun burnRate(errorRatio: Double, slo: Double) = errorRatio / (1.0 - slo)\nfun budgetSpent(burnRate: Double, minutes: Double, windowDays: Int = 30) =\n    burnRate * minutes / (windowDays * 1_440.0)\n\nbudgetSpent(burnRate(0.02, 0.999), 44.0)       // 0.0204",
+        "lang": "kotlin"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Error budgets and burn-rate alerts, replayed over outages",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/found/l06/ErrorBudget.kt",
+      "labs/sim/src/main/kotlin/sfz/found/l06/Traffic.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.found.l06.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 8 fail with `NotImplementedError`.",
+      "Read `Traffic.kt`. It is finished: a history is a list of `Minute`s, `traffic()` builds one with incidents in it, and `WORKBOOK_RULES` holds the three rules from the table. Time is virtual: \"now\" is an index into the list.",
+      "In `ErrorBudget.kt`, write `budgetMinutes`, `burnRate` and `budgetSpent`. They are one line each.",
+      "Write `errorRatio`: bad over total for the window that ends at minute `end`, including it, using only the minutes that exist near the start.",
+      "Write `replay`: for each rule, walk the minutes; a rule fires when both windows reach `burnRate × (1 − slo)`. Record an `Alert` when it starts firing and close it when it stops. Run the tests until all 8 pass: a total outage, a 2% elevation, a slow leak, a blip and two separate outages."
+    ],
+    "hints": [
+      "A window over minutes `end - n + 1 .. end` starts at `maxOf(0, end - n + 1)`. Off by one here moves every detection time by a minute, and the tests will say so.",
+      "Recomputing a 3-day window every minute is 4,320 additions per step. Running sums (a prefix array of bad and total counts) make each window two subtractions.",
+      "Keep one `firedAt: Int?` per rule while you walk the minutes. Close the episode at the first minute the rule is no longer firing, and remember to emit an open episode with `resolvedAt = null` if the history ends while it fires.",
+      "Sort the result with `compareBy({ it.firedAt }, { ruleIndex })`, so alerts that fire in the same minute come out in rule order."
+    ],
+    "done_when": "All 8 tests in `ErrorBudgetTest` pass."
+  },
+  "drill": {
+    "title": "Error-budget arithmetic from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write the formulas for: the error budget of an SLO in minutes over a window of days; the burn rate of an error ratio; the share of the budget spent by burning at a given rate for some minutes. Then use them: a 99.95% SLO over 30 days, and 1% of requests failing for 30 minutes.",
+    "answer": {
+      "lang": "text",
+      "src": "budget minutes  = (1 - slo) x days x 1,440\nburn rate       = errorRatio / (1 - slo)\nbudget spent    = burnRate x minutes / (days x 1,440)\n\n99.95% over 30 days:  0.0005 x 30 x 1,440 = 21.6 minutes\n1% failing:           burn rate = 0.01 / 0.0005 = 20\n30 minutes of it:     20 x 30 / 43,200 = 1.39% of the month's budget\n"
+    }
+  },
+  "recap": [
+    "Most of a system's cost comes after launch. Operability means good metrics, no dependence on one machine, a clear operational model, sane defaults, self-healing with manual override, and tools with guardrails.",
+    "An error budget is useful once alerts and a policy hang off it: page on burn rate over a long and a short window (14.4 over 1 hour and 5 minutes, 6 over 6 hours and 30 minutes), open a ticket at 1 over 3 days, and agree in advance what happens when the budget runs out.",
+    "The long window keeps blips from paging; the short window makes the page clear minutes after the fix. A naive 10-minute rule pages on blips and stays up through slow leaks until someone mutes it.",
+    "Essential complexity comes from the problem; accidental complexity from how it was built. Good abstractions like SQL and transactions hide mechanism, but they leak.",
+    "Keep changes reversible: expand and contract for data, feature flags and staged rollouts for code. Irreversible steps are the expensive ones.",
+    "Cloud against self-hosting depends on how variable the load is and on the skills you have; headline savings like 37signals' leave out purchase, refresh, staff and flexibility. Every number in this track rests on the network and the OS, which the next two tracks open up."
+  ],
+  "quiz": [
+    {
+      "q": "Every authorization calls three services in series (fraud check, card-network gateway, ledger). Each one independently meets a 99.9% success SLO. What is the highest success rate you can promise for authorizations?",
+      "options": [
+        "About 99.7%",
+        "99.9%",
+        "99.97%",
+        "About 99.0%"
+      ],
+      "answer": 0,
+      "why": "An authorization succeeds only if all three calls do: 0.999³ ≈ 0.997, so about 99.7%, with three times the error budget of any one dependency. 99.9% assumes their failures always line up, which they don't. To promise more you must take a dependency off the critical path (cache its answer, degrade gracefully, call it asynchronously) or get a tighter SLO from it."
+    },
+    {
+      "q": "0.5% of requests start failing against a 99.9% SLO. What is the burn rate, and how long would the 30-day budget last at that rate?",
+      "options": [
+        "Burn rate 0.5; 60 days",
+        "Burn rate 5; 6 days",
+        "Burn rate 50; 14 hours",
+        "Burn rate 5; 6 hours"
+      ],
+      "answer": 1,
+      "why": "Burn rate = 0.5% / 0.1% = 5, so the budget is spent five times too fast: 30 days / 5 = 6 days. Burn rate 0.5 inverts the division. This rate is below 6 and 14.4, so neither page fires; the slow-burn ticket catches it once the 3-day window has spent 10%."
+    },
+    {
+      "q": "Why does each burn-rate rule also require a short window, such as 5 minutes next to the 1-hour window, to be over the threshold?",
+      "options": [
+        "So that it pages faster when an incident starts",
+        "So that it stops firing soon after the problem is fixed, instead of while the long window still remembers the errors",
+        "So that short blips trigger a page too",
+        "Because Prometheus can't compute rates over long windows"
+      ],
+      "answer": 1,
+      "why": "The long window decides whether enough budget has been spent to matter, and it keeps remembering an incident for up to an hour after it ends. Requiring the short window too means the alert clears minutes after the fix; in the lab's 2% incident it clears at minute 101 instead of 116. It doesn't make the page fire sooner: both windows must agree, so the long one sets the pace."
+    },
+    {
+      "q": "Which of these is essential complexity in a card-payment service?",
+      "options": [
+        "Handling a request that the network delivered twice, so the card isn't charged twice",
+        "Three services that each implement idempotency keys differently",
+        "A Redis cache in front of a database that has plenty of spare capacity",
+        "A separate microservice for each database table"
+      ],
+      "answer": 0,
+      "why": "Networks really do deliver duplicates, so any payment system must make a retried request safe: that complexity comes from the problem. The other three come from how the system was built. Three idempotency implementations are one too many, the cache adds invalidation problems with no load to justify it, and a service per table splits one consistent model across network calls."
+    },
+    {
+      "q": "A team wants to move the nightly settlement batch from one large server to a managed cluster service, \"so it scales\". Using lesson 5, what should you measure first?",
+      "options": [
+        "How the cluster's throughput grows from 8 to 64 workers",
+        "How long one well-written thread takes on the same data, the baseline any cluster must beat (its COST)",
+        "The cloud provider's price per worker-hour",
+        "The batch's p99 latency"
+      ],
+      "answer": 1,
+      "why": "A speed-up curve compares the cluster with itself and can look excellent while every configuration is slower than one thread. COST compares it with a competent single-threaded program, and published systems often needed hundreds of cores to win, or never did. Price and scaling matter afterwards, once you know the cluster beats the simple option at all.",
+      "from": "found-05"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Why does a burn-rate alert check a short window as well as a long one?",
+      "back": "The long window says enough budget has gone to matter; the short one says it is still happening, so the alert clears minutes after the fix."
+    },
+    {
+      "front": "Three dependencies in series, each at 99.9%: the best success rate for the whole call?",
+      "back": "0.999³ ≈ 99.7%, three times the error budget of any one of them."
+    },
+    {
+      "front": "The SRE Workbook's paging rules for a 30-day 99.9% SLO?",
+      "back": "Page at burn rate 14.4 over 1 h (and 5 min): 2% of budget. Page at 6 over 6 h (and 30 min): 5%. Ticket at 1 over 3 days (and 6 h): 10%."
+    },
+    {
+      "front": "Essential vs accidental complexity?",
+      "back": "Essential comes from the problem (refunds, currencies, duplicate requests). Accidental comes from the solution (three retry libraries, an unneeded cache). The line moves as tools improve."
+    },
+    {
+      "front": "How do you change a column's format reversibly?",
+      "back": "Expand and contract: add the new column, write both, backfill, switch reads, and drop the old column last, after nothing reads it. Only the drop can't be undone."
+    },
+    {
+      "front": "What did AWS change after the February 2017 S3 outage?",
+      "back": "The capacity-removal tool: it now removes capacity more slowly and refuses to take a subsystem below its minimum capacity. A guardrail in the tool, not a warning to the operator."
+    },
+    {
+      "front": "37signals' reported S3 exit numbers?",
+      "back": "About $1.5M a year for S3; about $1.5M of arrays (18 PB) costing under $200K a year to run; about $1.3M a year saved. Self-reported, and running costs only."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Operability",
+      "plain": "How easy it is for the people on call to keep a system running."
+    },
+    {
+      "term": "Runbook",
+      "plain": "The written procedure for one alert: what it means, how to check, what to do, how to undo it."
+    },
+    {
+      "term": "Multiwindow burn-rate alert",
+      "plain": "An alert that fires only when the error budget is burning too fast over both a long and a short window."
+    },
+    {
+      "term": "Error budget policy",
+      "plain": "An agreement, made in advance, about what the team does as the error budget runs low."
+    },
+    {
+      "term": "Expand and contract",
+      "plain": "Changing a schema in reversible steps: add the new, use both, switch, and remove the old last."
+    },
+    {
+      "term": "Essential complexity",
+      "plain": "Complexity that comes from the problem itself."
+    },
+    {
+      "term": "Accidental complexity",
+      "plain": "Complexity that comes from how the system was built."
+    },
+    {
+      "term": "Feature flag",
+      "plain": "A switch that turns a code path on or off at run time, without a deploy."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your manager asks why you want to delete the \"error rate above 1% for 5 minutes\" alert and replace it with burn-rate alerts. Explain it in your own words, with numbers.",
+    "answer": "Our SLO is 99.9% success over 30 days, so the error budget is 0.1% of requests, about 43 minutes of full outage a month. The current alert ignores that: it pages for a 5-minute blip that uses a tiny fraction of the budget, and it never fires for a 0.5% leak that would empty the whole budget in six days. A burn-rate alert pages when we're spending the budget too fast for long enough to matter: 14.4 times too fast over an hour means 2% of the month is already gone, 6 times over six hours means 5%. Each rule also checks a short window, so the page clears minutes after the fix. A slow burn over three days opens a ticket instead of waking anyone. We get fewer pages, and each one means real budget is going."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Your SLO can't beat your dependencies.** If the authorization path calls the fraud check, the card-network gateway and the ledger in series, and each fails independently 0.1% of the time, the path fails about 0.3% of the time: 0.999³ ≈ 99.7%. Calls in parallel don't help unless any one of them is enough, which is what hedging (lesson 2) and replicas buy. So an SLO is also an architecture tool: it tells you which dependencies must come off the critical path, through a cache, a default answer, or an asynchronous call through a queue.\n\n**Low-traffic services.** Burn-rate alerts assume enough requests to make a ratio meaningful. At 10 requests an hour, a 99.9% budget over 30 days is about 7 failed requests, so one failure spends 13.9% of the month. The Workbook's suggestions include generating synthetic traffic, combining several small services into one SLO, or accepting a lower SLO for them.\n\n**Latency SLOs.** The same machinery works for latency: count a request as bad if it took longer than, say, 300 ms, and the error ratio becomes \"share of slow requests\". That turns lesson 2's percentiles into a budget: \"99% of authorizations under 300 ms\" allows 1% of requests to be slow, and a burn-rate alert tells you when they're becoming slow too fast."
+  },
+  "sources": [
+    {
+      "title": "Google SRE Workbook, chapter 5: Alerting on SLOs",
+      "url": "https://sre.google/workbook/alerting-on-slos/"
+    },
+    {
+      "title": "Google SRE book, chapter 4: Service Level Objectives",
+      "url": "https://sre.google/sre-book/service-level-objectives/"
+    },
+    {
+      "title": "AWS: Summary of the Amazon S3 service disruption (February 2017)",
+      "url": "https://aws.amazon.com/message/41926/"
+    },
+    {
+      "title": "The Register: 37signals cloud repatriation storage savings (May 2025)",
+      "url": "https://www.theregister.com/2025/05/09/37signals_cloud_repatriation_storage_savings"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapters 1 and 2",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

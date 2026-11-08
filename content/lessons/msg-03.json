@@ -1,0 +1,404 @@
+{
+  "id": "msg-03",
+  "title": "Partitions and segments on disk: retention and compaction",
+  "minutes": 40,
+  "goal": "By the end you can explain how a topic is split into partitions and each partition is stored as segment files, predict what retention will delete (whole segments, never single records), say what compaction keeps, and explain how tiered storage and diskless topics move segments off the broker's disk.",
+  "warmup": {
+    "q": "A topic has `retention.ms` set to one hour. One of its segments holds offsets 208 to 311. Offsets 208 to 249 were written two hours ago; 250 to 311 a minute ago. After the next retention check, what can a consumer still read from that segment?",
+    "options": [
+      "Offsets 250 to 311: Kafka deletes each record once it is older than an hour",
+      "Offsets 208 to 311: the file stays whole until its newest record is older than an hour",
+      "Nothing: one expired record expires the whole file",
+      "Offsets 208 to 249 only: retention removes the newest records first"
+    ],
+    "answer": 1,
+    "why": "Retention deletes whole segment files, and a segment expires only when its newest record is older than `retention.ms`. Offsets 208 to 249 are past retention but share a file with fresh records, so they stay readable. The first option is the per-record model most people start with; the lab's broker test shows the real broker keeping exactly these records."
+  },
+  "sections": [
+    {
+      "h": "One log is not enough: a topic is split into partitions",
+      "body": "Lesson 2 of this track built one log: a file you only append to, where the broker numbers every record with an offset and each reader keeps one number, its position. This lesson keeps that picture and looks at how a broker actually stores it. First, though, one log for a whole topic runs into two limits.\n\nThe first limit is the reader. A consumer group keeps one position per log. Two members of the same group can't share one position: they would both read offset 50, or one would skip records the other hasn't finished. So inside a group, only one consumer reads a given log at a time. Now put numbers on it. If the fraud check needs 2 ms per payment, one consumer handles at most 500 payments a second. At a peak of 3,000 payments a second, it falls 2,500 records further behind every second.\n\nThe second limit is the machine. One log is one set of files on one broker's disk, so one broker takes every write for the topic.\n\nKafka's fix is to split a topic into several logs, called **partitions**. Each partition is a complete log of its own, exactly like the one in lesson 2: offsets start at 0, and every group has its own position in it. With 6 partitions, six fraud-check consumers in one group each read one partition, and together they handle 6 × 500 = 3,000 payments a second. Different partitions can also live on different brokers (lesson 4 of this track).\n\nThe split breaks something. One log had one order for everything. Six logs don't: offset 10 in partition 0 and offset 10 in partition 3 have no order between them. For payments that matters, because the capture of a payment must not be processed before its authorization.\n\nThe fix is the record's **key**. When a record has a key, the producer hashes the key and uses the hash to pick a partition, so every record with the same key lands in the same partition and stays in order there. Key payments by account id and all of one account's records keep their order, while different accounts spread across partitions. This is the hash partitioning of the Partitioning track, applied to a log. Records without a key are spread across partitions in batches. Lesson 5 of this track covers the details. The rule to remember: **order is kept only within a partition**.\n\nOn the broker's disk, each partition is a directory named after the topic and the partition number: `card-auths-0`, `card-auths-1`, `card-auths-2`. Everything about the partition lives in that directory, and nothing in it refers to another partition.\n\nChoose the number of partitions with care. You can add partitions later but never remove them, and adding them changes which partition a key maps to. Records for one account written before the change stay in one partition, later ones may land in another, and a consumer can then see them out of order. For a payments topic keyed by account, decide the count up front.",
+      "try": {
+        "title": "Three partitions, three logs",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start the broker with `docker compose -f env/kafka.yml up -d --wait`, then open a shell in it: `docker compose -f env/kafka.yml exec kafka bash`.",
+          "Run the commands below. They create a 3-partition topic, append six keyed card authorizations and read them back with each record's partition and offset.",
+          "Predict before you run: will six records with three keys land two per partition?",
+          "Keep the shell open for the next Try-its."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "inside the kafka container",
+          "src": "cd /opt/kafka/bin\nB=localhost:9092\n./kafka-topics.sh --bootstrap-server $B --create --topic card-auths --partitions 3\n\nprintf 'card-1:auth 10.00\\ncard-2:auth 25.00\\ncard-3:auth 7.50\\ncard-1:auth 3.20\\ncard-2:auth 99.00\\ncard-1:auth 1.00\\n' \\\n  | ./kafka-console-producer.sh --bootstrap-server $B --topic card-auths \\\n      --reader-property parse.key=true --reader-property key.separator=:\n\n./kafka-console-consumer.sh --bootstrap-server $B --topic card-auths --from-beginning --max-messages 6 \\\n  --formatter-property print.partition=true --formatter-property print.offset=true --formatter-property print.key=true\n\nls -d /var/lib/kafka/data/card-auths-*\n"
+        },
+        "expect": "```text\nPartition:2\tOffset:0\tcard-1\tauth 10.00\nPartition:2\tOffset:1\tcard-1\tauth 3.20\nPartition:2\tOffset:2\tcard-1\tauth 1.00\nPartition:1\tOffset:0\tcard-2\tauth 25.00\nPartition:1\tOffset:1\tcard-3\tauth 7.50\nPartition:1\tOffset:2\tcard-2\tauth 99.00\n/var/lib/kafka/data/card-auths-0\n/var/lib/kafka/data/card-auths-1\n/var/lib/kafka/data/card-auths-2\n```\nAll three card-1 records are in partition 2, in the order you wrote them. card-2 and card-3 both hash to partition 1, and partition 0 got nothing: keys are hashed, not dealt out in turn. Each partition counts its own offsets from 0. The hash is deterministic, so you get the same partitions, but the two partitions may print in the other order. (The KIP-848 notice from lesson 2 prints too; it is left out here.)"
+      }
+    },
+    {
+      "h": "A partition is a chain of files: segments",
+      "body": "A log only grows. Put numbers on that: at 3,000 payments a second of about 1 KB each, a topic takes about 3 MB a second, about 260 GB a day and about 1.8 TB a week. Sooner or later the broker must delete the oldest records.\n\nThe simplest design keeps each partition in one big file and deletes from the front. That doesn't work, because a file system can cheaply cut a file short at its end but not at its start. To drop the oldest 260 GB from a 1.8 TB file, the broker would have to copy the remaining 1.5 TB into a new file, every day.\n\nSo the broker cuts the log into a chain of files called **segments**. Only the newest one, the **active segment**, takes appends. When the active segment is full, the broker closes it and opens a new one; this is called **rolling** the segment. A closed segment never changes again. Deleting old data now means deleting old files, which costs almost nothing however big they are.\n\nEach segment is named after its **base offset**, the offset of its first record, padded to 20 digits. The segment that starts at offset 208 is the file `00000000000000000208.log`. The names solve the next problem, finding a record. To read offset 230, the broker looks for the segment with the largest base offset at or below 230. That's `...208.log`. The broker keeps the segments sorted by base offset, so the lookup is quick.\n\nInside that file there is a second problem. A segment can be 1 GiB, and scanning it from the start at, say, 2 GB a second would take half a second for a single read. So next to each `.log` file sits an `.index` file that maps offsets to byte positions in the `.log` file. It is **sparse**: the broker adds an entry about every 4,096 bytes of data (`index.interval.bytes`), not one per record, which keeps the index small enough to hold in memory. The broker looks up 230 in the index, gets the byte position of the nearest entry at or below it, and reads forward a few kilobytes to offset 230. A third file, `.timeindex`, maps timestamps to offsets in the same sparse way, so a consumer can ask for the first record after nine o'clock.\n\nTwo topic settings decide when the active segment rolls:\n\n| Setting | Default | The segment rolls when |\n|---|---|---|\n| `segment.bytes` | 1 GiB | the next batch would make the file bigger than this |\n| `segment.ms` | 7 days | the segment is older than this when a new record arrives |\n\nKafka 4.0 raised the smallest allowed `segment.bytes` to 1 MiB (1,048,576 bytes). To see many segments in a lab, you write large records into 1 MiB segments, which is what the Try-it below does.",
+      "try": {
+        "title": "Watch segments roll",
+        "minutes": 4,
+        "steps": [
+          "In the container shell, create a one-partition topic with the smallest segment size Kafka 4.4 accepts, 1 MiB.",
+          "Write 400 records of 10,000 bytes each with the bundled perf-test tool: about 4 MB.",
+          "Predict how many `.log` files you will see and roughly where each one starts. Then list them and print the earliest and latest offsets."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "inside the kafka container, in /opt/kafka/bin",
+          "src": "B=localhost:9092\n./kafka-topics.sh --bootstrap-server $B --create --topic ledger --partitions 1 --config segment.bytes=1048576\n\n./kafka-producer-perf-test.sh --topic ledger --num-records 400 --record-size 10000 --throughput -1 \\\n  --command-property bootstrap.servers=$B\n\nls -l /var/lib/kafka/data/ledger-0/ | grep '\\.log'\n./kafka-get-offsets.sh --bootstrap-server $B --topic ledger --time earliest\n./kafka-get-offsets.sh --bootstrap-server $B --topic ledger --time latest\n"
+        },
+        "expect": "```text\n400 records sent, 1126.760563 records/sec (10.75 MB/sec), 96.03 ms avg latency, ...\n-rw-r--r-- 1 appuser appuser  1047488 Nov  7 17:50 00000000000000000000.log\n-rw-r--r-- 1 appuser appuser  1047488 Nov  7 17:50 00000000000000000104.log\n-rw-r--r-- 1 appuser appuser  1047488 Nov  7 17:50 00000000000000000208.log\n-rw-r--r-- 1 appuser appuser   886336 Nov  7 17:50 00000000000000000312.log\nledger:0:0\nledger:0:400\n```\nFour segments: three closed ones with 104 records each, and the active one, named 312, with the last 88. Two 10 kB records don't fit in the producer's default 16 KiB batch, so every record went in a batch of its own, about 10,072 bytes on disk. 104 of those fit in 1 MiB, and the 105th rolled the segment. The perf-test numbers depend on your machine. `kafka-get-offsets.sh` prints `topic:partition:offset`."
+      },
+      "refs": [
+        {
+          "title": "Kafka 4.4 topic configs (segment.bytes, segment.ms, retention.ms)",
+          "url": "https://kafka.apache.org/44/configuration/topic-configs/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Retention deletes whole segments, never single records",
+      "body": "Retention decides when old data goes. A topic with `cleanup.policy=delete`, the default, has two limits: `retention.ms` (7 days by default) caps the age of the data, and `retention.bytes` (-1, meaning no limit, by default) caps the size of each partition.\n\nBecause the broker deletes files, not records, it needs a rule for a whole file. A segment may go only when every record in it may go. The newest record in a segment is always the last one to expire, so the rule is: a segment has expired when its **newest** record is older than `retention.ms`. Every `log.retention.check.interval.ms` (5 minutes by default; the lab broker uses 5 seconds), the broker walks each partition's segments from the oldest, deletes each expired one whole, and stops at the first segment that has not expired. For size, it deletes the oldest segments as long as the partition would still hold at least `retention.bytes` without them.\n\nThe rule has three consequences that you will meet in production.\n\nRecords live longer than `retention.ms` says. An old record shares its segment with newer ones and goes only when the newest has expired. On a quiet topic a 1 GiB segment may take days to fill, so it rolls on `segment.ms` after 7 days, and then waits until its newest record is 7 days old too. Ask for 7 days and the oldest records can stay for about 14.\n\nThe earliest offset jumps. When a segment goes, the partition's **earliest offset**, the oldest offset still readable, moves to the next segment's base offset: 104 records at once in the Try-it below, never one at a time. A consumer group whose committed offset now points into deleted data gets an out-of-range error on its next fetch. The consumer setting `auto.offset.reset` decides what happens next, and with its default, `latest`, the consumer jumps to the end of the partition and skips everything in between.\n\nDeletion on disk is lazy. The broker first renames the files to `.deleted` and removes them a minute later (`log.segment.delete.delay.ms`), so that a reader still using a file can finish.\n\nOne more rule surprises people: the active segment is not protected. If every record in a partition has expired, the broker rolls a new, empty active segment and then deletes all the old ones. The partition is empty, but its offsets keep counting from where they were.",
+      "stepper": {
+        "title": "Segments roll, then a retention sweep",
+        "intro": "One partition with 1 MiB segments and one hour of retention, as in the lab's broker test.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"One active segment holding offsets 0 to 63.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box-a\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"93\" y=\"86\" text-anchor=\"middle\">…000000.log</text><text class=\"t t-s\" x=\"93\" y=\"106\" text-anchor=\"middle\">offsets 0-63</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><text class=\"t-s t-a\" x=\"93\" y=\"52\" text-anchor=\"middle\">active</text><text class=\"t\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 0</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">every record is about 10 kB, so 104 fit in 1 MiB</text></svg>",
+            "say": "Appends go to the **active segment**, the file `00000000000000000000.log`. Each record is about 10 kB. The first 250 records carry a timestamp two hours old; the lab's broker test writes them that way on purpose."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"Segment 0 is full and closed; a new active segment starts at offset 104.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"93\" y=\"86\" text-anchor=\"middle\">…000000.log</text><text class=\"t t-s\" x=\"93\" y=\"106\" text-anchor=\"middle\">offsets 0-103</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><rect class=\"box-a\" x=\"182\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"255\" y=\"86\" text-anchor=\"middle\">…000104.log</text><text class=\"t t-s\" x=\"255\" y=\"106\" text-anchor=\"middle\">offsets 104-110</text><text class=\"t-s t-m\" x=\"255\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><text class=\"t-s t-a\" x=\"255\" y=\"52\" text-anchor=\"middle\">active</text><text class=\"t\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 0</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">the 105th record would not fit, so the broker rolled</text></svg>",
+            "say": "Offset 104 would push the file past `segment.bytes`, so the broker **rolls**: it closes segment 0 and opens a new file named after its first offset, `...104.log`. The closed segment never changes again."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"Four segments: two hold only old records, two hold new ones.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"93\" y=\"86\" text-anchor=\"middle\">…000000.log</text><text class=\"t t-s\" x=\"93\" y=\"106\" text-anchor=\"middle\">offsets 0-103</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><rect class=\"box\" x=\"182\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"255\" y=\"86\" text-anchor=\"middle\">…000104.log</text><text class=\"t t-s\" x=\"255\" y=\"106\" text-anchor=\"middle\">offsets 104-207</text><text class=\"t-s t-m\" x=\"255\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><rect class=\"box\" x=\"344\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"417\" y=\"86\" text-anchor=\"middle\">…000208.log</text><text class=\"t t-s\" x=\"417\" y=\"106\" text-anchor=\"middle\">offsets 208-311</text><text class=\"t-s t-a\" x=\"417\" y=\"126\" text-anchor=\"middle\">newest: now</text><rect class=\"box\" x=\"506\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"579\" y=\"86\" text-anchor=\"middle\">…000312.log</text><text class=\"t t-s\" x=\"579\" y=\"106\" text-anchor=\"middle\">offsets 312-399</text><text class=\"t-s t-a\" x=\"579\" y=\"126\" text-anchor=\"middle\">newest: now</text><text class=\"t-s t-a\" x=\"579\" y=\"52\" text-anchor=\"middle\">active</text><text class=\"t\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 0</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">offsets 0-249 are two hours old, offsets 250-399 were written just now</text></svg>",
+            "say": "After 400 records there are four segments. Offsets 0 to 249 are old and 250 to 399 are new. Look at segment 208: it holds old records 208 to 249 and new records 250 to 311, so its **newest** record is new."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"The retention check marks segments 0 and 104 expired and stops at segment 208.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box-bad\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-bad\" x=\"93\" y=\"86\" text-anchor=\"middle\">…000000.log</text><text class=\"t t-s\" x=\"93\" y=\"106\" text-anchor=\"middle\">offsets 0-103</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><rect class=\"box-bad\" x=\"182\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-bad\" x=\"255\" y=\"86\" text-anchor=\"middle\">…000104.log</text><text class=\"t t-s\" x=\"255\" y=\"106\" text-anchor=\"middle\">offsets 104-207</text><text class=\"t-s t-m\" x=\"255\" y=\"126\" text-anchor=\"middle\">newest: 2 h ago</text><rect class=\"box-ok\" x=\"344\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"417\" y=\"86\" text-anchor=\"middle\">…000208.log</text><text class=\"t t-s\" x=\"417\" y=\"106\" text-anchor=\"middle\">offsets 208-311</text><text class=\"t-s t-m\" x=\"417\" y=\"126\" text-anchor=\"middle\">newest: now</text><rect class=\"box\" x=\"506\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"579\" y=\"86\" text-anchor=\"middle\">…000312.log</text><text class=\"t t-s\" x=\"579\" y=\"106\" text-anchor=\"middle\">offsets 312-399</text><text class=\"t-s t-m\" x=\"579\" y=\"126\" text-anchor=\"middle\">newest: now</text><text class=\"t-s t-a\" x=\"579\" y=\"52\" text-anchor=\"middle\">active</text><line class=\"ln-bad\" x1=\"336\" y1=\"56\" x2=\"336\" y2=\"148\"/><text class=\"t-s t-bad\" x=\"336\" y=\"166\" text-anchor=\"middle\">sweep stops here</text><text class=\"t\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 0</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">expired = now minus the segment's newest timestamp is more than retention.ms</text></svg>",
+            "say": "The retention check runs (every `log.retention.check.interval.ms`). It walks from the oldest segment and asks one question per file: is the newest record older than one hour? Segments 0 and 104: yes. Segment 208: no, so the sweep stops there."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"Segments 0 and 104 are deleted. The earliest offset jumps from 0 to 208.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box-dim\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"93\" y=\"86\" text-anchor=\"middle\">….log.deleted</text><text class=\"t-s t-m\" x=\"93\" y=\"106\" text-anchor=\"middle\">gone</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\"></text><rect class=\"box-dim\" x=\"182\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"255\" y=\"86\" text-anchor=\"middle\">….log.deleted</text><text class=\"t-s t-m\" x=\"255\" y=\"106\" text-anchor=\"middle\">gone</text><text class=\"t-s t-m\" x=\"255\" y=\"126\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"344\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"417\" y=\"86\" text-anchor=\"middle\">…000208.log</text><text class=\"t t-s\" x=\"417\" y=\"106\" text-anchor=\"middle\">offsets 208-311</text><text class=\"t-s t-m\" x=\"417\" y=\"126\" text-anchor=\"middle\">newest: now</text><rect class=\"box\" x=\"506\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"579\" y=\"86\" text-anchor=\"middle\">…000312.log</text><text class=\"t t-s\" x=\"579\" y=\"106\" text-anchor=\"middle\">offsets 312-399</text><text class=\"t-s t-m\" x=\"579\" y=\"126\" text-anchor=\"middle\">newest: now</text><text class=\"t-s t-a\" x=\"579\" y=\"52\" text-anchor=\"middle\">active</text><text class=\"t t-a\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 208</text><text class=\"t-s t-bad\" x=\"660\" y=\"196\" text-anchor=\"end\">a group at offset 150: out of range</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">files are renamed .deleted and removed 60 s later</text></svg>",
+            "say": "Both files go whole: renamed to `.deleted`, then removed a minute later. The earliest offset jumps from 0 to **208** in one step; it was never 1, 2 or 3. A consumer group whose committed offset was 150 now points at nothing, and `auto.offset.reset` decides where it lands."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 250\" role=\"img\" aria-label=\"Records 208 to 249 are older than retention but stay readable inside segment 208.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">partition ledger-0</text><text class=\"t-s t-m\" x=\"660\" y=\"28\" text-anchor=\"end\">segment.bytes 1 MiB, retention.ms 1 h</text><rect class=\"box-dim\" x=\"20\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"93\" y=\"86\" text-anchor=\"middle\">….log.deleted</text><text class=\"t-s t-m\" x=\"93\" y=\"106\" text-anchor=\"middle\">gone</text><text class=\"t-s t-m\" x=\"93\" y=\"126\" text-anchor=\"middle\"></text><rect class=\"box-dim\" x=\"182\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t-s t-code t-m\" x=\"255\" y=\"86\" text-anchor=\"middle\">….log.deleted</text><text class=\"t-s t-m\" x=\"255\" y=\"106\" text-anchor=\"middle\">gone</text><text class=\"t-s t-m\" x=\"255\" y=\"126\" text-anchor=\"middle\"></text><rect class=\"box-a\" x=\"344\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"417\" y=\"86\" text-anchor=\"middle\">…000208.log</text><text class=\"t t-s\" x=\"417\" y=\"106\" text-anchor=\"middle\">offsets 208-311</text><text class=\"t-s t-a\" x=\"417\" y=\"126\" text-anchor=\"middle\">208-249 are 2 h old</text><rect class=\"box\" x=\"506\" y=\"62\" width=\"146\" height=\"78\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"579\" y=\"86\" text-anchor=\"middle\">…000312.log</text><text class=\"t t-s\" x=\"579\" y=\"106\" text-anchor=\"middle\">offsets 312-399</text><text class=\"t-s t-m\" x=\"579\" y=\"126\" text-anchor=\"middle\">newest: now</text><text class=\"t-s t-a\" x=\"579\" y=\"52\" text-anchor=\"middle\">active</text><text class=\"t\" x=\"20\" y=\"196\" text-anchor=\"start\">earliest offset 208</text><text class=\"t-s t-m\" x=\"20\" y=\"232\" text-anchor=\"start\">the lab's broker test checks exactly this: earliest stops at 208, below 250</text></svg>",
+            "say": "Records 208 to 249 are older than `retention.ms` and still readable, because they share a file with fresh records. They stay until segment 208's newest record expires. Retention is a lower bound with a ragged edge, never an exact cut."
+          }
+        ]
+      },
+      "try": {
+        "title": "Make retention delete segments",
+        "minutes": 4,
+        "steps": [
+          "Keep the `ledger` topic from the previous Try-it: about 4 MB in four segments. The first block caps each partition at 2,500,000 bytes.",
+          "Predict the earliest offset after the next retention check (it runs every 5 seconds on the lab broker). Then run the first block.",
+          "The second block sets `retention.ms` to one second, so every record has expired. Predict the earliest and latest offsets, then run it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "inside the kafka container, in /opt/kafka/bin",
+          "src": "B=localhost:9092\n# 1. cap the partition at 2,500,000 bytes\n./kafka-configs.sh --bootstrap-server $B --alter --entity-type topics --entity-name ledger --add-config retention.bytes=2500000\nsleep 6\n./kafka-get-offsets.sh --bootstrap-server $B --topic ledger --time earliest\nls /var/lib/kafka/data/ledger-0/ | grep '\\.log'\n\n# 2. now let every record expire\n./kafka-configs.sh --bootstrap-server $B --alter --entity-type topics --entity-name ledger --add-config retention.ms=1000\nsleep 6\n./kafka-get-offsets.sh --bootstrap-server $B --topic ledger --time earliest\n./kafka-get-offsets.sh --bootstrap-server $B --topic ledger --time latest\nls /var/lib/kafka/data/ledger-0/ | grep '\\.log'\n"
+        },
+        "expect": "```text\nCompleted updating config for topic ledger.\nledger:0:104\n00000000000000000000.log.deleted\n00000000000000000104.log\n00000000000000000208.log\n00000000000000000312.log\nCompleted updating config for topic ledger.\nledger:0:400\nledger:0:400\n00000000000000000000.log.deleted\n00000000000000000104.log.deleted\n00000000000000000208.log.deleted\n00000000000000000312.log.deleted\n00000000000000000400.log\n```\nThe size cap removed exactly one segment, because removing the next one as well would have left the partition below 2,500,000 bytes. The earliest offset jumped from 0 to 104 in one step. With `retention.ms=1000` every segment expired, the active one too, so the broker rolled a new empty segment, `...400.log`, and deleted the rest. Earliest and latest are both 400: the partition is empty, and the next record will still get offset 400. The `.deleted` files vanish about a minute later."
+      }
+    },
+    {
+      "h": "Compaction keeps the last value for each key",
+      "body": "Some topics hold a current state rather than a history. Take a `card-status` topic: every time a card is activated, frozen or closed, a service writes a record keyed by card id. Other services read it from the beginning at start-up to build an in-memory map from card to status.\n\nTime-based retention is wrong for this topic. A card whose status last changed three weeks ago would drop out after 7 days, and a service rebuilding its map would think the card doesn't exist. Keeping everything forever is wrong too: with 10 million cards and a few updates each per day, the topic grows without end, and a rebuild reads years of history only to keep the last line for each card.\n\nWhat you want is the last record per key. That's what `cleanup.policy=compact` gives you. Instead of deleting old segments by age, the broker keeps at least the last record for every key and removes older records that a newer one with the same key has replaced.\n\nA background thread on the broker, the **log cleaner**, does the work. It picks the partition with the largest share of not-yet-cleaned (\"dirty\") data, once that share passes `min.cleanable.dirty.ratio` (0.5 by default). It reads the dirty segments and builds a map from each key to the offset of that key's last record. Then it copies the closed segments, keeping only records whose offset is the last one for their key, and swaps the copies in.\n\nThree rules matter to anyone who reads a compacted topic. Offsets never change: survivors keep their original offsets, so a compacted partition has gaps, and consumers skip them without noticing. Order never changes either. And the cleaner never touches the active segment, so the newest records look like a plain log until their segment rolls.\n\nHow do you delete a card, when you can only append? You append a record with the card's key and a null value, called a **tombstone**:\n\n```java\nproducer.send(new ProducerRecord<>(\"card-status\", \"card-2\", null));   // tombstone: card-2 is gone\n```\n\n```kotlin\nproducer.send(ProducerRecord<String, String>(\"card-status\", \"card-2\", null))   // tombstone: card-2 is gone\n```\n\nCompaction then removes the older values for card-2. It keeps the tombstone itself for `delete.retention.ms` (1 day by default), because a consumer that never sees the tombstone would keep card-2 in its map forever. The clock starts when the cleaner first processes the tombstone; `kafka-dump-log.sh` shows the end of that window as `deleteHorizonMs`. A consumer that falls more than a day behind can still miss it.\n\nCompaction is not deduplication. It keeps the last value per key only in closed segments, and only once the cleaner gets there. Until then every old value is still in the log and consumers read them all, so your code must handle every record. You can also combine both policies: `cleanup.policy=compact,delete` keeps the last value per key and also deletes segments past retention.",
+      "try": {
+        "title": "Compact a card-status topic",
+        "minutes": 5,
+        "steps": [
+          "In the container shell, create a compacted topic whose segments roll after 5 seconds, with a low dirty ratio so the cleaner starts right away.",
+          "Write six status updates that end with a tombstone for card-2. The `null.marker` setting turns the text `NULL` into a null value.",
+          "The script then waits, writes one more record to roll the first segment, and waits again so the cleaner can run. Predict which offsets survive before you read the output.",
+          "Exit the shell and stop the broker from the `labs` folder: `docker compose -f env/kafka.yml down -v`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "inside the kafka container, in /opt/kafka/bin",
+          "src": "B=localhost:9092\n./kafka-topics.sh --bootstrap-server $B --create --topic card-status \\\n  --config cleanup.policy=compact --config segment.ms=5000 --config min.cleanable.dirty.ratio=0.01\n\nprintf 'card-1:active\\ncard-2:active\\ncard-1:frozen\\ncard-3:active\\ncard-1:active\\ncard-2:NULL\\n' \\\n  | ./kafka-console-producer.sh --bootstrap-server $B --topic card-status \\\n      --reader-property parse.key=true --reader-property key.separator=: --reader-property null.marker=NULL\nsleep 6\n# one more record: it rolls the first segment, which can now be compacted\nprintf 'card-4:active\\n' | ./kafka-console-producer.sh --bootstrap-server $B --topic card-status \\\n  --reader-property parse.key=true --reader-property key.separator=:\nsleep 6\n\n./kafka-console-consumer.sh --bootstrap-server $B --topic card-status --from-beginning --max-messages 4 \\\n  --formatter-property print.offset=true --formatter-property print.key=true\n./kafka-dump-log.sh --files /var/lib/kafka/data/card-status-0/00000000000000000000.log --print-data-log\n"
+        },
+        "expect": "```text\nOffset:3\tcard-3\tactive\nOffset:4\tcard-1\tactive\nOffset:5\tcard-2\tnull\nOffset:6\tcard-4\tactive\n```\nand from the dump (trimmed):\n```text\nbaseOffset: 0 lastOffset: 5 count: 3 ... deleteHorizonMs: OptionalLong[1794160261750] ...\n| offset: 3 ... key: card-3 payload: active\n| offset: 4 ... key: card-1 payload: active\n| offset: 5 ... keySize: 6 valueSize: -1 ... key: card-2\n```\nOffsets 0, 1 and 2 are gone: a later record with the same key replaced each one. The survivors kept their offsets, so the partition now starts with a gap at 0 to 2. The tombstone for card-2 is still there (`valueSize: -1`), and its `deleteHorizonMs` is one day after the cleaner first processed it. Offset 6 is in the active segment, which the cleaner never touches. If you still see all six old records, the cleaner has not run yet: wait a few seconds and read again."
+      },
+      "refs": [
+        {
+          "title": "Kafka 4.4 design: log compaction",
+          "url": "https://kafka.apache.org/44/design/design/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Moving segments off the broker: tiered storage and diskless topics",
+      "body": "A closed segment never changes, so it doesn't have to stay on the broker that wrote it. That one fact is how Kafka separates storage from compute, the idea from the What data systems are for track's lesson on shared-nothing, shared-disk and the cloud: keep the durable copy in object storage, and treat the broker's disk as a cache.\n\nStart with what keeping everything local costs. The topic from the second section takes 3 MB a second, about 1.8 TB a week. Lesson 4 of this track keeps every partition on three brokers, so that is 5.4 TB of broker disk per week of retention. Compliance asks for 13 months, and the brokers now need about 300 TB, while adding a broker means copying partitions to it for hours. Yet almost every read is near the end of the log. The old segments sit there for the rare replay.\n\n**Tiered storage** (KIP-405), production-ready since Kafka 3.9, moves them out. With `remote.storage.enable=true` on a topic, the broker copies each closed segment to remote storage, usually an object store such as S3, through a `RemoteStorageManager` plugin you configure. It keeps only recent segments on local disk. `local.retention.ms` and `local.retention.bytes` say how many, and their default, -2, means \"the same as `retention.ms` and `retention.bytes`\", so nothing leaves until you lower them. `retention.ms` still decides when a record is gone everywhere. A consumer that reads an old offset gets it from the object store without knowing, only slower. The active segment always stays local. Kafka 4.3 and 4.4 added refinements, such as letting a new follower start from the last tiered offset and delaying uploads (`remote.copy.lag.ms`).\n\nTiered storage leaves the write path alone, and in the cloud that is where the money goes. Every byte a producer sends is still copied from the leader to two followers, and across three availability zones most of those copies cross zones. AWS charges about $0.02 for every GiB that crosses zones. At 100 MB a second, replication alone moves about 16,000 GiB a day between zones: around $320 a day.\n\n**Diskless topics** (KIP-1150) remove that traffic. Producers' batches go straight to object storage, a separate coordinator assigns their offsets, and brokers keep only metadata, staging space and a cache on local disk. The object store is the replicated copy, so brokers stop copying data to each other. The price is latency: a write counts once the object store has it. Products that already work this way, such as WarpStream (bought by Confluent in 2024), Redpanda's Cloud Topics (generally available in Redpanda 26.1) and AutoMQ, quote produce latencies of roughly 100 to 500 ms instead of a few milliseconds. KIP-1150 was accepted in March 2026 but has not shipped. Its core designs (KIP-1163 and KIP-1164) were still under discussion in August 2026, and Kafka 4.4 has no diskless setting.\n\nSo ask that lesson's question: where is the durable copy? On a classic topic, on the replicas' local disks. With tiered storage, recent segments on those disks and older ones in the object store. On a diskless topic, in the object store, with broker disks as a cache.",
+      "refs": [
+        {
+          "title": "Apache Kafka 3.9.0 release announcement (tiered storage production-ready)",
+          "url": "https://kafka.apache.org/blog/2024/11/06/apache-kafka-3.9.0-release-announcement/",
+          "kind": "read"
+        },
+        {
+          "title": "KIP-1150: Diskless Topics",
+          "url": "https://cwiki.apache.org/confluence/display/KAFKA/KIP-1150%3A+Diskless+Topics",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "Segments are the pages of the ledger book from lesson 2, and retention tears out whole pages, never single lines. A page goes only when its last line is older than the limit, so an old line at the top of a page survives as long as the page's newest line. Compaction is a different clean-up: a clerk recopies the full pages, keeps only the latest line for each account, and keeps the original line numbers so that no reference breaks. The analogy breaks on two points. The clerk never touches the page still being written, and a closed account (a tombstone) stays visible for a day before it disappears. Tiered storage is the archive room: old pages move there and can still be read, more slowly.",
+  "in_your_world": "Payment topics often come with a retention rule from compliance, for example \"keep authorizations for 13 months\" or \"never keep raw card data\". Kafka's retention is a lower bound with a ragged edge: data lives until its whole segment expires, so with 1 GiB segments a quiet topic keeps records well past `retention.ms`. If you must delete within a day of expiry, set `segment.ms` low enough (say 6 hours) that segments roll often, and check the earliest offset with `kafka-get-offsets.sh` instead of trusting the config. For long retention such as 13 months, turn on tiered storage so that old segments live in object storage instead of on every broker. Compacted topics suit reference data that your Quarkus services cache: the latest risk score per merchant, card status, currency rates. A service can rebuild its in-memory view at start-up by reading a compacted topic from the beginning, and a tombstone is how you tell every instance that a card was closed.",
+  "mistake": "Assuming a lagging consumer will fail when its data has been deleted. With the default `auto.offset.reset=latest`, a group whose committed offset fell off the start of the log jumps to the end and carries on. Apart from one INFO line from the client about resetting the offset, nothing tells you that thousands of payments were skipped. People don't expect it because the setting sounds as if it only matters for brand-new groups. For consumers that must not skip data, set `auto.offset.reset=earliest` (read what is left) or `none` (fail loudly and let an operator decide), and alert on consumer lag long before it gets near the retention limit.",
+  "compare": {
+    "title": "The cleaner's offset map in Java and Kotlin",
+    "java": {
+      "title": "Java",
+      "src": "// key -> offset of its last record; later records overwrite earlier ones\nMap<String, Long> last = new HashMap<>();\nfor (Rec r : closed) last.put(r.getKey(), r.getOffset());\n\nList<Rec> kept = closed.stream()\n        .filter(r -> r.getOffset() == last.get(r.getKey()))   // long == Long unboxes: compares values\n        .toList();"
+    },
+    "kotlin": {
+      "title": "Kotlin",
+      "src": "// key -> offset of its last record; associate keeps the last value for a repeated key\nval last: Map<String?, Long> = closed.associate { it.key to it.offset }\n\nval kept = closed.filter { it.offset == last[it.key] }"
+    },
+    "note": "`associate` builds the map in one call and keeps the last value it sees for each key, which is exactly the cleaner's rule. Java's `Collectors.toMap` would throw on the first repeated key unless you pass a merge function such as `(a, b) -> b`, so the plain loop is clearer. Watch the comparison in Java: `==` between two boxed `Long` objects compares references, which happens to work for values up to 127 and fails above. Here `getOffset()` returns a primitive `long`, so Java unboxes the other side and compares values. Kotlin's `==` always compares values."
+  },
+  "worked": {
+    "title": "Work out what a retention change will delete before you make it",
+    "steps": [
+      {
+        "say": "Finance wants `settlement-events` kept for 3 days instead of 7. Before you change `retention.ms`, find out how much would go. Start with where partition 0 begins today. (`admin` is an `Admin` client; repeat for each partition.)",
+        "code": "// 1. where partition 0 starts today\nTopicPartition tp = new TopicPartition(\"settlement-events\", 0);\nlong earliest = admin.listOffsets(Map.of(tp, OffsetSpec.earliest()))\n        .partitionResult(tp).get().offset();",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "// 1. where partition 0 starts today\nval tp = TopicPartition(\"settlement-events\", 0)\nval earliest = admin.listOffsets(mapOf(tp to OffsetSpec.earliest()))\n    .partitionResult(tp).get().offset()"
+      },
+      {
+        "say": "Find the first record younger than 3 days. `OffsetSpec.forTimestamp` asks the broker's time index for the earliest offset whose timestamp is at or after the time you give. If every record is older, it returns -1: everything would go.",
+        "code": "// 2. the first record younger than 3 days\nlong cutoff = System.currentTimeMillis() - Duration.ofDays(3).toMillis();\nlong firstYoung = admin.listOffsets(Map.of(tp, OffsetSpec.forTimestamp(cutoff)))\n        .partitionResult(tp).get().offset();",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "// 2. the first record younger than 3 days\nval cutoff = System.currentTimeMillis() - Duration.ofDays(3).toMillis()\nval firstYoung = admin.listOffsets(mapOf(tp to OffsetSpec.forTimestamp(cutoff)))\n    .partitionResult(tp).get().offset()"
+      },
+      {
+        "say": "Now apply the segment rule. The broker deletes only whole segments whose newest record is older than the cutoff, so the new earliest offset will be the base offset of the segment that holds `firstYoung`: at or below it, never above. `firstYoung - earliest` is the most that can go; the real number is rounded down to whole segments.",
+        "code": "// 3. an upper bound, rounded down to whole segments in practice\nSystem.out.printf(\"partition 0: up to %,d records older than 3 days%n\", firstYoung - earliest);",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "// 3. an upper bound, rounded down to whole segments in practice\nprintln(\"partition 0: up to %,d records older than 3 days\".format(firstYoung - earliest))"
+      },
+      {
+        "say": "Change only the one key with `incrementalAlterConfigs`. Then watch the earliest offset over the next retention checks (every 5 minutes by default). It moves in jumps, a segment at a time.",
+        "code": "// 4. change retention.ms and nothing else\nvar op = new AlterConfigOp(new ConfigEntry(\"retention.ms\", String.valueOf(Duration.ofDays(3).toMillis())),\n        AlterConfigOp.OpType.SET);\nvar topic = new ConfigResource(ConfigResource.Type.TOPIC, \"settlement-events\");\nadmin.incrementalAlterConfigs(Map.of(topic, List.of(op))).all().get();",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "// 4. change retention.ms and nothing else\nval op = AlterConfigOp(ConfigEntry(\"retention.ms\", Duration.ofDays(3).toMillis().toString()),\n    AlterConfigOp.OpType.SET)\nval topic = ConfigResource(ConfigResource.Type.TOPIC, \"settlement-events\")\nadmin.incrementalAlterConfigs(mapOf(topic to listOf(op))).all().get()"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Model segments, retention and compaction, then check a real broker",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/kafka/src/main/kotlin/sfz/msg/l03/SegmentedLog.kt",
+      "labs/kafka/src/main/java/sfz/msg/l03/Compaction.java"
+    ],
+    "run": "./gradlew :kafka:test --tests 'sfz.msg.l03.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. 14 of 16 fail. The two that pass are in `RetentionOnBrokerTest` and need no code from you: they show a real Kafka 4.4 broker doing what your model is about to do. Offsets 0 to 249 are two hours old, retention is one hour, and the earliest offset stops at a segment boundary below 250.",
+      "In `SegmentedLog.kt`, write `append`: build the `Rec`, roll to a new `Segment(endOffset)` when the active segment already has records and this one would push it past `segmentBytes`, then add the record and move `endOffset` on.",
+      "Write `deleteExpired`: walk from the oldest segment, stop at the first one that has not expired, and remove the expired ones whole. If that removed every segment, add an empty one at `endOffset`.",
+      "Run the tests. `SegmentedLogTest` should pass.",
+      "In `Compaction.java`, write `compact`: one pass to find each key's last offset, a second pass to copy the survivors in order, dropping tombstones older than `deleteRetentionMs`.",
+      "Run the tests until all 16 pass."
+    ],
+    "hints": [
+      "Roll before you append: the size check uses the record you are about to add. A segment that is still empty takes any record, however big.",
+      "A segment has expired when `nowMs - maxTimestampMs > retentionMs`. An empty segment's `maxTimestampMs` is -1, so check `records.isNotEmpty()` first, or an empty segment looks ancient.",
+      "In Java, `Rec` is a Kotlin data class: call `r.getKey()`, `r.getValue()`, `r.getOffset()` and `r.getTimestampMs()`. A `HashMap<String, Long>` filled in offset order leaves each key mapped to its last offset."
+    ],
+    "done_when": "All 16 tests in `SegmentedLogTest`, `CompactionTest` and `RetentionOnBrokerTest` pass."
+  },
+  "drill": {
+    "title": "Write the retention sweep from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write `deleteExpired(segments, nowMs, retentionMs)` for a mutable list of segments, oldest first, where each segment has `records` and `maxTimestampMs`. Delete whole expired segments from the front, stop at the first one that has not expired, and return how many you deleted. Then compare with the answer. Did you stop at the first young segment, or did you skip over it?",
+    "answer": {
+      "lang": "java",
+      "src": "static int deleteExpired(List<Segment> segments, long nowMs, long retentionMs) {\n    int deleted = 0;\n    while (!segments.isEmpty()) {\n        Segment oldest = segments.get(0);\n        boolean expired = !oldest.getRecords().isEmpty()\n                && nowMs - oldest.getMaxTimestampMs() > retentionMs;\n        if (!expired) break;          // the first young segment stops the sweep\n        segments.remove(0);           // the whole file goes\n        deleted++;\n    }\n    return deleted;\n}",
+      "alt": {
+        "lang": "kotlin",
+        "src": "fun deleteExpired(segments: MutableList<Segment>, nowMs: Long, retentionMs: Long): Int {\n    var deleted = 0\n    while (segments.isNotEmpty()) {\n        val oldest = segments[0]\n        val expired = oldest.records.isNotEmpty() && nowMs - oldest.maxTimestampMs > retentionMs\n        if (!expired) break           // the first young segment stops the sweep\n        segments.removeAt(0)          // the whole file goes\n        deleted++\n    }\n    return deleted\n}"
+      }
+    }
+  },
+  "recap": [
+    "A topic is a set of partitions. Each partition is its own log with its own offsets, and order holds only inside one partition.",
+    "On disk a partition is a directory of segments named by base offset. Only the active segment takes appends; it rolls at `segment.bytes` (1 GiB) or `segment.ms` (7 days).",
+    "Sparse `.index` and `.timeindex` files let the broker find an offset or a timestamp without scanning the partition.",
+    "Retention deletes whole segments, oldest first, once a segment's newest record passes `retention.ms` or the partition is over `retention.bytes`. The earliest offset jumps a segment at a time.",
+    "Compaction keeps at least the last record per key in closed segments. Offsets and order never change, and tombstones stay for `delete.retention.ms`.",
+    "Tiered storage (production-ready since Kafka 3.9) moves closed segments to object storage and keeps recent ones local. Diskless topics (KIP-1150, accepted, not shipped in 4.4) would write straight to object storage and drop broker-to-broker replication, at the cost of produce latency."
+  ],
+  "quiz": [
+    {
+      "q": "A topic has `retention.ms` of 7 days and the default 1 GiB `segment.bytes`, but it receives only a few megabytes a day. How long can its oldest records stay readable?",
+      "options": [
+        "Exactly 7 days",
+        "7 days plus up to 5 minutes for the next retention check",
+        "Up to about 14 days: the segment rolls on `segment.ms` after 7 days, then waits until its newest record is 7 days old",
+        "Forever, because a segment under 1 GiB never rolls"
+      ],
+      "answer": 2,
+      "why": "The segment never fills 1 GiB, so it rolls on time, after `segment.ms` (7 days). Its newest record is then almost 7 days younger than its oldest, and the file goes only when that newest record passes 7 days. The last option forgets `segment.ms`; the first two forget that retention works on whole files."
+    },
+    {
+      "q": "A consumer group was stopped for 9 days on a topic that keeps 7. When it starts again, its committed offset points into a deleted segment. The consumer uses the client defaults. What happens?",
+      "options": [
+        "It fails to start with an OffsetOutOfRangeException",
+        "It resumes from the earliest offset still on disk",
+        "The broker restores the deleted segment from a replica",
+        "It jumps to the end of the partition and skips everything in between, without an error"
+      ],
+      "answer": 3,
+      "why": "When the committed offset no longer exists, `auto.offset.reset` decides, and the client default is `latest`. The consumer moves to the end and the records in between are skipped silently. `earliest` would give the second option and `none` the first; replicas delete the same segments, so there is nothing to restore."
+    },
+    {
+      "q": "A compacted topic `card-status` has these records in closed segments: offset 10 card-7=active, 11 card-8=active, 12 card-7=frozen, 13 card-7=null. The cleaner runs, well within `delete.retention.ms`. What can a consumer read from these offsets afterwards?",
+      "options": [
+        "11 card-8=active and 13 card-7=null",
+        "11 card-8=active and 12 card-7=frozen",
+        "11 card-8=active only",
+        "All four records, renumbered as offsets 0 to 3"
+      ],
+      "answer": 0,
+      "why": "Only the last record per key survives: 11 for card-8, and 13, the tombstone, for card-7. The tombstone stays for `delete.retention.ms` so that consumers learn about the delete; the third option is what you get after that window. Offsets never change."
+    },
+    {
+      "q": "The `payments` topic must keep 13 months, and the cloud bill shows heavy cross-zone traffic between brokers. On Kafka 4.4, what does turning on tiered storage change?",
+      "options": [
+        "It removes broker-to-broker replication, because the object store now holds the copies",
+        "It moves the active segment to the object store too, so brokers need almost no disk",
+        "Old closed segments move to the object store, which cuts broker disk; replication between brokers, and its cross-zone traffic, stay as they were",
+        "Nothing until you also set `cleanup.policy=tiered`"
+      ],
+      "answer": 2,
+      "why": "Tiered storage only moves closed segments older than `local.retention.*`; the write path, with the leader copying every batch to its followers, is unchanged. Removing replication traffic is what diskless topics (KIP-1150) aim at, and they are accepted but not in Kafka 4.4. The active segment always stays local, and the switch is `remote.storage.enable=true`, not a cleanup policy."
+    },
+    {
+      "q": "From the previous lesson: a reconciliation job calls `assign`, then `seek(tp, 50)`, on a partition whose earliest offset is now 104 after retention. The consumer has `auto.offset.reset=none`. What happens?",
+      "options": [
+        "`seek` throws at once, because offset 50 is gone",
+        "`seek` succeeds, and the next `poll` throws OffsetOutOfRangeException",
+        "The next `poll` silently starts at 104",
+        "The next `poll` returns offsets 50 to 103 from a replica"
+      ],
+      "answer": 1,
+      "why": "`seek` only sets a number inside the client, so it cannot fail on a missing offset. The fetch for offset 50 fails on the broker, and with `auto.offset.reset=none` the consumer throws `OffsetOutOfRangeException` from `poll`. The lab's broker test checks exactly this. With `earliest` it would quietly start at 104 instead.",
+      "from": "msg-02"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is a segment?",
+      "back": "One file of a partition's log, named after its first (base) offset, such as `00000000000000000208.log`. Only the newest, the active segment, takes appends."
+    },
+    {
+      "front": "When does a segment roll?",
+      "back": "When the next batch would push it past `segment.bytes` (1 GiB by default), or when it is older than `segment.ms` (7 days) as a new record arrives."
+    },
+    {
+      "front": "Which record does time-based retention look at to decide whether a segment goes?",
+      "back": "The segment's newest record. The whole file is deleted once that record is older than `retention.ms`."
+    },
+    {
+      "front": "With tiered storage on, which segments stay on the broker's disk?",
+      "back": "The active segment and the recent closed ones, as set by `local.retention.ms` and `local.retention.bytes`. Older closed segments live in remote (object) storage; `retention.ms` still decides when data is deleted everywhere."
+    },
+    {
+      "front": "What is a tombstone?",
+      "back": "A record with a key and a null value. On a compacted topic it deletes the key, and it stays for `delete.retention.ms` (1 day by default) after the cleaner first reaches it."
+    },
+    {
+      "front": "Does compaction change offsets or order?",
+      "back": "No. Survivors keep their offsets and their order, so a compacted partition has gaps."
+    },
+    {
+      "front": "What is the smallest `segment.bytes` in Kafka 4.x?",
+      "back": "1 MiB (1,048,576 bytes). Kafka 4.0 raised it from 14 bytes."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Segment",
+      "plain": "One file of a partition's log, plus its index files, named after the offset of its first record."
+    },
+    {
+      "term": "Active segment",
+      "plain": "The newest segment of a partition, the only one that takes appends. Compaction never touches it."
+    },
+    {
+      "term": "Base offset",
+      "plain": "The offset of a segment's first record. It is also the segment's file name, padded to 20 digits."
+    },
+    {
+      "term": "Retention",
+      "plain": "Deleting old data by age (`retention.ms`) or size (`retention.bytes`), a whole segment at a time."
+    },
+    {
+      "term": "Earliest offset",
+      "plain": "The oldest offset a partition still holds, also called the log start offset. Retention moves it forward in jumps."
+    },
+    {
+      "term": "Log compaction",
+      "plain": "Cleaning a partition so that at least the last record for every key remains, with offsets unchanged."
+    },
+    {
+      "term": "Tombstone",
+      "plain": "A record with a key and a null value: on a compacted topic, the way to delete a key."
+    },
+    {
+      "term": "Tiered storage",
+      "plain": "Keeping recent segments on the broker's disk and older closed segments in remote storage, such as an object store."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague set `retention.ms` to one hour on a test topic and is surprised that records written three hours ago are still readable. Explain why, and what they could change to see retention act sooner.",
+    "answer": "Retention deletes whole segment files, and a segment goes only when its newest record is older than `retention.ms`. On a quiet test topic the active segment keeps taking records for a long time, because the defaults are 1 GiB per segment and 7 days per segment, so the three-hour-old records share a file with newer ones. The broker also only checks every `log.retention.check.interval.ms`, 5 minutes by default. To see retention sooner, make the segments roll sooner: lower `segment.ms` on the test topic, or `segment.bytes` (1 MiB at least). Then old records end up in closed segments that can expire on their own."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**How the diskless designs differ.** WarpStream's agents are stateless: they speak the Kafka protocol, keep all data in object storage and keep metadata in a service WarpStream runs. Its docs give about 500 ms p99 produce latency on standard S3 and about 170 ms p99 on S3 Express One Zone. AutoMQ, an Apache-licensed Kafka fork, replaces local segments with a write-ahead log in front of object storage. Aiven's open fork Inkless is the testbed for KIP-1150 itself. These are vendor figures, so measure at the guarantees you need before you compare them with a classic cluster's few milliseconds.\n\n**Compaction settings worth knowing.** `min.compaction.lag.ms` keeps recent values uncompacted for a while, so consumers see them. `max.compaction.lag.ms` asks the cleaner to compact a record within some time, though the design doc calls it a deadline the cleaner may miss; its default is `Long.MAX`, which means a value replaced or deleted by a tombstone has no deadline for physical removal unless you set one. And `kafka-log-dirs.sh --describe` shows how much disk each partition uses on each broker, the quickest way to find the partition that retention is not keeping in check."
+  },
+  "sources": [
+    {
+      "title": "Apache Kafka 4.4 documentation: Topic configs",
+      "url": "https://kafka.apache.org/44/configuration/topic-configs/"
+    },
+    {
+      "title": "Apache Kafka 4.4 documentation: Design (log compaction)",
+      "url": "https://kafka.apache.org/44/design/design/"
+    },
+    {
+      "title": "Apache Kafka 4.4 upgrade notes (segment.bytes minimum)",
+      "url": "https://kafka.apache.org/44/getting-started/upgrade/"
+    },
+    {
+      "title": "Apache Kafka 3.9.0 release announcement (tiered storage)",
+      "url": "https://kafka.apache.org/blog/2024/11/06/apache-kafka-3.9.0-release-announcement/"
+    },
+    {
+      "title": "KIP-1150: Diskless Topics",
+      "url": "https://cwiki.apache.org/confluence/display/KAFKA/KIP-1150%3A+Diskless+Topics"
+    }
+  ]
+}

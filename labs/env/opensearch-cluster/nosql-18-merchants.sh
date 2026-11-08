@@ -1,16 +1,16 @@
 #!/bin/sh
-# Lesson nosql-18: a merchants index with 3 primary shards and 1 replica each, on the three-node cluster.
+# Lesson shard-09: a merchants index with 3 primary shards and 1 replica each, on the three-node cluster.
 # Run from the labs folder: sh env/opensearch-cluster/nosql-18-merchants.sh   (safe to run again)
 OS=${OS:-http://localhost:9200}
 curl -s -X DELETE "$OS/merchants" > /dev/null
-# the same text field as lesson nosql-12, but split into 3 primaries, each with 1 replica
+# the same text field as lesson store-08, but split into 3 primaries, each with 1 replica
 curl -s -X PUT "$OS/merchants" -H 'Content-Type: application/json' -d '{
   "settings": { "number_of_shards": 3, "number_of_replicas": 1 },
   "mappings": { "properties": {
     "name": { "type": "text", "analyzer": "standard" },
     "city": { "type": "keyword" } } }
 }' > /dev/null
-# twelve merchants: the five from lesson nosql-12 and seven more
+# twelve merchants: the five from lesson store-08 and seven more
 curl -s -X POST "$OS/merchants/_bulk?refresh=true" -H 'Content-Type: application/x-ndjson' --data-binary '
 { "index": { "_id": "M-0042" } }
 { "name": "Northwind Bikes, bike repairs and spare parts", "city": "Leeds" }

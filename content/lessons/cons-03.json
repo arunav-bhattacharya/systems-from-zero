@@ -1,0 +1,447 @@
+{
+  "id": "cons-03",
+  "title": "Total order broadcast and the many faces of consensus",
+  "minutes": 40,
+  "goal": "By the end you can explain total order broadcast and why it keeps replicas identical, show that it, a linearizable compare-and-set, consensus and fault-tolerant atomic commit are one problem, state consensus's four properties and what FLP rules out, walk through a single-decree Paxos run with a crash, and say what Multi-Paxos, Viewstamped Replication and Zab add and what consensus costs.",
+  "warmup": {
+    "q": "FLP proves that no deterministic consensus algorithm can guarantee to terminate in an asynchronous network if one node may crash. Your Kubernetes cluster's etcd runs Raft. What does FLP mean for it?",
+    "options": [
+      "etcd may occasionally decide two different values",
+      "etcd can't work at all, and only appears to by luck",
+      "etcd may stall while the network misbehaves, but never decides two different values",
+      "etcd escapes FLP by relying on synchronized clocks for safety"
+    ],
+    "answer": 2,
+    "why": "FLP is about termination, not safety. Raft keeps its safety properties under any timing and uses timeouts only to make progress, which works whenever the network delivers messages within roughly the timeout. When it doesn't, elections can repeat and writes stall, and nothing wrong is ever decided. Raft's safety doesn't depend on clocks at all; only leases for fast reads do, and etcd's default linearizable read avoids them."
+  },
+  "sections": [
+    {
+      "h": "Total order broadcast: same messages, same order, every replica",
+      "body": "The last lesson ended on something quorums can't do: a compare-and-set that two writers can't both win. This lesson finds the tool that can, and it starts from a different problem.\n\nYou run a payment ledger as a state machine: a piece of deterministic code that takes commands one at a time (authorize, capture, refund) and updates its state. Run three copies of it on three machines. If every copy starts from the same state and applies the same commands in the same order, every copy ends in the same state, with no further coordination. This is **state machine replication**, and it reduces \"keep three ledgers identical\" to \"deliver the same commands in the same order to three places\".\n\nThat delivery problem has a name: **total order broadcast**, also called atomic broadcast. It promises two things. *Reliable delivery*: if one replica delivers a message, every replica that doesn't crash delivers it. *Total order*: every replica delivers messages in the same order. Seen from a replica, total order broadcast is an append-only log that it reads from the start.\n\nThe simplest way to build one: send every message to one node, the sequencer, which numbers it 1, 2, 3 and forwards it to every replica. Messages can overtake each other on the way, so each replica holds back message 8 until it has delivered 7. A Kafka partition is this shape: the partition leader decides the order, and consumers read it by offset.\n\nNow build the thing quorums couldn't. A compare-and-set register on top of the log: a client appends \"if the value is null, set it to c2\" as a command, and waits until its own replica applies that command. Every replica applies the same commands in the same order with the same code, so every replica computes the same answer for every CAS. The first CAS in the log wins and every later one fails, everywhere. Reads must go through the log too. A read answered straight from a replica's current state can lag behind a CAS that already returned to its client, and that is a stale read.\n\nWhere does it break? At the sequencer. If it crashes, nothing is ever delivered again. Promote a new one by hand, and you get minutes of downtime. Promote one automatically when the old one *seems* dead, and an old sequencer that was only slow may keep numbering messages too, so two replicas see two different message 8s: the split brain from the Replication track's first lesson. To replace the sequencer safely, the nodes must agree which message is number 8, despite crashes and delays. That is consensus.",
+      "try": {
+        "title": "Race six clients for one seat",
+        "minutes": 4,
+        "steps": [
+          "Run `LogDemo`. Six booking services send `cas(null -> their name)` for seat 12A through a total order broadcast with three replicas; messages take 1 to 20 ms and overtake each other.",
+          "Predict: can two clients both be told they got the seat? Will the replicas agree on who has it?",
+          "Run it again with `-Pargs=7` for another seed. Then read the last two lines: 200 runs of mixed CAS and reads, with reads through the log, then reads that skip it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.LogDemoKt -q\n./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.LogDemoKt -Pargs=7 -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.LogDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l03/demo/LogDemo.kt"
+        },
+        "expect": "```text\nseed 3: six clients race for seat 12A\n   21 ms  c5 sent at 1 ms: seat taken\n   33 ms  c3 sent at 9 ms: seat taken\n   35 ms  c2 sent at 4 ms: got the seat\n   40 ms  c1 sent at 5 ms: seat taken\n   42 ms  c6 sent at 5 ms: seat taken\n   57 ms  c4 sent at 9 ms: seat taken\n  r1 applied c2 c5 c1 c3 c4 c6  ->  seat 12A belongs to c2\n  r2 applied c2 c5 c1 c3 c4 c6  ->  seat 12A belongs to c2\n  r3 applied c2 c5 c1 c3 c4 c6  ->  seat 12A belongs to c2\n\nreads through the log: 0 of 200 histories not linearizable\nreads from the home replica, skipping the log: 2 of 200 histories not linearizable\n```\n\nc2's command reached the sequencer first, so it is first in every replica's log and wins everywhere. c5 heard \"seat taken\" before c2 heard \"got the seat\": answers travel separately, and order lives in the log, not in the replies. Reads that skip the log returned a stale value in 2 of 200 histories, which is rare enough to pass every test you would write by hand."
+      },
+      "refs": [
+        {
+          "title": "Kafka 4.4: KRaft operations (a Raft log for cluster metadata)",
+          "url": "https://kafka.apache.org/44/operations/kraft/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Consensus is one problem in many disguises",
+      "body": "**Consensus** is the problem of getting several nodes to decide one value. Each node may propose a value; all of them must end up deciding the same one. Four properties pin it down:\n\n- *Uniform agreement*: no two nodes decide differently.\n- *Integrity*: no node decides twice.\n- *Validity*: the decided value was proposed by someone.\n- *Termination*: every node that doesn't crash eventually decides.\n\nThe first three are safety properties, things that must never go wrong. Termination is a liveness property. Without it the problem is easy: name one node the dictator and let it decide. With it, the dictator's crash leaves everyone waiting forever, which is two-phase commit's coordinator problem.\n\nHere is the lesson's main claim: consensus, a linearizable compare-and-set register, total order broadcast and fault-tolerant atomic commit are the same problem. Each can be built from any other, so a system that solves one has solved them all. The figure shows the reductions.\n\n*CAS to consensus*: start a register at null; every proposer does `compareAndExchange(null, myValue)`. Exactly one succeeds; every proposer decides the winner's value (the value it found, or its own if it found null). That is the lab's last exercise, three lines.\n\n*Consensus to log*: run one consensus instance per log position. Instance 1 decides message 1, instance 2 decides message 2, and so on. *Log to consensus*: everyone appends their proposal; the first entry in the log is the decision. *Log to CAS*: section 1.\n\n*Atomic commit*: the Transactions track's lesson on two-phase commit showed why 2PC alone isn't fault tolerant. Every participant votes, and the coordinator alone writes the decision; when it dies, prepared participants wait in doubt with their locks held. Make the decision itself a consensus value, chosen by a group of nodes, and any member of the group can finish the job. Gray and Lamport's Paxos Commit does this, and Spanner runs two-phase commit between groups that are each replicated with Paxos. The voting rule stays: commit only if every participant voted yes.\n\nNot every atomic instruction is this strong. Maurice Herlihy showed in 1991 that each shared object has a *consensus number*: the most processes it can solve consensus for. A fetch-and-add counter can decide between two processes: each first writes its proposal where the other can read it, then increments the counter, and whoever got 0 wins; the one that got 1 knows exactly who beat it. With three, a process that got 2 can't tell which of the other two got 0. Compare-and-set works for any number. That is why lock-free algorithms on the JVM are built from `compareAndSet`, and why a coordination service exposes CAS, not just counters.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"Four problems that reduce to each other: linearizable compare-and-set, consensus, a total order log and fault-tolerant atomic commit. Fetch-and-add is weaker: it decides for two proposers only.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><path class=\"ln-a\" d=\"M 580 130 L 580 64 L 100 64 L 100 126\" fill=\"none\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"340\" y=\"54\" text-anchor=\"middle\">apply each CAS in log order (section 1)</text><rect class=\"box\" x=\"20\" y=\"130\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"100\" y=\"154\" text-anchor=\"middle\">linearizable</text><text class=\"t-s\" x=\"100\" y=\"170\" text-anchor=\"middle\">compare-and-set</text><rect class=\"box-a\" x=\"260\" y=\"130\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t-a\" x=\"340\" y=\"163\" text-anchor=\"middle\">consensus</text><rect class=\"box\" x=\"500\" y=\"130\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"580\" y=\"154\" text-anchor=\"middle\">total order</text><text class=\"t-s\" x=\"580\" y=\"170\" text-anchor=\"middle\">log</text><line class=\"ln\" x1=\"182\" y1=\"158\" x2=\"256\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"220\" y=\"118\" text-anchor=\"middle\">first CAS wins</text><line class=\"ln\" x1=\"422\" y1=\"158\" x2=\"496\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">one decision per slot</text><line class=\"ln\" x1=\"330\" y1=\"188\" x2=\"330\" y2=\"246\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"350\" y1=\"248\" x2=\"350\" y2=\"190\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"362\" y=\"222\" text-anchor=\"start\">votes in, one decision out</text><rect class=\"box\" x=\"260\" y=\"250\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"274\" text-anchor=\"middle\">atomic commit</text><text class=\"t-s\" x=\"340\" y=\"290\" text-anchor=\"middle\">(fault tolerant)</text><rect class=\"box-dim\" x=\"20\" y=\"250\" width=\"160\" height=\"56\" rx=\"8\"/><text class=\"t-s t-m\" x=\"100\" y=\"274\" text-anchor=\"middle\">fetch-and-add</text><text class=\"t-s t-m\" x=\"100\" y=\"290\" text-anchor=\"middle\">2 proposers only</text></svg>",
+        "caption": "Each arrow is a construction from the lab or the text. Build any one of the four and you have the others; fetch-and-add is too weak."
+      },
+      "try": {
+        "title": "Build a log from compare-and-set, on paper",
+        "minutes": 3,
+        "steps": [
+          "You have an unlimited supply of linearizable registers `slot[1]`, `slot[2]`... each with `compareAndExchange(expected, new)`, which returns the value before. Write a few lines of Kotlin for `append(msg)` that puts `msg` in the first free slot, even with other clients appending at the same time.",
+          "Then say what a replica does to deliver the log in order, and why two replicas can never deliver different messages in slot 5."
+        ],
+        "expect": "```kotlin\nfun append(msg: String): Int {\n    var i = 1\n    while (true) {\n        val before = slot[i].compareAndExchange(null, msg)\n        if (before == null) return i     // the slot was free: msg is entry i\n        i++                              // someone else won slot i; try the next one\n    }\n}\n```\n\nA replica delivers by reading `slot[1]`, `slot[2]`... in order and waiting while the next slot is still null. Each slot holds the value of the one CAS that won it, and a linearizable register shows that one value to everybody, so slot 5 can't hold different messages for different replicas. You have built total order broadcast from CAS. If a client crashes between winning a slot and telling anyone, the message is still in the log; a client that wants exactly-once must check whether its message is already there before retrying."
+      },
+      "refs": [
+        {
+          "title": "Herlihy, Wait-Free Synchronization (ACM TOPLAS, 1991)",
+          "url": "https://doi.org/10.1145/114005.102808",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "FLP: no algorithm can promise to finish, and how real ones get around it",
+      "body": "In 1985 Fischer, Lynch and Paterson proved a result now known as **FLP**: in an asynchronous system, no deterministic consensus algorithm can guarantee termination if even one node may crash. Every algorithm that never decides wrongly has some schedule of message delays in which it never decides at all.\n\nThe model matters. *Asynchronous* means no bounds on message delay or on how slowly a node runs, and no clocks to measure them. The intuition is the one from the Faults, time and truth track: without timing, a crashed node and a slow one look identical. An algorithm that waits for a node may wait forever. An algorithm that moves on without it may move on while the slow node's vote was the deciding one. The proof shows an adversary that controls delivery order can keep the algorithm on the fence indefinitely.\n\nFLP doesn't say consensus is impossible in practice, and it doesn't say safety must break. It says termination can't be *guaranteed* in that model. Real systems step outside the model in one of three ways:\n\n- Partial synchrony (Dwork, Lynch and Stockmeyer, 1988): delays have a bound that holds most of the time, but nobody knows when. Use timeouts to suspect crashed nodes, and accept that the suspicion is sometimes wrong. When the network behaves, the algorithm finishes; when it doesn't, it stalls but never disagrees. The Faults, time and truth track's lesson on system models introduced it; Paxos, Raft, Zab and Viewstamped Replication all live in it.\n- Failure detectors (Chandra and Toueg, 1996) package the timeouts as an oracle that may be wrong for a while but is eventually right about some correct node.\n- Randomness (Ben-Or, 1983): flip coins, and the chance of running forever shrinks to zero.\n\nPaxos shows FLP from the algorithm's side. Two proposers can keep overtaking each other: P1 prepares 1.1, P2 prepares 2.2 before P1's accept arrives, P1 retries with 3.1 before P2's accept arrives, and so on. Lamport's fix is to pick one distinguished proposer, a leader, and to elect one you need either randomness or real time. The Try-it runs exactly this race and changes only the timing. Safety never moves; progress depends entirely on the timeout.",
+      "try": {
+        "title": "Make Paxos stall without breaking it",
+        "minutes": 4,
+        "steps": [
+          "Run `PaxosDemo` with `-Pargs=timing`. Two proposers, five acceptors, one-way delays of 1 to 30 ms (so a round trip can take 60 ms), and a proposer abandons a round after its timeout. Each line is 1,000 seeded runs, stopped after 2 seconds.",
+          "Before you run it, predict how many runs decide with a 20 ms timeout, and how many choose two values in any configuration."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -Pargs=timing -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -Pargs=timing -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l03/demo/PaxosDemo.kt"
+        },
+        "expect": "```text\n2 proposers, 5 acceptors, no loss, one-way delay 1 to 30 ms (a round trip up to 60 ms), give up at 2 s\ntimeout    retry                runs that decided    mean rounds    two values\n20 ms      at once                        1 of 1,000          204.5             0\n20 ms      random backoff                97 of 1,000          169.0             0\n40 ms      at once                      477 of 1,000           93.3             0\n40 ms      random backoff              1000 of 1,000           15.0             0\n60 ms      at once                     1000 of 1,000           10.7             0\n60 ms      random backoff              1000 of 1,000            6.2             0\n120 ms     at once                     1000 of 1,000            5.9             0\n120 ms     random backoff              1000 of 1,000            4.7             0\n```\n\nWith a 20 ms timeout, shorter than a round trip, proposers abandon rounds before the answers can arrive: 1 run of 1,000 decided when retrying at once, 97 with random backoff, each after hundreds of rounds. From 60 ms up every run decides, in a handful of rounds. The last column never moves: in all 8,000 runs no two values were chosen. Timing decides whether Paxos finishes, never what it decides. Raft's randomized election timeouts in the next lesson are the same fix."
+      },
+      "refs": [
+        {
+          "title": "Fischer, Lynch and Paterson, Impossibility of Distributed Consensus with One Faulty Process (JACM, 1985)",
+          "url": "https://doi.org/10.1145/3149.214121",
+          "kind": "read"
+        },
+        {
+          "title": "Dwork, Lynch and Stockmeyer, Consensus in the Presence of Partial Synchrony (JACM, 1988)",
+          "url": "https://doi.org/10.1145/42282.42283",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Paxos in plain words, and the family it started",
+      "body": "Leslie Lamport's Paxos decides one value among acceptors (usually 3 or 5 nodes), on behalf of proposers that want different values chosen. Every attempt carries a ballot number that no other proposer uses: here (round, proposer id), so 2.2 beats 1.1. A value is **chosen** once a majority of acceptors have accepted it under the same ballot. Each acceptor stores two things on disk: the highest ballot it has promised, and the last proposal it accepted.\n\nPhase 1, prepare and promise. A proposer picks a new ballot *b* and sends prepare(*b*) to the acceptors. An acceptor that hasn't promised anything higher promises *b* (it will never again accept a lower ballot) and replies with the last proposal it accepted, if any.\n\nPhase 2, accept. With promises from a majority, the proposer chooses a value: **the value of the highest-numbered accepted proposal among the replies, or its own value if none was reported**. It sends accept(*b*, value). An acceptor accepts unless it has promised a higher ballot since.\n\nThe stepper plays a run where the first proposer crashes right after its value was chosen. Why does the second one end up with the same value? Any two majorities share at least one acceptor. If a value *v* was chosen under ballot *b*, a majority accepted it. A later proposer's phase 1 must hear from a majority, so it hears from at least one acceptor that accepted *v*. The highest-numbered rule makes it adopt *v* (or a later proposal that, by the same argument, already carries *v*). So once chosen, a value stays chosen. Messages can be lost, duplicated or reordered, and acceptors can crash and restart from disk, without breaking this. Forget the disk, and it breaks: the Try-it shows both.\n\nSingle-decree Paxos decides one value in two round trips. Real systems need a log, so they run Multi-Paxos: a stable leader runs phase 1 once, for all future log slots, and then each command needs only phase 2, one round trip. A new leader fills any gaps it finds with no-op entries. Chubby, Spanner and DynamoDB's partition replication all use Multi-Paxos.\n\nTwo relatives grew up separately. Viewstamped Replication (Oki and Liskov, 1988, revised by Liskov and Cowling in 2012) has a primary that orders requests and a view-change protocol to replace it, where a view number plays the ballot's role. Zab is ZooKeeper's atomic broadcast: an epoch number per leader, and every transaction id (`zxid`) is the epoch in its high 32 bits plus a counter. They share one skeleton: a number that increases with each leader, a majority to install the leader, a majority to commit each entry, and the guarantee that the two majorities overlap. Raft, the next lesson, is that skeleton written down so that you can implement it.",
+      "stepper": {
+        "title": "One Paxos decision, with a crash in the middle",
+        "intro": "Ballots are written round.proposer, so 2.2 is round 2 from P2. Each acceptor's promise and accepted proposal are on its disk.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"P1 sends prepare 1.1 to all three acceptors.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-a\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">sent prepare 1.1</text><rect class=\"box\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">waiting</text><line class=\"ln-a\" x1=\"170\" y1=\"208\" x2=\"120\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"170\" y1=\"208\" x2=\"340\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"170\" y1=\"208\" x2=\"560\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">P1 to all: prepare(1.1)</text></svg>",
+            "say": "Three acceptors, two proposers. P1 wants pay-77 captured, P2 wants it voided. P1 picks ballot 1.1 (round 1, proposer 1) and sends **prepare(1.1)** to every acceptor: \"promise not to accept anything numbered below 1.1, and tell me what you have accepted\"."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A1 and A2 promise 1.1; A3's copy is still in flight.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-a\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-a\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">2 promises: a majority</text><rect class=\"box\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">waiting</text><line class=\"ln-a\" x1=\"134\" y1=\"102\" x2=\"184\" y2=\"206\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"354\" y1=\"102\" x2=\"184\" y2=\"206\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">A1, A2 to P1: promise(1.1), nothing accepted</text></svg>",
+            "say": "A1 and A2 write `promised = 1.1` to disk and answer with a **promise**. Neither has accepted anything. Two of three is a majority, so P1 doesn't wait for A3, whose prepare is still in flight."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"P1 sends accept 1.1 capture; A1 and A2 accept, the message to A3 is lost, and P1 crashes.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box-a\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-bad\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">crashed</text><rect class=\"box\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">waiting</text><line class=\"ln-a\" x1=\"170\" y1=\"208\" x2=\"120\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"170\" y1=\"208\" x2=\"340\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-bad\" x1=\"170\" y1=\"208\" x2=\"384.5\" y2=\"150.8\"/><text class=\"t-s t-bad\" x=\"394.5\" y=\"154.8\" text-anchor=\"start\">lost</text><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">capture is chosen: a majority accepted 1.1. Nobody knows yet.</text></svg>",
+            "say": "No promise reported an accepted value, so P1 may use its own: **accept(1.1, capture)**. A1 and A2 accept it. The copy to A3 is lost, and P1 crashes before any *accepted* reply reaches it. A majority has accepted the same ballot, so capture is **chosen**, but no proposer has learned that."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"P2 times out and sends prepare 2.2; it reaches A2 and A3.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: -</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-bad\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">crashed</text><rect class=\"box-a\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">sent prepare 2.2</text><line class=\"ln-a\" x1=\"510\" y1=\"208\" x2=\"340\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"510\" y1=\"208\" x2=\"560\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">P2 to all: prepare(2.2); A1 is slow to answer</text></svg>",
+            "say": "P2 has heard nothing and its timer fires. It picks a higher ballot, 2.2, and sends **prepare(2.2)**. A1 is slow, so only A2 and A3 matter this round."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A2 promises 2.2 and reports it accepted 1.1 capture; A3 promises with nothing accepted.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box-a\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box-a\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: -</text><rect class=\"box-bad\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">crashed</text><rect class=\"box-a\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">A2 reports 1.1 capture</text><line class=\"ln-a\" x1=\"354\" y1=\"102\" x2=\"524\" y2=\"206\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"574\" y1=\"102\" x2=\"524\" y2=\"206\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">A2: promise(2.2, accepted 1.1 capture); A3: promise(2.2, nothing)</text></svg>",
+            "say": "A2 raises its promise to 2.2 and tells P2 what it accepted: ballot 1.1, capture. A3 promises too (P1's old prepare, if it ever arrives, is now below its promise). P2 has a majority of promises, and one of them carries a value."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"P2 must propose capture, the value of the highest accepted ballot, and A2 and A3 accept 2.2 capture.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box-a\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: 2.2 capture</text><rect class=\"box-a\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: 2.2 capture</text><rect class=\"box-bad\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">crashed</text><rect class=\"box-a\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">proposes capture, not void</text><line class=\"ln-a\" x1=\"510\" y1=\"208\" x2=\"340\" y2=\"104\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"510\" y1=\"208\" x2=\"560\" y2=\"104\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">the rule: use the value of the highest-numbered accepted proposal</text></svg>",
+            "say": "Here is the rule that makes Paxos safe. P2 must propose **the value of the highest-numbered proposal among the promises**, which is capture, and not its own void. It sends accept(2.2, capture), and both acceptors accept."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A2 and A3 answer accepted; P2 learns capture. The two majorities shared A2.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"120\" y=\"44\" text-anchor=\"middle\">A1</text><text class=\"t-s\" x=\"120\" y=\"66\" text-anchor=\"middle\">promised: 1.1</text><text class=\"t-s\" x=\"120\" y=\"86\" text-anchor=\"middle\">accepted: 1.1 capture</text><rect class=\"box\" x=\"240\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"44\" text-anchor=\"middle\">A2</text><text class=\"t-s\" x=\"340\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"340\" y=\"86\" text-anchor=\"middle\">accepted: 2.2 capture</text><rect class=\"box\" x=\"460\" y=\"20\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"560\" y=\"44\" text-anchor=\"middle\">A3</text><text class=\"t-s\" x=\"560\" y=\"66\" text-anchor=\"middle\">promised: 2.2</text><text class=\"t-s\" x=\"560\" y=\"86\" text-anchor=\"middle\">accepted: 2.2 capture</text><rect class=\"box-bad\" x=\"60\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"170\" y=\"234\" text-anchor=\"middle\">P1 wants capture</text><text class=\"t-s\" x=\"170\" y=\"256\" text-anchor=\"middle\">crashed</text><rect class=\"box-ok\" x=\"400\" y=\"210\" width=\"220\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"510\" y=\"234\" text-anchor=\"middle\">P2 wants void</text><text class=\"t-s\" x=\"510\" y=\"256\" text-anchor=\"middle\">learned: capture</text><line class=\"ln-a\" x1=\"354\" y1=\"102\" x2=\"524\" y2=\"206\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"574\" y1=\"102\" x2=\"524\" y2=\"206\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"304\" text-anchor=\"middle\">majorities {A1, A2} and {A2, A3} share A2: it carried the value</text></svg>",
+            "say": "P2 hears **accepted(2.2)** from a majority and learns the decision: capture, the same value that was chosen in frame 3. It had to be: any two majorities of three share an acceptor, here A2, and the phase-1 answers made P2 hear about the chosen value before it could propose anything else."
+          }
+        ]
+      },
+      "try": {
+        "title": "Break the rule, break the disk",
+        "minutes": 4,
+        "steps": [
+          "Run `PaxosDemo`. Three proposers (capture, void, refund), five acceptors, 20% of messages lost, 10% duplicated, up to two acceptors down at a time, and all but one proposer crash early. 500 seeded runs per line.",
+          "The second line replaces the highest-numbered rule with \"always propose your own value\". The third makes acceptors forget their promises and accepts when they restart, as if they acknowledged before writing to disk. Predict all three \"two different values\" counts first."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l03/demo/PaxosDemo.kt"
+        },
+        "expect": "```text\n3 proposers (capture, void, refund), 5 acceptors, 20% of messages lost, 10% duplicated,\nup to 2 acceptors down at a time, all but one proposer crash early\n\nPaxos as written\n  runs where someone learned a decision: 500 of 500\n  runs where two different values were chosen: 0\n  rounds per run: mean 7.8, max 43\n\nproposers ignore the promises and push their own value\n  runs where someone learned a decision: 500 of 500\n  runs where two different values were chosen: 114\n  rounds per run: mean 7.8, max 43\n\nacceptors forget their promises when they restart\n  runs where someone learned a decision: 500 of 500\n  runs where two different values were chosen: 36\n  rounds per run: mean 7.7, max 43\n```\n\nWritten correctly, Paxos survived all of it: lost and duplicated messages, crashed acceptors and proposers, and no run chose two values. Drop the highest-numbered rule and 114 runs chose two values: a later proposer overwrote a value that was already chosen. Let acceptors forget and 36 runs split: an acceptor that promised 2.2 and lost the promise can accept an older ballot again, so two majorities stop sharing what they know. That is the NATS JetStream failure Jepsen found in 2025, where Raft nodes acknowledged writes they had only flushed to disk every two minutes."
+      },
+      "refs": [
+        {
+          "title": "Lamport, Paxos Made Simple (PDF)",
+          "url": "https://lamport.azurewebsites.net/pubs/paxos-simple.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Ongaro and Ousterhout, In Search of an Understandable Consensus Algorithm (the Raft paper, PDF)",
+          "url": "https://raft.github.io/raft.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "What consensus costs",
+      "body": "Consensus gives you a leader that can be replaced without losing or forking anything. Four costs come with it.\n\nStart with majorities. Tolerating *f* crashed nodes takes 2*f* + 1: three nodes survive one failure, five survive two. A fourth node buys nothing, because a majority of four is three, so four still survive only one. Kafka's KRaft documentation gives the same rule for its controllers: run three or five. The side of a partition without a majority can't decide anything, which is CAP from lesson 1 again.\n\nThen round trips and disks. Classic Paxos takes two round trips to a majority per value; Multi-Paxos and Raft take one per command once a leader is stable. Every acceptor must write its promise or its accepted entry to disk before answering, so each step costs an `fsync` too: often under a millisecond on an SSD, about 10 ms on a spinning disk. In the Try-it, a decision costs 4 messages per acceptor and about 22 ms with both phases, and half of each with phase 2 alone. Reads need care as well: a leader must confirm it is still the leader before it answers a linearizable read (lesson 4).\n\nMore nodes means fewer writes. Every write goes through the leader and needs a majority, so adding servers adds work to every write. The ZooKeeper paper (USENIX ATC 2010) measured a saturated ensemble:\n\n| ZooKeeper servers | 3 | 5 | 7 | 9 | 13 |\n|---|---|---|---|---|---|\n| writes per second, saturated | 21,000 | 18,000 | 14,000 | 12,000 | 8,000 |\n| reads per second, saturated | 87,000 | 165,000 | 257,000 | 296,000 | 460,000 |\n\nReads rise with the server count because ZooKeeper serves them from the local replica without consensus, which also makes them possibly stale. Writes fall. To get more write throughput you split the data into many independent consensus groups (shards), the way CockroachDB, TiKV and Spanner run one group per range of keys.\n\nThe fourth is timeouts. Too long, and a dead leader means a long outage. Too short, and slow round trips look like failures, as the timing Try-it showed. The next lesson shows how Raft and etcd choose them.\n\nClever variants have a history, too. EPaxos (Moraru, Andersen and Kaminsky, SOSP 2013) removes the leader: any replica can commit a command in one round trip if no conflicting command is in flight. In 2019 Pierre Sutra found a bug, in both its TLA+ specification and its Go implementation, that let replicas disagree and broke linearizability. A 2021 re-evaluation (Tollman, Park and Ousterhout, NSDI) confirmed the lower median latency across regions but measured tail latency more than four times worse than Multi-Paxos. A 2025 paper reported a further bug, in which recovery can deadlock. Twelve years of expert attention, and the corrections kept coming. Use a consensus implementation that many systems run and test (etcd's Raft library, ZooKeeper, KRaft), and treat any homemade failover that isn't one as unsafe until proven otherwise.",
+      "try": {
+        "title": "Count the messages per decision",
+        "minutes": 3,
+        "steps": [
+          "Run `PaxosDemo` with `-Pargs=cost`: one proposer, no loss, delays of 1 to 10 ms, with 3, 5 and 7 acceptors. It reports messages and milliseconds per decision, for the whole round and for phase 2 alone (what Multi-Paxos pays per command once a leader holds its promises).",
+          "Predict: do more acceptors make a decision slower?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -Pargs=cost -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l03.demo.PaxosDemoKt -Pargs=cost -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l03/demo/PaxosDemo.kt"
+        },
+        "expect": "```text\none proposer, no loss, one-way delay 1 to 10 ms, 1,000 runs per line\nacceptors         messages    phase 2 only      ms, whole round     ms, phase 2 only\n3                     11.9               6                 22.2                 11.0\n5                     19.9              10                 22.0                 11.0\n7                     27.9              14                 22.0                 10.9\n```\n\nMessages grow with the number of acceptors (about 4 per acceptor; slightly under because the run stops as soon as the decision is learned), and phase 2 alone is half the messages and half the time. Latency barely moves with more acceptors here, because the simulation has no disks and no CPU limit and the leader waits only for the fastest majority. On real servers each extra acceptor is more network and `fsync` work for the leader on every write, which is the ZooKeeper table's falling write rate."
+      },
+      "refs": [
+        {
+          "title": "Hunt et al., ZooKeeper: Wait-free coordination for Internet-scale systems (USENIX ATC 2010, PDF)",
+          "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Tollman, Park and Ousterhout, EPaxos Revisited (NSDI 2021)",
+          "url": "https://www.usenix.org/conference/nsdi21/presentation/tollman",
+          "kind": "read"
+        },
+        {
+          "title": "Sutra, On the correctness of Egalitarian Paxos",
+          "url": "https://arxiv.org/abs/1906.10917",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A board of five directors must approve exactly one bid for a company, and they can only send letters, which may be delayed or lost. Each bid carries a ticket number. A broker first writes to the directors: \"will you ignore every ticket below mine, and which bid, if any, have you already signed?\" Once three directors promise, the broker must put forward the highest-ticket bid any of them has signed, or its own bid if none has, and asks them to sign it. When three directors have signed the same ticket, the bid is accepted, even if the broker's car breaks down on the way home. Any later broker writes to at least three directors, so at least one of them has signed it and says so. The analogy breaks at the filing cabinet: a real acceptor that loses its records after a crash (or never wrote them down) can sign a lower ticket again, and the whole guarantee goes.",
+  "in_your_world": "You already run consensus, mostly without seeing it. Kafka 4.x elects its controller and orders cluster metadata with KRaft, a Raft dialect, which is why you run 3 or 5 controllers. Kubernetes stores every object in etcd (Raft). A Cassandra `INSERT ... IF NOT EXISTS` for an idempotency key runs a Paxos round on that partition. DynamoDB replicates each partition with Multi-Paxos. Temporal's history service relies on a database to order each workflow's events, and that database's own leader and replication rules decide whether an acknowledged event can be lost. The design lesson for your own services: don't write failover logic of the form \"if the primary looks dead, promote me\". Take the decision from one of these systems (an etcd lease with a fencing token, a database's conditional write), so that two pods can never both believe they are the payment-batch leader.",
+  "mistake": "Building leader election or a unique-ID allocator on a heartbeat and a timeout: \"if I haven't heard from the leader for 10 seconds, I'm the leader now.\" It works in every test, because in tests the old leader really is dead. In production the old leader was paused by a garbage collection or a slow disk, comes back, and both nodes act as leader; or a network split puts one on each side. People write it because it looks like what consensus does, and the failing case needs an unlucky pause. The fix is to take leadership from a consensus system (an etcd or ZooKeeper lease, a row lock or advisory lock on the database primary, a Kafka consumer group's partition assignment) and to fence every write with the epoch or token it gives you, as in the Faults, time and truth track's lesson on leases.",
+  "compare": {
+    "title": "Two-phase commit and Paxos both vote twice. They are not the same.",
+    "a": {
+      "label": "Two-phase commit",
+      "lang": "text",
+      "src": "who asks:     the coordinator only\nwho must say yes:  every participant\noutcome:      commit only if all voted yes\nif the asker dies: participants wait in doubt\n               (blocking; locks held)\nwhat it solves: atomic commit, assuming the\n               coordinator comes back"
+    },
+    "b": {
+      "label": "Paxos",
+      "lang": "text",
+      "src": "who asks:     any proposer, with a higher ballot\nwho must say yes:  a majority of acceptors\noutcome:      one value, which never changes\nif the asker dies: another proposer finishes,\n               adopting any accepted value\nwhat it solves: consensus, with up to f of\n               2f + 1 acceptors down"
+    },
+    "note": "Both have a prepare round and a commit round, so they get confused. The difference is who is allowed to finish. In two-phase commit only the coordinator can, and it needs every participant. In Paxos anyone can start a new ballot, a majority is enough, and the promise round makes sure the new proposer learns anything already chosen. Fault-tolerant atomic commit puts the two together: the vote rule from 2PC, with the decision made by consensus."
+  },
+  "worked": {
+    "title": "Decide what to do with an in-doubt payment, safely",
+    "steps": [
+      {
+        "say": "The problem: a payment coordinator decides `capture` or `void` for pay-77, and it can crash. Write down the safety property first.",
+        "lang": "text",
+        "code": "property: every service that learns the outcome of pay-77 learns the same outcome\nthreats:  coordinator crash, a second coordinator taking over, lost messages"
+      },
+      {
+        "say": "The tempting design: whoever finds the decision missing writes one. Two coordinators can both find it missing and write different outcomes. That is check-then-act, the race from the Transactions track.",
+        "lang": "kotlin",
+        "code": "// unsafe: read, then write\nif (store.get(\"decision:pay-77\") == null) {\n    store.put(\"decision:pay-77\", \"capture\")    // another coordinator may write \"void\" here too\n}"
+      },
+      {
+        "say": "Replace it with consensus in its compare-and-set disguise: one atomic operation on a linearizable register, and use the value it reports, not your own.",
+        "lang": "kotlin",
+        "code": "// safe: the first CAS wins, everyone adopts the winner\nval before = register.compareAndExchange(\"decision:pay-77\", expected = null, value = \"capture\")\nval outcome = before ?: \"capture\"     // someone decided first: use theirs"
+      },
+      {
+        "say": "Get that register from something that already runs consensus. With etcd, a transaction that creates the key only if it doesn't exist is that CAS (lesson 5 covers etcd).",
+        "lang": "text",
+        "code": "etcdctl txn <<'EOF'\ncreate(\"decision/pay-77\") = \"0\"\n\nput decision/pay-77 capture\n\nget decision/pay-77\n\nEOF"
+      },
+      {
+        "say": "Check liveness separately: if the etcd cluster loses its majority, the CAS can't complete. Decide what the coordinator does then (retry with backoff, alert), and never fall back to the unsafe read-then-write.",
+        "lang": "text",
+        "code": "no majority -> CAS times out -> outcome unknown -> retry the SAME CAS later\n(the CAS is idempotent: retrying returns the value that won)"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Paxos on a hostile network, and a register on a log",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/cons/l03/Paxos.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l03/LogRegister.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l03/Sim.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.cons.l03.*'",
+    "steps": [
+      "Run the tests from the `labs` folder (no Docker, about a second). All 17 fail. Skim `Sim.kt` (virtual time; a network that loses, duplicates and reorders) and `runPaxos` at the bottom of `Paxos.kt`, which delivers messages, crashes nodes and restarts rounds. You write the rules, not the plumbing.",
+      "Exercise 1, `Acceptor.onPrepare` and `onAccept`: promise or accept unless you've promised a higher ballot (an equal one is fine, for duplicates); a promise carries what you last accepted.",
+      "Exercise 2, `chooseValue` and `Proposer.onPromise`: ignore other ballots, count each acceptor once, and at the first majority return the Accept with the value of the highest accepted ballot, or your own. Exercise 3, `Proposer.onAccepted`: at a majority, set `decided`.",
+      "`PaxosTest` checks each rule; `PaxosPropertyTest` runs 500 random hostile configurations and requires that no two values are ever chosen, plus a liveness test and a check that the test catches a broken value rule.",
+      "Exercises 4 to 6 in `LogRegister.kt`: `Replica.apply` (the state machine: return the value before, swap on a match), `LogRegister.submit` (remember the callback, broadcast), and `propose` (consensus from one compare-and-exchange). `LogRegisterTest` checks the seat race, identical replica logs and linearizability of 200 recorded histories."
+    ],
+    "hints": [
+      "`onPrepare`: `val p = promised; if (p != null && m.ballot < p) return Reject(m.ballot, p)`, then set `promised` and return `Promise(m.ballot, acceptedBallot, acceptedValue)`.",
+      "`chooseValue`: `promises.filter { it.accepted != null }.maxByOrNull { it.accepted!! }?.value ?: own`. `Ballot` is `Comparable`.",
+      "In `onPromise`, return null once `proposed` is set, so a late promise doesn't send a second Accept with a different value.",
+      "`propose` is one line: `register.compareAndExchange(client, null, value) { before -> done(before ?: value) }`."
+    ],
+    "done_when": "All 17 tests in `PaxosTest`, `PaxosPropertyTest` and `LogRegisterTest` pass."
+  },
+  "drill": {
+    "title": "The Paxos rules, from memory",
+    "minutes": 5,
+    "prompt": "Write the acceptor's two handlers and the proposer's value rule for single-decree Paxos. State, in one comment each, which line would break safety if you dropped it.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun onPrepare(m: Prepare): Message {\n    val p = promised\n    if (p != null && m.ballot < p) return Reject(m.ballot, p)  // without it: an old proposer's round could still finish\n    promised = m.ballot                                         // on disk before replying, or a restart forgets the promise\n    return Promise(m.ballot, acceptedBallot, acceptedValue)     // without the accepted value, a chosen value can be overwritten\n}\n\nfun onAccept(m: Accept): Message {\n    val p = promised\n    if (p != null && m.ballot < p) return Reject(m.ballot, p)  // without it: accept a ballot you promised to ignore\n    promised = m.ballot\n    acceptedBallot = m.ballot\n    acceptedValue = m.value\n    return Accepted(m.ballot, m.value)\n}\n\nfun chooseValue(own: String, promises: Collection<Promise>): String =\n    promises.filter { it.accepted != null }.maxByOrNull { it.accepted!! }?.value ?: own   // the safety rule"
+    }
+  },
+  "recap": [
+    "Total order broadcast delivers the same messages in the same order everywhere; with deterministic code on each replica (state machine replication) that keeps replicas identical. A fixed sequencer is the simplest version and fails with its sequencer.",
+    "Consensus (agreement, integrity, validity, termination), linearizable compare-and-set, total order broadcast and fault-tolerant atomic commit reduce to each other. Fetch-and-add is weaker: consensus number 2.",
+    "FLP: in an asynchronous model, no deterministic algorithm can guarantee termination with one crash. Real algorithms stay safe always and use timeouts (partial synchrony), failure detectors or randomness to make progress.",
+    "Paxos: prepare and promise, then accept with the value of the highest-numbered accepted proposal. Any two majorities overlap, so a chosen value stays chosen, provided acceptors keep their promises on disk.",
+    "Multi-Paxos runs phase 1 once and pays one round trip per command; Viewstamped Replication and Zab are the same skeleton of epoch, majority to elect, majority to commit. Raft is next.",
+    "The cost: 2f + 1 nodes for f failures, a round trip and an fsync per write, falling write throughput as nodes are added (ZooKeeper: 21,000 writes a second at 3 servers, 8,000 at 13), timeouts to tune, and subtle bugs in clever variants such as EPaxos."
+  ],
+  "quiz": [
+    {
+      "q": "Three replicas of a ledger receive the same commands through a total order broadcast. One replica's code reads the wall clock to stamp each capture. What goes wrong?",
+      "options": [
+        "Nothing: the log fixes the order, so the replicas stay identical",
+        "The replicas can end with different state, because state machine replication needs every replica's code to be deterministic",
+        "The log will reorder the commands to match the timestamps",
+        "Only reads become stale"
+      ],
+      "answer": 1,
+      "why": "Same commands, same order, same starting state gives the same result only if applying a command depends on nothing else. The wall clock differs per machine, so the stamps, and anything computed from them, differ. Put the timestamp into the command before it enters the log, so every replica applies the same value."
+    },
+    {
+      "q": "You have a shared counter with an atomic fetch-and-add and nothing else. Can three services use it to agree on which of them runs tonight's settlement?",
+      "options": [
+        "Yes: whoever gets 0 runs it",
+        "Yes, but only if the counter is linearizable",
+        "No: \"whoever gets 0\" picks a winner, but the losers can't always learn who won, so it can't solve consensus for three; use compare-and-set",
+        "No: fetch-and-add can't even pick a winner"
+      ],
+      "answer": 2,
+      "why": "Herlihy's consensus number for fetch-and-add is 2. Getting 0 tells a service it won; a service that got 1 or 2 knows it lost but can't tell which of the other two won, because the counter doesn't record identities. With CAS, every service can write its name into an empty register and read back the winner."
+    },
+    {
+      "q": "A proposer in single-decree Paxos receives promises from a majority. Two report accepted proposals: (ballot 3.1, `void`) and (ballot 5.2, `capture`). Its own value is `refund`. What must it propose?",
+      "options": [
+        "`refund`, its own value",
+        "`void`, the first one reported",
+        "`capture`, the value of the highest-numbered accepted proposal",
+        "Any of the three: all were proposed"
+      ],
+      "answer": 2,
+      "why": "If any value has been chosen, it is the value of the highest-numbered accepted proposal a majority can report, so the proposer must carry it forward. Proposing its own value could overwrite a chosen value; the Try-it measured 114 split runs in 500 when the rule was dropped."
+    },
+    {
+      "q": "You run a three-node ZooKeeper ensemble and want it to survive two node failures. What do you change, and what does it cost?",
+      "options": [
+        "Add a fourth node; it costs nothing on writes",
+        "Go to five nodes; writes need three acknowledgements instead of two, so saturated write throughput drops (about 21,000 to 18,000 a second in the ZooKeeper paper)",
+        "Go to five nodes; write throughput rises because there are more servers",
+        "Nothing: three nodes already survive two failures"
+      ],
+      "answer": 1,
+      "why": "Tolerating f failures takes 2f + 1 nodes, so two failures take five; four would still only tolerate one. Every write must reach a majority through the leader, so more nodes means more work per write. Reads scale up instead, because ZooKeeper serves them locally."
+    },
+    {
+      "q": "From the Transactions track's two-phase commit lesson: the coordinator crashes after every participant voted yes, before anyone learns the outcome. What changes if the coordinator's decision is made by a Paxos group instead of by one process?",
+      "options": [
+        "Nothing: participants still wait in doubt until that exact process restarts",
+        "Participants no longer need to vote",
+        "Any member of the group can finish: the decision (or the absence of one) survives the crash on a majority, so a new leader can complete it",
+        "The transaction automatically aborts"
+      ],
+      "answer": 2,
+      "why": "Two-phase commit blocks because only the coordinator knows, or will decide, the outcome. If the decision is a consensus value, a majority of the group holds it, and another member can take over, learn it through a new ballot and tell the participants. The voting rule stays: commit only if everyone voted yes. This is fault-tolerant atomic commit, as in Paxos Commit and Spanner.",
+      "from": "txn-07"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What two properties define total order broadcast?",
+      "back": "Reliable delivery (if one replica delivers a message, every correct replica does) and total order (all deliver messages in the same order)."
+    },
+    {
+      "front": "What is state machine replication?",
+      "back": "Run deterministic code on each replica and feed every replica the same commands in the same order, so all reach the same state."
+    },
+    {
+      "front": "The four properties of consensus?",
+      "back": "Uniform agreement, integrity (decide once), validity (decide a proposed value), termination (correct nodes eventually decide). The first three are safety; termination is liveness."
+    },
+    {
+      "front": "How do you get consensus from compare-and-set?",
+      "back": "Each proposer does compareAndExchange(null, myValue) on one register; everyone decides the value that won (what they found, or their own if they found null)."
+    },
+    {
+      "front": "What exactly does FLP rule out?",
+      "back": "A deterministic algorithm that always terminates in a fully asynchronous system where one node may crash. Safety is still possible; termination isn't guaranteed."
+    },
+    {
+      "front": "Paxos phase 2: which value must the proposer use?",
+      "back": "The value of the highest-numbered accepted proposal reported in the majority's promises, or its own value if none was reported."
+    },
+    {
+      "front": "Why do 4 consensus nodes tolerate no more failures than 3?",
+      "back": "A majority of 4 is 3, so losing 2 leaves no majority. Tolerating f failures needs 2f + 1 nodes."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Total order broadcast",
+      "plain": "Delivering the same messages in the same order to every replica; an append-only log."
+    },
+    {
+      "term": "State machine replication",
+      "plain": "Identical deterministic replicas kept identical by applying the same command log."
+    },
+    {
+      "term": "Consensus",
+      "plain": "Several nodes deciding one value, despite crashes and delays."
+    },
+    {
+      "term": "Ballot",
+      "plain": "A unique, increasing number on each Paxos attempt; a higher one overrides a lower one."
+    },
+    {
+      "term": "Acceptor",
+      "plain": "A Paxos node that promises and accepts proposals and keeps both on disk."
+    },
+    {
+      "term": "Partial synchrony",
+      "plain": "A model where message delays are usually bounded, but nobody knows when the bound holds."
+    },
+    {
+      "term": "Consensus number",
+      "plain": "How many processes an atomic operation can solve consensus for: 2 for fetch-and-add, any number for CAS."
+    },
+    {
+      "term": "Multi-Paxos",
+      "plain": "Paxos for a log: a stable leader runs phase 1 once, then one round trip per command."
+    }
+  ],
+  "explain_back": {
+    "prompt": "An architect proposes replacing etcd with \"a simple heartbeat: the node with the lowest ID that's alive is the leader\". Explain to them why that isn't enough, and what consensus gives that the heartbeat doesn't.",
+    "answer": "The heartbeat scheme decides who is leader from each node's own view of who is alive, and those views can differ. If node 1 is paused by a long garbage collection, node 2 stops hearing it and takes over; when node 1 wakes up, it still thinks it is leader, and for a while both accept writes. A network split does the same thing permanently: each side sees a different lowest live ID. Consensus avoids this because a node becomes leader only when a majority votes for it under a new, higher epoch number, and any two majorities share a node, so two leaders can't both be confirmed for the same epoch. Every write is committed only once a majority has it, so a new leader is guaranteed to have every committed write. The epoch also works as a fencing token, so the database can reject writes from an old leader that wakes up. What consensus can't promise is progress during a bad partition, but it never lets two nodes both be right about being leader, which is the property the payment batch needs."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Lamport first described Paxos in \"The Part-Time Parliament\", written around 1990 as the story of a Greek island's legislature and published in ACM TOCS in 1998. Reviewers found the story hard to read, and \"Paxos Made Simple\" (2001) restated it in plain terms; it also describes Multi-Paxos and the gap-filling no-ops. \"Paxos Made Live\" (Chandra, Griesemer and Redstone, 2007) is Google's account of what it took to turn the algorithm into Chubby's replicated log: disk corruption, master leases, snapshots and group membership, none of which the paper covers.\n\nFlexible Paxos (Howard, Malkhi and Spiegelman, 2016) showed that majorities are more than you need: only the phase-1 quorums must intersect the phase-2 quorums. With six acceptors you could, for example, use any four for leader election and any three for each command. Production systems mostly keep majorities, because they are simpler to reason about when membership changes.\n\nHerlihy's 1991 paper on wait-free synchronization ranks shared objects by consensus number: read/write registers have 1, test-and-set, fetch-and-add, queues and stacks have 2, and compare-and-set has infinity. It is why `java.util.concurrent` is built on `compareAndSet`.\n\nDesigning Data-Intensive Applications, 2nd edition, chapter 10 presents the consensus equivalences and the common structure of Raft, Paxos, Zab and Viewstamped Replication."
+  },
+  "sources": [
+    {
+      "title": "Lamport, Paxos Made Simple (PDF)",
+      "url": "https://lamport.azurewebsites.net/pubs/paxos-simple.pdf"
+    },
+    {
+      "title": "Fischer, Lynch and Paterson, Impossibility of Distributed Consensus with One Faulty Process (JACM, 1985)",
+      "url": "https://doi.org/10.1145/3149.214121"
+    },
+    {
+      "title": "Hunt et al., ZooKeeper: Wait-free coordination for Internet-scale systems (USENIX ATC 2010)",
+      "url": "https://www.usenix.org/legacy/event/atc10/tech/full_papers/Hunt.pdf"
+    },
+    {
+      "title": "Tollman, Park and Ousterhout, EPaxos Revisited (NSDI 2021)",
+      "url": "https://www.usenix.org/conference/nsdi21/presentation/tollman"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 10",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

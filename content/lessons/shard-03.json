@@ -1,0 +1,390 @@
+{
+  "id": "shard-03",
+  "title": "Rebalancing and request routing",
+  "minutes": 40,
+  "goal": "By the end you can count how much data each rebalancing scheme moves when a node joins, explain how automatic rebalancing can turn one overloaded node into an outage, and trace a request to its shard through any node, a routing tier, or a client that follows MOVED and ASK redirects.",
+  "warmup": {
+    "q": "Ten nodes hold 100,000 keys placed by `hash mod 10`. You add an eleventh node and switch to `hash mod 11`. About how many keys now belong to a different node?",
+    "options": [
+      "About 9,100: the new node's fair share",
+      "About 50,000: half of them",
+      "About 91,000: almost all of them",
+      "None until a rebalance job runs"
+    ],
+    "answer": 2,
+    "why": "A key stays put only if its hash leaves the same remainder for 10 and 11. The remainders repeat every 110 numbers and agree only for 0 to 9, so 10 keys in 110 stay and about 91% move. The demo counts 91,032. About 9,100 is what a good scheme moves, and the first option is tempting because it's the right answer for every scheme in this lesson except `hash mod N`."
+  },
+  "sections": [
+    {
+      "h": "Changing N under hash mod N moves almost every key",
+      "body": "Lesson 1 placed keys with `hash mod N`. But N doesn't stay put. You add machines before Black Friday, replace one with a failed disk, retire old hardware. Each change of N changes the answer for most keys.\n\nWork it out for 10 nodes going to 11. A key stays where it is only if `h mod 10` equals `h mod 11`. Both remainders repeat every 110 numbers, and they agree only for the first 10 numbers of each cycle, 0 to 9. So 10 keys in 110 stay put, and the other 100 in 110, about 91%, move. The demo below counts 91,032 of 100,000.\n\nMoving a key isn't free. Its bytes cross the network from the old node to the new one while both keep serving traffic. On a 3 TB cluster, 91% is 2.7 TB of copying to add one machine. The new node only needs its fair share, 1/11 of the data, about 270 GB. That's the least any scheme can move, and everything above it is waste: keys going from node 3 to node 7 when neither of them is new.\n\nThat sets the target for this lesson. Moving data between nodes is called **rebalancing**, and a good scheme rebalances like this when a node joins:\n\n- it moves about 1/(N+1) of the data, the new node's fair share;\n- everything that moves goes to the new node;\n- many old nodes share the sending, so no single disk or network link does all of it.\n\nLesson 2's ring gets close. With 16 tokens per node, the demo moves 10.2% of the keys, all to the new node, from 9 senders. With one token per node it moves 9.2%, all from a single sender. The next two sections cover the other designs real stores use: a fixed number of partitions, partitions that split as they grow, and partition counts that grow with the nodes. The last section covers the other half of the second map: once shards move, how does a request find them?",
+      "try": {
+        "title": "Count what moves when an eleventh node joins",
+        "minutes": 3,
+        "steps": [
+          "Read `RebalanceDemo.kt`. It places 100,000 payment keys on 10 nodes four ways: `hash mod N`, 1,000 fixed partitions, a ring with 1 token per node and a ring with 16. Then it adds `node-11` and counts the keys whose owner changed, how many went to the new node, and how many old nodes sent them.",
+          "Predict the percentage for `hash mod N`, and which scheme has a single sender.",
+          "Run it from the `labs` folder. No Docker needed."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "RebalanceDemo.kt",
+          "src": "package sfz.shard.l03.demo\n\nimport java.nio.ByteBuffer\nimport java.security.MessageDigest\nimport java.util.TreeMap\n\nfun md5(key: String): Long = ByteBuffer.wrap(MessageDigest.getInstance(\"MD5\").digest(key.toByteArray())).long\n\n/** Ten nodes hold 100,000 payment keys. An eleventh joins. How many keys move, and who sends them? */\nfun main() {\n    val ten = (1..10).map { \"node-%02d\".format(it) }\n    val eleven = ten + \"node-11\"\n    val keys = (0 until 100_000).map { \"pay-$it\" }\n\n    fun report(name: String, before: (String) -> String, after: (String) -> String) {\n        val moved = keys.filter { before(it) != after(it) }\n        val senders = moved.map(before).toSet().size\n        val toNew = moved.count { after(it) == \"node-11\" }\n        println(\"%-26s %,6d keys move (%4.1f%%), %,6d of them to node-11, sent by %2d %s\"\n            .format(name, moved.size, moved.size / 1_000.0, toNew, senders, if (senders == 1) \"node\" else \"nodes\"))\n    }\n\n    // lesson 1: node = hash mod N\n    report(\"hash mod N\", { ten[Math.floorMod(md5(it), 10L).toInt()] }, { eleven[Math.floorMod(md5(it), 11L).toInt()] })\n\n    // fixed partitions: 1,000 of them; a key's partition never changes, whole partitions change node\n    val owner = Array(1_000) { ten[it % 10] }\n    val before = owner.copyOf()\n    var given = 0\n    while (given < 1_000 / 11) { // node-11 takes 90 partitions, one at a time from the busiest node\n        val donor = ten.maxBy { n -> owner.count { it == n } }\n        owner[owner.indices.last { owner[it] == donor }] = \"node-11\"\n        given++\n    }\n    val partition = { key: String -> Math.floorMod(md5(key), 1_000L).toInt() }\n    report(\"1,000 fixed partitions\", { before[partition(it)] }, { owner[partition(it)] })\n\n    // lesson 2: a ring with T tokens per node\n    for (t in listOf(1, 16)) {\n        fun ring(nodes: List<String>) = TreeMap<Long, String>().apply { nodes.forEach { n -> repeat(t) { put(md5(\"$n#$it\"), n) } } }\n        val r10 = ring(ten)\n        val r11 = ring(eleven)\n        val owner = { r: TreeMap<Long, String>, k: String -> (r.ceilingEntry(md5(k)) ?: r.firstEntry()).value }\n        report(\"ring, $t token(s) per node\", { owner(r10, it) }, { owner(r11, it) })\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l03.demo.RebalanceDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l03/demo/RebalanceDemo.kt"
+        },
+        "expect": "```text\nhash mod N                 91,032 keys move (91.0%),  9,150 of them to node-11, sent by 10 nodes\n1,000 fixed partitions      8,955 keys move ( 9.0%),  8,955 of them to node-11, sent by 10 nodes\nring, 1 token(s) per node   9,212 keys move ( 9.2%),  9,212 of them to node-11, sent by  1 node\nring, 16 token(s) per node 10,230 keys move (10.2%), 10,230 of them to node-11, sent by  9 nodes\n```\n\n`hash mod N` moves 91% of the keys, and only 9,150 of those 91,032 go to the new node: the rest trade places between old nodes. The other three move close to the ideal 9.1%, all of it to `node-11`. One token per node puts all the sending on one neighbour. Fixed partitions spread it over all ten old nodes, and the 16-token ring over nine."
+      }
+    },
+    {
+      "h": "Fixed partitions: many more partitions than nodes, moved whole",
+      "body": "Split lesson 1's first map in two. First, hash each key to one of P partitions with `hash mod P`, where P is chosen once, when the system is created, and is much bigger than the node count: say 1,000 partitions for 10 nodes. Second, keep a table from partition to node, 100 partitions each. A key's partition never changes. When an eleventh node joins, it takes whole partitions from the others until it holds its share, 90 of them, about nine from each old node. Only the keys in those 90 partitions move: 8,955 of 100,000 in the demo, the minimum, sent by all ten old nodes.\n\nA partition is a natural unit to move. It's a set of files, or a log, that the old node can copy across while it keeps serving; then the table flips the partition's owner to the new node. The stepper walks through one join.\n\nThis is the most common design. A Kafka topic has a fixed number of partitions; the producer picks a key's partition by hashing the key mod that number, and brokers move whole partitions between them. Elasticsearch and OpenSearch fix an index's number of primary shards when you create it, and route each document with `hash(_routing) % number_of_primary_shards`, where `_routing` is the document id unless you set it. Redis Cluster has 16,384 hash slots (the Caching track's Redis Cluster lesson). Couchbase, Riak and Citus work the same way. And Notion's 480 logical shards from lesson 1 are fixed partitions over PostgreSQL: going from 32 machines to 96 moved schemas between machines, and no workspace changed shard.\n\nNotion chose 480 because it divides evenly by many numbers. With P partitions on N nodes, the busiest node holds P/N rounded up. 480 spreads perfectly over 32, 40, 48 or 96 machines. 512 spreads perfectly only over powers of two: on 96 machines some hold 6 and some 5, and the busiest carries 13% more than the average.\n\nThe price is that P is chosen once. Too few, and you hit a wall: with 12 partitions, a 13th node has nothing to hold, and more nodes stop helping. Too many, and every partition has a fixed cost. Elastic's sizing guidance aims for shards of 10 to 50 GB, and each shard runs its part of a search on one thread, so thousands of tiny shards use up the search thread pool. Changing P later means rehashing keys. In Kafka, adding partitions changes `hash mod P` for most keys, so a key's new records go to a different partition from its old ones, and per-key order breaks. Elasticsearch makes you split, shrink or reindex. So pick P for the size you expect years from now, with plenty of divisors.",
+      "stepper": {
+        "title": "Node D joins: whole partitions move",
+        "intro": "Click Next. Only the table from partition to node changes.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"Twelve fixed partitions on three nodes, four each\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">partition = hash(key) mod 12, fixed forever; the table maps partition to node</text><rect class=\"box\" x=\"16\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"90\" y=\"68\" text-anchor=\"middle\">node A</text><rect class=\"box\" x=\"32\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"106\" text-anchor=\"middle\">p0</text><rect class=\"box\" x=\"96\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"106\" text-anchor=\"middle\">p3</text><rect class=\"box\" x=\"32\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"148\" text-anchor=\"middle\">p6</text><rect class=\"box\" x=\"96\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"148\" text-anchor=\"middle\">p9</text><rect class=\"box\" x=\"184\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"258\" y=\"68\" text-anchor=\"middle\">node B</text><rect class=\"box\" x=\"200\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"106\" text-anchor=\"middle\">p1</text><rect class=\"box\" x=\"264\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"106\" text-anchor=\"middle\">p4</text><rect class=\"box\" x=\"200\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"148\" text-anchor=\"middle\">p7</text><rect class=\"box\" x=\"264\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"148\" text-anchor=\"middle\">p10</text><rect class=\"box\" x=\"352\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"426\" y=\"68\" text-anchor=\"middle\">node C</text><rect class=\"box\" x=\"368\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"106\" text-anchor=\"middle\">p2</text><rect class=\"box\" x=\"432\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"106\" text-anchor=\"middle\">p5</text><rect class=\"box\" x=\"368\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"148\" text-anchor=\"middle\">p8</text><rect class=\"box\" x=\"432\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"148\" text-anchor=\"middle\">p11</text><rect class=\"box-dim\" x=\"520\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"594\" y=\"68\" text-anchor=\"middle\">node D, not yet</text><text class=\"t-s t-code\" x=\"340\" y=\"198\" text-anchor=\"middle\">pay-7 is in p9 on A; pay-81701 is in p2 on C</text><text class=\"t-s t-m\" x=\"340\" y=\"224\" text-anchor=\"middle\">3 nodes, 4 partitions each, round robin</text></svg>",
+            "say": "Twelve partitions on three nodes. A key's partition is `hash(key) mod 12`, chosen once: `pay-7` is in partition 9 and `pay-81701` in partition 2, forever. A table says which node holds each partition: here round robin, four each."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"Node D joins with no partitions\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">partition = hash(key) mod 12, fixed forever; the table maps partition to node</text><rect class=\"box\" x=\"16\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"90\" y=\"68\" text-anchor=\"middle\">node A</text><rect class=\"box\" x=\"32\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"106\" text-anchor=\"middle\">p0</text><rect class=\"box\" x=\"96\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"106\" text-anchor=\"middle\">p3</text><rect class=\"box\" x=\"32\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"148\" text-anchor=\"middle\">p6</text><rect class=\"box\" x=\"96\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"148\" text-anchor=\"middle\">p9</text><rect class=\"box\" x=\"184\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"258\" y=\"68\" text-anchor=\"middle\">node B</text><rect class=\"box\" x=\"200\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"106\" text-anchor=\"middle\">p1</text><rect class=\"box\" x=\"264\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"106\" text-anchor=\"middle\">p4</text><rect class=\"box\" x=\"200\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"148\" text-anchor=\"middle\">p7</text><rect class=\"box\" x=\"264\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"148\" text-anchor=\"middle\">p10</text><rect class=\"box\" x=\"352\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"426\" y=\"68\" text-anchor=\"middle\">node C</text><rect class=\"box\" x=\"368\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"106\" text-anchor=\"middle\">p2</text><rect class=\"box\" x=\"432\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"106\" text-anchor=\"middle\">p5</text><rect class=\"box\" x=\"368\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"148\" text-anchor=\"middle\">p8</text><rect class=\"box\" x=\"432\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"148\" text-anchor=\"middle\">p11</text><rect class=\"box-a\" x=\"520\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"594\" y=\"68\" text-anchor=\"middle\">node D</text><text class=\"t-s t-m\" x=\"340\" y=\"224\" text-anchor=\"middle\">D's fair share: 12 / 4 = 3 partitions</text></svg>",
+            "say": "Node D joins. Its fair share is 12 / 4 = 3 partitions. No key is rehashed: the partition count didn't change, so `hash mod 12` gives every key the same partition as before. Only the second map, partition to node, is about to change."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"Partition 9 moves from A to D\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">partition = hash(key) mod 12, fixed forever; the table maps partition to node</text><rect class=\"box\" x=\"16\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"90\" y=\"68\" text-anchor=\"middle\">node A</text><rect class=\"box\" x=\"32\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"106\" text-anchor=\"middle\">p0</text><rect class=\"box\" x=\"96\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"106\" text-anchor=\"middle\">p3</text><rect class=\"box\" x=\"32\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"148\" text-anchor=\"middle\">p6</text><rect class=\"box-dim\" x=\"96\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"184\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"258\" y=\"68\" text-anchor=\"middle\">node B</text><rect class=\"box\" x=\"200\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"106\" text-anchor=\"middle\">p1</text><rect class=\"box\" x=\"264\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"106\" text-anchor=\"middle\">p4</text><rect class=\"box\" x=\"200\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"148\" text-anchor=\"middle\">p7</text><rect class=\"box\" x=\"264\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"148\" text-anchor=\"middle\">p10</text><rect class=\"box\" x=\"352\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"426\" y=\"68\" text-anchor=\"middle\">node C</text><rect class=\"box\" x=\"368\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"106\" text-anchor=\"middle\">p2</text><rect class=\"box\" x=\"432\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"106\" text-anchor=\"middle\">p5</text><rect class=\"box\" x=\"368\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"148\" text-anchor=\"middle\">p8</text><rect class=\"box\" x=\"432\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"148\" text-anchor=\"middle\">p11</text><rect class=\"box-a\" x=\"520\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"594\" y=\"68\" text-anchor=\"middle\">node D</text><rect class=\"box-a\" x=\"536\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"562\" y=\"106\" text-anchor=\"middle\">p9</text><text class=\"t-s t-m\" x=\"340\" y=\"224\" text-anchor=\"middle\">A copies p9 to D, keeps serving it, then the table flips p9 to D</text></svg>",
+            "say": "The busiest node gives first. A, B and C hold four each, so the tie goes to A by name, and A gives up its highest partition, p9. A copies p9's data to D while it keeps serving p9; when D has caught up, the table changes p9's owner to D. `pay-7` moved with it, as part of a whole partition."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"Partitions 10 and 11 move from B and C; every node now holds three\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">partition = hash(key) mod 12, fixed forever; the table maps partition to node</text><rect class=\"box\" x=\"16\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"90\" y=\"68\" text-anchor=\"middle\">node A</text><rect class=\"box\" x=\"32\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"106\" text-anchor=\"middle\">p0</text><rect class=\"box\" x=\"96\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"106\" text-anchor=\"middle\">p3</text><rect class=\"box\" x=\"32\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"148\" text-anchor=\"middle\">p6</text><rect class=\"box-dim\" x=\"96\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"184\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"258\" y=\"68\" text-anchor=\"middle\">node B</text><rect class=\"box\" x=\"200\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"106\" text-anchor=\"middle\">p1</text><rect class=\"box\" x=\"264\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"106\" text-anchor=\"middle\">p4</text><rect class=\"box\" x=\"200\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"148\" text-anchor=\"middle\">p7</text><rect class=\"box-dim\" x=\"264\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"352\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"426\" y=\"68\" text-anchor=\"middle\">node C</text><rect class=\"box\" x=\"368\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"106\" text-anchor=\"middle\">p2</text><rect class=\"box\" x=\"432\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"106\" text-anchor=\"middle\">p5</text><rect class=\"box\" x=\"368\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"148\" text-anchor=\"middle\">p8</text><rect class=\"box-dim\" x=\"432\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box-a\" x=\"520\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"594\" y=\"68\" text-anchor=\"middle\">node D</text><rect class=\"box-a\" x=\"536\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"562\" y=\"106\" text-anchor=\"middle\">p9</text><rect class=\"box-a\" x=\"600\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"626\" y=\"106\" text-anchor=\"middle\">p10</text><rect class=\"box-a\" x=\"536\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"562\" y=\"148\" text-anchor=\"middle\">p11</text><text class=\"t-s t-m\" x=\"340\" y=\"224\" text-anchor=\"middle\">3 of 12 partitions moved: a quarter of the keys, all to D, from 3 senders</text></svg>",
+            "say": "B gives p10 and C gives p11. Every node holds three. A quarter of the partitions moved, which is D's fair share and the least any scheme can move, and three nodes did the sending. The lab's `addNode` follows exactly this rule."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 238\" role=\"img\" aria-label=\"pay-81701 is still in partition 2 on node C\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"26\" text-anchor=\"middle\">partition = hash(key) mod 12, fixed forever; the table maps partition to node</text><rect class=\"box\" x=\"16\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"90\" y=\"68\" text-anchor=\"middle\">node A</text><rect class=\"box\" x=\"32\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"106\" text-anchor=\"middle\">p0</text><rect class=\"box\" x=\"96\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"122\" y=\"106\" text-anchor=\"middle\">p3</text><rect class=\"box\" x=\"32\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"58\" y=\"148\" text-anchor=\"middle\">p6</text><rect class=\"box-dim\" x=\"96\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"184\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"258\" y=\"68\" text-anchor=\"middle\">node B</text><rect class=\"box\" x=\"200\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"106\" text-anchor=\"middle\">p1</text><rect class=\"box\" x=\"264\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"290\" y=\"106\" text-anchor=\"middle\">p4</text><rect class=\"box\" x=\"200\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"226\" y=\"148\" text-anchor=\"middle\">p7</text><rect class=\"box-dim\" x=\"264\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"352\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"426\" y=\"68\" text-anchor=\"middle\">node C</text><rect class=\"box-b\" x=\"368\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"106\" text-anchor=\"middle\">p2</text><rect class=\"box\" x=\"432\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"458\" y=\"106\" text-anchor=\"middle\">p5</text><rect class=\"box\" x=\"368\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"394\" y=\"148\" text-anchor=\"middle\">p8</text><rect class=\"box-dim\" x=\"432\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><rect class=\"box\" x=\"520\" y=\"44\" width=\"148\" height=\"128\" rx=\"8\"/><text class=\"t\" x=\"594\" y=\"68\" text-anchor=\"middle\">node D</text><rect class=\"box-b\" x=\"536\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"562\" y=\"106\" text-anchor=\"middle\">p9</text><rect class=\"box\" x=\"600\" y=\"86\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"626\" y=\"106\" text-anchor=\"middle\">p10</text><rect class=\"box\" x=\"536\" y=\"128\" width=\"52\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"562\" y=\"148\" text-anchor=\"middle\">p11</text><text class=\"t-s t-code\" x=\"340\" y=\"198\" text-anchor=\"middle\">pay-7: p9, now on D; pay-81701: p2, still on C</text><text class=\"t-s t-m\" x=\"340\" y=\"224\" text-anchor=\"middle\">a key never changes partition; only the partition-to-node table changed</text></svg>",
+            "say": "Check both keys. `pay-81701` is still in p2, and p2 never left C, so nothing about it changed. `pay-7` is still in p9; p9 now lives on D. Compare `hash mod N` from the last section, which would have moved three keys in four, between every pair of nodes."
+          }
+        ]
+      },
+      "try": {
+        "title": "See why 480 beats 512",
+        "minutes": 2,
+        "steps": [
+          "Read `PartitionCountDemo.kt`. For 12, 480 and 512 partitions spread over 5 to 96 nodes, it prints the fewest and most partitions a node holds, and how much more the busiest node carries than the average.",
+          "Predict: on 96 nodes, which of 480 and 512 is even?",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "PartitionCountDemo.kt",
+          "src": "package sfz.shard.l03.demo\n\n/** Fixed partitions spread over N nodes: the busiest node holds ceil(P / N), the quietest floor(P / N). */\nfun main() {\n    println(\"partitions  nodes  per node (min to max)  busiest node vs average\")\n    for (p in listOf(12, 480, 512)) {\n        for (n in listOf(5, 13, 32, 40, 48, 96)) {\n            val min = p / n\n            val max = (p + n - 1) / n\n            val ratio = max / (p.toDouble() / n)\n            val note = if (min == 0) \"  <- some nodes hold nothing\" else \"\"\n            println(\"%10d  %5d  %9d to %-9d  %22.2f%s\".format(p, n, min, max, ratio, note))\n        }\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l03.demo.PartitionCountDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l03/demo/PartitionCountDemo.kt"
+        },
+        "expect": "```text\npartitions  nodes  per node (min to max)  busiest node vs average\n        12      5          2 to 3                            1.25\n        12     13          0 to 1                            1.08  <- some nodes hold nothing\n        12     32          0 to 1                            2.67  <- some nodes hold nothing\n        12     40          0 to 1                            3.33  <- some nodes hold nothing\n        12     48          0 to 1                            4.00  <- some nodes hold nothing\n        12     96          0 to 1                            8.00  <- some nodes hold nothing\n       480      5         96 to 96                           1.00\n       480     13         36 to 37                           1.00\n       480     32         15 to 15                           1.00\n       480     40         12 to 12                           1.00\n       480     48         10 to 10                           1.00\n       480     96          5 to 5                            1.00\n       512      5        102 to 103                          1.01\n       512     13         39 to 40                           1.02\n       512     32         16 to 16                           1.00\n       512     40         12 to 13                           1.02\n       512     48         10 to 11                           1.03\n       512     96          5 to 6                            1.13\n```\n\nWith 12 partitions, past 12 nodes some nodes hold nothing, and the \"busiest vs average\" column shows each partition-holding node carrying up to 8 times its fair share. 480 is perfectly even at Notion's 32 and 96 machines and at 40 and 48 too. 512 is even only at 32. At 13 nodes neither divides evenly, but with many partitions per node the difference is under 3%: a big P hides bad divisors."
+      },
+      "refs": [
+        {
+          "title": "The Great Re-shard: adding Postgres capacity (again) with zero downtime (Notion)",
+          "url": "https://www.notion.com/blog/the-great-re-shard",
+          "kind": "read"
+        },
+        {
+          "title": "Elastic docs: size your shards",
+          "url": "https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Partitions that split, and the danger of moving them automatically",
+      "body": "Key-range stores can't fix their partition count in advance, because a range holds whatever keys fall into it. So they split. A range that grows past a size limit is cut in two at its middle key: HBase splits a region at 10 GiB, and CockroachDB splits a range at 512 MiB. MongoDB works in ranges of about 128 MB, which its balancer splits and moves to even out data size across shards. CockroachDB also merges neighbours that shrink below 128 MiB, and splits a range that is too busy, so one hot range can be served by two nodes. The number of partitions now follows the data: a small table has a few, a big one has thousands. A split moves nothing between machines by itself. It makes a new unit that can move, and a new node takes whole ranges, as with fixed partitions.\n\nCassandra takes a third path: the number of partitions grows with the nodes. Each node owns 16 token ranges, so 10 nodes make 160 ranges, and an 11th node adds 16 more by splitting existing ones (lesson 2). A partition's size grows with the data per node, not with the data in total.\n\nWho decides when to move a partition? The store can do it on its own, or it can propose a plan for a person to approve. Automatic is convenient, and it fails in one specific way. Suppose a node gets overloaded, by a hot partition say. Its replies slow down and its heartbeats arrive late, so the failure detector decides it's dead. The rebalancer moves its partitions to the survivors, which were already busy. Now they're overloaded, their heartbeats slip, and they're declared dead too. That's a **cascading failure**: the rebalancer itself spreads the overload. The Try-it runs it on five nodes at 88% of capacity. One partition triples, and two seconds later the automatic cluster serves nothing, while the cluster that only alerted a person still serves 4,520 of 4,840 requests a second.\n\nSo many systems keep a person in the loop for membership. Dynamo made adding and removing nodes an explicit admin command, so that a node that drops out for a few minutes doesn't trigger a flood of copying. Couchbase and Riak propose a new assignment and wait for an administrator to commit it. MongoDB's balancer is automatic but careful: a shard takes part in only one chunk migration at a time, and you can limit balancing to a window of quiet hours. For a peak you can see coming, Black Friday or a ticket sale, rebalance by hand beforehand, while the cluster is quiet.",
+      "try": {
+        "title": "Watch automatic rebalancing take a cluster down",
+        "minutes": 3,
+        "steps": [
+          "Read `CascadeDemo.kt`. Five nodes hold 20 partitions of 220 requests a second, 880 per node against a capacity of 1,000. At second 1, partition 7 on node-3 goes to 660. A node over capacity misses its health checks and is called dead. One policy moves a dead node's partitions to the least loaded survivors; the other only alerts a person.",
+          "Predict how many seconds the automatic cluster lasts.",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "CascadeDemo.kt",
+          "src": "package sfz.shard.l03.demo\n\n/**\n * Five nodes, 20 partitions of 220 requests a second each: 880 a second per node, against a capacity\n * of 1,000. At second 1, one merchant in partition 7 (on node-3) triples that partition's traffic.\n * A node over capacity answers health checks late, so the failure detector calls it dead.\n */\nfun main() {\n    val capacity = 1_000.0\n    for (automatic in listOf(true, false)) {\n        val load = MutableList(20) { 220.0 }\n        val owner = MutableList(20) { \"node-${it % 5 + 1}\" }\n        val alive = (1..5).map { \"node-$it\" }.toSortedSet()\n        println(if (automatic) \"automatic: move a dead node's partitions to the others\" else \"manual: alert a person, move nothing\")\n        for (second in 0..3) {\n            if (second == 1) load[7] = 660.0 // the hot merchant\n            val perNode = alive.associateWith { n -> owner.indices.filter { owner[it] == n }.sumOf { load[it] } }\n            val served = perNode.values.sumOf { minOf(it, capacity) }\n            println(\"  second $second: %s  served %,.0f of %,.0f a second\".format(\n                perNode.entries.joinToString(\" \") { \"${it.key}=%.0f\".format(it.value) }.ifEmpty { \"no nodes left\" }, served, load.sum()))\n            if (!automatic) continue\n            val dead = perNode.filter { it.value > capacity }.keys\n            alive -= dead\n            if (alive.isEmpty()) continue\n            // the \"fix\": hand every partition of a dead node to the least loaded survivor, one at a time\n            for (p in owner.indices.filter { owner[it] in dead }) {\n                owner[p] = alive.minBy { n -> owner.indices.filter { owner[it] == n }.sumOf { load[it] } }\n            }\n        }\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l03.demo.CascadeDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l03/demo/CascadeDemo.kt"
+        },
+        "expect": "```text\nautomatic: move a dead node's partitions to the others\n  second 0: node-1=880 node-2=880 node-3=880 node-4=880 node-5=880  served 4,400 of 4,400 a second\n  second 1: node-1=880 node-2=880 node-3=1320 node-4=880 node-5=880  served 4,520 of 4,840 a second\n  second 2: node-1=1100 node-2=1540 node-4=1100 node-5=1100  served 4,000 of 4,840 a second\n  second 3: no nodes left  served 0 of 4,840 a second\nmanual: alert a person, move nothing\n  second 0: node-1=880 node-2=880 node-3=880 node-4=880 node-5=880  served 4,400 of 4,400 a second\n  second 1: node-1=880 node-2=880 node-3=1320 node-4=880 node-5=880  served 4,520 of 4,840 a second\n  second 2: node-1=880 node-2=880 node-3=1320 node-4=880 node-5=880  served 4,520 of 4,840 a second\n  second 3: node-1=880 node-2=880 node-3=1320 node-4=880 node-5=880  served 4,520 of 4,840 a second\n```\n\nAt second 1 node-3 is over capacity and drops 320 requests a second. The automatic policy calls it dead and hands its four partitions (1,320 a second) to the other four nodes. Each was at 880, so every one of them goes over 1,000, and at second 3 the whole cluster is \"dead\". The manual policy keeps losing 320 a second on one node, 7% of traffic, until a person moves or splits partition 7. The model is crude (real detectors wait several seconds, and real moves take minutes of copying, which adds load), but the shape is the one real cascades have."
+      },
+      "refs": [
+        {
+          "title": "MongoDB manual: data partitioning with chunks (range size and the balancer)",
+          "url": "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/",
+          "kind": "docs"
+        },
+        {
+          "title": "CockroachDB docs: load-based splitting",
+          "url": "https://docs.cockroachlabs.com/docs/stable/load-based-splitting",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Finding the shard: any node, a routing tier or a smart client",
+      "body": "Partitions move, so a client can't hard-code where a key lives. Something has to hold the second map, partition to node, and every request has to consult it. The figure shows the three places to put that lookup.\n\nAny node. The client sends the request to any node, and that node forwards it to the right one. Cassandra works this way: whichever node receives a request becomes its coordinator, and every node keeps the whole token map, spread by gossip (lesson 5 covers it). Cassandra 6.0, still at alpha, moves this map into a consensus-backed metadata service.\n\nA routing tier. The client talks to a router that knows the map and stores no data. MongoDB's `mongos` caches the chunk map from the config servers (a small replica set that stores the cluster's metadata) and sends each query to the shards that hold its chunks; a query without the shard key goes to all of them. Figma's DBProxy sits between the application and PgBouncer (a connection pooler), parses each SQL query and routes it by shard key. Vitess does the same for MySQL.\n\nA partition-aware client. The client library keeps its own copy of the map and goes straight to the owner, saving a hop. Cassandra's token-aware drivers compute the token and pick a replica. A Kafka producer fetches the cluster's metadata, which names the leader broker of each partition, and refreshes it when a broker answers that it's no longer the leader. A Redis Cluster client caches the slot map.\n\nWherever the lookups happen, the authoritative map has to live somewhere every party agrees on, or two routers can each believe a different node owns a partition. Many systems keep it in a consensus store, a small replicated service that changes its data only when a majority of its nodes agree: HBase in ZooKeeper, Kubernetes in etcd, Kafka in its own KRaft controllers, and CockroachDB, TiDB and ScyllaDB in built-in Raft groups. The Consistency and consensus track builds these.\n\nEvery copy of the map goes stale the moment a partition moves, so the real design question is what a node does with a request for a key it no longer owns. Redis Cluster's answer, from the Caching track, is the cleanest to study. A node that doesn't own the key's slot answers `MOVED <slot> <node>`: the slot lives there now, so update your map and retry. While a slot is migrating, its old owner still answers the keys it has and answers `ASK <slot> <node>` for keys that have already been copied. The client sends that one request to the new node, prefixed by the command `ASKING`, and leaves its map alone, because most of the slot is still on the old owner. When the migration ends, the old owner answers `MOVED`, once per client, and the maps catch up. **No request fails during a migration: each one costs at most one extra hop.** The lab builds that client.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 700 302\" role=\"img\" aria-label=\"Three ways a request finds the node that owns its key: any node forwards it, a routing tier sends it on, or the client keeps the map and goes straight to the owner\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-a\" x=\"120\" y=\"32\" text-anchor=\"middle\">1. any node forwards</text><rect class=\"box\" x=\"70\" y=\"46\" width=\"100\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"120.0\" y=\"71.0\" text-anchor=\"middle\">client</text><rect class=\"box\" x=\"24\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"67.0\" y=\"209.0\" text-anchor=\"middle\">node B</text><rect class=\"box-a\" x=\"130\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"173.0\" y=\"209.0\" text-anchor=\"middle\">node A</text><line class=\"ln\" x1=\"108\" y1=\"86\" x2=\"74\" y2=\"182\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"110\" y1=\"204\" x2=\"128\" y2=\"204\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"175\" y=\"150\" text-anchor=\"middle\">B forwards</text><text class=\"t-s t-m\" x=\"175\" y=\"166\" text-anchor=\"middle\">to A</text><text class=\"t-s\" x=\"120\" y=\"250\" text-anchor=\"middle\">Cassandra coordinator</text><text class=\"t-s\" x=\"120\" y=\"268\" text-anchor=\"middle\">(token map by gossip)</text><line class=\"ln-d\" x1=\"235\" y1=\"14\" x2=\"235\" y2=\"288\"/><text class=\"t-s t-a\" x=\"350\" y=\"32\" text-anchor=\"middle\">2. a routing tier</text><rect class=\"box\" x=\"300\" y=\"46\" width=\"100\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"71.0\" text-anchor=\"middle\">client</text><rect class=\"box\" x=\"254\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"297.0\" y=\"209.0\" text-anchor=\"middle\">node B</text><rect class=\"box-a\" x=\"360\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"403.0\" y=\"209.0\" text-anchor=\"middle\">node A</text><rect class=\"box-b\" x=\"290\" y=\"112\" width=\"120\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"350.0\" y=\"137.0\" text-anchor=\"middle\">router</text><line class=\"ln\" x1=\"350\" y1=\"86\" x2=\"350\" y2=\"110\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"370\" y1=\"152\" x2=\"398\" y2=\"182\" marker-end=\"url(#arr)\"/><text class=\"t-s\" x=\"350\" y=\"250\" text-anchor=\"middle\">MongoDB mongos, Vitess,</text><text class=\"t-s\" x=\"350\" y=\"268\" text-anchor=\"middle\">Figma's DBProxy</text><line class=\"ln-d\" x1=\"465\" y1=\"14\" x2=\"465\" y2=\"288\"/><text class=\"t-s t-a\" x=\"580\" y=\"32\" text-anchor=\"middle\">3. a partition-aware client</text><rect class=\"box-b\" x=\"520\" y=\"46\" width=\"120\" height=\"46\" rx=\"8\"/><text class=\"t\" x=\"580.0\" y=\"65.0\" text-anchor=\"middle\">client</text><text class=\"t-s t-m\" x=\"580.0\" y=\"83.0\" text-anchor=\"middle\">keeps the map</text><rect class=\"box\" x=\"484\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"527.0\" y=\"209.0\" text-anchor=\"middle\">node B</text><rect class=\"box-a\" x=\"590\" y=\"184\" width=\"86\" height=\"40\" rx=\"8\"/><text class=\"t\" x=\"633.0\" y=\"209.0\" text-anchor=\"middle\">node A</text><line class=\"ln-a\" x1=\"600\" y1=\"92\" x2=\"630\" y2=\"182\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"530\" y=\"150\" text-anchor=\"middle\">straight to A</text><text class=\"t-s\" x=\"580\" y=\"250\" text-anchor=\"middle\">token-aware drivers, Kafka</text><text class=\"t-s\" x=\"580\" y=\"268\" text-anchor=\"middle\">clients, Redis Cluster clients</text></svg>",
+        "caption": "Three places to look up partition to node: any node forwards, a routing tier sends on, or the client keeps the map and goes straight to the owner."
+      },
+      "try": {
+        "title": "Trace three reads through a slot migration",
+        "minutes": 3,
+        "steps": [
+          "Read `RedirectDemo.kt`. Three nodes share 16 slots; slot 0 starts on A and holds three keys. The client reads all three before the migration, after one key has been copied to C, and after the migration ends. Each line prints every hop and the client's map entry for slot 0.",
+          "Predict which reads get `ASK`, which get `MOVED`, and when the client's map changes.",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "RedirectDemo.kt",
+          "src": "package sfz.shard.l03.demo\n\n/** Three nodes, 16 slots. Slot 0 moves from A to C while a client keeps reading it. */\nfun main() {\n    val slotOf = { key: String -> Math.floorMod(md5(key), 16L).toInt() }\n    val owner = Array(16) { listOf(\"A\", \"B\", \"C\")[it * 3 / 16] }\n    val stores = mapOf(\"A\" to HashMap<String, String>(), \"B\" to HashMap(), \"C\" to HashMap())\n    val keys = (0 until 300).map { \"pay-$it\" }.filter { slotOf(it) == 0 }.sorted().take(3)\n    keys.forEach { stores.getValue(owner[0])[it] = \"value of $it\" }\n    var migratingTo: String? = null\n\n    // the server side: what node answers to GET key\n    fun serve(node: String, key: String, asking: Boolean): String {\n        val slot = slotOf(key)\n        return when {\n            owner[slot] == node && migratingTo != null && key !in stores.getValue(node) -> \"ASK $slot $migratingTo\"\n            owner[slot] == node -> \"\\\"${stores.getValue(node)[key]}\\\"\"\n            migratingTo == node && asking -> \"\\\"${stores.getValue(node)[key]}\\\"\"\n            else -> \"MOVED $slot ${owner[slot]}\"\n        }\n    }\n\n    // the client: its own slot map; MOVED updates it, ASK doesn't\n    val slotMap = owner.copyOf()\n    fun get(key: String) {\n        var node = slotMap[slotOf(key)]\n        var asking = false\n        val trace = StringBuilder(\"GET $key\")\n        while (true) {\n            val reply = serve(node, key, asking)\n            trace.append(\" -> ${if (asking) \"ASKING, \" else \"\"}$node: $reply\")\n            val parts = reply.split(\" \")\n            when (parts[0]) {\n                \"MOVED\" -> { slotMap[parts[1].toInt()] = parts[2]; node = parts[2]; asking = false }\n                \"ASK\" -> { node = parts[2]; asking = true }\n                else -> break\n            }\n        }\n        println(\"  $trace   (client map: slot 0 on ${slotMap[0]})\")\n    }\n\n    println(\"before the migration\")\n    keys.forEach(::get)\n    println(\"slot 0 starts moving to C; ${keys[0]} has been copied\")\n    migratingTo = \"C\"\n    stores.getValue(\"C\")[keys[0]] = stores.getValue(\"A\").remove(keys[0])!!\n    keys.forEach(::get)\n    println(\"the rest are copied, and C owns slot 0\")\n    keys.drop(1).forEach { stores.getValue(\"C\")[it] = stores.getValue(\"A\").remove(it)!! }\n    owner[0] = \"C\"\n    migratingTo = null\n    keys.forEach(::get)\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.shard.l03.demo.RedirectDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/shard/l03/demo/RedirectDemo.kt"
+        },
+        "expect": "```text\nbefore the migration\n  GET pay-103 -> A: \"value of pay-103\"   (client map: slot 0 on A)\n  GET pay-117 -> A: \"value of pay-117\"   (client map: slot 0 on A)\n  GET pay-159 -> A: \"value of pay-159\"   (client map: slot 0 on A)\nslot 0 starts moving to C; pay-103 has been copied\n  GET pay-103 -> A: ASK 0 C -> ASKING, C: \"value of pay-103\"   (client map: slot 0 on A)\n  GET pay-117 -> A: \"value of pay-117\"   (client map: slot 0 on A)\n  GET pay-159 -> A: \"value of pay-159\"   (client map: slot 0 on A)\nthe rest are copied, and C owns slot 0\n  GET pay-103 -> A: MOVED 0 C -> C: \"value of pay-103\"   (client map: slot 0 on C)\n  GET pay-117 -> C: \"value of pay-117\"   (client map: slot 0 on C)\n  GET pay-159 -> C: \"value of pay-159\"   (client map: slot 0 on C)\n```\n\nDuring the migration only the copied key costs a hop, and the client's map still says A, which is right for the two keys A still holds. After the migration, the first read gets `MOVED`, the map flips to C, and the next two reads go straight there. Every read returned its value. The model uses 16 slots and MD5; Redis uses 16,384 slots and CRC16, with the same replies."
+      },
+      "refs": [
+        {
+          "title": "Redis Cluster specification: MOVED and ASK redirection",
+          "url": "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/",
+          "kind": "docs"
+        },
+        {
+          "title": "MongoDB manual: sharded cluster query routing (mongos)",
+          "url": "https://www.mongodb.com/docs/manual/core/sharded-cluster-query-router/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Picture a storage building with 1,000 numbered lockers and ten attendants. A customer's locker number is stamped on their key and never changes. When an eleventh attendant starts, the manager hands over the keys to 90 lockers from the other ten, a few from each; no locker moves and no customer gets a new number. A building that instead sends customer number c to attendant c mod N would make nearly every customer find a new attendant the day one is hired. To get served, a customer can ask any attendant, who walks them over; ask at the front desk; or carry a map. A customer with an old map hears \"not me any more, she has it now\" (MOVED), or, during a handover, \"that locker has already gone to her, just this once\" (ASK). The analogy breaks on cost: handing over a locker key takes a second, while moving a partition copies gigabytes between live machines, and the copying itself loads the very nodes it's meant to relieve.",
+  "in_your_world": "Your Kafka topics are fixed partitions. A payments topic keyed by merchant gets its partition count once, and adding partitions later sends a merchant's new events to a different partition from its old ones, so the per-merchant order your consumers rely on breaks across the change. Pick the count with divisors in mind: 12 partitions spread evenly over 1, 2, 3, 4, 6 or 12 consumers in a group, while with 5 consumers two of them get three partitions and three get two. The Kafka client already follows a redirect much like MOVED: when a broker restarts and leadership moves, the producer gets a not-leader error, refreshes its metadata and resends. With Redis Cluster through Lettuce, turn on adaptive topology refresh so that MOVED and ASK replies trigger a map refresh promptly. And if you ever shard Postgres or Oracle by hand, start with many logical shards on few machines, as Notion did.",
+  "mistake": "The most common mistake is choosing the partition count for today's size. A topic created with 6 partitions is fine until the consumer group needs 12 members, and an index created with 3 primary shards is fine until each shard holds 200 GB. Raising the count later rehashes keys, which breaks per-key order in Kafka and means a split or a reindex in Elasticsearch. It happens because a small count looks tidy and the growth is years away. The fix is to size for the volume you expect in a few years, with a count that has many divisors (48, 60, 120, 480), and to check the per-partition overhead against your platform's guidance before going much higher.",
+  "worked": {
+    "title": "Choose the number of logical shards for a sharded ledger",
+    "steps": [
+      {
+        "say": "Start from the growth, not from today's machines. The ledger has 3 TB, grows 40 GB a day, and each Postgres machine should hold at most 500 GB.",
+        "lang": "text",
+        "code": "today        3 TB                       -> 6 machines at 500 GB\nin 3 years   3 TB + 40 GB x 1,095 days  = about 46.8 TB\n             46.8 TB / 500 GB          -> about 94 machines"
+      },
+      {
+        "say": "So the count must spread evenly over anything from 6 to about 100 machines, with at least a few shards per machine at the top end so one machine can be relieved by moving one or two shards. Compare candidates by the busiest machine's share against the average.",
+        "lang": "kotlin",
+        "code": "fun busiestVsAverage(partitions: Int, machines: Int): Double {\n    val busiest = (partitions + machines - 1) / machines // ceil(P / N)\n    return busiest / (partitions.toDouble() / machines)\n}\n\nfor (p in listOf(256, 480, 512, 720))\n    println(\"$p: \" + listOf(6, 8, 12, 16, 24, 32, 48, 96).map { \"%.2f\".format(busiestVsAverage(p, it)) })"
+      },
+      {
+        "say": "Read the result. 480 is perfectly even at every count from 6 to 96 machines. 720 is uneven at 32 and 96 (720 / 96 = 7.5, so some machines hold 8 and some 7). 256 and 512 are even only at powers of two, and at 96 machines the busiest carries 13% more than the average. Pick 480.",
+        "lang": "text",
+        "code": "256: [1.01, 1.00, 1.03, 1.00, 1.03, 1.00, 1.13, 1.13]\n480: [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]\n512: [1.01, 1.00, 1.01, 1.00, 1.03, 1.00, 1.03, 1.13]\n720: [1.00, 1.00, 1.00, 1.00, 1.00, 1.02, 1.00, 1.07]"
+      },
+      {
+        "say": "Keep the routing table small and in one place. Each logical shard is a schema; the table maps shard number to a database host. Moving a shard is: copy the schema to the new host, catch up from the old host's replication stream, pause writes to that one shard for a moment, flip the table entry, resume. Every other shard keeps working.",
+        "lang": "kotlin",
+        "code": "const val LOGICAL_SHARDS = 480\n\nfun logicalShard(merchantId: String): Int =\n    Math.floorMod(stableHash(merchantId), LOGICAL_SHARDS.toLong()).toInt() // never changes\n\n// the second map: logical shard -> host, kept in one store every router reads\nval hostOf: Map<Int, String> = (0 until LOGICAL_SHARDS).associateWith { \"ledger-db-%02d\".format(it % 6) }"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Rebalance two ways, then follow MOVED and ASK",
+    "minutes": 15,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/shard/l03/Placement.kt",
+      "labs/sim/src/main/kotlin/sfz/shard/l03/DynamicRanges.kt",
+      "labs/sim/src/main/kotlin/sfz/shard/l03/Redirects.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.shard.l03.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. 13 of 15 fail with `NotImplementedError`. Two pass already: the `hash mod N` count, which uses the given `ModN`, and the importing node's reply without `ASKING`, which tests the given `Cluster`.",
+      "In `Placement.kt`, write `FixedPartitions.addNode`: move one partition at a time from the busiest node to the new one until it holds its fair share. Watch the jqwik property: for any node count and partition count, every node ends with the fair share rounded down or up.",
+      "In `DynamicRanges.kt`, write `insert`: add the key to its range, and split a range that passes `maxKeys` at its median key. The test with time-ordered keys checks that every insert lands in the last range, however often it splits.",
+      "In `Redirects.kt`, write `RoutingClient.get`: follow `MOVED` (update the map) and `ASK` (one request with `asking = true`, map unchanged). All 15 pass.",
+      "Experiment: change your `Ask` branch so it also writes the new node into `slotMap`. Run the tests and read which one fails, and why: the client now sends the keys still on A to C, which bounces them back with `MOVED`. Put it back."
+    ],
+    "hints": [
+      "`addNode`: count partitions per node first (`owner.forEach { counts.merge(it, 1, Int::plus) }`), then loop while the new node holds fewer than `partitionCount / nodes.size`. The donor is the max by count, then by name sorting first: `compareBy<Map.Entry<String, Int>> { it.value }.thenByDescending { it.key }`.",
+      "The donor's highest partition is `owner.indices.last { owner[it] == donor }`.",
+      "`insert`: `range.keys.elementAt(range.keys.size / 2)` is the median. `range.keys.tailSet(median, true)` is a live view of the upper half: copy it into the new range's keys, then `clear()` the view to remove those keys from the old range. Put the new range in `byStart` under the median.",
+      "`get`: loop at most six times. Keep `node` and `asking` in local variables. On `Moved`, set `slotMap[reply.slot] = reply.node` and `asking = false`; on `Ask`, set `asking = true` and touch nothing else."
+    ],
+    "done_when": "All 15 tests in `RebalanceTest` and `RedirectsTest` pass."
+  },
+  "drill": {
+    "title": "The redirect loop from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write `get(key)` for a client with a `slotMap: Array<String>` and a `send(node, key, asking): Reply`, where `Reply` is `Value(v)`, `Moved(slot, node)` or `Ask(slot, node)`. Then say in one sentence why `Ask` must not update the map.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun get(key: String): String? {\n    var node = slotMap[slotOf(key)]\n    var asking = false\n    repeat(6) {\n        when (val r = send(node, key, asking)) {\n            is Reply.Value -> return r.value\n            is Reply.Moved -> { slotMap[r.slot] = r.node; node = r.node; asking = false } // the slot moved for good\n            is Reply.Ask -> { node = r.node; asking = true }                              // this key, this once\n        }\n    }\n    throw IllegalStateException(\"too many redirects for $key\")\n}\n// During a migration most of the slot's keys are still on the old owner;\n// pointing the map at the new owner would bounce all of them back with MOVED."
+    }
+  },
+  "recap": [
+    "`hash mod N` moves about N/(N+1) of the keys when a node joins (91% going from 10 to 11). A good scheme moves about 1/(N+1), all of it to the new node, from many senders.",
+    "Fixed partitions (Kafka, Elasticsearch and OpenSearch, Redis Cluster's 16,384 slots, Notion's 480) hash keys to P partitions once and move whole partitions. Choose P big and with many divisors: it's hard to change later.",
+    "Key-range stores split ranges as they grow (HBase at 10 GiB, CockroachDB at 512 MiB and when a range gets too busy; MongoDB's balancer works in 128 MB ranges). Cassandra's partition count grows with the nodes, 16 ranges each.",
+    "Automatic rebalancing can cascade: an overloaded node is called dead, its load lands on the others, and they fail in turn. Keep a person in the loop for membership, and rebalance before a known peak.",
+    "Requests find shards through any node (Cassandra), a routing tier (mongos, DBProxy, Vitess) or a partition-aware client (token-aware drivers, Kafka metadata, Redis Cluster). The authoritative map lives in a consensus store or is spread by gossip.",
+    "Redis Cluster's MOVED updates the client's map; ASK sends one request, after `ASKING`, to the importing node and leaves the map alone. No request fails during a migration."
+  ],
+  "quiz": [
+    {
+      "q": "A cluster has 64 fixed partitions and grows from 32 nodes to 80. What happens?",
+      "options": [
+        "16 of the new nodes hold no partition, so they add nothing for this data",
+        "The partitions split automatically into 80",
+        "Every key is rehashed into 80 partitions",
+        "Each node ends up with 0.8 of a partition"
+      ],
+      "answer": 0,
+      "why": "A partition is the smallest unit that moves, and 64 partitions can occupy at most 64 nodes. Fixed-partition stores don't split partitions or rehash keys by themselves; raising P means a split or reindex. This is the wall you hit when P is chosen too small."
+    },
+    {
+      "q": "One partition on node-3 gets hot and node-3's latency climbs past the failure detector's timeout. The cluster rebalances automatically when a node fails. What is the risk?",
+      "options": [
+        "None: moving node-3's partitions away is the right fix",
+        "node-3 loses its data, because it was declared dead",
+        "The hot partition splits by itself and the load disappears",
+        "node-3's load, hot partition included, lands on nodes that were already busy, which overload and get declared dead in turn"
+      ],
+      "answer": 3,
+      "why": "The node isn't dead, it's slow. Moving its partitions adds its whole load, plus the cost of copying, to the survivors. If they were near capacity, they slow down too, and the rebalancer repeats the mistake. That's why Dynamo made membership changes an explicit admin action."
+    },
+    {
+      "q": "During a slot migration, a Redis Cluster client gets `ASK 0 C` for a key. What should it do?",
+      "options": [
+        "Update its map to say slot 0 is on C, then retry there",
+        "Send `ASKING`, then the command, to C, and keep its map saying slot 0 is on the old owner",
+        "Retry the old owner until the key comes back",
+        "Refresh the whole slot map from every node"
+      ],
+      "answer": 1,
+      "why": "ASK means this one key has already been copied, while most of the slot is still on the old owner. Updating the map would send every other key of slot 0 to C, which would bounce them back with MOVED. Only MOVED, when the slot has moved for good, updates the map."
+    },
+    {
+      "q": "A MongoDB collection is sharded on `{ merchantId: 1 }`. A query filters only on `cardFingerprint`, which has an index. What does `mongos` do?",
+      "options": [
+        "Sends it to the one shard whose chunk range contains the fingerprint",
+        "Asks the config servers to run it",
+        "Broadcasts it to every shard of the collection, each uses its own index, and merges the results",
+        "Rejects it, because mongos only routes by shard key"
+      ],
+      "answer": 2,
+      "why": "Chunks are ranges of the shard key, so a fingerprint says nothing about which shard holds the rows. mongos broadcasts the query, each shard picks its best local index, and mongos merges the cursors. Lesson 4 is about exactly this cost."
+    },
+    {
+      "q": "From lesson 2: a Cassandra cluster with 16 tokens per node gets an eleventh node. Which is true?",
+      "options": [
+        "It takes about 1/11 of the data, in small slices from several existing nodes",
+        "It takes half of one neighbour's data",
+        "Every key is rehashed, as with `hash mod N`",
+        "It takes nothing until a repair runs"
+      ],
+      "answer": 0,
+      "from": "shard-02",
+      "why": "Each of the new node's 16 tokens takes the slice just before it from whichever node owned it, so the new node gets about its fair share, from several senders. Half of one neighbour is the one-token case at its worst, and rehashing everything is `hash mod N`."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "How many keys move when `hash mod N` goes from 10 to 11 nodes?",
+      "back": "About 10 in 11 (91%): a key stays only if its hash leaves the same remainder for 10 and 11."
+    },
+    {
+      "front": "What's the least data a join can move?",
+      "back": "The new node's fair share, 1/(N+1) of the data, all of it to the new node."
+    },
+    {
+      "front": "Fixed partitions: what changes when a node joins?",
+      "back": "Only the partition-to-node table. Whole partitions move; a key's partition never changes."
+    },
+    {
+      "front": "Why did Notion pick 480 logical shards?",
+      "back": "480 divides evenly by many machine counts (32, 40, 48, 96 and more), so every machine holds the same number of shards. 512 is even only at powers of two."
+    },
+    {
+      "front": "How can automatic rebalancing cause an outage?",
+      "back": "An overloaded node is declared dead; its load moves onto others, which overload and are declared dead in turn: a cascading failure."
+    },
+    {
+      "front": "MOVED or ASK: which one updates the client's slot map?",
+      "back": "MOVED: the slot has moved for good. ASK is for one key during a migration: send `ASKING` plus the command to the target, and keep the map."
+    },
+    {
+      "front": "Three places to route a request to its shard?",
+      "back": "Any node forwards (Cassandra); a routing tier (mongos, Vitess, Figma's DBProxy); a partition-aware client (token-aware drivers, Kafka clients, Redis Cluster clients)."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Rebalancing",
+      "plain": "Moving data between nodes so each holds a fair share, for example when a node joins or leaves."
+    },
+    {
+      "term": "Fixed partitions",
+      "plain": "A partition count chosen once and much larger than the node count; keys never change partition, and whole partitions move between nodes."
+    },
+    {
+      "term": "Dynamic splitting",
+      "plain": "Cutting a range in two when it grows past a size limit (or gets too busy), so the partition count follows the data."
+    },
+    {
+      "term": "Cascading failure",
+      "plain": "A failure that spreads because the reaction to it, such as moving load onto other nodes, overloads them too."
+    },
+    {
+      "term": "Routing tier",
+      "plain": "A layer of routers that knows which node holds each partition and forwards requests, holding no data itself, like MongoDB's mongos."
+    },
+    {
+      "term": "Partition-aware client",
+      "plain": "A client library that keeps its own copy of the partition map and sends each request straight to the owner."
+    },
+    {
+      "term": "MOVED",
+      "plain": "Redis Cluster's reply meaning the key's slot lives on another node now: update your map and retry there."
+    },
+    {
+      "term": "ASK",
+      "plain": "Redis Cluster's reply during a slot migration meaning this key has already moved: send ASKING and this one request to the new node, and keep your map."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your team shards the ledger over 8 Postgres machines with `hash(merchant_id) mod 8` and now needs 4 more machines. Explain why that's painful, and what you'd have done differently.",
+    "answer": "With `hash mod 8`, going to 12 machines changes the remainder for most merchants: a merchant stays only if its hash leaves the same remainder mod 8 and mod 12, which happens for 8 out of every 24 hash values, a third. So about two thirds of the data has to be copied, much of it between old machines that aren't gaining anything, all while serving payments. And during the move, every router has to know which merchants have moved, merchant by merchant. If we'd started with fixed logical shards, say 480 schemas with 60 on each of the 8 machines, a merchant's logical shard would never change. Adding 4 machines would move 160 whole schemas, 40 to each new machine, a third of the data, all of it to new machines, and the routing table would change one schema at a time. 480 also spreads evenly over 8, 12, 16 or 24 machines. We'd keep that table in one place every router reads, and move shards one at a time by hand, outside the peak season."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Rebalancing tools have become first-class operations in the stores you'll use.\n\nMongoDB 8.0 added `moveCollection` (move an unsharded collection to another shard), `unshardCollection`, and resharding to the same shard key as a way to redistribute data. Resharding writes to all shards in parallel, while the balancer's chunk migrations are limited to one per shard at a time; Percona measured a few-gigabyte reshard at about 3 minutes on MongoDB 7.0 and under 1 minute on 8.0, on an idle cluster.\n\nRedis 8.4 and Valkey 9.0 added atomic slot migration, which moves a whole slot as one operation instead of key by key. Clients still have to understand MOVED, but the window in which ASK appears shrinks.\n\nElasticsearch and OpenSearch can split an index into a multiple of its primary shard count, or shrink it to a factor of it, without reindexing every document. Any other change of the shard count is a reindex.\n\nDesigning Data-Intensive Applications, 2nd edition, chapter 7 has a good section on the open problems of request routing: who decides the assignment without split brain, how routers learn about changes, and what happens to requests in flight at the cutover. The Consistency and consensus track answers the first question; this lesson's MOVED and ASK are one answer to the third."
+  },
+  "sources": [
+    {
+      "title": "Redis Cluster specification",
+      "url": "https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/"
+    },
+    {
+      "title": "Elastic docs: size your shards",
+      "url": "https://www.elastic.co/docs/deploy-manage/production-guidance/optimize-performance/size-shards"
+    },
+    {
+      "title": "DeCandia et al., Dynamo: Amazon's Highly Available Key-value Store, SOSP 2007",
+      "url": "https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf"
+    },
+    {
+      "title": "MongoDB manual: data partitioning with chunks",
+      "url": "https://www.mongodb.com/docs/manual/core/sharding-data-partitioning/"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 7 (Kleppmann and Riccomini)",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

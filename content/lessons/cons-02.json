@@ -1,0 +1,426 @@
+{
+  "id": "cons-02",
+  "title": "Linearizability: one copy, one timeline",
+  "minutes": 40,
+  "goal": "By the end you can state Herlihy and Wing's definition and place linearization points on a register timeline, check a history with a Wing and Gong search (and say what Knossos, Porcupine and Lincheck do), name the jobs that need linearizability, explain why a single leader can give it and quorums alone can't, and say what it costs in latency, availability and on your own CPU.",
+  "warmup": {
+    "q": "A leaderless store keeps 3 replicas and uses w = 2 and r = 2, so w + r > n. It doesn't wait for read repair. A capture is being written. The fraud service's read returns `captured`. 5 ms after that read returned, the ledger service starts a read. What can it return?",
+    "options": [
+      "Only `captured`: the read and write quorums must overlap",
+      "`captured` or the old status: the write may still be on one replica only, and ledger's two replicas can both lack it",
+      "An error, because a write is in progress",
+      "Always the old status, because the write hasn't been acknowledged yet"
+    ],
+    "answer": 1,
+    "why": "The overlap guarantee covers completed writes. This one is still in flight, so it may sit on just one replica, which fraud's read happened to reach. Ledger asks all three and takes the first two answers; if those are the two replicas the write hasn't reached, it returns the old status. That is a read starting after another read saw the new value, and returning the old one: not linearizable. The fix (making the reader write the value back to a quorum first) is in section 4."
+  },
+  "sections": [
+    {
+      "h": "Linearizable means every operation takes effect at one instant inside its bar",
+      "body": "The previous lesson put linearizability at the top of the ladder. Here is the definition Maurice Herlihy and Jeannette Wing gave in 1990, for objects shared by concurrent processes: a history is linearizable if every operation appears to take effect at a single instant somewhere between its invocation and its response, and the operations, ordered by those instants, form a correct sequential history of the object.\n\nThe objects in this lesson are registers: a single key you can read, write and compare-and-set, like one row's status column or one entry in etcd. The instant is called the operation's **linearization point**. It is a thought experiment. The store doesn't report it; you ask whether *any* choice of points works.\n\nThe stepper below works through one history by hand. Three things fall out of it.\n\nA read that overlaps a write may return the old value or the new one. While the capture is in flight, ledger saw the old status and fraud saw the new one, and both are fine.\n\nOnce any read has returned the new value, every read that *starts later* must return it, or something newer. This is the rule that catches replicated systems, because nothing in \"copy the write to every replica eventually\" enforces it. Email's read started after fraud's had already seen 2, so email must see 2.\n\nThe order that matters is real time. Fraud and email are different services on different machines. If they never talk to each other, how could anyone notice email's stale read? Through any second channel: fraud publishes \"captured\" to Kafka, email's consumer reacts to it and reads the old status. Section 3 comes back to this.\n\nHerlihy and Wing proved one more property that the lab relies on: linearizability is **local**. A history is linearizable exactly when, for each object, the operations on that object are linearizable. So you can check each key on its own. Sequential consistency doesn't have this property: the previous lesson's lab had a two-key history where each key was fine on its own and the whole was not even sequential.\n\nIn the definition, \"appears\" carries the weight. A store may do anything inside: buffer, replicate, retry. What it may not do is let any client observe something that one copy, changing at one instant per operation, couldn't have produced.",
+      "stepper": {
+        "title": "Placing linearization points",
+        "intro": "One write and three reads of a payment's status. The dots on the bars' edges are the instants each operation took effect.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Four operations on one status: a long capture write from 0 to 60 ms, and reads by ledger, fraud and email.\"><text class=\"t-s\" x=\"20\" y=\"62\" text-anchor=\"start\">capture</text><rect class=\"box-a\" x=\"130\" y=\"40\" width=\"510\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"385\" y=\"61\" text-anchor=\"middle\">write status = 2</text><text class=\"t-s\" x=\"20\" y=\"132\" text-anchor=\"start\">ledger</text><rect class=\"box\" x=\"172.5\" y=\"110\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"131\" text-anchor=\"middle\">read: -</text><text class=\"t-s\" x=\"20\" y=\"192\" text-anchor=\"start\">fraud</text><rect class=\"box\" x=\"300\" y=\"170\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"342.5\" y=\"191\" text-anchor=\"middle\">read: 2</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">email</text><rect class=\"box\" x=\"470\" y=\"230\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"512.5\" y=\"251\" text-anchor=\"middle\">read: -</text><line class=\"ln\" x1=\"130\" y1=\"290\" x2=\"640\" y2=\"290\"/><line class=\"ln\" x1=\"130\" y1=\"285\" x2=\"130\" y2=\"295\"/><text class=\"t-s t-m\" x=\"130\" y=\"312\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"215\" y1=\"285\" x2=\"215\" y2=\"295\"/><text class=\"t-s t-m\" x=\"215\" y=\"312\" text-anchor=\"middle\">10</text><line class=\"ln\" x1=\"300\" y1=\"285\" x2=\"300\" y2=\"295\"/><text class=\"t-s t-m\" x=\"300\" y=\"312\" text-anchor=\"middle\">20</text><line class=\"ln\" x1=\"385\" y1=\"285\" x2=\"385\" y2=\"295\"/><text class=\"t-s t-m\" x=\"385\" y=\"312\" text-anchor=\"middle\">30</text><line class=\"ln\" x1=\"470\" y1=\"285\" x2=\"470\" y2=\"295\"/><text class=\"t-s t-m\" x=\"470\" y=\"312\" text-anchor=\"middle\">40</text><line class=\"ln\" x1=\"555\" y1=\"285\" x2=\"555\" y2=\"295\"/><text class=\"t-s t-m\" x=\"555\" y=\"312\" text-anchor=\"middle\">50</text><line class=\"ln\" x1=\"640\" y1=\"285\" x2=\"640\" y2=\"295\"/><text class=\"t-s t-m\" x=\"640\" y=\"312\" text-anchor=\"middle\">60</text><text class=\"t-s t-m\" x=\"652\" y=\"294\" text-anchor=\"start\">ms</text></svg>",
+            "say": "A capture service writes `status = 2` (captured); the write takes 60 ms end to end. Three services read the status while it is in flight. Each bar runs from request sent to answer received. Linearizability says: pick one instant inside each bar where the operation \"really happened\", so that the instants, in time order, replay on a single register."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Ledger's read returned the old value, so its point goes before the write's.\"><text class=\"t-s\" x=\"20\" y=\"62\" text-anchor=\"start\">capture</text><rect class=\"box-a\" x=\"130\" y=\"40\" width=\"510\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"385\" y=\"61\" text-anchor=\"middle\">write status = 2</text><text class=\"t-s\" x=\"20\" y=\"132\" text-anchor=\"start\">ledger</text><rect class=\"box\" x=\"172.5\" y=\"110\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"131\" text-anchor=\"middle\">read: -</text><text class=\"t-s\" x=\"20\" y=\"192\" text-anchor=\"start\">fraud</text><rect class=\"box\" x=\"300\" y=\"170\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"342.5\" y=\"191\" text-anchor=\"middle\">read: 2</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">email</text><rect class=\"box\" x=\"470\" y=\"230\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"512.5\" y=\"251\" text-anchor=\"middle\">read: -</text><line class=\"ln\" x1=\"130\" y1=\"290\" x2=\"640\" y2=\"290\"/><line class=\"ln\" x1=\"130\" y1=\"285\" x2=\"130\" y2=\"295\"/><text class=\"t-s t-m\" x=\"130\" y=\"312\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"215\" y1=\"285\" x2=\"215\" y2=\"295\"/><text class=\"t-s t-m\" x=\"215\" y=\"312\" text-anchor=\"middle\">10</text><line class=\"ln\" x1=\"300\" y1=\"285\" x2=\"300\" y2=\"295\"/><text class=\"t-s t-m\" x=\"300\" y=\"312\" text-anchor=\"middle\">20</text><line class=\"ln\" x1=\"385\" y1=\"285\" x2=\"385\" y2=\"295\"/><text class=\"t-s t-m\" x=\"385\" y=\"312\" text-anchor=\"middle\">30</text><line class=\"ln\" x1=\"470\" y1=\"285\" x2=\"470\" y2=\"295\"/><text class=\"t-s t-m\" x=\"470\" y=\"312\" text-anchor=\"middle\">40</text><line class=\"ln\" x1=\"555\" y1=\"285\" x2=\"555\" y2=\"295\"/><text class=\"t-s t-m\" x=\"555\" y=\"312\" text-anchor=\"middle\">50</text><line class=\"ln\" x1=\"640\" y1=\"285\" x2=\"640\" y2=\"295\"/><text class=\"t-s t-m\" x=\"640\" y=\"312\" text-anchor=\"middle\">60</text><text class=\"t-s t-m\" x=\"652\" y=\"294\" text-anchor=\"start\">ms</text><circle class=\"box-b\" cx=\"215\" cy=\"144\" r=\"6\"/></svg>",
+            "say": "Ledger's read (5 to 15 ms) returned `-`, the old state. That's allowed while the write is in flight: put ledger's point at, say, 10 ms, and the write's point later."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Fraud's read returned 2, so the write's point must come before fraud's.\"><text class=\"t-s\" x=\"20\" y=\"62\" text-anchor=\"start\">capture</text><rect class=\"box-a\" x=\"130\" y=\"40\" width=\"510\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"385\" y=\"61\" text-anchor=\"middle\">write status = 2</text><text class=\"t-s\" x=\"20\" y=\"132\" text-anchor=\"start\">ledger</text><rect class=\"box\" x=\"172.5\" y=\"110\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"131\" text-anchor=\"middle\">read: -</text><text class=\"t-s\" x=\"20\" y=\"192\" text-anchor=\"start\">fraud</text><rect class=\"box\" x=\"300\" y=\"170\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"342.5\" y=\"191\" text-anchor=\"middle\">read: 2</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">email</text><rect class=\"box\" x=\"470\" y=\"230\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"512.5\" y=\"251\" text-anchor=\"middle\">read: -</text><line class=\"ln\" x1=\"130\" y1=\"290\" x2=\"640\" y2=\"290\"/><line class=\"ln\" x1=\"130\" y1=\"285\" x2=\"130\" y2=\"295\"/><text class=\"t-s t-m\" x=\"130\" y=\"312\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"215\" y1=\"285\" x2=\"215\" y2=\"295\"/><text class=\"t-s t-m\" x=\"215\" y=\"312\" text-anchor=\"middle\">10</text><line class=\"ln\" x1=\"300\" y1=\"285\" x2=\"300\" y2=\"295\"/><text class=\"t-s t-m\" x=\"300\" y=\"312\" text-anchor=\"middle\">20</text><line class=\"ln\" x1=\"385\" y1=\"285\" x2=\"385\" y2=\"295\"/><text class=\"t-s t-m\" x=\"385\" y=\"312\" text-anchor=\"middle\">30</text><line class=\"ln\" x1=\"470\" y1=\"285\" x2=\"470\" y2=\"295\"/><text class=\"t-s t-m\" x=\"470\" y=\"312\" text-anchor=\"middle\">40</text><line class=\"ln\" x1=\"555\" y1=\"285\" x2=\"555\" y2=\"295\"/><text class=\"t-s t-m\" x=\"555\" y=\"312\" text-anchor=\"middle\">50</text><line class=\"ln\" x1=\"640\" y1=\"285\" x2=\"640\" y2=\"295\"/><text class=\"t-s t-m\" x=\"640\" y=\"312\" text-anchor=\"middle\">60</text><text class=\"t-s t-m\" x=\"652\" y=\"294\" text-anchor=\"start\">ms</text><circle class=\"box-b\" cx=\"215\" cy=\"144\" r=\"6\"/><circle class=\"box-b\" cx=\"283\" cy=\"74\" r=\"6\"/><circle class=\"box-b\" cx=\"342.5\" cy=\"204\" r=\"6\"/></svg>",
+            "say": "Fraud's read (20 to 30 ms) returned 2, the new value. So the write's point must come before fraud's point, which is at most 30 ms. Put the write at 18 ms and fraud at 25. The write is still running from the capture service's point of view; that doesn't matter."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"Email's read started after fraud's ended and returned the old value. No point inside its bar works: not linearizable.\"><text class=\"t-s\" x=\"20\" y=\"62\" text-anchor=\"start\">capture</text><rect class=\"box-a\" x=\"130\" y=\"40\" width=\"510\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"385\" y=\"61\" text-anchor=\"middle\">write status = 2</text><text class=\"t-s\" x=\"20\" y=\"132\" text-anchor=\"start\">ledger</text><rect class=\"box\" x=\"172.5\" y=\"110\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"131\" text-anchor=\"middle\">read: -</text><text class=\"t-s\" x=\"20\" y=\"192\" text-anchor=\"start\">fraud</text><rect class=\"box\" x=\"300\" y=\"170\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"342.5\" y=\"191\" text-anchor=\"middle\">read: 2</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">email</text><rect class=\"box-bad\" x=\"470\" y=\"230\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"512.5\" y=\"251\" text-anchor=\"middle\">read: -</text><line class=\"ln\" x1=\"130\" y1=\"290\" x2=\"640\" y2=\"290\"/><line class=\"ln\" x1=\"130\" y1=\"285\" x2=\"130\" y2=\"295\"/><text class=\"t-s t-m\" x=\"130\" y=\"312\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"215\" y1=\"285\" x2=\"215\" y2=\"295\"/><text class=\"t-s t-m\" x=\"215\" y=\"312\" text-anchor=\"middle\">10</text><line class=\"ln\" x1=\"300\" y1=\"285\" x2=\"300\" y2=\"295\"/><text class=\"t-s t-m\" x=\"300\" y=\"312\" text-anchor=\"middle\">20</text><line class=\"ln\" x1=\"385\" y1=\"285\" x2=\"385\" y2=\"295\"/><text class=\"t-s t-m\" x=\"385\" y=\"312\" text-anchor=\"middle\">30</text><line class=\"ln\" x1=\"470\" y1=\"285\" x2=\"470\" y2=\"295\"/><text class=\"t-s t-m\" x=\"470\" y=\"312\" text-anchor=\"middle\">40</text><line class=\"ln\" x1=\"555\" y1=\"285\" x2=\"555\" y2=\"295\"/><text class=\"t-s t-m\" x=\"555\" y=\"312\" text-anchor=\"middle\">50</text><line class=\"ln\" x1=\"640\" y1=\"285\" x2=\"640\" y2=\"295\"/><text class=\"t-s t-m\" x=\"640\" y=\"312\" text-anchor=\"middle\">60</text><text class=\"t-s t-m\" x=\"652\" y=\"294\" text-anchor=\"start\">ms</text><circle class=\"box-b\" cx=\"215\" cy=\"144\" r=\"6\"/><circle class=\"box-b\" cx=\"283\" cy=\"74\" r=\"6\"/><circle class=\"box-b\" cx=\"342.5\" cy=\"204\" r=\"6\"/></svg>",
+            "say": "Email's read (40 to 50 ms) returned `-`. Its point must lie inside its own bar, so after 40 ms, which is after fraud's read ended and after the write's point. A single register would answer 2 there. **No choice of points works: the history is not linearizable.** Once any read has returned the new value, every read that starts later must too."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"If email's read had returned 2, the points ledger, write, fraud, email move forward in time: linearizable.\"><text class=\"t-s\" x=\"20\" y=\"62\" text-anchor=\"start\">capture</text><rect class=\"box-a\" x=\"130\" y=\"40\" width=\"510\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"385\" y=\"61\" text-anchor=\"middle\">write status = 2</text><text class=\"t-s\" x=\"20\" y=\"132\" text-anchor=\"start\">ledger</text><rect class=\"box\" x=\"172.5\" y=\"110\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"215\" y=\"131\" text-anchor=\"middle\">read: -</text><text class=\"t-s\" x=\"20\" y=\"192\" text-anchor=\"start\">fraud</text><rect class=\"box\" x=\"300\" y=\"170\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"342.5\" y=\"191\" text-anchor=\"middle\">read: 2</text><text class=\"t-s\" x=\"20\" y=\"252\" text-anchor=\"start\">email</text><rect class=\"box-ok\" x=\"470\" y=\"230\" width=\"85\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"512.5\" y=\"251\" text-anchor=\"middle\">read: 2</text><line class=\"ln\" x1=\"130\" y1=\"290\" x2=\"640\" y2=\"290\"/><line class=\"ln\" x1=\"130\" y1=\"285\" x2=\"130\" y2=\"295\"/><text class=\"t-s t-m\" x=\"130\" y=\"312\" text-anchor=\"middle\">0</text><line class=\"ln\" x1=\"215\" y1=\"285\" x2=\"215\" y2=\"295\"/><text class=\"t-s t-m\" x=\"215\" y=\"312\" text-anchor=\"middle\">10</text><line class=\"ln\" x1=\"300\" y1=\"285\" x2=\"300\" y2=\"295\"/><text class=\"t-s t-m\" x=\"300\" y=\"312\" text-anchor=\"middle\">20</text><line class=\"ln\" x1=\"385\" y1=\"285\" x2=\"385\" y2=\"295\"/><text class=\"t-s t-m\" x=\"385\" y=\"312\" text-anchor=\"middle\">30</text><line class=\"ln\" x1=\"470\" y1=\"285\" x2=\"470\" y2=\"295\"/><text class=\"t-s t-m\" x=\"470\" y=\"312\" text-anchor=\"middle\">40</text><line class=\"ln\" x1=\"555\" y1=\"285\" x2=\"555\" y2=\"295\"/><text class=\"t-s t-m\" x=\"555\" y=\"312\" text-anchor=\"middle\">50</text><line class=\"ln\" x1=\"640\" y1=\"285\" x2=\"640\" y2=\"295\"/><text class=\"t-s t-m\" x=\"640\" y=\"312\" text-anchor=\"middle\">60</text><text class=\"t-s t-m\" x=\"652\" y=\"294\" text-anchor=\"start\">ms</text><text class=\"t-s t-a\" x=\"130\" y=\"22\" text-anchor=\"start\">linearization: ledger (10), write (18), fraud (25), email (45)</text><circle class=\"box-b\" cx=\"215\" cy=\"144\" r=\"6\"/><circle class=\"box-b\" cx=\"283\" cy=\"74\" r=\"6\"/><circle class=\"box-b\" cx=\"342.5\" cy=\"204\" r=\"6\"/><circle class=\"box-b\" cx=\"512.5\" cy=\"264\" r=\"6\"/></svg>",
+            "say": "Had email read 2, the points would be ledger at 10 ms, the write at 18, fraud at 25 and email at 45, each inside its own bar, and replaying them in that order on one register gives every recorded answer. That order is a **linearization**. The lab's checker searches for it; when no line exists, the history is not linearizable."
+          }
+        ]
+      },
+      "try": {
+        "title": "Check the stepper's history",
+        "minutes": 3,
+        "steps": [
+          "Open `CheckerDemo.kt`. It builds the stepper's history with the lab's builder, checks it, then checks it again with email's read changed to return 2.",
+          "Predict the search steps: will the bad history take more or fewer than the good one?",
+          "Run it from the `labs` folder."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.CheckerDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.CheckerDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l02/demo/CheckerDemo.kt"
+        },
+        "expect": "```text\nas recorded: linearizable no (7 search steps)\n  longest prefix: ledger:r(status)=-@5-15, capture:w(status,2)@0-60, fraud:r(status)=2@20-30\nwith email's read returning 2: linearizable yes (6 search steps)\n  linearization: ledger:r(status)=-@5-15, capture:w(status,2)@0-60, fraud:r(status)=2@20-30, email:r(status)=2@40-50\n```\n\nThe failing check reports the longest prefix it could build: ledger, then the write, then fraud. Email's read can't be added after that, and no other prefix gets further. That prefix is where you start reading when a real checker rejects a history. Both histories are tiny, so both checks take a handful of steps."
+      },
+      "refs": [
+        {
+          "title": "Jepsen: linearizability",
+          "url": "https://jepsen.io/consistency/models/linearizable",
+          "kind": "read"
+        },
+        {
+          "title": "Herlihy and Wing, Linearizability: A Correctness Condition for Concurrent Objects (ACM TOPLAS, 1990)",
+          "url": "https://doi.org/10.1145/78969.78972",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Checking a history means searching for the order",
+      "body": "A checker gets a history and a sequential model of the object (for a register: a read returns the current value, a write replaces it, a compare-and-set swaps only on a match) and searches for a linearization. Jeannette Wing and Chun Gong described the classic search in 1993, and every tool since builds on it.\n\nThe search builds the order one operation at a time. At each step, it may take any operation that is **minimal**: not yet placed, and no other unplaced operation finished before it started. Putting a minimal operation next can't break real-time order. The checker asks the model whether that operation's recorded answer is possible from the current state. If yes, it places it and goes deeper. If the branch dead-ends, it takes the operation back and tries the next one. If every branch dead-ends, the history is not linearizable.\n\nGavin Lowe added the improvement that makes it practical. Two different routes often reach the same situation: the same set of operations placed and the same register value. Remember every situation you've explored, and never explore one twice. The lab's checker is about 40 lines with that cache.\n\nEven so, checking is hard in general. Gibbons and Korach proved in 1997 that testing whether a history is linearizable is NP-complete: no known algorithm is fast on every history. The cost grows with concurrency, the number of operations whose bars overlap, since each overlap is a choice of order. History length matters much less. The Try-it shows the growth: with 8 clients overlapping, a history the checker must reject takes thousands of steps with the cache and more than five million without it.\n\nThree tools you might meet:\n\n- Knossos is Jepsen's checker, written in Clojure. It runs two searches in parallel and takes whichever finishes first, and it still struggles past a few hundred operations of high concurrency. That is why Jepsen's newer checker, Elle, takes a different route for transactional histories.\n- Porcupine (Go) is a Wing and Gong style checker with Lowe's cache, plus splitting the history by key (locality, from section 1). Its README reports it as 1,000 to 10,000 times faster than Knossos on Jepsen histories. etcd's robustness tests use it.\n- Lincheck (JetBrains, version 3.7) checks JVM data structures. You annotate the methods with `@Operation`, and it runs them concurrently (stress testing) or explores interleavings (model checking), then checks the results for linearizability by default. It is the tool to reach for when you write a lock-free cache or a concurrent rate limiter in Kotlin.",
+      "try": {
+        "title": "Watch the search cost grow with concurrency",
+        "minutes": 3,
+        "steps": [
+          "Run `CheckerDemo` with `-Pargs=cost`. It builds histories from a single atomic register with 2 to 8 clients overlapping, makes the last read return a value nobody wrote (so the checker must try everything before saying no), and counts search steps with and without Lowe's cache, giving up at 5,000,000.",
+          "Before you run it, guess the step count for 8 clients with the cache."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.CheckerDemoKt -Pargs=cost -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.CheckerDemoKt -Pargs=cost -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l02/demo/CheckerDemo.kt"
+        },
+        "expect": "```text\nclients  ops   steps with cache   steps without cache\n      2   12                 31                   342\n      3   18                120                 25454\n      4   24                341           > 5,000,000\n      5   30               1137           > 5,000,000\n      6   36               2645           > 5,000,000\n      7   42               6896           > 5,000,000\n      8   48              17117           > 5,000,000\n```\n\nWithout the cache, 3 clients already take 25,454 steps and 4 clients more than five million. With it, the count still grows two and a half to four times with each extra client: 17,117 steps for 48 operations. Real checkers add more tricks (splitting by key, smarter ordering) but none removes the growth, which is why Jepsen keeps concurrency low when it checks linearizability."
+      },
+      "refs": [
+        {
+          "title": "Porcupine: a fast linearizability checker",
+          "url": "https://github.com/anishathalye/porcupine",
+          "kind": "read"
+        },
+        {
+          "title": "Lincheck",
+          "url": "https://github.com/JetBrains/lincheck",
+          "kind": "docs"
+        },
+        {
+          "title": "Knossos",
+          "url": "https://github.com/jepsen-io/knossos",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "What needs it: one leader, one owner, one timeline across channels",
+      "body": "Most data doesn't need linearizability. A merchant dashboard can be a second behind. Three kinds of job do need it, and payments has all three.\n\nStart with leader election and locks. A lock service must give a lease to at most one holder. If the store behind it can return stale reads, two nodes can both read \"free\", both write \"mine\", and both believe they won: split brain. The settlement-batch lock in the Faults, time and truth track's lesson on leases depended on exactly this, and that lesson added fencing tokens because even a correct lock can't stop a paused holder. Fencing needs a counter that never goes backwards, and that counter needs linearizability too. ZooKeeper and etcd exist mostly to provide these primitives, which lesson 5 covers.\n\nNext come uniqueness and \"never below zero\" rules. An idempotency key may be claimed by one request. A card number may belong to one account. Seat 12A may be sold once. A balance may never go negative. Each of these needs every node to agree on one up-to-date value at the moment of the decision: a linearizable compare-and-set, or a single leader that does the check. Some constraints can be relaxed on purpose. An airline overbooks and compensates; a stand-in authorization approves a small amount and reconciles later. That is a business decision, made knowingly.\n\nThe third is timing across channels. The checkout service writes the authorization to the payments database, then publishes `payment-authorized` to Kafka. The settlement consumer picks up the event and reads the authorization from a read replica. Kafka delivered the event in 5 ms; the replica is 40 ms behind. The consumer finds no authorization, marks the event as failed and moves on. Nothing was lost, yet the two channels disagree, and the settlement run is wrong. The event carried timing information (\"this happened\") that the replica didn't respect.\n\nThere are three fixes, in rising order of cost. Read from the leader for anything driven by an event. Or carry a position in the event (the log position from the Replication track's lag lesson) and make the replica wait until it has reached it, which gives read-your-writes across services. Or put the data in the event itself, so there is nothing to look up.\n\nNotice what all three jobs share: a decision that must not be made twice, or a fact that one party has seen and another must not miss. If neither applies, a weaker model is cheaper and fine.",
+      "refs": [
+        {
+          "title": "Kleppmann, How to do distributed locking",
+          "url": "https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Which replication gives it, and why quorums alone don't",
+      "body": "Go through the replication schemes from the Replication track and ask of each: can a client ever observe something one copy couldn't produce?\n\nSingle leader: yes, it can be linearizable, if every read and write goes to the leader and the leader really is the leader. Both conditions fail in practice. Reads from followers are the usual optimization, and the Try-it measures what that costs: 424 of 1,000 simulated histories were not linearizable. And a leader cut off by a partition may keep serving reads while a new leader takes writes elsewhere. An asynchronous failover that loses acknowledged writes, as in the Replication track's first lesson, also breaks it: a write that finished is gone.\n\nConsensus (Raft, Zab, Paxos, lessons 3 to 5) makes the leader question safe: a majority must agree on the leader and on every write. Writes are linearizable. Reads are only linearizable if the leader confirms it is still leader before answering, which is why etcd's linearizable read costs a round trip to a majority (the Raft lesson, lesson 4, covers the two ways to do it: ReadIndex and leases).\n\nMulti-leader: no. Two leaders accept conflicting writes concurrently, by design.\n\nLeaderless with quorums: no, and this surprises people, because the Replication track's leaderless lesson showed that w + r > n makes every read set overlap every write set. The figure shows the race. A write of 9 reaches R1 quickly and R2 and R3 late. Reader A asks all three, hears first from R1 and R2, and returns the newer value, 9. Reader B starts after A has finished, hears first from R2 and R3, and returns 8. B started after A finished and saw an older value: not linearizable. The overlap guarantee is about *completed* writes. This write hadn't completed, and A's read exposed it early.\n\nThe fix is for the reader to finish the job the writer started. Before returning 9, reader A writes 9 back to a write quorum and waits for the acknowledgements. Now any read that starts after A returns must overlap a replica holding 9. Writers do a read first to pick a version higher than any they see. This is the **ABD** algorithm (Attiya, Bar-Noy and Dolev), and it makes read and write linearizable on a leaderless store. It costs a second round trip on every read: 30.7 ms instead of 15.3 ms in the Try-it. It can't give you compare-and-set: two writers can each pick \"version 8\" for different values. For that you need consensus, lesson 3's subject.\n\nReal stores sit between these. Cassandra does wait for read repair on a `QUORUM` read, but orders writes by client or coordinator timestamps, so clock skew breaks linearizability anyway; its linearizable path is the Paxos-based lightweight transaction. Riak doesn't wait for read repair at all.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 360\" role=\"img\" aria-label=\"A write of 9 reaches replica R1 at 10 ms but R2 and R3 only at 70 and 75 ms. Reader A, from 20 to 40 ms, reads R1 and R2 and returns 9. Reader B, from 48 to 68 ms, reads R2 and R3 and returns 8, although A had finished first.\"><text class=\"t-s\" x=\"20\" y=\"52\" text-anchor=\"start\">writer</text><rect class=\"box\" x=\"120\" y=\"30\" width=\"486\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"363\" y=\"51\" text-anchor=\"middle\">write 9, waiting for 2 acks</text><text class=\"t-s\" x=\"20\" y=\"102\" text-anchor=\"start\">R1</text><rect class=\"box\" x=\"120\" y=\"80\" width=\"54\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"147\" y=\"101\" text-anchor=\"middle\">8</text><rect class=\"box-a\" x=\"174\" y=\"80\" width=\"486\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"417\" y=\"101\" text-anchor=\"middle\">9</text><text class=\"t-s\" x=\"20\" y=\"152\" text-anchor=\"start\">R2</text><rect class=\"box\" x=\"120\" y=\"130\" width=\"378\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"309\" y=\"151\" text-anchor=\"middle\">8</text><rect class=\"box-a\" x=\"498\" y=\"130\" width=\"162\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"579\" y=\"151\" text-anchor=\"middle\">9</text><text class=\"t-s\" x=\"20\" y=\"202\" text-anchor=\"start\">R3</text><rect class=\"box\" x=\"120\" y=\"180\" width=\"405\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"322.5\" y=\"201\" text-anchor=\"middle\">8</text><rect class=\"box-a\" x=\"525\" y=\"180\" width=\"135\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"592.5\" y=\"201\" text-anchor=\"middle\">9</text><text class=\"t-s\" x=\"20\" y=\"262\" text-anchor=\"start\">reader A</text><rect class=\"box-ok\" x=\"228\" y=\"240\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"282\" y=\"261\" text-anchor=\"middle\">A reads: 9</text><text class=\"t-s\" x=\"20\" y=\"312\" text-anchor=\"start\">reader B</text><rect class=\"box-bad\" x=\"379.2\" y=\"290\" width=\"108\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"433.2\" y=\"311\" text-anchor=\"middle\">B reads: 8</text><circle class=\"box-b\" cx=\"282\" cy=\"97\" r=\"6\"/><circle class=\"box-b\" cx=\"282\" cy=\"147\" r=\"6\"/><circle class=\"box-bad\" cx=\"433.2\" cy=\"147\" r=\"6\"/><circle class=\"box-bad\" cx=\"433.2\" cy=\"197\" r=\"6\"/><text class=\"t-s t-m\" x=\"660\" y=\"352\" text-anchor=\"end\">dots: the replicas each read reached first</text></svg>",
+        "caption": "Three replicas, w = 2, r = 2. Reader A finishes before reader B starts, and B still returns the older value."
+      },
+      "try": {
+        "title": "Count non-linearizable histories per store",
+        "minutes": 4,
+        "steps": [
+          "Run `QuorumDemo`. It records 1,000 histories from each of four stores (3 clients, 10 operations each, one key) on a simulated network where 10% of messages take up to 100 ms, and checks each history with the lab's checker.",
+          "Predict the four counts first. Then read the bottom of the output: the first bad quorum history, around the read the checker couldn't place."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.QuorumDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.QuorumDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l02/demo/QuorumDemo.kt"
+        },
+        "expect": "```text\nstore                                     bad histories   mean read ms\nsingle leader, reads at the leader              0 of 1000           21.0\nsingle leader, reads at the follower          424 of 1000           21.2\nquorum n=3 w=2 r=2                             20 of 1000           15.3\nquorum n=3 w=2 r=2, sync read repair            0 of 1000           30.7\n\nseed 5, the operations around c2's read at 218 ms (the checker's first unplaceable op):\n    76-99   c3  w(balance,7)     ============\n   121-195  c3  r(balance)=7                           ======================================\n   136-163  c1  w(balance,8)                                   ==============\n   165-230  c1  w(balance,9)                                                 =================================\n   176-191  c2  r(balance)=9                                                       ========\n   195-205  c2  r(balance)=9                                                                ======\n   203-219  c3  r(balance)=9                                                                    =========\n   211-218  c2  r(balance)=9                                                                        ====\n   218-233  c2  r(balance)=8                                                                            ========\n   223-245  c3  w(balance,10)                                                                             ============\n   233-243  c1  r(balance)=9                                                                                   ======\n```\n\nFollower reads fail often; the plain quorum store fails rarely (20 of 1,000), which is exactly why the bug survives testing; with synchronous read repair, none fail. In seed 5, `w(balance,9)` is in flight from 165 to 230 ms, and c2 reads 9 four times. Then c2's read at 218 ms reaches two replicas that still hold 8 and returns it, older than what c2 itself saw a moment earlier. Note the quorum reads are faster than the leader's (15.3 against 21.0 ms): a quorum read waits for the fastest 2 of 3 replies."
+      },
+      "refs": [
+        {
+          "title": "Apache Cassandra: Dynamo (quorums, read repair, timestamps)",
+          "url": "https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "What it costs: a round trip on every request, and your own CPU",
+      "body": "The first cost is latency, paid with no failure anywhere. Hagit Attiya and Jennifer Welch proved in 1994 that linearizable reads and writes need a response time proportional to the uncertainty in network delay; no cleverer algorithm avoids it, while weaker models can answer from local state. etcd's own benchmark shows the size of it on one cluster (three members on Google Cloud, measured with etcd 3.2): one client doing linearizable reads got 1,353 reads a second at 0.7 ms each, against 2,909 a second at 0.3 ms for serializable reads that any member answers locally. With 1,000 clients the numbers were 141,578 against 185,758 reads a second, at 5.5 ms against 2.2 ms. Across regions the round trip is tens of milliseconds, and it lands on every read.\n\nThe second cost is availability, from the previous lesson's CAP section: a replica on the minority side of a partition can't confirm it has the latest value, so it must refuse or wait.\n\nThe third cost is the one in your laptop. A multicore CPU isn't linearizable either, and it gives up linearizability for speed, with no network involved. Each core has a **store buffer**: a write goes there first and reaches the shared cache a little later, so the core can carry on without waiting. Meanwhile another core reads the old value. The JIT compiler adds its own reordering: a store and a later load to different addresses may swap. The Try-it runs the classic test. Thread 1 writes `x = 1` then reads `y`; thread 2 writes `y = 1` then reads `x`. In any single order of those four steps, at least one read comes after the other thread's write, so both reads returning 0 is impossible for one copy of memory. With plain arrays it happened in hundreds of thousands of the five million trials, a different number on every run.\n\nJava's answer is `volatile`. The Java Memory Model (JLS section 17.4.4) puts every volatile read and write into one total order that agrees with each thread's program order, and each volatile read sees the last write before it in that order. That is sequential consistency for those fields. HotSpot pays for it with a **fence**, an instruction that makes the core finish its pending memory operations before it goes on; on x86 that is a locked instruction after each volatile store, which drains the store buffer. `AtomicLong`, `AtomicReference.compareAndSet` and `ConcurrentHashMap` build on the same machinery, and Lincheck is how you check a class like them for linearizability.\n\nSo \"one copy, one timeline\" has the same price everywhere: someone has to wait until the others have caught up. On a CPU the wait is tens of nanoseconds; in a data centre about a millisecond; across an ocean about 70 ms.",
+      "try": {
+        "title": "Catch your CPU reordering",
+        "minutes": 3,
+        "steps": [
+          "Run `StoreBufferDemo`. It runs 5,000,000 trials of the two-thread test above, first on plain `IntArray`s, then on `AtomicIntegerArray`, whose `get` and `set` have volatile semantics. These are real threads on real cores, not a simulation.",
+          "Predict the plain count. Run it twice: does it change?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.StoreBufferDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.cons.l02.demo.StoreBufferDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/cons/l02/demo/StoreBufferDemo.kt"
+        },
+        "expect": "One run on an Apple M2 Max with JDK 25:\n\n```text\nmemory                             trials    both read 0\nplain IntArray                  5,000,000      1,948,111\nvolatile (AtomicIntegerArray)    5,000,000              0\n```\n\nThe plain count changes a lot from run to run (four runs here gave between about 670,000 and 1,950,000) and depends on the CPU, the JIT and what else is running, so expect your own numbers. The volatile count is always 0: the outcome is forbidden, and the fences make sure it never happens."
+      },
+      "refs": [
+        {
+          "title": "etcd: performance (linearizable vs serializable reads)",
+          "url": "https://etcd.io/docs/v3.6/op-guide/performance/",
+          "kind": "docs"
+        },
+        {
+          "title": "Java Language Specification, chapter 17: threads and locks",
+          "url": "https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "A single whiteboard in a shared office is linearizable: whoever reads it after a change sees the change, and two people can't see two versions. Now give each floor its own whiteboard and a runner who copies changes between them. A colleague on floor 3 reads the new figure, phones a colleague on floor 1, who looks at their board and sees the old one: two people, one timeline, two answers. To make the boards behave like one, every reader would have to phone round to most floors before trusting their board, which is exactly the wait linearizability costs. The analogy breaks at concurrency: on a real system millions of these reads and writes overlap each second, and you only notice a violation when a second channel, such as a phone call or a Kafka event, connects two of them.",
+  "in_your_world": "Three places in a payments stack lean on linearizability. Idempotency keys: if two pods both check \"have I seen key k?\" against a store that can serve stale reads, both process the payment. Put the claim in one atomic operation on the primary (`INSERT ... ON CONFLICT DO NOTHING` in PostgreSQL, a `SET NX` on a Redis primary, a conditional put in DynamoDB) instead of read-then-write. Event-driven lookups: a Kafka consumer that reads the database row named in an event should read from the primary, or the event should carry the commit position or the data itself. Locks and leader election for batch jobs: use a consensus-backed service (etcd, ZooKeeper, or the database primary itself), and fence the resource. On the JVM side, the same reasoning sits under every `@Volatile` field and `AtomicLong` in your Quarkus services, and Lincheck is the way to test a concurrent class you wrote yourself.",
+  "mistake": "Reading from a replica in the request path of a decision. A service authorizes a refund by reading the payment from a read replica \"to take load off the primary\", sees `captured`, and refunds, while the primary already says `refunded` because another request refunded it 30 ms earlier. Teams do this because replica reads are a standard scaling tip, and in tests the replica is never behind. The fix: route every read that decides something to the primary (or make the decision itself an atomic conditional write on the primary), and keep replica reads for display and reporting, where a stale answer only costs a refresh.",
+  "compare": {
+    "title": "A quorum read, without and with the write-back",
+    "a": {
+      "label": "plain quorum read",
+      "lang": "kotlin",
+      "title": "one round trip",
+      "src": "override fun read(client: String, key: String, done: (Int?) -> Unit) =\n    queryQuorum(key) { highest ->\n        done(highest.value)            // newest of r answers, even if only one replica has it\n    }"
+    },
+    "b": {
+      "label": "ABD read",
+      "lang": "kotlin",
+      "title": "two round trips",
+      "src": "override fun read(client: String, key: String, done: (Int?) -> Unit) =\n    queryQuorum(key) { highest ->\n        writeToQuorum(key, highest) {  // make sure w replicas hold it\n            done(highest.value)        // only now may anyone see it\n        }\n    }"
+    },
+    "note": "The only difference is waiting for the value to reach a write quorum before answering. Without the wait, a read can expose a write that is still on a single replica, and a later read can miss it. With it, any read that starts afterwards overlaps a replica holding the value. The price is a second round trip on every read, and it still gives no compare-and-set."
+  },
+  "worked": {
+    "title": "Check a history by hand, the way the search does",
+    "steps": [
+      {
+        "say": "Write the history down as bars, sorted by start time. Here: a write of 9 from 0 to 50 ms, and three reads.",
+        "lang": "text",
+        "code": "w(9)     0-50\nr = 9   10-20\nr = 8   30-40      <- 8 was the value before the write\nr = 9   45-55"
+      },
+      {
+        "say": "Find the minimal operations: those that start before every unplaced operation has ended. At the start, the earliest end is 20 ms (the first read), so the write (starts 0) and the first read (starts 10) are minimal; the others start at 30 and 45, after 20.",
+        "lang": "text",
+        "code": "unplaced ends: 50, 20, 40, 55  ->  min end 20\nminimal: w(9) [starts 0], r=9 [starts 10]"
+      },
+      {
+        "say": "Try each minimal operation against the register (value 8 at the start). The read of 9 is impossible from 8. The write is possible: place it, value becomes 9.",
+        "lang": "text",
+        "code": "state 8: r=9? no      w(9)? yes -> state 9, placed {w}"
+      },
+      {
+        "say": "Go deeper. Now the first read (9) fits. Then the minimal set is the read of 8 (min end 40); from state 9 it is impossible, and nothing else is minimal. Back up: no other choice at any level leads anywhere, so the history is not linearizable.",
+        "lang": "text",
+        "code": "state 9: r=9 yes -> placed {w, r9}\nstate 9: minimal {r=8}: impossible -> dead end\nback to the start: r=9 first is impossible -> no linearization"
+      },
+      {
+        "say": "Name the cause in words. A read that began after another read had returned 9 returned 8, the older value: the register went back in time.",
+        "lang": "text",
+        "code": "r=9 (10-20) ended before r=8 (30-40) began, and r=8 is older: not linearizable"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A linearizability checker, run against two replicated stores",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/cons/l02/Checker.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l02/Stores.kt",
+      "labs/sim/src/main/kotlin/sfz/cons/l02/History.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.cons.l02.*'",
+    "steps": [
+      "Run the tests from the `labs` folder (no Docker, about a second). All 18 fail. Read `History.kt`: `Op` (read, write and CAS with start and end times) and `Register.step(state, op)`, which says whether an operation's recorded answer is possible from a state and what the state becomes.",
+      "Exercise 1, `Linearizability.checkKey`: the Wing and Gong search. Sort by start. Recursively: if every op is placed, succeed; otherwise compute the earliest end among unplaced ops, and try each unplaced op that starts no later than that. Keep a `HashSet` of (placed set, state) you've already explored. Return the order on success and the longest prefix on failure, with a step count. `check` (given) runs it per key.",
+      "`CheckerTest` and `OraclePropertyTest` check your search against hand-made histories and against brute force on 1,000 random ones. Then `StoresTest` records 200 histories from each store: the single leader passes, follower reads and the plain quorum store fail.",
+      "Exercise 2, `QuorumStore.finishRead`: when `syncReadRepair` is true, write the value back with `writeToQuorum` and answer only when that completes. The last two tests of `StoresTest` then pass: zero violations, and a read costs about twice as long."
+    ],
+    "hints": [
+      "Use a `java.util.BitSet` for the placed set and store `placed.clone() as BitSet` in the cache; storing the live object means every entry changes when you mutate it.",
+      "Sorted by start, once an unplaced op starts after the earliest end you can `break`: every later op starts even later.",
+      "Track the longest prefix by copying `path.toList()` whenever the path gets longer than the best so far.",
+      "A bad seed replays exactly: `record(seed) { QuorumStore(it) }` gives the same history every time, so print it and read it next to `Linearizability.check(h).order`."
+    ],
+    "done_when": "All 18 tests in `CheckerTest`, `OraclePropertyTest` and `StoresTest` pass."
+  },
+  "drill": {
+    "title": "The search, from memory",
+    "minutes": 5,
+    "prompt": "Write the core of a Wing and Gong linearizability search with Lowe's cache for one register: given ops sorted by start and `Register.step(state, op)`, return whether a linearization exists. You may ignore the step count and the longest prefix.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun linearizable(all: List<Op>): Boolean {\n    val placed = BitSet(all.size)\n    val seen = HashSet<Pair<BitSet, Int?>>()\n    fun go(count: Int, state: Int?): Boolean {\n        if (count == all.size) return true\n        if (!seen.add((placed.clone() as BitSet) to state)) return false\n        val minEnd = all.indices.filter { !placed[it] }.minOf { all[it].end }\n        for (i in all.indices) {\n            if (placed[i]) continue\n            if (all[i].start > minEnd) break               // not minimal, nor anything after it\n            val (ok, next) = Register.step(state, all[i])\n            if (!ok) continue\n            placed.set(i)\n            if (go(count + 1, next)) return true\n            placed.clear(i)                                 // dead end: take it back\n        }\n        return false\n    }\n    return go(0, null)\n}"
+    }
+  },
+  "recap": [
+    "Linearizable (Herlihy and Wing, 1990): each operation takes effect at one instant inside its bar, and those instants replay on one copy. Once any read sees a new value, every read that starts later must too.",
+    "Linearizability is local: check each key on its own. Checking is NP-complete in general and grows with concurrency; Wing and Gong's search with Lowe's cache is the basis of Knossos and Porcupine, and Lincheck does it for JVM objects.",
+    "It is needed for leader election and locks, for uniqueness and \"never below zero\" decisions, and wherever a second channel (a Kafka event, a phone call) tells someone a write happened.",
+    "A single leader gives it if all reads go to a leader that really is the leader; consensus gives it if reads also confirm leadership; multi-leader and plain quorums don't. ABD (read, then write back to a quorum) fixes quorum reads and writes, at a second round trip, and still can't do compare-and-set.",
+    "It costs a round trip on every request (Attiya and Welch; etcd measured 0.7 ms against 0.3 ms), unavailability on the minority side of a partition, and fences on a multicore CPU, which Java's `volatile` pays for you."
+  ],
+  "quiz": [
+    {
+      "q": "A write of `status = 2` runs from 0 to 100 ms. Read A runs 10 to 20 ms and returns 2. Read B runs 30 to 40 ms and returns the old value. Read C runs 50 to 60 ms and returns 2. Is the history linearizable?",
+      "options": [
+        "Yes: every read overlaps the write, so each may return either value",
+        "No: B started after A had returned 2, so B must also return 2",
+        "Yes, if B ran on a different replica from A",
+        "No: C should have returned the old value"
+      ],
+      "answer": 1,
+      "why": "Overlapping the write lets a read return either value only until some read has returned the new one. A returned 2 and finished before B began, so B's point must come after the write's point, where the register holds 2. Which replica served B is invisible to the definition; that is the point of it."
+    },
+    {
+      "q": "Why do linearizability checkers like Porcupine split a history by key before searching?",
+      "options": [
+        "Because each key's history must be linearizable on its own anyway, and searching small pieces avoids multiplying their choices together",
+        "Because keys on different nodes can't affect each other",
+        "Because sequential consistency is local",
+        "Because the search can only handle one key at a time"
+      ],
+      "answer": 0,
+      "why": "Herlihy and Wing proved linearizability is local: the whole history is linearizable exactly when each object's sub-history is. Searching each key alone turns a product of choices into a sum. Sequential consistency is the model that is not local, so the same trick would give wrong answers for it."
+    },
+    {
+      "q": "The checkout service writes an authorization to PostgreSQL, then publishes `payment-authorized` to Kafka. The settlement consumer reads the authorization from a streaming replica and sometimes doesn't find it. Which fix gives the consumer what it needs at the lowest cost?",
+      "options": [
+        "Increase the Kafka consumer's poll interval",
+        "Read the authorization from the primary for event-driven lookups (or carry the commit position in the event and wait for the replica to reach it)",
+        "Set `acks=all` on the producer",
+        "Make the replica synchronous with `synchronous_commit = on`"
+      ],
+      "answer": 1,
+      "why": "The event is a second channel that says \"this happened\"; the consumer needs to see whatever the producer had written before publishing. Reading from the primary gives that. `synchronous_commit = on` only waits for the standby to flush the WAL, not to replay it, so a replica read can still miss the row (`remote_apply` would wait for replay, at a cost on every commit). Producer acks and poll intervals don't touch the database at all."
+    },
+    {
+      "q": "A leaderless key-value store adds synchronous read repair: before answering, a read writes the value it chose back to a write quorum. Writers read first and pick a higher version. Which operation can it still not make linearizable?",
+      "options": [
+        "Reads",
+        "Writes",
+        "Compare-and-set",
+        "Reads of keys that were never written"
+      ],
+      "answer": 2,
+      "why": "That is the ABD algorithm, and it makes reads and writes linearizable. Compare-and-set needs every replica to agree which of two concurrent attempts wins; two writers can each read version 7 and both write \"version 8\" with different values. Deciding between them is consensus, the next lesson's subject."
+    },
+    {
+      "q": "From the Replication track's lesson on lag: a session token that carries the last log position you wrote gives you read-your-writes on followers. Does it make the store linearizable for that client's reads?",
+      "options": [
+        "Yes: the client never misses its own writes",
+        "No: the client can still miss writes by other clients that finished before its read began",
+        "Yes, if the token also carries the highest position it has read",
+        "No, because log positions aren't timestamps"
+      ],
+      "answer": 1,
+      "why": "The token only bounds the read below by what this session wrote (and saw, if you add monotonic reads). Another client's write that finished a moment ago may be past the follower's position and past the token, and linearizability requires seeing it. To get that, the read must reach the leader or wait for a position the leader confirms is current, which is what ReadIndex does.",
+      "from": "repl-03"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "Herlihy and Wing's definition of linearizability, in one sentence?",
+      "back": "Every operation appears to take effect at one instant between its invocation and its response, and those instants, in order, form a correct sequential history."
+    },
+    {
+      "front": "A read overlaps a write. What may it return, and when does that stop?",
+      "back": "The old or the new value, until any read has returned the new value; every read that starts after that must return it or something newer."
+    },
+    {
+      "front": "What does \"linearizability is local\" mean, and why does it matter?",
+      "back": "A history is linearizable exactly when each object's sub-history is. Checkers can split by key, which is much faster."
+    },
+    {
+      "front": "What is a minimal operation in the Wing and Gong search?",
+      "back": "An unplaced operation such that no other unplaced operation finished before it started; only those may go next."
+    },
+    {
+      "front": "Why isn't w + r > n linearizable?",
+      "back": "A read can see a write that is still on one replica, and a later read can reach two replicas that lack it and return the older value."
+    },
+    {
+      "front": "What does ABD add to quorum reads and writes, and what does it cost?",
+      "back": "The reader writes the value back to a write quorum before answering, and writers read first to pick a higher version. A second round trip; still no compare-and-set."
+    },
+    {
+      "front": "What does Java's volatile guarantee?",
+      "back": "All volatile reads and writes fall into one total order consistent with each thread's program order, and a volatile read sees the last write before it (JLS 17.4): sequential consistency for those fields."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Register",
+      "plain": "One value you can read, write and compare-and-set: a key, a row's column, an etcd entry."
+    },
+    {
+      "term": "Linearization point",
+      "plain": "The instant inside an operation's bar where it can be said to take effect."
+    },
+    {
+      "term": "Linearization",
+      "plain": "An order of all operations, one point each, that respects real time and replays on one copy."
+    },
+    {
+      "term": "Minimal operation",
+      "plain": "One that could go next without breaking real-time order."
+    },
+    {
+      "term": "Local (compositional)",
+      "plain": "A property that holds for the whole exactly when it holds for each object."
+    },
+    {
+      "term": "ABD",
+      "plain": "Attiya, Bar-Noy and Dolev's quorum algorithm: reads write back before answering, writes read first."
+    },
+    {
+      "term": "Store buffer",
+      "plain": "A per-core queue that holds writes before they reach the shared cache."
+    }
+  ],
+  "explain_back": {
+    "prompt": "Your team lead asks why the fraud service saw a payment as captured but the email service, a moment later, didn't, \"if both use the same database with quorum reads\". Explain it in plain words.",
+    "answer": "The database keeps three copies of each payment. When the capture was written, it reached one copy quickly and the other two a little later, and the write only counts as finished once two copies have it. The fraud service asked all three copies, got its first two answers from the fast copy and a slow one, and took the newer value: captured. The email service started after that, asked again, got its first two answers from the two slow copies, and both still said authorized. Quorums only promise that you see writes that have finished; this one was still in flight, and fraud saw it early. To rule this out, a read that sees a newer value has to copy it to a second replica before answering, which makes every read take two round trips instead of one. For deciding things, we read from the primary instead, so there is only one copy to ask."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "Wing and Gong's search treats a timed-out operation as the hard case. If a client sent a write and never heard back, the write may or may not have happened, at any moment after it was sent. Checkers give such an operation an end time of infinity and allow the search to either place it anywhere after its start or leave it out. That is why Jepsen histories mark operations as `:ok`, `:fail` or `:info` (unknown), and why your own retry logic should record \"unknown\" outcomes instead of guessing.\n\nPorcupine's README explains its speed-ups and shows the visualization it draws for a failed check: the longest partial linearization, with the operations it could not place. The MIT 6.5840 distributed systems course uses it to grade students' Raft key-value stores.\n\nLincheck runs `@Operation` methods from several threads and compares the results with every sequential execution. Its model-checking mode controls the thread switches itself, so a failure comes with an exact interleaving you can replay in IntelliJ. Try it on a class you wrote with `@Volatile` fields and a check-then-act: it will usually find the race in seconds.\n\nDesigning Data-Intensive Applications, 2nd edition, chapter 10 discusses linearizability, the quorum race and the cost of linearizable systems."
+  },
+  "sources": [
+    {
+      "title": "Herlihy and Wing, Linearizability: A Correctness Condition for Concurrent Objects (ACM TOPLAS, 1990)",
+      "url": "https://doi.org/10.1145/78969.78972"
+    },
+    {
+      "title": "Porcupine: a fast linearizability checker",
+      "url": "https://github.com/anishathalye/porcupine"
+    },
+    {
+      "title": "etcd: performance",
+      "url": "https://etcd.io/docs/v3.6/op-guide/performance/"
+    },
+    {
+      "title": "Java Language Specification (Java SE 25), chapter 17",
+      "url": "https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 10",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

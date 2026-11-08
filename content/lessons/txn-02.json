@@ -1,0 +1,636 @@
+{
+  "id": "txn-02",
+  "title": "Lost updates: row locks, SKIP LOCKED and job queues",
+  "minutes": 40,
+  "goal": "By the end you can spot a read-modify-write cycle and the lost update it causes, prevent it four ways (an atomic UPDATE, SELECT ... FOR UPDATE, compare-and-set, and PostgreSQL's detection at Repeatable Read, which MySQL lacks), build a job queue that many workers drain at once with FOR UPDATE SKIP LOCKED, and stop the deadlocks that locking brings by locking rows in a fixed order.",
+  "warmup": {
+    "q": "Two services debit 1,000 from account 109 (balance 5,000) at the same moment, at Read Committed. Each runs `SELECT balance_minor`, subtracts in Kotlin, then `UPDATE accounts SET balance_minor = :computed`. The second UPDATE waits for the first one's row lock. What is the balance when both have committed?",
+    "options": [
+      "3,000: the row lock made the two debits take turns",
+      "4,000: one debit is lost",
+      "5,000: the second transaction rolls the first one back",
+      "The second UPDATE fails with a serialization error"
+    ],
+    "answer": 1,
+    "why": "Both read 5,000 before either wrote, and each computed 4,000 in Kotlin. The lock made the second UPDATE wait, but the value it then wrote was decided before the wait, so it overwrote the first debit: a lost update. The first option is the trap: a lock orders writes, it doesn't recompute them. A serialization error would come at Repeatable Read, which this isn't."
+  },
+  "sections": [
+    {
+      "h": "Read, compute, write: two transactions lose an update",
+      "body": "Lesson 1 laid out what each isolation level allows. One anomaly in its table, the lost update, is the one a payments service meets first, and this lesson is about the ways to prevent it. A job queue is the worked case, because claiming a job turns out to be the same bug.\n\n`accounts.balance_minor` caches each account's balance. Two services debit Ivy's account 109 at the same moment: a card payment of 1,000 and a monthly fee of 1,000. Each one reads the balance, subtracts in Kotlin, and writes the result:\n\n```kotlin\nval balance = selectBalance(109)        // 5000\nupdateBalance(109, balance - 1000)      // SET balance_minor = 4000\n```\n\nRun them one after the other and the balance ends at 3,000. Let them overlap: both read 5,000, the payment writes 4,000 and commits, the fee writes 4,000 and commits. Two debits ran, and one left no trace. This is a **lost update**: two transactions read the same value, each writes a result computed from it, and the second write erases the first. Nothing failed, so no log line tells you.\n\nThe shape is a read-modify-write cycle: read a value, compute a new one in the application, write it back. It hides in more places than balances: a counter, a JSON document read whole into an object and saved back, an ORM that loads an entity, changes one field and saves the row, a worker that reads which job is next and then marks it taken.\n\nPostgreSQL saw the overlap and couldn't help. An UPDATE locks every row it changes until its transaction ends, so the fee's UPDATE waited for the payment's commit. Then it went ahead with the value it had been given, 4,000, computed from a read that was no longer true. The lock put the two writes in order. It couldn't fix a number the application had computed from an old read.\n\nThe simulator runs the broken version. Each transaction's UPDATE and COMMIT are one step there, so, as in PostgreSQL, nobody ever reads a value that isn't committed yet.",
+      "sim": {
+        "title": "Two debits of 1,000 on account 109",
+        "intro": "Each transaction reads the balance, subtracts 1,000 in Kotlin, then writes the result and commits in one step. Pick who runs next. Can you end with balance = 4000?",
+        "vars": {
+          "balance": 5000
+        },
+        "threads": [
+          {
+            "name": "Tx A (card payment)",
+            "steps": [
+              {
+                "op": "read",
+                "var": "balance",
+                "reg": "b",
+                "code": "SELECT balance_minor ... WHERE account_id = 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -1000,
+                "code": "b = b - 1000                // in Kotlin"
+              },
+              {
+                "op": "write",
+                "var": "balance",
+                "reg": "b",
+                "code": "UPDATE ... SET balance_minor = :b; COMMIT;"
+              }
+            ]
+          },
+          {
+            "name": "Tx B (monthly fee)",
+            "steps": [
+              {
+                "op": "read",
+                "var": "balance",
+                "reg": "b",
+                "code": "SELECT balance_minor ... WHERE account_id = 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -1000,
+                "code": "b = b - 1000                // in Kotlin"
+              },
+              {
+                "op": "write",
+                "var": "balance",
+                "reg": "b",
+                "code": "UPDATE ... SET balance_minor = :b; COMMIT;"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "balance",
+          "eq": 4000,
+          "say": "Lost update: two debits ran and the balance fell by 1,000. Both read 5,000 before either wrote. In PostgreSQL the second UPDATE would also have waited for the first one's row lock, and that changes nothing: its value was computed from the old read. Let one transaction finish before the other reads, and you get 3,000."
+        }
+      },
+      "try": {
+        "title": "Lose an update, then keep it",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the first block, switching terminals where the comments say. B's UPDATE hangs: it waits for A's row lock. Run A's COMMIT and watch B's UPDATE finish.",
+          "Read the balance. Then run the atomic version below it the same way, and read the balance again."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- A\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- A: the payment writes 5000 - 1000\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- B: the fee writes 5000 - 1000 too (this one waits)\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- A\nCOMMIT;\n-- B\nCOMMIT;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;\n\n-- the atomic version: A, then B, then A's COMMIT, then B's COMMIT\nBEGIN;                                                                      -- A\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;  -- A\nBEGIN;                                                                      -- B\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;  -- B (waits)\nCOMMIT;                                                                     -- A\nCOMMIT;                                                                     -- B\nSELECT balance_minor FROM accounts WHERE account_id = 109;                  -- A\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;           -- A: put it back"
+        },
+        "expect": "Both SELECTs show 5000. B's first UPDATE prints nothing: it waits for the lock A took on row 109. The moment A commits, B's UPDATE finishes:\n\n```postgresql\n-- B, after A's COMMIT\nUPDATE 1\nCOMMIT\n-- A\n balance_minor\n---------------\n          4000\n(1 row)\n```\n\nTwo debits, and the balance went down by 1,000. B waited for A and still overwrote A's work, because the value 4000 was decided before the wait. In the atomic version B waits the same way, then PostgreSQL rereads the row A committed and subtracts from it: the final SELECT shows 3000. The last statement puts 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Explicit locking (row-level locks)",
+          "url": "https://www.postgresql.org/docs/18/explicit-locking.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Fix it in the database: an atomic update, a row lock, or compare-and-set",
+      "body": "Each fix takes the read-modify-write out of the application's hands, or makes the database check it.\n\nThe first lets the database do the arithmetic: `UPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109`. The second UPDATE still waits for the first one's row lock. When the lock goes, PostgreSQL rereads row 109 as the first transaction committed it, checks the WHERE clause again on that version, and subtracts from 4,000. One statement, no extra lock, no retry: use it whenever the new value fits in SQL. MongoDB's `$inc` and Redis's `INCRBY` are the same idea. Most real lost updates come from an ORM that loads an entity, changes a field and saves the whole row, where a one-line UPDATE would have done.\n\nThe second fix locks the row when you read it. When the new value needs logic SQL can't express, such as a fraud score or a call to another service, read with `SELECT balance_minor FROM accounts WHERE account_id = 109 FOR UPDATE`. The read takes the same lock an UPDATE would, so the second transaction's read waits until the first commits, and then returns 4,000. PostgreSQL writes that lock into the row version itself, in its header on the 8 KB page, so a million locked rows cost no memory; a waiting transaction sleeps on the holder's transaction id until it ends (lesson 5 builds this). Ask for no more than you need: `FOR NO KEY UPDATE` is enough when you won't delete the row or change its key, and unlike `FOR UPDATE` it lets inserts that reference the row through their foreign-key checks, such as payments on a card you've locked.\n\nThe third fix is **compare-and-set**: read without a lock, then write only if the value is still what you read: `UPDATE accounts SET balance_minor = 4700 WHERE account_id = 109 AND balance_minor = 5000`. If someone changed the row in between, the WHERE no longer matches, the UPDATE changes 0 rows, and the application reloads and tries again. A version column does the same for a row with many fields. JPA's `@Version` writes exactly this UPDATE, with `AND version = ?`, and throws `OptimisticLockException` when it changes 0 rows. The Try it shows why this works in PostgreSQL: the second compare-and-set waits for the first one's row lock, and then PostgreSQL checks `balance_minor = 5000` against the newly committed version, not against its snapshot. Not every database evaluates the WHERE of an UPDATE that way, so check yours before you rely on it.\n\nPrefer the lock for rows that are often contended, where a retry would usually fail again, and compare-and-set for rows that rarely are, where a wait would usually be wasted.",
+      "try": {
+        "title": "Compare and set, and the recheck that makes it work",
+        "minutes": 4,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the block, switching at each comment. Both sessions read 5,000. A debits 1,000 and B debits 300, each only if the balance is still 5,000. B's UPDATE waits for A.",
+          "Before A's COMMIT, predict how many rows B's UPDATE changes. Then let B reload and try again, and read the final balance."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- A\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nBEGIN;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- A: the payment, if the balance is still what A read\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109 AND balance_minor = 5000;\n-- B: the fee, if the balance is still what B read (waits)\nUPDATE accounts SET balance_minor = 4700 WHERE account_id = 109 AND balance_minor = 5000;\n-- A\nCOMMIT;\n-- B: 0 rows changed, so reload and try again\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 3700 WHERE account_id = 109 AND balance_minor = 4000;\nCOMMIT;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;"
+        },
+        "expect": "A's UPDATE prints `UPDATE 1`. B's prints nothing until A commits, then:\n\n```postgresql\nUPDATE 0\n```\n\nB waited for A's row lock, then PostgreSQL checked `balance_minor = 5000` against A's committed version, 4000, and the row no longer matched. B reloads 4000 and its second compare-and-set prints `UPDATE 1`. A's final SELECT shows 3700: both debits. The last statement puts 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Transaction isolation (how Read Committed rechecks a WHERE clause)",
+          "url": "https://www.postgresql.org/docs/18/transaction-iso.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Repeatable Read catches the lost update in PostgreSQL, and not in MySQL",
+      "body": "The fourth fix needs no change to the SQL: run at Repeatable Read and let PostgreSQL notice. The fee's transaction then reads from a snapshot taken at its first statement. When its UPDATE reaches row 109 and finds a version committed after that snapshot, it can't do what Read Committed does and move on to the new version, because its snapshot says that version doesn't exist. PostgreSQL aborts it with `could not serialize access due to concurrent update`, SQLSTATE 40001, and the application retries the whole transaction with lesson 1's retry loop. The second run reads 4,000. The rule is called first-updater-wins: the first transaction to change a row keeps it, and a concurrent second writer fails. It catches the bug even when the computed value is written as a constant, because the check is about the row, not the SQL. Lesson 4 shows where the check lives. Oracle's SERIALIZABLE does the same and raises ORA-08177, and SQL Server's SNAPSHOT level raises an update conflict.\n\nMySQL's InnoDB doesn't. Its default REPEATABLE READ gives plain SELECTs a snapshot but lets an UPDATE write over the newest committed row without asking whether it changed since the snapshot. In the Try it, the script that fails in PostgreSQL commits in MySQL and loses the payment: the balance ends at 4,700. Hermitage marks MySQL's REPEATABLE READ as allowing lost updates, and Jepsen's 2023 analysis counted 198 lost updates among 446 transactions in one test on a single healthy MySQL 8.0.34 node. On MySQL, use one of the first three fixes, or SERIALIZABLE.\n\nDetection also assumes one up-to-date copy of the row. A database that accepts writes on several replicas at once (the Replication track's multi-leader and leaderless designs) can't lock a row or compare it with the latest version, and last-write-wins resolution loses updates by design. There the tools are updates that commute, such as increments, and merges.",
+      "try": {
+        "title": "The same race in PostgreSQL and in MySQL",
+        "minutes": 6,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the PostgreSQL block, switching at each comment. B's UPDATE waits for A. Predict what it does when A commits.",
+          "Start MySQL 8.4 from the `labs` folder: `docker compose -f env/mysql.yml up -d --wait`. Open two terminals with `docker compose -f env/mysql.yml exec db mysql course` and run the MySQL block the same way. Its `accounts` table has Ivy's two accounts at 5,000 each. Stop it afterwards with `docker compose -f env/mysql.yml down -v`, unless you go on to lesson 3 today."
+        ],
+        "code": {
+          "lang": "sql",
+          "title": "two sessions in psql, then two in mysql",
+          "src": "-- PostgreSQL. A\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nBEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- A: the payment of 1,000\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- B: the fee of 300 (waits)\nUPDATE accounts SET balance_minor = 4700 WHERE account_id = 109;\n-- A\nCOMMIT;\n-- B\n\\echo :SQLSTATE\nROLLBACK;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;\n\n-- MySQL (REPEATABLE READ is its default). A\nSTART TRANSACTION;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- B\nSTART TRANSACTION;\nSELECT balance_minor FROM accounts WHERE account_id = 109;\n-- A\nUPDATE accounts SET balance_minor = 4000 WHERE account_id = 109;\n-- B (waits)\nUPDATE accounts SET balance_minor = 4700 WHERE account_id = 109;\n-- A\nCOMMIT;\n-- B\nCOMMIT;\n-- A\nSELECT balance_minor FROM accounts WHERE account_id = 109;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id = 109;"
+        },
+        "expect": "In PostgreSQL, the moment A commits, B's UPDATE fails:\n\n```postgresql\nERROR:  could not serialize access due to concurrent update\n40001\n```\n\nA's SELECT then shows 4000: the payment stands, and the fee must be retried from its read. In MySQL, B's UPDATE also waits for A's lock, and then succeeds (your time differs):\n\n```text\nQuery OK, 1 row affected (1.41 sec)\nRows matched: 1  Changed: 1  Warnings: 0\n```\n\nBoth COMMITs succeed, and A's SELECT shows the balance at 4700:\n\n```text\n+---------------+\n| balance_minor |\n+---------------+\n|          4700 |\n+---------------+\n```\n\nTwo debits of 1,300 in all, and the balance fell by 300. Same isolation level name, same statements: PostgreSQL refused the second write, MySQL let it erase the first. Each block ends by putting 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "Hermitage: testing transaction isolation levels",
+          "url": "https://github.com/ept/hermitage",
+          "kind": "read"
+        },
+        {
+          "title": "Jepsen: MySQL 8.0.34 (2023)",
+          "url": "https://jepsen.io/analyses/mysql-8.0.34",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "The worked case: claiming a job is a read-modify-write too",
+      "body": "The `jobs` table is a to-do list for background work: send a receipt, settle a merchant's day, review a payment for fraud. In the seed, five of its eight rows are `queued` and due, and the oldest is job 2, a fraud review of payment 31. A worker loops: find the oldest due job, mark it `running`, do the work, mark it `done`. You run three workers so that three jobs run at once.\n\nClaiming a job is a read-modify-write. A worker that runs `SELECT job_id ... ORDER BY run_after LIMIT 1` and then `UPDATE jobs SET status = 'running' ...` races every worker that read the same row: the second UPDATE waits for the first, then writes over it. Job 2 ends with `attempts = 2`, and the fraud team reviews payment 31 twice.\n\nThe lock fix applies: claim with `SELECT ... FOR UPDATE`. The second worker's read now waits on job 2, and when the first worker commits, PostgreSQL rechecks job 2 against the WHERE clause, sees `running`, and moves on to job 3. No job runs twice. But a worker that keeps its transaction open while it works commits only when its job is done, so with 2-second fraud reviews three workers finish one job every 2 seconds. They all want the same first row.\n\nThe workers don't need job 2; any due job will do. `SKIP LOCKED` says exactly that: when a row is locked by another transaction, skip it instead of waiting. The claim becomes one statement that picks, locks, marks and returns a job:\n\n```sql\nUPDATE jobs\nSET status = 'running', locked_by = current_setting('application_name'),\n    locked_at = now(), attempts = attempts + 1\nWHERE job_id = (SELECT job_id FROM jobs\n                WHERE status = 'queued' AND run_after <= now()\n                ORDER BY run_after, job_id LIMIT 1\n                FOR UPDATE SKIP LOCKED)\nRETURNING job_id, kind, payload;\n```\n\nWorker 1's subquery locks job 2, worker 2's skips it and locks job 3, worker 3's skips both and locks 5. Nobody waits. `LIMIT 1` keeps each claim to one row, and the partial index `jobs_ready_idx` (on `run_after`, for queued rows only) keeps the search short however many done jobs pile up. A third option, `NOWAIT`, fails at once with SQLSTATE 55P03 instead of waiting, which suits a request that should answer \"this refund is being processed\" rather than hang.\n\nThen decide how long a worker holds its job. Keep the transaction open while the job runs, and the lock is the lease: if the pod dies, PostgreSQL rolls back and the job is `queued` again. That costs one connection per running job, and an open transaction holds back VACUUM (lesson 4). For anything that calls a card issuer or an email provider, claim and commit instead: the work runs outside any transaction, a reaper puts back jobs whose `locked_at` is too old, and the work must be safe to run twice. The worked example builds that worker.",
+      "stepper": {
+        "title": "Three workers claim jobs: FOR UPDATE, SKIP LOCKED, NOWAIT",
+        "intro": "Click Next. Each worker holds its transaction open while its job runs, about 2 seconds.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Five queued jobs and three idle workers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">plain FOR UPDATE</text><rect class=\"box\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">BEGIN; next job?</text><rect class=\"box\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">BEGIN; next job?</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">BEGIN; next job?</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: queued</text><rect class=\"box\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: queued</text><rect class=\"box\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: queued</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 0</text><text class=\"t-s\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 0</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">Five jobs are due. Three workers ask for the next one at the same moment.</text></svg>",
+            "say": "Jobs 2, 3, 5, 7 and 8 are queued and due. Three workers each run `BEGIN` and the claim query with a plain `FOR UPDATE`, and each keeps its transaction open while it runs the job, about 2 seconds."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"W1 locks job 2; W2 and W3 wait for job 2\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">plain FOR UPDATE</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">holds job 2</text><rect class=\"box\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">waits for job 2</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">waits for job 2</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-a\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: locked by W1</text><rect class=\"box\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: queued</text><rect class=\"box\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: queued</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"190\" y1=\"145\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 1</text><text class=\"t-s t-bad\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 2</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">W1 locks job 2. W2 and W3 want the same first row, so both wait.</text></svg>",
+            "say": "All three read the same snapshot, so all three pick job 2. W1 locks it first. W2 and W3 reach the same row and **wait** for W1's transaction to end. Two workers are idle while a job is ready for each of them."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"W1 commits; W2 takes job 3 and W3 waits for it\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">plain FOR UPDATE</text><rect class=\"box-ok\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">done, committed</text><rect class=\"box-a\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">holds job 3</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">waits for job 3</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-ok\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: done</text><rect class=\"box-a\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: locked by W2</text><rect class=\"box\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: queued</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"145\" x2=\"248\" y2=\"107\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"107\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 1</text><text class=\"t-s t-bad\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 1</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 1</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">W1 commits after 2 s. W2 and W3 recheck job 2, drop it, and both move to job 3.</text></svg>",
+            "say": "W1 finishes and commits. W2 and W3 wake up. PostgreSQL rechecks job 2 against the WHERE clause, sees `done`, and moves each of them on to the next row. They collide again, on job 3: W2 gets it, W3 waits."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Still one job at a time\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">plain FOR UPDATE</text><rect class=\"box\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">waits for job 5</text><rect class=\"box-ok\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">done, committed</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">holds job 5</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-ok\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: done</text><rect class=\"box-ok\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: done</text><rect class=\"box-a\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: locked by W3</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"145\" marker-end=\"url(#arr)\"/><line class=\"ln-d\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"145\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 1</text><text class=\"t-s t-bad\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 1</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 2</text><text class=\"t-s t-bad\" x=\"20\" y=\"284\" text-anchor=\"start\">Three workers, one job at a time: five jobs take about 10 s.</text></svg>",
+            "say": "The pattern repeats. Every claim lines up behind the worker in front of it, so three workers run at the speed of one. No job runs twice, and nothing fails, so no log line tells you."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"With SKIP LOCKED, three workers hold jobs 2, 3 and 5 at once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">FOR UPDATE SKIP LOCKED</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">holds job 2</text><rect class=\"box-a\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">skipped 2; holds 3</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">skipped 2, 3; holds 5</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-a\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: locked by W1</text><rect class=\"box-a\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: locked by W2</text><rect class=\"box-a\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: locked by W3</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"145\" x2=\"248\" y2=\"107\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"145\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 3</text><text class=\"t-s\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 0</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">SKIP LOCKED steps over rows other workers hold. Three claims, no waiting.</text></svg>",
+            "say": "The same start with `FOR UPDATE SKIP LOCKED`. W2 finds job 2 locked and skips it instead of waiting, then locks job 3. W3 skips 2 and 3 and locks 5. Each claim returns at once, and three jobs run at once."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"W2 crashes and job 3 is queued again\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">FOR UPDATE SKIP LOCKED</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">holds job 2</text><rect class=\"box-bad\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">crashed: rolled back</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">holds job 5</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-a\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: locked by W1</text><rect class=\"box\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: queued</text><rect class=\"box-a\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: locked by W3</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"145\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 2</text><text class=\"t-s\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 0</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 0</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">W2&#x27;s pod dies. Its connection closes, PostgreSQL rolls back, job 3 is free.</text></svg>",
+            "say": "W2's pod is killed in the middle of job 3. Its connection closes, PostgreSQL rolls back its open transaction, and the lock on job 3 goes with it. Job 3 is `queued` again, as if W2 had never touched it. Nobody has to clean up."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"W1 finishes job 2 and claims job 3\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">FOR UPDATE SKIP LOCKED</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">done 2; holds job 3</text><rect class=\"box-dim\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">gone</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">holds job 5</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-ok\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: done</text><rect class=\"box-a\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: locked by W1</text><rect class=\"box-a\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: locked by W3</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"107\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"190\" y1=\"215\" x2=\"248\" y2=\"145\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 2</text><text class=\"t-s\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 0</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 1</text><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">W1 commits job 2 and claims again: job 3 is the oldest row nobody holds.</text></svg>",
+            "say": "W1 commits job 2 and runs the claim again. Job 3 is the oldest queued row and nobody holds it now, so W1 takes it. Job 5 is still locked by W3, and W1 never had to look at it."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"With NOWAIT, W2 and W3 fail with 55P03\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">Five due jobs, three workers</text><rect class=\"box-b\" x=\"430\" y=\"8\" width=\"230\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"545\" y=\"24.5\" text-anchor=\"middle\">FOR UPDATE NOWAIT</text><rect class=\"box-a\" x=\"20\" y=\"52\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"71\" text-anchor=\"start\">worker W1</text><text class=\"t-s\" x=\"32\" y=\"89\" text-anchor=\"start\">holds job 2</text><rect class=\"box-bad\" x=\"20\" y=\"122\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"141\" text-anchor=\"start\">worker W2</text><text class=\"t-s\" x=\"32\" y=\"159\" text-anchor=\"start\">ERROR 55P03</text><rect class=\"box-bad\" x=\"20\" y=\"192\" width=\"170\" height=\"46\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"211\" text-anchor=\"start\">worker W3</text><text class=\"t-s\" x=\"32\" y=\"229\" text-anchor=\"start\">ERROR 55P03</text><text class=\"t-s t-m\" x=\"345\" y=\"40\" text-anchor=\"middle\">jobs, oldest run_after first</text><rect class=\"box-a\" x=\"250\" y=\"54\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"73.5\" text-anchor=\"middle\">job 2: locked by W1</text><rect class=\"box\" x=\"250\" y=\"92\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"111.5\" text-anchor=\"middle\">job 3: queued</text><rect class=\"box\" x=\"250\" y=\"130\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"149.5\" text-anchor=\"middle\">job 5: queued</text><rect class=\"box\" x=\"250\" y=\"168\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"187.5\" text-anchor=\"middle\">job 7: queued</text><rect class=\"box\" x=\"250\" y=\"206\" width=\"190\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"345\" y=\"225.5\" text-anchor=\"middle\">job 8: queued</text><line class=\"ln-a\" x1=\"190\" y1=\"75\" x2=\"248\" y2=\"69\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"470\" y=\"60\" width=\"190\" height=\"118\" rx=\"8\"/><text class=\"t-s\" x=\"484\" y=\"88\" text-anchor=\"start\">running now: 1</text><text class=\"t-s\" x=\"484\" y=\"118\" text-anchor=\"start\">waiting for a lock: 0</text><text class=\"t-s\" x=\"484\" y=\"148\" text-anchor=\"start\">jobs done: 0</text><text class=\"t-s t-bad\" x=\"20\" y=\"284\" text-anchor=\"start\">NOWAIT gives up at once: an error when the first row is taken.</text></svg>",
+            "say": "The third choice, `NOWAIT`: a worker that finds its row locked neither waits nor skips. It fails at once with `could not obtain lock on row in relation \"jobs\"`, SQLSTATE 55P03. That suits a request that should fail fast, not a queue."
+          }
+        ]
+      },
+      "try": {
+        "title": "Three workers, no waiting",
+        "minutes": 5,
+        "steps": [
+          "Open three terminals in the `labs` folder and run psql in each: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A, B and C. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Name each worker and turn on timing: `SET application_name = 'worker-1';` and `\\timing on` in A, the same with `'worker-2'` in B and `'worker-3'` in C. The claim reads that name with `current_setting('application_name')`.",
+          "Run `BEGIN;` and the claim in A, then B, then C, without committing. Which job does each get, and does any of them wait? Then run the rest of the block: a NOWAIT probe in B, a crash of C (its ROLLBACK), and a new claim in A."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, three sessions on database course",
+          "src": "-- A, then B, then C: the same two statements\nBEGIN;\nUPDATE jobs\nSET status = 'running', locked_by = current_setting('application_name'),\n    locked_at = now(), attempts = attempts + 1\nWHERE job_id = (SELECT job_id FROM jobs\n                WHERE status = 'queued' AND run_after <= now()\n                ORDER BY run_after, job_id LIMIT 1\n                FOR UPDATE SKIP LOCKED)\nRETURNING job_id, kind, locked_by;\n\n-- A: is anybody waiting?\nSELECT application_name, state, wait_event_type FROM pg_stat_activity\nWHERE application_name LIKE 'worker-%' ORDER BY 1;\n-- B: the oldest queued job, but fail instead of waiting\nSELECT job_id, kind FROM jobs WHERE status = 'queued' ORDER BY run_after, job_id LIMIT 1 FOR UPDATE NOWAIT;\n\\echo :SQLSTATE\nROLLBACK;\n-- C: the worker crashes\nROLLBACK;\n-- A: finish job 2, then claim again\nCOMMIT;\nBEGIN;\nUPDATE jobs\nSET status = 'running', locked_by = current_setting('application_name'),\n    locked_at = now(), attempts = attempts + 1\nWHERE job_id = (SELECT job_id FROM jobs\n                WHERE status = 'queued' AND run_after <= now()\n                ORDER BY run_after, job_id LIMIT 1\n                FOR UPDATE SKIP LOCKED)\nRETURNING job_id, kind, locked_by;\nROLLBACK;\nUPDATE jobs SET status = 'queued', locked_by = NULL, locked_at = NULL, attempts = 0 WHERE job_id IN (2, 3, 5);"
+        },
+        "expect": "Each claim returns at once with a different job (output trimmed; the times are a few milliseconds to a couple of hundred on a busy laptop):\n\n```postgresql\n-- A\n job_id |     kind     | locked_by\n--------+--------------+-----------\n      2 | fraud_review | worker-1\n-- B\n      3 | send_receipt | worker-2\n-- C\n      5 | settle_merchant | worker-3\n```\n\n`pg_stat_activity` shows nobody waiting: worker-1 is `active` (it is running that query), the other two are `idle in transaction`, and none has `wait_event_type = Lock`. B's NOWAIT probe fails at once with `ERROR:  could not obtain lock on row in relation \"jobs\"` and `55P03`, because job 2 is still queued in B's snapshot but locked by A. After C's ROLLBACK and A's COMMIT, A's new claim returns job 3: B's earlier ROLLBACK put job 3 back, and job 5, freed by C, is next in line. The last statement resets the three jobs."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: SELECT, the locking clause",
+          "url": "https://www.postgresql.org/docs/18/sql-select.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Locks taken in opposite orders deadlock",
+      "body": "Locking to prevent lost updates has a cost of its own. Ivy moves 1,000 from account 109 to 209 while a scheduled sweep moves 3,000 from 209 to 109. Each transfer is two UPDATEs, a debit and then a credit, and each UPDATE locks its row. Transfer A locks 109. Transfer B locks 209. A's credit needs 209, so A waits for B. B's credit needs 109, so B waits for A. Neither can finish. That is a **deadlock**: a cycle of transactions, each waiting for a lock the next one holds. Try it in the simulator: run A's first line, then B's.\n\nPostgreSQL doesn't wait forever. A transaction that has waited for a lock for `deadlock_timeout` (1 second by default) checks who waits for whom. If it finds a cycle, it aborts one transaction with SQLSTATE `40P01`, `deadlock detected`, and the other one gets its lock and finishes. The cost is a second of waiting and a transaction to retry; lesson 1's retry loop already treats 40P01 like 40001, and lesson 5 builds the detector.\n\nBetter to make the cycle impossible: every transaction takes its locks in the same order. Sort the two account ids and lock the lower one first, whichever way the money moves:\n\n```sql\nSELECT account_id FROM accounts\nWHERE account_id IN (109, 209)\nORDER BY account_id\nFOR UPDATE;              -- both transfers lock 109, then 209\n```\n\nNow B's first lock request is for 109, which A holds, so B waits while holding nothing, and A finishes. The same rule covers a Kafka consumer that applies a batch of balance changes one row at a time: sort the batch first.\n\n```kotlin\nfor (change in batch.sortedBy { it.accountId }) {     // every consumer locks in ascending id order\n    update.setLong(1, change.amountMinor)\n    update.setLong(2, change.accountId)\n    update.executeUpdate()                            // holds this row's lock until COMMIT\n}\nconn.commit()\n```\n\nTwo more tools belong here. `SET lock_timeout = '2s'` makes any statement that waits longer for a lock fail with 55P03, so a stuck holder can't hang a request. And when what you need to serialize isn't a row, use an **advisory lock**, a lock on a number your application picks. `SELECT pg_try_advisory_xact_lock(1, 20260612)` returns true for the first pod that wants to settle merchant 1's day and false for every other, and PostgreSQL releases it at COMMIT. Prefer the `_xact_` functions with a connection pool: the session-level `pg_advisory_lock` survives COMMIT and stays with the pooled connection after your code has closed it.",
+      "sim": {
+        "title": "Two transfers between 109 and 209",
+        "intro": "Each UPDATE first takes its row's lock, then reads, changes and writes the balance. Run A to the end, then B: both finish. Reset, then run A's first line and B's first line, and keep going.",
+        "vars": {
+          "balance_109": 5000,
+          "balance_209": 5000
+        },
+        "locks": [
+          "row 109",
+          "row 209"
+        ],
+        "threads": [
+          {
+            "name": "Tx A: 1,000 from 109 to 209",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "row 109",
+                "code": "UPDATE ... - 1000 WHERE account_id = 109: lock row 109"
+              },
+              {
+                "op": "read",
+                "var": "balance_109",
+                "reg": "b",
+                "code": "  reads 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -1000,
+                "code": "  b = b - 1000"
+              },
+              {
+                "op": "write",
+                "var": "balance_109",
+                "reg": "b",
+                "code": "  writes 109"
+              },
+              {
+                "op": "lock",
+                "lock": "row 209",
+                "code": "UPDATE ... + 1000 WHERE account_id = 209: lock row 209"
+              },
+              {
+                "op": "read",
+                "var": "balance_209",
+                "reg": "b",
+                "code": "  reads 209"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": 1000,
+                "code": "  b = b + 1000"
+              },
+              {
+                "op": "write",
+                "var": "balance_209",
+                "reg": "b",
+                "code": "  writes 209"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 209",
+                "code": "COMMIT: releases row 209"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 109",
+                "code": "  and row 109"
+              }
+            ]
+          },
+          {
+            "name": "Tx B: 3,000 from 209 to 109",
+            "steps": [
+              {
+                "op": "lock",
+                "lock": "row 209",
+                "code": "UPDATE ... - 3000 WHERE account_id = 209: lock row 209"
+              },
+              {
+                "op": "read",
+                "var": "balance_209",
+                "reg": "b",
+                "code": "  reads 209"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": -3000,
+                "code": "  b = b - 3000"
+              },
+              {
+                "op": "write",
+                "var": "balance_209",
+                "reg": "b",
+                "code": "  writes 209"
+              },
+              {
+                "op": "lock",
+                "lock": "row 109",
+                "code": "UPDATE ... + 3000 WHERE account_id = 109: lock row 109"
+              },
+              {
+                "op": "read",
+                "var": "balance_109",
+                "reg": "b",
+                "code": "  reads 109"
+              },
+              {
+                "op": "add",
+                "reg": "b",
+                "n": 3000,
+                "code": "  b = b + 3000"
+              },
+              {
+                "op": "write",
+                "var": "balance_109",
+                "reg": "b",
+                "code": "  writes 109"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 109",
+                "code": "COMMIT: releases row 109"
+              },
+              {
+                "op": "unlock",
+                "lock": "row 209",
+                "code": "  and row 209"
+              }
+            ]
+          }
+        ],
+        "goal": {
+          "var": "balance_109",
+          "eq": 7000,
+          "say": "Both transfers committed: 109 holds 7,000 and 209 holds 3,000. One transfer ran while the other waited at its first lock. Reset, run A's first line, then B's first line: each holds one row and needs the other's. PostgreSQL would abort one of them after a second, with 40P01."
+        }
+      },
+      "try": {
+        "title": "Make a deadlock, then prevent it",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Turn on `\\timing on` in both. Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder).",
+          "Run the first block, switching terminals at each comment. After B's second UPDATE, wait. About a second later one terminal prints `ERROR:  deadlock detected`. Usually it is the one that started waiting first, A. Run ROLLBACK in that terminal and COMMIT in the other, then read the balances.",
+          "Run the second block. Both transfers now start by locking the two accounts in id order. Does anything wait, and does anything fail?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- 1. A moves 1,000 from 109 to 209; B moves 3,000 from 209 to 109\n-- A\nBEGIN;\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;\n-- B\nBEGIN;\nUPDATE accounts SET balance_minor = balance_minor - 3000 WHERE account_id = 209;\n-- A (waits for B)\nUPDATE accounts SET balance_minor = balance_minor + 1000 WHERE account_id = 209;\n-- B (waits for A: a cycle)\nUPDATE accounts SET balance_minor = balance_minor + 3000 WHERE account_id = 109;\n-- the terminal with the error: ROLLBACK; the other: COMMIT\nSELECT account_id, balance_minor FROM accounts WHERE account_id IN (109, 209) ORDER BY account_id;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id IN (109, 209);\n\n-- 2. the same transfers, locking in account_id order first\n-- A\nBEGIN;\nSELECT account_id FROM accounts WHERE account_id IN (109, 209) ORDER BY account_id FOR UPDATE;\n-- B (waits for A, holding nothing)\nBEGIN;\nSELECT account_id FROM accounts WHERE account_id IN (209, 109) ORDER BY account_id FOR UPDATE;\n-- A\nUPDATE accounts SET balance_minor = balance_minor - 1000 WHERE account_id = 109;\nUPDATE accounts SET balance_minor = balance_minor + 1000 WHERE account_id = 209;\nCOMMIT;\n-- B\nUPDATE accounts SET balance_minor = balance_minor - 3000 WHERE account_id = 209;\nUPDATE accounts SET balance_minor = balance_minor + 3000 WHERE account_id = 109;\nCOMMIT;\nSELECT account_id, balance_minor FROM accounts WHERE account_id IN (109, 209) ORDER BY account_id;\nUPDATE accounts SET balance_minor = 5000 WHERE account_id IN (109, 209);"
+        },
+        "expect": "In block 1, one second after B's second UPDATE starts waiting (here it was A that lost; your process and transaction numbers differ):\n\n```postgresql\nERROR:  deadlock detected\nDETAIL:  Process 6685 waits for ShareLock on transaction 6950; blocked by process 6699.\nProcess 6699 waits for ShareLock on transaction 6949; blocked by process 6685.\nHINT:  See server log for query details.\nCONTEXT:  while updating tuple (0,49) in relation \"accounts\"\nTime: 1006.392 ms (00:01.006)\n```\n\n`\\echo :SQLSTATE` there prints `40P01`. At the same instant the other terminal's UPDATE finishes. After the ROLLBACK and the COMMIT only B's transfer happened: 109 is 8000 and 209 is 2000 (if B got the error instead, you see A's transfer: 4000 and 6000). The aborted transfer must be retried. In block 2, B's locking SELECT waits about as long as A takes, then returns both ids, and nothing fails. The final SELECT shows 109 at 7000 and 209 at 3000: both transfers, applied once each. Each block ends by putting 5,000 back."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Lock management settings (deadlock_timeout, lock_timeout)",
+          "url": "https://www.postgresql.org/docs/18/runtime-config-locks.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Advisory lock functions",
+          "url": "https://www.postgresql.org/docs/18/functions-admin.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "analogy": "Picture a shared spreadsheet cell that holds Ivy's balance. Two colleagues copy the number into their calculators, subtract, and type the result back, and the second one types over the first: a lost update. The atomic update is typing \"=cell-1000\" instead of a number. A row lock is an \"I'm editing this\" flag that makes the other colleague wait before reading. Compare-and-set is typing your number only if the cell still shows the one you copied. A team working down a column of tasks with SKIP LOCKED skips every cell someone has flagged. The analogy breaks in two places. In PostgreSQL anyone may still look at a flagged cell: a plain SELECT reads the last committed version and never waits. And a flag disappears the moment its transaction ends, even when the colleague's laptop dies, because the server rolls back a transaction whose connection is gone.",
+  "in_your_world": "JPA's `@Version` is compare-and-set: Hibernate adds `AND version = ?` to every UPDATE and throws `OptimisticLockException` when it changes no row, so a lost update becomes an exception you catch, reload and retry. Where you write the UPDATE yourself, make it relative. The transactional outbox is this lesson's job queue in a payments service: the payment and an `outbox` row commit in one transaction, and a relay claims outbox rows with `ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`, publishes them to Kafka and marks them sent, so you can run as many relay pods as you like. A Quarkus `@Scheduled` settlement job runs on every pod; `pg_try_advisory_xact_lock(merchant, day)` lets exactly one of them settle each merchant's day. On Oracle at work, `FOR UPDATE SKIP LOCKED` exists too, but a deadlock (ORA-00060) rolls back only the statement that detected it, so your code must roll back the rest itself. And Temporal activities that move money between accounts should lock those accounts in id order, or two workflows moving money in opposite directions will deadlock and retry.",
+  "mistake": "Loading a row, changing it in the application and saving it back, at the default Read Committed, and trusting the transaction to keep it safe. People do it because the ORM makes it the natural way to write an update, and because it passes every test with one request at a time; the second request only shows up in production under load. The symptom is a balance or a counter that is slightly too high, or a job that ran twice, with no error anywhere. Write the update as one relative statement where you can (`SET x = x - 1000`). Where you can't, lock the row with `SELECT ... FOR UPDATE` or add a version column and retry on 0 rows. On PostgreSQL, Repeatable Read turns the race into a 40001 to retry; on MySQL it doesn't, so don't rely on the level there.",
+  "compare": {
+    "title": "Claiming a job and surviving a deadlock: Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle AI Database 26ai",
+      "src": "-- 26ai: FETCH FIRST with FOR UPDATE SKIP LOCKED is new\nSELECT job_id FROM jobs\nWHERE status = 'queued' AND run_after <= SYSTIMESTAMP\nORDER BY run_after, job_id\nFETCH FIRST 1 ROWS ONLY\nFOR UPDATE SKIP LOCKED;\n\n-- older code: open the cursor with no limit and fetch\n-- one row; WHERE ROWNUM = 1 ... SKIP LOCKED returns\n-- nothing when that one row is already locked\n\n-- FOR UPDATE WAIT 2     wait at most 2 seconds\n-- no FOR SHARE or FOR KEY SHARE: row locks are\n-- always exclusive\n\n-- deadlock: ORA-00060 rolls back the STATEMENT;\n-- the transaction is still open and still holds\n-- its other locks until you ROLLBACK"
+    },
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL 18",
+      "src": "-- LIMIT with FOR UPDATE SKIP LOCKED since 9.5\nSELECT job_id FROM jobs\nWHERE status = 'queued' AND run_after <= now()\nORDER BY run_after, job_id\nLIMIT 1\nFOR UPDATE SKIP LOCKED;\n\n-- locking stops once LIMIT has its row, so a locked\n-- first row is skipped and the next free one is\n-- returned\n\n-- no WAIT n: SET lock_timeout = '2s' (55P03)\n-- four modes: FOR UPDATE, FOR NO KEY UPDATE,\n-- FOR SHARE, FOR KEY SHARE (foreign-key checks)\n\n-- deadlock: 40P01 aborts the whole TRANSACTION;\n-- after it only ROLLBACK works, and every lock\n-- is released"
+    },
+    "note": "Both databases store row locks with the rows rather than in a memory table, and both have SKIP LOCKED for queues, so the claim looks almost the same. Three things differ in practice. Limiting the claim: PostgreSQL's LIMIT counts only the rows it managed to lock, while Oracle accepts FETCH FIRST together with FOR UPDATE only since 26ai, so older Oracle queue code fetches from an unbounded SKIP LOCKED cursor. Lock modes: Oracle has one exclusive row lock, and its foreign-key trap is a different one (an unindexed foreign key makes a parent DELETE lock the whole child table). Deadlocks: PostgreSQL aborts the whole transaction, Oracle rolls back one statement and leaves the transaction open, so Oracle code must roll back explicitly before it retries."
+  },
+  "worked": {
+    "title": "A receipt worker in Kotlin: claim, commit, work, and a reaper",
+    "steps": [
+      {
+        "say": "Sending a receipt calls an email provider that can take seconds, so this worker uses claim and commit. The claim is its own short transaction: one statement, then COMMIT at once. Commit before the slow part and nothing stays locked while the email goes out.",
+        "lang": "kotlin",
+        "code": "// 1. claim one job in a short transaction of its own\ndata class Job(val id: Long, val payload: String, val attempts: Int)\n\nfun claim(conn: Connection, worker: String): Job? {\n    conn.autoCommit = false\n    val job = conn.prepareStatement(\n        \"\"\"\n        UPDATE jobs SET status = 'running', locked_by = ?, locked_at = now(), attempts = attempts + 1\n        WHERE job_id = (SELECT job_id FROM jobs\n                        WHERE status = 'queued' AND kind = 'send_receipt' AND run_after <= now()\n                        ORDER BY run_after, job_id LIMIT 1\n                        FOR UPDATE SKIP LOCKED)\n        RETURNING job_id, payload, attempts\n        \"\"\",\n    ).use { ps ->\n        ps.setString(1, worker)\n        ps.executeQuery().use { rs -> if (rs.next()) Job(rs.getLong(1), rs.getString(2), rs.getInt(3)) else null }\n    }\n    conn.commit()                   // the claim is visible to everyone, and no lock is held\n    return job\n}"
+      },
+      {
+        "say": "The work runs outside any transaction. A second short transaction records the outcome. On failure the job goes back to the queue with a delay that grows with each attempt, and after the third attempt it stops at `failed`, like job 6 in the seed.",
+        "lang": "kotlin",
+        "code": "// 2. do the work, then record the outcome in a second short transaction\ninterface ReceiptMailer { fun send(payload: String, idempotencyKey: String) }\n\nfun runOne(conn: Connection, worker: String, mail: ReceiptMailer) {\n    val job = claim(conn, worker) ?: return\n    val ok = runCatching { mail.send(job.payload, idempotencyKey = \"job-${job.id}\") }.isSuccess\n    conn.prepareStatement(\n        \"\"\"\n        UPDATE jobs SET status = CASE WHEN ? THEN 'done' WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END,\n                        run_after = now() + attempts * interval '1 minute',\n                        locked_by = NULL, locked_at = NULL\n        WHERE job_id = ? AND locked_by = ?\n        \"\"\",\n    ).use { ps -> ps.setBoolean(1, ok); ps.setLong(2, job.id); ps.setString(3, worker); ps.executeUpdate() }\n    conn.commit()\n}"
+      },
+      {
+        "say": "A worker that dies between the claim and the outcome leaves its job `running` with an old `locked_at`. The reaper puts such jobs back. It is one UPDATE, so it is safe to run on every pod every minute: row locks make each job move once. The `locked_by = ?` in step 2 stops a slow worker from overwriting a job that the reaper already handed to someone else.",
+        "lang": "sql",
+        "code": "-- 3. the reaper: put back jobs whose worker went quiet 10 minutes ago\nUPDATE jobs\nSET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END,\n    locked_by = NULL,\n    locked_at = NULL\nWHERE status = 'running'\n  AND locked_at < now() - interval '10 minutes';"
+      },
+      {
+        "say": "Claim and commit means a job can run twice: the worker sent the email, then died before step 2 committed, and the reaper queued it again. So the side effect carries a key that stays the same across attempts. The email provider drops a second request with the same key, the same way the payments table drops a second `payment_uid` (lesson 1).",
+        "lang": "kotlin",
+        "code": "// 4. the same key on every attempt of one job: a repeat is harmless\nmail.send(job.payload, idempotencyKey = \"job-${job.id}\")   // not a random UUID per attempt\n\n// with a lock-held design instead (BEGIN, claim, work, done, COMMIT), a crash rolls the claim\n// back and the job is simply queued again, but attempts rolls back too: it can't count crashes"
+      }
+    ]
+  },
+  "lab": {
+    "title": "A job queue that never double-claims, and transfers that never deadlock",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/txn/l02/claim_job.sql",
+      "labs/sql/src/main/resources/sfz/txn/l02/transfer.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.txn.l02.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder. Six of the ten fail. The tests open real sessions at once (up to six workers) and commit for real, then put the seed back.",
+      "`claim_job.sql` is one statement that a worker runs inside its own open transaction. Read the failures: one says a worker waited for another worker's lock, one shows job 2 claimed twice with `attempts = 2`.",
+      "Fix the claim. Add a plain `FOR UPDATE` first and run the tests: the double claim goes away, and the waiting does not. Then make it skip what other workers hold.",
+      "`transfer.sql` moves money between the two accounts in a temp table `transfer`. Two sessions run it in opposite directions, one statement at a time. Read the log in the failure: it shows the deadlock and the retry. Make every transfer lock its two accounts in the same order before it changes them.",
+      "Run the tests until all ten pass. The last one checks that you lock only the two accounts: Ivy's transfer must not wait for Ben's."
+    ],
+    "hints": [
+      "Put `FOR UPDATE SKIP LOCKED` at the end of the subquery, after `LIMIT 1`. The outer UPDATE then changes a row its own subquery already holds.",
+      "For the transfer, add one statement after `BEGIN`: `SELECT a.account_id FROM accounts a, transfer t WHERE a.account_id IN (t.from_account, t.to_account) ORDER BY a.account_id FOR UPDATE OF a;`. `OF a` locks only the account rows.",
+      "`LOCK TABLE accounts` also stops the deadlock, and fails the last test: every transfer in the company would wait for every other one."
+    ],
+    "done_when": "All ten tests in `RowLocksTest` pass."
+  },
+  "drill": {
+    "title": "The claim, the compare-and-set and the lock order, from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write (1) the statement a worker runs to claim the oldest due queued job from `jobs`, mark it running and return it, so that ten workers at once never wait for each other and never get the same job; (2) a compare-and-set that debits 1,000 from account 109 only if its balance is still the 5,000 you read, and what the application does when it changes 0 rows; and (3) the first statement of a transfer between accounts `:from` and `:to` that makes deadlocks between transfers impossible.",
+    "answer": {
+      "lang": "sql",
+      "src": "-- 1. the claim\nUPDATE jobs\nSET status = 'running', locked_by = :worker, locked_at = now(), attempts = attempts + 1\nWHERE job_id = (SELECT job_id FROM jobs\n                WHERE status = 'queued' AND run_after <= now()\n                ORDER BY run_after, job_id\n                LIMIT 1\n                FOR UPDATE SKIP LOCKED)\nRETURNING job_id, kind, payload;\n\n-- 2. compare-and-set: write only if the value is still the one you read\nUPDATE accounts SET balance_minor = 4000\nWHERE account_id = 109 AND balance_minor = 5000;\n-- 0 rows changed: someone got there first. Reload the balance and try again\n-- (with a version column: ... AND version = :read_version, SET version = version + 1)\n\n-- 3. lock both accounts, lowest id first, before changing either\nSELECT account_id FROM accounts\nWHERE account_id IN (:from, :to)\nORDER BY account_id\nFOR UPDATE;"
+    }
+  },
+  "recap": [
+    "A lost update is a read-modify-write cycle gone wrong: two transactions read the same value, each writes a result computed from it, and the second write erases the first. The row lock makes the second write wait, and it still writes the stale value.",
+    "Fix it in the database: a relative UPDATE (`SET x = x - n`, the best when it fits), `SELECT ... FOR UPDATE` before computing, or compare-and-set with the old value or a version column, retrying on 0 rows.",
+    "PostgreSQL's Repeatable Read detects the lost update (first-updater-wins) and fails the second writer with 40001; retry the whole transaction. MySQL's REPEATABLE READ doesn't: the second write silently wins.",
+    "A row lock is a mark in the row version, held until COMMIT or ROLLBACK; plain reads never wait for it. Use `FOR NO KEY UPDATE` when you won't change the key, so foreign-key checks pass.",
+    "A job claim is a read-modify-write: `FOR UPDATE` stops double runs but queues the workers; `FOR UPDATE SKIP LOCKED` lets each take the next free job; `NOWAIT` fails at once with 55P03.",
+    "Locks taken in opposite orders deadlock; PostgreSQL aborts one with 40P01 after `deadlock_timeout` (1 s). Lock rows in a fixed order, bound waits with `lock_timeout`, and use `_xact_` advisory locks for things that aren't rows."
+  ],
+  "quiz": [
+    {
+      "q": "Three workers claim with `... ORDER BY run_after LIMIT 1 FOR UPDATE` and keep the transaction open while each 2-second job runs. Thirty jobs are queued. About how long until all are done, and what brings it near 20 seconds?",
+      "options": [
+        "About 20 seconds already: each worker locks a different row",
+        "About 60 seconds, because the workers queue on the same first row; SKIP LOCKED in the claim brings it near 20",
+        "About 60 seconds, because PostgreSQL runs one FOR UPDATE per table at a time; a bigger connection pool fixes it",
+        "It never finishes: the three workers deadlock"
+      ],
+      "answer": 1,
+      "why": "All three pick the same oldest row, so two wait while one works: one job every 2 seconds, 60 seconds for thirty. With SKIP LOCKED each claim skips rows other workers hold, three jobs run at once, and thirty take about 20 seconds. PostgreSQL has no per-table limit on row locks, and the waits form a line, not a cycle, so there is no deadlock."
+    },
+    {
+      "q": "A service written for PostgreSQL relies on REPEATABLE READ to turn concurrent read-modify-writes of a balance into 40001 errors, which it retries. The team moves it to MySQL 8.4 and keeps the default level, also called REPEATABLE READ. What changes?",
+      "options": [
+        "Nothing: both databases implement the same SQL standard level",
+        "MySQL reports a deadlock instead of a serialization failure",
+        "The second write now commits without an error, and one update is lost",
+        "MySQL makes the second transaction's SELECT wait for the first"
+      ],
+      "answer": 2,
+      "why": "InnoDB's REPEATABLE READ gives plain SELECTs a snapshot, but an UPDATE writes over the newest committed row without checking whether it changed since that snapshot. The second write waits for the first one's lock and then wins: Hermitage and Jepsen both found lost updates at this level. The level's name is the same, and the guarantee isn't. On MySQL, use a relative UPDATE, a row lock or compare-and-set."
+    },
+    {
+      "q": "Two Kafka consumers apply batches of balance changes, one UPDATE per row in message order. A few times a day one batch fails with SQLSTATE 40P01. What is the best fix?",
+      "options": [
+        "Sort each batch by account_id and apply the updates in that order",
+        "Raise deadlock_timeout to 10 seconds so the transactions have time to finish",
+        "Run the batches at SERIALIZABLE",
+        "Add an index on accounts (account_id)"
+      ],
+      "answer": 0,
+      "why": "40P01 is a deadlock: two batches that touch the same accounts in different orders each hold a row the other needs. If every batch locks in ascending id order, a second batch waits at its first shared row while holding nothing, and no cycle can form. A longer deadlock_timeout only makes the stuck pair wait longer before PostgreSQL breaks the cycle. Serializable adds serialization failures to the deadlocks, and account_id already has its primary key index."
+    },
+    {
+      "q": "A JPA entity has a `@Version` column. Saving it issues `UPDATE payments SET status = 'refunded', version = 8 WHERE payment_id = 31 AND version = 7`, and the update count is 0. What happened, and what should the code do?",
+      "options": [
+        "The row was deleted; create it again",
+        "PostgreSQL rolled back the transaction; retry the same UPDATE",
+        "The UPDATE is still waiting for a lock; wait longer",
+        "Another transaction changed the payment since it was loaded; reload it, reapply the change and save again, or report the conflict"
+      ],
+      "answer": 3,
+      "why": "That UPDATE is compare-and-set: it changes the row only if the version is still the one that was read. 0 rows means someone else committed a change, version 8 or later, in between, and Hibernate throws OptimisticLockException. Retrying the same UPDATE would match 0 rows again, because the version it checks is stale. Reload, decide again with the new state, and save."
+    },
+    {
+      "q": "Lesson 1's table says Read Committed allows lost updates. Then why does `UPDATE accounts SET balance_minor = balance_minor - 100 WHERE account_id = 109`, run by two transactions at once at Read Committed, never lose one?",
+      "options": [
+        "Read Committed turns a concurrent update into error 40001",
+        "The second UPDATE waits for the first one's row lock, then PostgreSQL rereads the newly committed version and subtracts from it",
+        "Every single statement runs at SERIALIZABLE",
+        "Each statement in autocommit mode takes a table lock"
+      ],
+      "answer": 1,
+      "from": "txn-01",
+      "why": "The lost update in lesson 1's table comes from computing a value in the application from an earlier read. A relative UPDATE does the read and the write in one statement under the row lock: when the second one gets the lock, Read Committed follows the row to its new version, rechecks the WHERE and computes from 4,900. 40001 is what Repeatable Read does, and nothing takes a table lock here."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What is a lost update?",
+      "back": "Two transactions read the same value and each write a result computed from it; the second write erases the first. No error is raised."
+    },
+    {
+      "front": "Why doesn't `SET balance_minor = balance_minor - 1000` lose updates at Read Committed?",
+      "back": "The second UPDATE waits for the row lock, then PostgreSQL rereads the newly committed version, rechecks the WHERE and computes from it."
+    },
+    {
+      "front": "A compare-and-set UPDATE changes 0 rows. What does it mean?",
+      "back": "Someone changed the row since you read it. Reload, decide again, and retry; JPA's @Version throws OptimisticLockException here."
+    },
+    {
+      "front": "What does PostgreSQL's Repeatable Read do with a lost update, and MySQL's?",
+      "back": "PostgreSQL fails the second writer with 40001, could not serialize access due to concurrent update. MySQL lets the second write win silently."
+    },
+    {
+      "front": "Where does PostgreSQL keep a row lock?",
+      "back": "In the locked row version itself (its header on the 8 KB page), not in memory. A waiter sleeps on the holder's transaction id in the lock manager."
+    },
+    {
+      "front": "What does `FOR UPDATE SKIP LOCKED` do when the first candidate row is locked?",
+      "back": "Skips it and tries the next row, without waiting. With LIMIT 1 it returns the first row it could lock, or none."
+    },
+    {
+      "front": "How do you make deadlocks between transfers impossible?",
+      "back": "Lock the rows in one fixed order in every transaction, for example ascending account_id, before changing any of them."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Lost update",
+      "plain": "Two concurrent read-modify-write cycles on one value, where the second write erases the first."
+    },
+    {
+      "term": "Read-modify-write cycle",
+      "plain": "Reading a value, computing a new one in the application, and writing it back."
+    },
+    {
+      "term": "Row lock",
+      "plain": "A mark a transaction puts on a row so that other writers and lockers wait until it commits or rolls back. Plain reads ignore it."
+    },
+    {
+      "term": "Compare-and-set",
+      "plain": "A write that happens only if the value (or a version number) is still the one you read; otherwise it changes nothing."
+    },
+    {
+      "term": "First-updater-wins",
+      "plain": "Snapshot isolation's rule: of two concurrent transactions that change the same row, the second one to try fails."
+    },
+    {
+      "term": "SKIP LOCKED",
+      "plain": "A locking clause option that skips rows other transactions have locked instead of waiting for them. Made for queue tables."
+    },
+    {
+      "term": "Deadlock",
+      "plain": "A cycle of transactions, each waiting for a lock the next one holds. PostgreSQL aborts one with 40P01."
+    },
+    {
+      "term": "Advisory lock",
+      "plain": "A lock on a number the application chooses, for serializing work that is not a row, such as one settlement run per merchant per day."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate wants to process payout jobs from a PostgreSQL table with ten pods, each running `SELECT * FROM payouts_queue WHERE status = 'new' ORDER BY id LIMIT 1 FOR UPDATE`, then calling the bank, then marking the row done, all in one transaction. Explain what will happen under load and what you would change.",
+    "answer": "Every pod picks the same oldest row from the same snapshot, so one pod gets its lock and nine wait for it. The first pod holds the lock for the whole bank call, maybe a second, so the nine sit idle and then collide again on the next row. No payout runs twice, which is why tests pass, but ten pods drain the queue at the speed of one, and adding pods only adds waiters. I'd add SKIP LOCKED so each pod takes the oldest row nobody holds, and fold the claim into one UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING. Because a bank call is slow, I would not hold the transaction open across it: commit the claim with a locked_at time, call the bank, and mark the row done in a second short transaction. That needs a reaper for rows stuck in running and an idempotency key on the bank call that stays the same across attempts, because a reaped payout may already have been sent. I'd also check there is a partial index on the queue's ordering column for status = 'new', so a claim stays a few pages as done rows accumulate."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Four lock strengths.** PostgreSQL has four row lock modes, strongest first. `FOR UPDATE` is taken by DELETE, by an UPDATE that changes a column with a unique index a foreign key could point at, and by `SELECT ... FOR UPDATE`. `FOR NO KEY UPDATE` is taken by every other UPDATE. `FOR SHARE` lets several transactions hold the row and blocks any change to it. `FOR KEY SHARE` blocks only a DELETE or a key change, and it is what a foreign-key check takes on the parent row. KEY SHARE conflicts only with FOR UPDATE, so an ordinary UPDATE of a card doesn't block payments that reference it, while an explicit `SELECT ... FROM cards WHERE card_id = 5 FOR UPDATE` does. This split arrived in PostgreSQL 9.3; before it, foreign-key checks took SHARE locks and blocked every UPDATE of the parent. The `pgrowlocks` extension shows the modes on a table's rows.\n\n**MultiXacts.** When several transactions lock one row at once, as the foreign-key checks of many payments on one card do, a single transaction id no longer fits in the row header. PostgreSQL writes a MultiXact id there instead, a pointer to a list of lockers and their modes in `pg_multixact`. MultiXact ids wrap around like transaction ids and need their own freezing (lesson 4).\n\n**SKIP LOCKED is for queues only.** The PostgreSQL docs say it gives an inconsistent view of the data, unsuitable for general work but fine for \"multiple consumers accessing a queue-like table\". Never use it for a report or a balance check: a row you skipped still exists.\n\n**Waking workers.** Polling an empty queue every 100 ms from ten pods is cheap with the partial index, but `LISTEN` and `NOTIFY` can wake workers instead: the inserting code runs `NOTIFY jobs_ready`, idle workers hold a connection in `LISTEN jobs_ready`, and pgJDBC delivers the notification through `PGConnection.getNotifications()`. Keep the polling as a fallback: a notification sent while a worker restarts is lost.\n\n**Queue tables churn.** Every UPDATE writes a new row version (lesson 4). Delete or archive done jobs in batches, or partition by day and drop old partitions, and let autovacuum visit the table more often than its default, which waits until 20% of a table's rows are dead.\n\n**Claims belong at Read Committed.** At Repeatable Read and Serializable, `SELECT ... FOR UPDATE` on a row that another transaction changed and committed after your snapshot fails with 40001 instead of returning the new version, so a queue claim at those levels turns contention into retries."
+  },
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: Explicit locking",
+      "url": "https://www.postgresql.org/docs/18/explicit-locking.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: SELECT (the locking clause)",
+      "url": "https://www.postgresql.org/docs/18/sql-select.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Transaction isolation",
+      "url": "https://www.postgresql.org/docs/18/transaction-iso.html"
+    },
+    {
+      "title": "Jepsen: MySQL 8.0.34 (2023)",
+      "url": "https://jepsen.io/analyses/mysql-8.0.34"
+    },
+    {
+      "title": "Oracle AI Database 26ai: SQL new features (SELECT FOR UPDATE with row limit)",
+      "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/nfcoa/appdev_sql.html"
+    }
+  ]
+}

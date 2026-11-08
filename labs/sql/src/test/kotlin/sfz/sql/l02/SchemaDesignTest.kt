@@ -14,7 +14,7 @@ class SchemaDesignTest {
 
     @Test
     fun `mcc_description_conflicts finds the mcc with two descriptions`() = rollback {
-        val rows = exercise(2, "mcc_description_conflicts")
+        val rows = exercise("sql/l02", "mcc_description_conflicts")
         rows.assertColumns("mcc", "descriptions")
         // payment 18's row says "Electronic stores"; the other 5732 rows say "Electronics stores"
         rows.assertRowsInOrder(row("5732", 2))
@@ -30,10 +30,10 @@ class SchemaDesignTest {
                 (92, '4111', 'Commuter transport', 275)    -- a new mcc with one description
             """,
         )
-        exercise(2, "mcc_description_conflicts").assertRowsInOrder(row("5411", 2), row("5732", 2))
+        exercise("sql/l02", "mcc_description_conflicts").assertRowsInOrder(row("5411", 2), row("5732", 2))
     }
 
-    private fun Tx.createCardLimits() = runExercise(2, "card_limits")
+    private fun Tx.createCardLimits() = runExercise("sql/l02", "card_limits")
 
     private val insert = "INSERT INTO card_limits (card_id, valid_during, daily_limit_minor) VALUES (?, ?::tstzrange, ?)"
 
@@ -102,7 +102,7 @@ class SchemaDesignTest {
 
     @Test
     fun `balance_drift is empty on the seed, where every cache is right`() = rollback {
-        val rows = exercise(2, "balance_drift")
+        val rows = exercise("sql/l02", "balance_drift")
         rows.assertColumns("account_id", "cached", "ledger")
         rows.assertRowsInOrder()
     }
@@ -119,7 +119,7 @@ class SchemaDesignTest {
         )
         // account 112 has no ledger rows at all, so its balance must be 0
         update("UPDATE accounts SET balance_minor = 700 WHERE account_id = 112")
-        exercise(2, "balance_drift").assertRowsInOrder(
+        exercise("sql/l02", "balance_drift").assertRowsInOrder(
             row(103, 9086, 10086),
             row(112, 700, 0),
             row(900, -860000, -861000),
@@ -129,6 +129,6 @@ class SchemaDesignTest {
     @Test
     fun `balance_drift leaves alone an empty account with a zero balance`() = rollback {
         update("INSERT INTO accounts (account_id, kind, customer_id, opened_at) VALUES (211, 'customer', 11, '2026-07-01 00:00+00')")
-        exercise(2, "balance_drift").assertRowsInOrder()
+        exercise("sql/l02", "balance_drift").assertRowsInOrder()
     }
 }

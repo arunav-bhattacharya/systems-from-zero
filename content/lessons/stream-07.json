@@ -1,0 +1,439 @@
+{
+  "id": "stream-07",
+  "title": "Fault tolerance in stream processing: checkpoints and exactly-once",
+  "minutes": 40,
+  "goal": "By the end you can say what \"exactly-once\" really promises in a stream processor, compare micro-batches with barrier snapshots, explain how aligned barriers make a consistent snapshot of a running dataflow and what skipping alignment or going unaligned trades, make the output exactly-once with an idempotent or transactional sink, name the side effects that stay at-least-once, and estimate recovery time from where the state lives.",
+  "warmup": {
+    "q": "A Flink job with exactly-once checkpoints and an exactly-once Kafka sink counts payments per card. Inside the job, it emails the cardholder when a card's count reaches 10. It crashes and restores from its last checkpoint. How many emails can one card get?",
+    "options": [
+      "Exactly one: the job is exactly-once",
+      "At most one: the email is part of the restored state",
+      "One or more: the replay after the restore can send it again",
+      "None: emails in flight are rolled back with the transaction"
+    ],
+    "answer": 2,
+    "why": "Exactly-once covers the job's state and what its transactional sink commits. The records after the checkpoint are processed again on restore, and an email sent while processing them goes out again; nothing can roll back an email. Section 4 measures it: 135 emails where 90 were due. Send it through the sink (an outbox topic) with an idempotency key the mail service checks."
+  },
+  "sections": [
+    {
+      "h": "Batch gets exactly-once for free; a stream has to earn it",
+      "body": "A batch job that dies halfway is easy to recover. Throw away its half-written output and run it again. The input files haven't changed, each task writes its own output file, and the output becomes visible only when the whole job succeeds. Every record's effect appears once, although some records were processed twice. That's the meaning of \"exactly-once\" worth keeping: **effectively once**. Records may be processed more than once; their effects on the output are visible once.\n\nA stream processor can't wait for the end, because there is no end. After a crash, three things have to come back in agreement: the input positions (offsets), the operators' state (counts, windows, join tables from the last two lessons), and the output the world has already seen. The Messaging track's consumer lesson showed what happens when only two of them agree. Commit the offset before processing and a crash loses records. Commit after processing and a crash replays every record since the last commit. In the Try-it, a job writes one row per payment and commits its offset every 100 payments; it crashes just after payment 950 and writes 51 rows twice.\n\nThe first fix makes the stream a sequence of small batch jobs. **Micro-batching**, which Spark Streaming introduced and Structured Streaming still uses by default, cuts the input into batches by offset range, runs each one like a batch job, and makes a batch's output and its end offset durable together. A crash in the middle of a batch leaves nothing of that batch visible, and the rerun reads the same offsets again. The Try-it's micro-batch run ends with exactly 1,000 rows.\n\nThe price is latency and a fixed rhythm. A row waits for the end of its batch: 50 ms on average with 100 ms batches, and Spark puts the end-to-end floor of a micro-batch query at about 100 ms (lesson 8 is Spark's case study). A batch is also a window in processing time, whether you want one or not. A count over 5 minutes of event time spans many batches, so its state has to be carried from batch to batch and saved with each one, and the state problem is back.",
+      "try": {
+        "title": "Crash a record-at-a-time job and a micro-batch job",
+        "minutes": 3,
+        "steps": [
+          "Run `MicroBatchDemo` from the `labs` folder. It needs only the JDK: plain Kotlin on virtual time.",
+          "Predict the duplicate count for the record-at-a-time job before you run it. The offset is committed after payments 100, 200, ..., 900, and the job dies after writing the row for payment 950.",
+          "Then explain the micro-batch job's average delay of 50.5 ms."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "MicroBatchDemo.kt",
+          "src": "package sfz.stream.l07.demo\n\n/**\n * 1,000 payments arrive, one per virtual ms, and the job writes one output row per payment. It crashes just after\n * payment 950 and restarts from what it committed. Two designs:\n *\n * - record at a time: write each row at once, commit the input offset after every 100 records (at-least-once).\n * - micro-batches of 100 ms: keep a batch's rows in memory, then make the rows and the batch's end offset durable\n *   in one step (Spark writes the batch's output, then its commit-log entry). A crash mid-batch leaves nothing of it.\n */\nfun main() {\n    val payments = 1_000\n    val crashAfter = 950\n\n    // record at a time\n    val rows = mutableListOf<Int>()                 // durable: what the world sees\n    var committed = 0                               // durable: the committed offset\n    var crashed = false\n    var p = 0\n    while (p < payments) {\n        if (!crashed && p > crashAfter) { crashed = true; p = committed; continue }   // crash, restart from the offset\n        rows += p\n        if ((p + 1) % 100 == 0) committed = p + 1\n        p++\n    }\n    println(\"record at a time: ${rows.size} rows for $payments payments, ${rows.size - rows.toSet().size} duplicates, \" +\n        \"a row is visible right after its payment\")\n\n    // micro-batches of 100 ms\n    val visible = mutableListOf<Int>()              // durable: what the world sees\n    var batchEnd = 0                                // durable: the commit log, the end offset of the last batch\n    var waited = 0L\n    crashed = false\n    var start = 0\n    while (start < payments) {\n        val end = minOf(start + 100, payments)\n        val batch = mutableListOf<Int>()            // in memory until the batch commits\n        for (q in start until end) {\n            if (!crashed && q > crashAfter) { crashed = true; break }\n            batch += q\n        }\n        if (batch.size < end - start) {\n            println(\"crash in the batch [$start, $end): ${batch.size} rows in memory are lost; rerun the batch from offset $batchEnd\")\n            start = batchEnd\n            continue\n        }\n        visible += batch                            // the batch's rows and its commit entry: one step\n        batchEnd = end\n        waited += batch.sumOf { (end - it).toLong() } // payment q arrives at q ms and shows up when the batch ends\n        start = end\n    }\n    println(\"micro-batches:    ${visible.size} rows for $payments payments, ${visible.size - visible.toSet().size} duplicates, \" +\n        \"a row is visible %.1f ms after its payment on average\".format(waited.toDouble() / payments))\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.stream.l07.demo.MicroBatchDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/stream/l07/demo/MicroBatchDemo.kt"
+        },
+        "expect": "```text\nrecord at a time: 1051 rows for 1000 payments, 51 duplicates, a row is visible right after its payment\ncrash in the batch [900, 1000): 51 rows in memory are lost; rerun the batch from offset 900\nmicro-batches:    1000 rows for 1000 payments, 0 duplicates, a row is visible 50.5 ms after its payment on average\n```\nThe record-at-a-time job had written rows 0 to 950 when it died, with offset 900 committed, so it read 900 to 950 again: 51 rows written twice. The micro-batch job had the same 51 rows in memory, not yet visible; the crash threw them away and the rerun of the batch produced each once. A payment that arrives at the start of a 100 ms batch waits about 100 ms and one at the end about 1 ms: 50.5 ms on average."
+      },
+      "refs": [
+        {
+          "title": "Spark Structured Streaming programming guide",
+          "url": "https://spark.apache.org/docs/latest/streaming/index.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Barriers take a consistent snapshot while the data keeps moving",
+      "body": "Flink takes the other road. It processes each record as it arrives and, every few seconds, saves a snapshot of the whole job: every operator's state plus every source's offset. After a crash, every operator loads the last snapshot and every source rewinds to the offsets in it. That's only correct if the snapshot is **consistent**: it must describe a moment the job could really have been in, where every record counted in the state comes before the saved offsets and no record after them is counted. Otherwise the replay counts some records twice.\n\nVersion 1: stop the sources, wait until every channel between operators is empty, save everything, start again. It's consistent, and the whole job stalls for every checkpoint, seconds at a time on a large job.\n\nChandy and Lamport solved the general problem in 1985: take a consistent snapshot of a distributed system with FIFO channels without stopping it. The process that starts a snapshot records its own state and sends a marker on each outgoing channel. A process that receives its first marker records its state and sends markers on all its outgoing channels. For each of its other incoming channels, it also records the messages that arrive before that channel's marker: that's the channel's state. The process states plus the channel states form a consistent snapshot.\n\nFlink adapts this to a dataflow graph with **asynchronous barrier snapshotting** (Carbone and others, 2015). The coordinator tells every source to inject barrier n, and each source records its offset as it does. Barriers never overtake records, so barrier n splits every stream into before and after checkpoint n. An operator with one input snapshots its state when barrier n arrives and passes the barrier on. An operator with several inputs **aligns**: once barrier n arrives on one input, it stops reading that input until barrier n has arrived on all of them, then snapshots and forwards the barrier. Alignment is what keeps the channels' state empty, so Flink only has to save operator state, not records in flight. The state is written to durable storage in the background while processing goes on. The checkpoint is complete when every sink has acknowledged barrier n.\n\nThe lab's model makes consistency a one-line check: in every aligned snapshot of the counter, the number of records counted equals the sum of the source offsets.",
+      "stepper": {
+        "title": "One aligned checkpoint, a crash and a restore",
+        "intro": "Two sources, a keyed counter with two inputs, and a transactional sink. Chips are records (c1 = a card-1 record) and barriers (B1).",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 1: the job is running; no checkpoint yet.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">running</text><rect class=\"box\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c1</text><rect class=\"box\" x=\"280\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"68.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"240\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"257.0\" y=\"68.5\" text-anchor=\"middle\">c3</text><rect class=\"box\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"280\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"200.5\" text-anchor=\"middle\">c3</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">9 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"542\" y=\"115\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"559.0\" y=\"134.5\" text-anchor=\"middle\">u</text><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open:</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">8 updates</text><rect class=\"box\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">no checkpoint yet</text></svg>",
+            "say": "Two sources feed a keyed counter, which feeds a sink. Each channel is a FIFO queue; the head is at the right. The counter has counted 9 records so far, 4 from source 0 and 5 from source 1. Both sources have read up to offset 7."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 2: the coordinator starts checkpoint 1; each source records its offset and injects barrier B1.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">checkpoint 1 starts</text><rect class=\"box-a\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c1</text><rect class=\"box\" x=\"280\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"68.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"240\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"257.0\" y=\"68.5\" text-anchor=\"middle\">c3</text><rect class=\"box-a\" x=\"200\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"217.0\" y=\"68.5\" text-anchor=\"middle\">B1</text><rect class=\"box-a\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"280\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"200.5\" text-anchor=\"middle\">c3</text><rect class=\"box-a\" x=\"240\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"257.0\" y=\"200.5\" text-anchor=\"middle\">B1</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">9 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"542\" y=\"115\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"559.0\" y=\"134.5\" text-anchor=\"middle\">u</text><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open:</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">8 updates</text><rect class=\"box-a\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1 started: offsets [7, 7]</text></svg>",
+            "say": "The coordinator starts checkpoint 1. Each source writes down its offset, 7 and 7, and puts barrier **B1** into its channel behind the records it has already sent. Barriers never overtake records, so B1 splits each channel into before and after checkpoint 1. Nothing stops: sources keep reading."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 3: B1 reaches the counter on input 0 first; input 0 is blocked while input 1 catches up.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">alignment</text><rect class=\"box\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 9</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"280\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"68.5\" text-anchor=\"middle\">c1</text><text class=\"t-s t-bad\" x=\"134\" y=\"70\" text-anchor=\"start\">blocked</text><rect class=\"box\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 8</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c3</text><rect class=\"box-a\" x=\"280\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"200.5\" text-anchor=\"middle\">B1</text><rect class=\"box\" x=\"240\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"257.0\" y=\"200.5\" text-anchor=\"middle\">c2</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">13 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\">B1 seen on input 0</text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"542\" y=\"115\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"559.0\" y=\"134.5\" text-anchor=\"middle\">u</text><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open:</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">12 updates</text><rect class=\"box\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1 started: offsets [7, 7]</text></svg>",
+            "say": "B1 arrives at the counter on input 0 while input 1 still has a record before its B1. The counter **blocks input 0**: records 7 and 8 from source 0 belong after the checkpoint, so they wait in the channel. It keeps reading input 1. This is barrier alignment."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 4: B1 arrives on input 1; the counter snapshots 14 counted and forwards B1.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">aligned: snapshot</text><rect class=\"box\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 9</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"280\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"68.5\" text-anchor=\"middle\">c1</text><rect class=\"box\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 8</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c2</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">14 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\">snapshot sent</text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><rect class=\"box-a\" x=\"542\" y=\"115\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"559.0\" y=\"134.5\" text-anchor=\"middle\">B1</text><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open:</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">14 updates</text><rect class=\"box-a\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1: offsets [7, 7], counter 14 counted</text></svg>",
+            "say": "B1 has now arrived on both inputs. The counter has counted exactly the 14 records before the barriers, 7 from each source: the same as the offsets, 7 + 7. It sends that state to storage (asynchronously, in a real engine), forwards one B1 to the sink, and unblocks input 0."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 5: the sink receives B1, pre-commits its transaction and acknowledges; checkpoint 1 is complete.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">checkpoint 1 complete</text><text class=\"t-s t-m\" x=\"668\" y=\"22\" text-anchor=\"end\">the world sees 14 updates</text><rect class=\"box\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 10</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c3</text><rect class=\"box\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 9</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c3</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">17 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"542\" y=\"115\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"559.0\" y=\"134.5\" text-anchor=\"middle\">u</text><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">txn 1</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">committed</text><rect class=\"box-ok\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1 complete: offsets [7, 7], counter 14</text></svg>",
+            "say": "B1 reaches the sink. A transactional sink pre-commits the updates it got before B1 and acknowledges. Every operator has now stored its part, so the coordinator marks checkpoint 1 **complete** and tells the sink to commit. The outside world now sees the 14 updates of checkpoint 1, and nothing after it."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 6: the job crashes; memory is gone, durable storage and the input logs survive.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">crash</text><text class=\"t-s t-m\" x=\"668\" y=\"22\" text-anchor=\"end\">the world sees 14 updates</text><rect class=\"box\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">log kept</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"134\" y=\"70\" text-anchor=\"start\">lost</text><rect class=\"box\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">log kept</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"134\" y=\"202\" text-anchor=\"start\">lost</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">state lost</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\"></text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box-bad\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open txn</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">lost</text><rect class=\"box\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1 complete: offsets [7, 7], counter 14</text></svg>",
+            "say": "The machine dies. The counter's 17, the channels and the sink's open transaction are gone. What survives is durable: the input logs (Kafka partitions) and checkpoint 1. The 3 updates made after checkpoint 1 were never committed, so the world never saw them and there is nothing to undo."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 296\" role=\"img\" aria-label=\"Frame 7: restore: sources rewind to offsets 7 and 7, the counter loads 14; records 7 and up are read again.\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16\" y=\"22\" text-anchor=\"start\">restored from checkpoint 1</text><text class=\"t-s t-m\" x=\"668\" y=\"22\" text-anchor=\"end\">the world sees 14 updates</text><rect class=\"box-a\" x=\"16\" y=\"40\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"61.0\" text-anchor=\"middle\">source 0</text><text class=\"t-s t-m\" x=\"64.0\" y=\"77.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"64\" x2=\"122\" y2=\"64\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"40\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"68.5\" text-anchor=\"middle\">c2</text><rect class=\"box\" x=\"280\" y=\"49\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"297.0\" y=\"68.5\" text-anchor=\"middle\">c1</text><rect class=\"box-a\" x=\"16\" y=\"172\" width=\"96\" height=\"48\" rx=\"8\"/><text class=\"t t-s\" x=\"64.0\" y=\"193.0\" text-anchor=\"middle\">source 1</text><text class=\"t-s t-m\" x=\"64.0\" y=\"209.0\" text-anchor=\"middle\">offset 7</text><line class=\"ln\" x1=\"112\" y1=\"196\" x2=\"122\" y2=\"196\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"122\" y=\"172\" width=\"240\" height=\"48\" rx=\"8\"/><rect class=\"box\" x=\"320\" y=\"181\" width=\"34\" height=\"30\" rx=\"8\"/><text class=\"t t-s t-code\" x=\"337.0\" y=\"200.5\" text-anchor=\"middle\">c2</text><line class=\"ln\" x1=\"362\" y1=\"64\" x2=\"384\" y2=\"98\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"362\" y1=\"196\" x2=\"384\" y2=\"162\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"386\" y=\"84\" width=\"130\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"451\" y=\"104\" text-anchor=\"middle\">counter</text><text class=\"t-s t-code\" x=\"451\" y=\"126\" text-anchor=\"middle\">14 counted</text><text class=\"t-s t-m\" x=\"451\" y=\"144\" text-anchor=\"middle\">loaded</text><rect class=\"box\" x=\"520\" y=\"106\" width=\"64\" height=\"48\" rx=\"8\"/><line class=\"ln\" x1=\"584\" y1=\"130\" x2=\"594\" y2=\"130\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"596\" y=\"84\" width=\"72\" height=\"92\" rx=\"8\"/><text class=\"t\" x=\"632\" y=\"104\" text-anchor=\"middle\">sink</text><text class=\"t-s t-m\" x=\"632\" y=\"126\" text-anchor=\"middle\">open:</text><text class=\"t-s t-m\" x=\"632\" y=\"144\" text-anchor=\"middle\">0 updates</text><rect class=\"box\" x=\"16\" y=\"234\" width=\"652\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"28\" y=\"254\" text-anchor=\"start\">durable checkpoint storage</text><text class=\"t-s t-code\" x=\"28\" y=\"276\" text-anchor=\"start\">checkpoint 1 complete: offsets [7, 7], counter 14</text></svg>",
+            "say": "Every operator loads checkpoint 1, and every source rewinds to its offset. Records 7 and up are read again. None of them were in the snapshot's 14, so each is counted once, and with a transactional sink each update becomes visible once. Records were processed twice; their effects show once."
+          }
+        ]
+      },
+      "try": {
+        "title": "Read the checkpoints of a job that crashes",
+        "minutes": 4,
+        "steps": [
+          "Run `SnapshotDemo`. It runs the lab's job (two sources of 50 records, a keyed counter, a transactional sink) with aligned barriers, a checkpoint every 20 virtual ms, and a crash at 160 ms.",
+          "Check the last column against the offsets on every line. What rule do they follow?",
+          "Checkpoint 3 is missing and checkpoint 4 has the same offsets as 2. Work out why from the crash line."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SnapshotDemo.kt",
+          "src": "package sfz.stream.l07.demo\n\n/**\n * The lab's job with aligned barriers and a transactional sink: two sources of 50 card records each, a keyed\n * counter, a checkpoint every 20 virtual ms. It crashes at 160 ms and restarts from the last completed checkpoint.\n */\nfun main() {\n    val inputs = listOf(List(50) { \"card-${it % 3 + 1}\" }, List(50) { \"card-${it % 2 + 2}\" })\n    val job = Job(inputs, aligned = true, sink = { TransactionalSink(it) }, seed = 1).run(crashAt = 160)\n    println(\"checkpoint  source offsets  counter state                          records counted\")\n    for (s in job.completed) {\n        println(\"%-11d %-15s %-38s %d\".format(s.id, s.offsets, s.counts.toSortedMap(), s.counts.values.sum()))\n    }\n    println(\"crashed at 160 ms; restarted from checkpoint ${job.restoredFrom}\")\n    println(\"finished at ${job.now} ms: ${job.external.size} updates written, ${job.duplicates()} duplicates\")\n    println(\"final counts ${job.finalCounts().toSortedMap()}, truth ${job.truth().toSortedMap()}\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.stream.l07.demo.SnapshotDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/stream/l07/demo/SnapshotDemo.kt"
+        },
+        "expect": "```text\ncheckpoint  source offsets  counter state                          records counted\n1           [4, 5]          {card-1=2, card-2=4, card-3=3}         9\n2           [9, 7]          {card-1=3, card-2=7, card-3=6}         16\n4           [9, 7]          {card-1=3, card-2=7, card-3=6}         16\n5           [14, 12]        {card-1=5, card-2=11, card-3=10}       26\n6           [28, 32]        {card-1=10, card-2=25, card-3=25}      60\n7           [50, 50]        {card-1=17, card-2=42, card-3=41}      100\ncrashed at 160 ms; restarted from checkpoint 2\nfinished at 424 ms: 100 updates written, 0 duplicates\nfinal counts {card-1=17, card-2=42, card-3=41}, truth {card-1=17, card-2=42, card-3=41}\n```\nIn every checkpoint the records counted equal the sum of the offsets (4 + 5 = 9, 9 + 7 = 16, ...): the state holds exactly the records before the barriers. Checkpoint 3 was in flight at 160 ms and died with the job. The job restarted from checkpoint 2, and checkpoint 4 began at once, before the sources had moved, so it saved the same position. Checkpoint 7 is the final one at the end of the input. The run is deterministic: the same seed gives the same lines on any machine."
+      },
+      "refs": [
+        {
+          "title": "Chandy and Lamport, Distributed Snapshots (ACM TOCS, 1985)",
+          "url": "https://www.microsoft.com/en-us/research/publication/distributed-snapshots-determining-global-states-distributed-system/",
+          "kind": "read"
+        },
+        {
+          "title": "Carbone et al., Lightweight Asynchronous Snapshots for Distributed Dataflows (2015)",
+          "url": "https://arxiv.org/abs/1506.08603",
+          "kind": "read"
+        },
+        {
+          "title": "Flink 2.3: stateful stream processing, checkpoints and barriers",
+          "url": "https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Alignment costs time, and skipping it costs correctness",
+      "body": "Alignment isn't free. While the counter waits for barrier n on the slow input, the fast input sits blocked, and its records pile up in the channel. In the next Try-it, inputs spent about 68 virtual ms per run blocked by alignment. In a real job that's backpressure: under load a barrier queues behind megabytes of buffered records, checkpoints take minutes, and they can time out.\n\nThere are two ways around it, and they're very different.\n\n**Skip alignment.** Flink's `AT_LEAST_ONCE` checkpointing mode keeps reading every input after a barrier arrives and snapshots when the last barrier is in. The snapshot then counts records from after the barrier on the fast input, but the saved offset still points before them, so a restore replays them and counts them again. In the Try-it, 152 of 178 snapshots taken without alignment were inconsistent, and 23 of 30 crashed runs ended with counts that were too high. Flink notes one exception: a pipeline of only `map`, `flatMap` and `filter` has no operator with several inputs, so nothing needs aligning and it stays exactly-once.\n\n**Unaligned checkpoints.** Here the barrier jumps ahead of the records buffered in the channel, and the operator saves those overtaken records as part of the snapshot. That is literally Chandy and Lamport's channel state, the part alignment existed to avoid. The checkpoint finishes quickly even under heavy backpressure, and it stays exactly-once, because a restore replays the saved in-flight records before reading on. The cost is size: every snapshot carries in-flight data too, so it writes more and restores more. Savepoints, the snapshots you take by hand before an upgrade, are always aligned.\n\nOne default catches people out: **checkpointing in Flink is off** until you set an interval (`execution.checkpointing.interval`). A job without it has no snapshot to restore, so a restart begins with empty state. Kafka Streams has no barriers at all; it gets the same effect from transactions, as the next section shows.",
+      "try": {
+        "title": "Turn alignment off",
+        "minutes": 3,
+        "steps": [
+          "Run `AlignmentDemo`. It runs the same job over 30 seeds, each one a different interleaving, with alignment on and off. Every run crashes at 160 ms.",
+          "Predict before you read: with alignment off, will every snapshot be inconsistent? Will every crashed run overcount?"
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "AlignmentDemo.kt",
+          "src": "package sfz.stream.l07.demo\n\n/**\n * The same job, with and without barrier alignment, over 30 seeds (30 different interleavings), each crashing at\n * 160 ms. Counts snapshots that hold records past their own offsets, runs whose final counts are too high, and the\n * time inputs spent blocked while the counter aligned.\n */\nfun main() {\n    val inputs = listOf(List(50) { \"card-${it % 3 + 1}\" }, List(50) { \"card-${it % 2 + 2}\" })\n    println(\"alignment  snapshots  inconsistent  runs overcounting  blocked ms per run\")\n    for (aligned in listOf(true, false)) {\n        var snapshots = 0\n        var inconsistent = 0\n        var overcounting = 0\n        var blocked = 0L\n        for (seed in 1L..30) {\n            val job = Job(inputs, aligned, sink = { AppendSink(it) }, seed = seed).run(crashAt = 160)\n            snapshots += job.completed.size\n            inconsistent += job.completed.count { it.counts.values.sum() != it.offsets.sum() }\n            if (job.finalCounts().any { (k, n) -> n > job.truth().getValue(k) }) overcounting++\n            blocked += job.blockedMs\n        }\n        println(\"%-10s %-10d %-13d %-18s %.1f\".format(if (aligned) \"on\" else \"off\", snapshots, inconsistent,\n            \"$overcounting of 30\", blocked / 30.0))\n    }\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.stream.l07.demo.AlignmentDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/stream/l07/demo/AlignmentDemo.kt"
+        },
+        "expect": "```text\nalignment  snapshots  inconsistent  runs overcounting  blocked ms per run\non         195        0             0 of 30            68.5\noff        178        152           23 of 30           0.0\n```\nWith alignment, no snapshot ever counted a record past its offsets, at the cost of about 68 ms per run with an input blocked. Without it, nothing blocks, but most snapshots counted records the sources will send again. Not every crash overcounts: if the run restores from a snapshot that happened to be consistent, or crashes before any checkpoint, the replay is clean. That's why the bug survives testing."
+      },
+      "refs": [
+        {
+          "title": "Flink 2.3: stateful stream processing, checkpoints and barriers",
+          "url": "https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Exactly-once ends at the sink: idempotent and transactional writes",
+      "body": "A consistent snapshot makes the **state** exactly-once. The output is another matter. Between checkpoint n and the crash, the sink already wrote updates to the outside world. After the restore, the job replays those records and writes them again. In the next Try-it, aligned checkpoints with a plain append sink end with the right counts, and still 318 of the 3,318 updates written are duplicates.\n\nTwo fixes, both from earlier lessons.\n\nAn **idempotent sink** makes the second write harmless. Upsert by key, so a card's count is overwritten with the same value, or store the input offset or an event id next to the value and skip what's already there. (Storm's Trident did offsets; the Messaging track's consumer lesson did idempotency keys.) It assumes the replay is deterministic: same records, same order, same results. Segment's deduplication service shows the scale this can reach: about 0.6% of its events were duplicates, mostly mobile clients retrying, and after three months its RocksDB of seen message ids held about 60 billion keys, 1.5 TB. That's the cost of remembering.\n\nA **transactional sink** makes the output part of the checkpoint, with two-phase commit (the Transactions track's lesson on atomic commit). It writes each checkpoint's output into an open transaction. On barrier n it pre-commits, flushing so the commit can't fail later, and acknowledges. When the coordinator says checkpoint n is complete, it commits. Flink's Kafka sink in exactly-once mode works this way with Kafka transactions, so readers with `read_committed` see the output only after each checkpoint, and the latency of every result grows to the checkpoint interval. In the Try-it: 3,000 updates for 3,000 records, no duplicates. Kafka Streams gets there without barriers (the Messaging track's exactly-once lesson): each commit interval's output, state changelog writes and input offsets go into one Kafka transaction, so all three commit together or not at all (lesson 5).\n\nWhat it costs, measured. Confluent's 2017 benchmark: with 1 KB messages and 100 ms transactions, the transactional producer lost about 3% throughput against `acks=all`. Kafka Streams with exactly-once at a 100 ms commit interval lost 15 to 30%, and almost nothing at 30 seconds.\n\nThe edge stays where it was. The counter in the Try-it sends an email when a card's count reaches 10. Every setup sent 135 or 150 emails for 90 crossings, because a side effect inside the job, an email, an HTTP call to the card issuer, a write to a database other than the sink, runs again on replay. Kafka can't join a database transaction either: KIP-939 (two-phase commit with Kafka as a participant) was accepted, but its API isn't in Kafka 4.4. Use the outbox (lesson 2), or an idempotency key the other side checks.",
+      "try": {
+        "title": "Four setups, one crash",
+        "minutes": 4,
+        "steps": [
+          "Run `SinkDemo`. It runs every combination of alignment on or off and an append or transactional sink, 30 seeds each, every run crashing at 160 ms. The counter also sends an email whenever a card's count reaches 10.",
+          "Predict which row has 0 duplicates and right counts. Then predict whether any row sends exactly 90 emails."
+        ],
+        "code": {
+          "lang": "kotlin",
+          "title": "SinkDemo.kt",
+          "src": "package sfz.stream.l07.demo\n\n/**\n * Four setups, 30 seeds each, every run crashing at 160 ms. For each: the updates the outside world received, how\n * many of them were duplicates, the runs that ended with wrong counts, and the alert emails sent. The counter sends\n * an email (a side effect outside the job) whenever a card's count reaches 10. Three cards, so 3 emails is right.\n */\nfun main() {\n    val inputs = listOf(List(50) { \"card-${it % 3 + 1}\" }, List(50) { \"card-${it % 2 + 2}\" })\n    val sinks = listOf(\"append\" to { out: MutableList<Update> -> AppendSink(out) as Sink },\n        \"transactional\" to { out: MutableList<Update> -> TransactionalSink(out) as Sink })\n    println(\"alignment  sink           updates written  duplicates  runs with wrong counts  emails sent\")\n    for (aligned in listOf(true, false)) for ((name, sink) in sinks) {\n        var written = 0\n        var duplicates = 0\n        var wrong = 0\n        var emails = 0\n        for (seed in 1L..30) {\n            val job = Job(inputs, aligned, sink, seed = seed, sideEffect = { if (it.count == 10) emails++ }).run(crashAt = 160)\n            written += job.external.size\n            duplicates += job.duplicates()\n            if (job.finalCounts() != job.truth()) wrong++\n        }\n        println(\"%-10s %-14s %-16s %-11d %-23s %d\".format(if (aligned) \"on\" else \"off\", name, \"$written (of 3000)\",\n            duplicates, \"$wrong of 30\", emails))\n    }\n    println(\"(30 runs: 3,000 records, and 90 emails would be one per card per run)\")\n}\n",
+          "run": "./gradlew :sim:demo -Pmain=sfz.stream.l07.demo.SinkDemoKt",
+          "file": "labs/sim/src/demo/kotlin/sfz/stream/l07/demo/SinkDemo.kt"
+        },
+        "expect": "```text\nalignment  sink           updates written  duplicates  runs with wrong counts  emails sent\non         append         3318 (of 3000)   318         0 of 30                 135\non         transactional  3000 (of 3000)   0           0 of 30                 135\noff        append         3460 (of 3000)   460         23 of 30                150\noff        transactional  3075 (of 3000)   75          23 of 30                150\n(30 runs: 3,000 records, and 90 emails would be one per card per run)\n```\nOnly alignment plus a transactional sink is exactly-once end to end. Alignment alone makes the state right (no wrong counts) while the append sink writes 318 duplicates. A transactional sink can't save a job without alignment: the snapshot already counted records that the restore replays, and their updates are committed in the next checkpoint's transaction. And no setup sends 90 emails. A side effect inside the job repeats whenever its record is replayed."
+      },
+      "refs": [
+        {
+          "title": "Confluent: Exactly-once semantics are possible, here's how Kafka does it",
+          "url": "https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/",
+          "kind": "read"
+        },
+        {
+          "title": "Segment: delivering billions of messages exactly once",
+          "url": "https://www.twilio.com/en-us/blog/insights/exactly-once-delivery/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Where the state lives decides how long recovery takes",
+      "body": "Correct recovery isn't fast recovery. After a crash, every engine has to get its state back before it can process again, and how long that takes depends on where the state lives.\n\nKafka Streams keeps state in local RocksDB, backed by a compacted changelog topic (lesson 5). A task that moves to an instance with an empty disk replays its changelog first. At an effective 100 MB/s, a 50 GB store takes about 500 seconds, more than 8 minutes, and the task's partitions wait. A standby replica (`num.standby.replicas=1`) keeps a second copy warm by reading the changelog all the time, so a failover replays only the last few seconds. It costs a second copy on disk and a second reader on the brokers.\n\nFlink 1.x keeps large state on local disk too, in RocksDB, and copies it to durable storage such as S3 at each checkpoint, often incrementally. Recovering or rescaling downloads it back, which for terabytes of state is the outage. Flink 2.0 (March 2025) added **disaggregated state**: the ForSt backend keeps the primary copy in a remote file system and uses local disk as a cache, and asynchronous execution hides the remote reads. A checkpoint then has little to upload and a restore has little to download. The VLDB 2025 paper on it reports checkpoints up to 94% shorter, recovery after a failure or a rescale up to 49 times faster, and up to 50% lower cost. Those are the authors' measurements on their workloads, so read them as the best case.\n\nState that only covers a short window needs neither. If a job keeps the last 5 minutes, replaying 5 minutes of input rebuilds it, and checkpointing it buys little.",
+      "try": {
+        "title": "Size your recovery",
+        "minutes": 3,
+        "steps": [
+          "A fraud-velocity app in Kafka Streams keeps 40 GB of window state per task. Its changelog restores at about 100 MB/s. How long is a task down after it moves to a fresh pod?",
+          "Now add `num.standby.replicas=1`. The standby lags the active copy by about 2 seconds, and the app writes about 6,000 store updates a second to that task's changelog. Roughly how many records does a failover replay?",
+          "What does the standby cost you, in disk and in broker traffic?"
+        ],
+        "expect": "40 GB at 100 MB/s is about 400 seconds, nearly 7 minutes with that task's partitions stalled. With a warm standby the new active copy replays only what it hadn't read yet: about 2 s × 6,000 = 12,000 records, well under a second. The price is a second 40 GB copy on another instance's disk, and a second consumer reading every changelog partition from the brokers all the time. (Numbers are illustrative; measure your own restore rate with the restore listener lesson 5's demo used.)"
+      },
+      "refs": [
+        {
+          "title": "Mei et al., Disaggregated State Management in Apache Flink 2.0 (PVLDB 18, 2025)",
+          "url": "https://www.vldb.org/pvldb/vol18/p4846-mei.pdf",
+          "kind": "read"
+        }
+      ]
+    }
+  ],
+  "analogy": "A bank wants the total of all its money at one instant, but cash is always moving between branches by courier. The head office sends each branch a sealed audit envelope by the same couriers. A branch that receives its first envelope counts its vault right then and passes envelopes on along its routes. For every other route into the branch, it also adds up the cash that arrives before that route's envelope, because that money left the other branch before the other branch counted. Vaults plus cash in transit give a total that was true at one consistent moment, and no branch ever closed. That's Chandy and Lamport. Flink's alignment is a branch that stops accepting couriers on a route whose envelope already came, so it never has to count cash in transit. The analogy breaks at the restore: a bank never rewinds, while a stream job goes back to the audit and processes everything since then a second time.",
+  "in_your_world": "Your Kafka Streams services already use the transaction approach: with `processing.guarantee=exactly_once_v2`, each commit's output, changelog writes and offsets commit together, and a crash replays at most one commit interval. The edge is where your payments code lives. A `peek` or `foreach` that calls the card issuer, posts to the ledger in Oracle, or sends a webhook runs again on replay, exactly-once or not. Move those calls behind the sink: write a command to an outbox topic, and let a consumer call the issuer with an idempotency key, the same pattern your Temporal activities follow, since an activity is also retried at least once. For recovery time, size standby replicas from the restore arithmetic, not from a default. If you run Flink, turn checkpointing on explicitly; a job without it restarts with empty state.",
+  "mistake": "Believing `exactly_once_v2` or Flink's exactly-once mode covers everything the job does. People read \"exactly-once\" as \"each record is processed once\", when it means \"the effects inside the engine are visible once\". The records are processed again after every crash, so an HTTP call, an email or a database write made from inside a `map`, `peek` or `foreach` happens again, and tests never show it because test harnesses don't crash. The fix: keep processing side-effect free, send every external action through the sink as a record (an outbox topic, or a transactional or idempotent sink), and make the receiver deduplicate with an idempotency key carried in that record.",
+  "compare": {
+    "title": "One crash, two engines",
+    "a": {
+      "label": "Flink: barriers and a 2PC sink",
+      "lang": "text",
+      "src": "every 10 s     sources record offsets, inject barrier n\n               operators align, snapshot state to S3\n               sink pre-commits its Kafka transaction, acks n\ncheckpoint n   coordinator marks n complete\n               sink commits: output n becomes visible\ncrash          in-flight state, buffers, open transaction lost\nrestore        all operators load checkpoint n\n               sources rewind to n's offsets, replay\nduplicates     none in the sink's output; side effects repeat"
+    },
+    "b": {
+      "label": "Kafka Streams: transactions",
+      "lang": "text",
+      "src": "every 100 ms   (commit.interval.ms under exactly_once_v2)\n               output records, changelog writes and input\n               offsets go into one Kafka transaction\n               commit: all three visible together\ncrash          open transaction aborted\nrestore        store rebuilt from the changelog (committed\n               records only), input read from committed offset\nduplicates     none for read_committed readers;\n               side effects repeat"
+    },
+    "note": "Both make state, position and output agree at a point, then replay from it. Flink coordinates the whole graph with barriers and keeps state snapshots in a file system, and its sink commits once per checkpoint, so output latency is the checkpoint interval. Kafka Streams has no global coordinator: each task commits its own transaction, and the state's durable copy is the changelog topic itself, which is why it can commit every 100 ms but recovers by replaying that changelog. Neither can take back an email."
+  },
+  "worked": {
+    "title": "Make a Kafka Streams payment counter crash-safe end to end",
+    "steps": [
+      {
+        "say": "Turn on exactly-once. Each stream thread gets a transactional producer, and the commit interval drops to 100 ms by default. On a dev cluster with one broker, lower the transaction log's replication factor and min ISR to 1; in production, keep 3 brokers.",
+        "code": "val props = Properties().apply {\n    put(StreamsConfig.APPLICATION_ID_CONFIG, \"card-velocity\")\n    put(StreamsConfig.PROCESSING_GUARANTEE_CONFIG, StreamsConfig.EXACTLY_ONCE_V2)  // output + changelog + offsets, one txn\n    put(StreamsConfig.NUM_STANDBY_REPLICAS_CONFIG, 1)                            // a warm copy for fast failover\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Make every reader of the output read committed data only. A consumer at the default `read_uncommitted` sees records from transactions that later abort, so it sees exactly the duplicates the transaction was meant to hide.",
+        "code": "put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, \"read_committed\")   // in every consumer of card-alerts",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Find the side effects in the topology and take them out. This `foreach` calls the issuer to block a card: it runs again on every replay. Instead, emit a command record with an idempotency key built from the input record's identity, and let a separate consumer make the call.",
+        "code": "// before: runs again after every crash\nalerts.foreach { card, _ -> issuer.block(card) }\n\n// after: the command is output, so it commits with the transaction\nalerts.mapValues { card, alert -> BlockCommand(card, idempotencyKey = \"block-$card-${alert.windowStart}\") }\n    .to(\"issuer-commands\")",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Make the consumer of `issuer-commands` idempotent too. It reads committed commands only, and the issuer API dedupes on the key, so a command delivered twice (the consumer itself is at-least-once) blocks the card once.",
+        "code": "for (rec in consumer.poll(Duration.ofMillis(500))) {\n    issuer.block(rec.value().card, idempotencyKey = rec.value().idempotencyKey)   // safe to repeat\n}\nconsumer.commitSync()",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Check the recovery budget. With 20 GB of window state per task and a restore rate near 100 MB/s, a task without a standby is down for about 200 s after it moves. The standby from step 1 cuts that to the few seconds it lags behind.",
+        "code": "",
+        "lang": ""
+      }
+    ]
+  },
+  "lab": {
+    "title": "Barrier snapshots, a crash and a restore",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/stream/l07/Checkpointing.kt",
+      "labs/sim/src/main/kotlin/sfz/stream/l07/Dataflow.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.stream.l07.*'",
+    "steps": [
+      "Read `Dataflow.kt` (given): two sources, three channels, the counter, a sink and the job that runs them on virtual time with a seeded random scheduler. Find where it triggers a checkpoint, where it completes one, and what a crash keeps.",
+      "Run the tests from the `labs` folder. All nine fail on `TODO`s in `Checkpointing.kt`.",
+      "Write `CountingTask.canTake` and `onItem`: count records and emit an `Update`; on a barrier, mark the input, and once every input has delivered it, call `onSnapshot` with the counts, clear the marks and return the barrier. With `aligned`, an input that delivered the barrier can't be taken from until then.",
+      "Write `TransactionalSink`: updates go into the open transaction; a barrier moves it to `prepared` under the barrier's id and returns the id; `onCheckpointComplete(id)` appends every prepared transaction up to `id` to the external list.",
+      "Run the tests again. Read the two tests that compare setups: which one shows the state is exactly-once while the output isn't?"
+    ],
+    "hints": [
+      "`canTake` is one line: `!aligned || !seen[input]`.",
+      "Snapshot before you return the barrier, and clear `seen` so the next checkpoint starts fresh. The job copies the counts you pass, so passing `counts` itself is fine.",
+      "`prepared` is a sorted map: `prepared.headMap(id + 1)` is every checkpoint up to `id`. Append its values in order, then `clear()` that view.",
+      "If `an aligned snapshot counts exactly the records before its offsets` fails, you're probably snapshotting on the first barrier instead of the last, or taking records from a blocked input."
+    ],
+    "done_when": "All 9 tests in `CheckpointingTest` pass."
+  },
+  "drill": {
+    "title": "Barrier alignment from memory",
+    "minutes": 5,
+    "prompt": "Write, from memory, the barrier handling of an operator with two inputs: what it does with a record, with the first barrier n, and with the second. Then say in one line each what changes in Flink's at-least-once mode and with unaligned checkpoints.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun canTake(input: Int) = !aligned || !seen[input]        // aligned: block an input once its barrier arrived\n\nfun onItem(input: Int, item: Item): List<Item> = when (item) {\n    is Record -> listOf(process(item))                     // normal work\n    is Barrier -> {\n        seen[input] = true\n        if (seen.all { it }) {                              // barrier n on every input\n            snapshot(item.id, state)                        // state = exactly the records before the barriers\n            seen.fill(false)\n            listOf(item)                                    // forward one barrier downstream\n        } else emptyList()                                  // wait for the other input\n    }\n    else -> error(\"unexpected $item\")\n}\n\n// At-least-once mode: canTake is always true, so the snapshot may include records from after\n// the barrier on the fast input; a restore replays and counts them again.\n// Unaligned: the barrier overtakes buffered records, which are saved in the snapshot as channel\n// state and replayed first on restore; exactly-once, but bigger snapshots."
+    }
+  },
+  "recap": [
+    "Exactly-once in a stream processor means effectively once: records are processed again after a crash, but their effects on state and on the committed output appear once.",
+    "Micro-batches make each slice of the stream a small batch job whose output and end offset become durable together. Simple, with a latency floor of about a batch.",
+    "Barrier snapshots (Chandy and Lamport, adapted by Flink) save every operator's state and every source's offset at a consistent cut. Alignment blocks an input whose barrier arrived first, so no record in flight needs saving.",
+    "Skipping alignment gives at-least-once state. Unaligned checkpoints stay exactly-once by saving the overtaken records, at the cost of bigger snapshots.",
+    "Output needs an idempotent sink or a transactional one that commits on checkpoint completion; Kafka Streams commits output, changelog and offsets in one transaction. Side effects inside the job repeat on replay.",
+    "Recovery time follows where the state lives: changelog replay in Kafka Streams (standbys help), snapshot downloads in Flink 1.x, remote primary state in Flink 2.x."
+  ],
+  "quiz": [
+    {
+      "q": "A Spark Structured Streaming job crashes in the middle of micro-batch 41. What happens to the rows batch 41 had produced so far?",
+      "options": [
+        "They're already visible, and the rerun writes them again",
+        "They were never made visible; the restart runs batch 41 again from the same offsets",
+        "They're kept, and the rerun skips the records it already processed",
+        "They're lost, along with batch 41's input"
+      ],
+      "answer": 1,
+      "why": "A micro-batch's output and its end offset become durable together (Spark writes the batch's offsets first, and its commit entry after the sink has written). A crash before that leaves the batch uncommitted, and the restart reruns it from the same offset range. The input is still in Kafka, so nothing is lost. Whether the rerun can duplicate rows depends on the sink being idempotent, which lesson 8 shows."
+    },
+    {
+      "q": "In an aligned checkpoint, barrier 7 has arrived on input A of a join operator but not yet on input B. What does the operator do with the next record on input A?",
+      "options": [
+        "Leaves it in input A's channel until barrier 7 arrives on input B",
+        "Processes it at once, like any record",
+        "Drops it; the source will send it again",
+        "Saves it into checkpoint 7 as channel state"
+      ],
+      "answer": 0,
+      "why": "That record comes after barrier 7 on A, so it belongs to checkpoint 8. Processing it now would put it in checkpoint 7's state while A's saved offset still points before it, and a restore would count it twice. Saving it as channel state is what unaligned checkpoints do instead of blocking."
+    },
+    {
+      "q": "A team switches a Flink job with many two-input operators to the `AT_LEAST_ONCE` checkpointing mode to cut checkpoint time under backpressure. What should they expect after a crash?",
+      "options": [
+        "Nothing changes: the sink is transactional, so output is still exactly-once",
+        "Lost records, because offsets are saved before the state",
+        "Slower recovery, because more state must be read",
+        "Some records counted twice in the restored state, and so in the output"
+      ],
+      "answer": 3,
+      "why": "Without alignment, a snapshot can include records from after the barrier on the faster input while the saved offset still points before them. The restore replays those records into a state that already holds them. A transactional sink commits whatever the job computes, so the double count reaches the output too (the Try-it's 23 of 30 runs). Unaligned checkpoints would cut checkpoint time and stay exactly-once."
+    },
+    {
+      "q": "A Kafka Streams app runs with `exactly_once_v2`. Its topology writes alerts to a topic and, in a `peek`, posts each alert to a Slack webhook. After a crash and restore, what do the alert topic and Slack show?",
+      "options": [
+        "Both show each alert once",
+        "Both can show some alerts twice",
+        "The topic shows each alert once to `read_committed` readers; Slack can show some twice",
+        "The topic can show duplicates; Slack shows each once"
+      ],
+      "answer": 2,
+      "why": "The output records, changelog writes and offsets are in one transaction, so a crash aborts the open transaction and committed readers never see its records. The records of that interval are processed again, though, and the webhook in `peek` fires again for them. Only effects that go through the transaction are exactly-once."
+    },
+    {
+      "q": "From lesson 5: a Kafka Streams task with a 30 GB store moves to a new instance with an empty disk, and there are no standby replicas. What happens before it processes the next record?",
+      "options": [
+        "It reads the input topic from offset 0 to rebuild the store",
+        "It replays the store's changelog topic into a new local store, about 300 s at 100 MB/s, then continues from the committed offset",
+        "It downloads the latest checkpoint of the store from object storage",
+        "Nothing: the store is rebuilt lazily, key by key, as records arrive"
+      ],
+      "answer": 1,
+      "why": "Kafka Streams' durable copy of a store is its compacted changelog topic. A new owner of the task replays it before processing, and the time grows with the store: 30 GB at about 100 MB/s is 300 s. Reading the input from 0 would be far slower and fails once retention has deleted old records. Downloading snapshots from object storage is how Flink restores, not Kafka Streams.",
+      "from": "stream-05"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does \"exactly-once\" promise in a stream processor?",
+      "back": "Effectively once: after a crash, records are processed again, but their effects on state and on committed output appear once."
+    },
+    {
+      "front": "What makes a snapshot of a dataflow consistent?",
+      "back": "Every record counted in the operators' state comes before the saved source offsets, and none after them."
+    },
+    {
+      "front": "What does barrier alignment do?",
+      "back": "When barrier n arrives on one input of a multi-input operator, that input is blocked until barrier n arrives on all inputs; then the operator snapshots and forwards the barrier."
+    },
+    {
+      "front": "Unaligned checkpoint vs at-least-once mode?",
+      "back": "Unaligned: barriers overtake buffered records, which are saved in the snapshot, so it stays exactly-once with bigger snapshots. At-least-once: no alignment and nothing saved, so a restore double-counts."
+    },
+    {
+      "front": "How does a transactional (two-phase commit) sink work with checkpoints?",
+      "back": "It writes into an open transaction, pre-commits on barrier n, and commits when checkpoint n completes. Output appears once per checkpoint."
+    },
+    {
+      "front": "Which effects stay at-least-once even in an exactly-once job?",
+      "back": "Side effects inside the job: emails, HTTP calls, writes to systems other than the sink. They run again when records are replayed."
+    },
+    {
+      "front": "What did Flink 2.0's disaggregated state change?",
+      "back": "The primary copy of state lives in a remote file system, with local disk as a cache, so checkpoints and restores move little data (up to 94% shorter checkpoints, 49x faster recovery in the VLDB 2025 paper)."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Effectively once",
+      "plain": "Each record's effect on the output appears once, even though the record may be processed more than once."
+    },
+    {
+      "term": "Micro-batch",
+      "plain": "A small slice of the stream processed as one batch job, whose output and end offset are made durable together."
+    },
+    {
+      "term": "Checkpoint",
+      "plain": "A saved, consistent copy of every operator's state and every source's offset, used to restart after a crash."
+    },
+    {
+      "term": "Barrier",
+      "plain": "A marker that sources inject into the stream to split it into before and after a checkpoint."
+    },
+    {
+      "term": "Alignment",
+      "plain": "Blocking an input whose barrier arrived first until the barrier arrives on every input."
+    },
+    {
+      "term": "Unaligned checkpoint",
+      "plain": "A checkpoint whose barriers overtake buffered records and save them as part of the snapshot."
+    },
+    {
+      "term": "Transactional sink",
+      "plain": "A sink that commits each checkpoint's output only when the checkpoint is complete (two-phase commit)."
+    },
+    {
+      "term": "Standby replica",
+      "plain": "A warm copy of a Kafka Streams store kept up to date from its changelog, to cut failover time."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A colleague asks: \"If Flink snapshots every operator separately, at slightly different times, how can the snapshot ever be consistent?\" Explain barriers and alignment, and what goes wrong without alignment.",
+    "answer": "The snapshot isn't taken at one instant of wall-clock time. It's taken at one position in the data. Each source injects barrier n into its stream and writes down its offset at that point, and because barriers never overtake records, the barrier splits every stream into before and after the checkpoint. Each operator snapshots when the barrier reaches it, so its state contains exactly the records before the barrier. An operator with two inputs has to wait: when barrier n arrives on one input, it stops reading that input until barrier n has arrived on the other, then snapshots and forwards the barrier. Then every operator's state matches the sources' offsets, even though they snapshot at different times. Without alignment, the operator keeps reading the fast input after its barrier, so its snapshot counts records whose source offset was saved before them, and after a restore those records are replayed and counted twice. Unaligned checkpoints fix that differently: they save the records the barrier overtook as part of the snapshot."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Cycles.** Asynchronous barrier snapshotting saves only operator state on acyclic graphs, because alignment empties the channels. On a dataflow with a cycle (an iteration feeding back), the paper logs the records on the back edge during the snapshot, which is Chandy and Lamport's channel state again.\n\n**Other engines.** RisingWave also moves barriers through its dataflow and offers exactly-once sinks coordinated with them. Materialize assigns every update a logical timestamp and answers queries at a consistent timestamp. Spark's micro-batches write `offsets/` before a batch and `commits/` after it, and lesson 8 shows the replay. Spark 4.3's real-time mode keeps exactly-once for state but its built-in Kafka sink is at-least-once.\n\n**Transactions are only as good as their protocol.** In 2024 Jepsen, testing a Kafka-compatible system, found aborted reads, lost writes and torn transactions in Kafka's own transaction protocol (KAFKA-17754, since folded into a ticket about duplicates under `exactly_once_v2`). Treat the guarantee as something to test in your own failure drills, not only to configure.\n\n**The book's version.** *Designing Data-Intensive Applications*, 2nd edition, chapter 12, covers micro-batching, checkpointing, atomic commit, idempotence and rebuilding state after a failure; read it for the framing, and the Flink and Chandy-Lamport papers for the mechanism."
+  },
+  "sources": [
+    {
+      "title": "Chandy and Lamport, Distributed Snapshots: Determining Global States of a Distributed System (1985)",
+      "url": "https://www.microsoft.com/en-us/research/publication/distributed-snapshots-determining-global-states-distributed-system/"
+    },
+    {
+      "title": "Carbone et al., Lightweight Asynchronous Snapshots for Distributed Dataflows (2015)",
+      "url": "https://arxiv.org/abs/1506.08603"
+    },
+    {
+      "title": "Flink 2.3: stateful stream processing (checkpoints, alignment, unaligned checkpoints)",
+      "url": "https://nightlies.apache.org/flink/flink-docs-release-2.3/docs/concepts/stateful-stream-processing/"
+    },
+    {
+      "title": "Mei et al., Disaggregated State Management in Apache Flink 2.0 (PVLDB 18, 2025)",
+      "url": "https://www.vldb.org/pvldb/vol18/p4846-mei.pdf"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 12",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}

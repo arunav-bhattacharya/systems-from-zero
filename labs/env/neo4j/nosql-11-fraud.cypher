@@ -1,4 +1,4 @@
-// The fraud graph for lesson nosql-11: accounts, the devices and phones they use, and transfers.
+// The fraud graph for lesson model-08: accounts, the devices and phones they use, and transfers.
 // Load: docker compose -f env/neo4j.yml exec neo4j cypher-shell -f /sfz/nosql-11-fraud.cypher
 MATCH (n) DETACH DELETE n;
 DROP CONSTRAINT account_id IF EXISTS;

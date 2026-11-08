@@ -1,0 +1,427 @@
+{
+  "id": "dist-04",
+  "title": "Process pauses: when your own program stops the world",
+  "minutes": 40,
+  "goal": "By the end you can name what can stop a running process for seconds without telling it, show why a lease holder that checks its lease can still write after the lease ran out, and measure how far checks inside the holder reduce that damage and why they can't remove it.",
+  "warmup": {
+    "q": "Worker A holds a 2-second lease on a merchant's ledger and renews it whenever less than 1 second is left. Before each update it checks, on the monotonic clock, that the lease hasn't run out. Can one of A's updates land after its lease ran out?",
+    "options": [
+      "No: a monotonic clock can't jump, so the check is exact",
+      "No: renewing with a full second to spare covers any pause",
+      "Yes: if A's thread stops after the check, for longer than what is left of the lease",
+      "Only if A's clock drifts away from the lease service's clock"
+    ],
+    "answer": 2,
+    "why": "The check was true when it ran, and nothing stops the thread from being frozen right after it, by a collector, a hypervisor or a signal. When it resumes, it carries on with the update as if no time had passed. The monotonic clock does measure the gap, but only when the code next reads it, after the update has gone. Renewing early protects only against pauses shorter than what is left, 1 to 2 seconds here. Clock drift is lesson 3's problem; this one happens with perfect clocks."
+  },
+  "sections": [
+    {
+      "h": "A lease holder can check its lease and still write after it ran out",
+      "body": "Merchant M-0042's ledger takes updates from one worker at a time. Two workers, A and B, run the same code so that one can take over if the other dies. They agree on who may write with a **lease**: a lock that runs out on its own. A lease service grants A the lease for 2 seconds, and A renews it whenever less than 1 second is left. If A crashes, the renewals stop, the lease runs out, and the service grants it to B. Nobody has to decide whether A is dead, which lesson 2 showed nobody can know for sure. (Lesson 5 builds leases on Redis, etcd and ZooKeeper. Here the service is just a counter and a deadline.)\n\nA's loop runs every 100 ms:\n\n```kotlin\nval clock = TimeSource.Monotonic\nvar leaseEnd = clock.markNow() + 2.seconds           // a point on the monotonic clock (lesson 3)\n\nwhile (running) {\n    if (leaseEnd - clock.markNow() < 1.seconds) leaseEnd = renew()   // renew() returns the new end\n    if (leaseEnd.hasNotPassedNow()) {                // the check\n        val update = buildUpdate()                   // about 60 ms of work\n        ledger.write(update)                         // the act\n    }\n    Thread.sleep(100)\n}\n```\n\nIt measures the lease on a monotonic clock, as lesson 3 said it should, so no NTP step can fool it. It still has a bug, and the bug has nothing to do with clocks. Here is one run from the lab's simulator. At 1,500 ms A checks: 1.6 seconds left. It starts building the update. At 1,520 ms the JVM stops A's thread for 3 seconds. Lease 1 runs out at 3,105 ms. The service grants lease 2 to B at 3,155 ms, and B's updates start landing. At 4,520 ms A's thread runs again. From inside the thread nothing happened: it was in the middle of `buildUpdate()`, so it finishes and writes. The ledger applies A's update at 4,530 ms, about 1.4 seconds after A's lease ran out, on top of 13 updates from B.\n\nThe check was right when it ran. Then the thread stopped between the check and the act, and a thread can't notice its own pause. The world kept moving: the lease ran out on time and a new holder took over. A woke up still acting on an answer it got 3 seconds earlier. That is the model for this lesson. **Seen from inside, a program is one continuous run of instructions. Seen from outside, it can stop between any two of them, for any length of time.** Every check-then-act on a lease, a leader role or a lock has a gap between the check and the act, and a pause can land in it.\n\nChecking again just before the write makes the gap smaller, but the pause can land right after the second check too. Section 4 measures how much the extra check buys. First, what stops a process.",
+      "stepper": {
+        "title": "A checks its lease, stops for 3 seconds, and writes anyway",
+        "intro": "The run from the Try it below, drawn to scale. Blue ticks on the ledger are A's updates, green ones B's.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"At 1,500 ms holder A checks its lease and finds 1.6 seconds left\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"60.0\" text-anchor=\"start\">lease service</text><text class=\"t-s t-m\" x=\"16.0\" y=\"124.0\" text-anchor=\"start\">holder A</text><text class=\"t-s t-m\" x=\"16.0\" y=\"184.0\" text-anchor=\"start\">holder B</text><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger</text><line class=\"ln\" x1=\"140.0\" y1=\"262.0\" x2=\"600.0\" y2=\"262.0\"/><line class=\"ln\" x1=\"140.0\" y1=\"258.0\" x2=\"140.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"140.0\" y=\"280.0\" text-anchor=\"middle\">1 s</text><line class=\"ln\" x1=\"255.0\" y1=\"258.0\" x2=\"255.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"255.0\" y=\"280.0\" text-anchor=\"middle\">2 s</text><line class=\"ln\" x1=\"370.0\" y1=\"258.0\" x2=\"370.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"370.0\" y=\"280.0\" text-anchor=\"middle\">3 s</text><line class=\"ln\" x1=\"485.0\" y1=\"258.0\" x2=\"485.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"485.0\" y=\"280.0\" text-anchor=\"middle\">4 s</text><line class=\"ln\" x1=\"600.0\" y1=\"258.0\" x2=\"600.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"600.0\" y=\"280.0\" text-anchor=\"middle\">5 s</text><rect class=\"box-a\" x=\"140.0\" y=\"45.0\" width=\"242.1\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"261.0\" y=\"60.0\" text-anchor=\"middle\">lease 1, holder A</text><rect class=\"box\" x=\"140.0\" y=\"111.0\" width=\"57.5\" height=\"18.0\" rx=\"8.0\"/><line class=\"ln-a\" x1=\"197.5\" y1=\"106.0\" x2=\"197.5\" y2=\"134.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"148.0\" text-anchor=\"middle\">check: 1.6 s left</text><text class=\"t-s t-m\" x=\"260.8\" y=\"184.0\" text-anchor=\"middle\">asks every 100 ms: refused</text><rect class=\"box-a\" x=\"146.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"157.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"169.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"180.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"192.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><line class=\"ln-d\" x1=\"197.5\" y1=\"30.0\" x2=\"197.5\" y2=\"248.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"22.0\" text-anchor=\"middle\">1,500 ms</text></svg>",
+            "say": "1,500 ms. A renewed at 1,100 ms, so its check finds 1.6 s left on lease 1. It starts the 60 ms of work that builds the next ledger update. B asks for the lease every 100 ms and is refused."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"A has been stopped since 1,520 ms and its lease runs out at 3,105 ms\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"60.0\" text-anchor=\"start\">lease service</text><text class=\"t-s t-m\" x=\"16.0\" y=\"124.0\" text-anchor=\"start\">holder A</text><text class=\"t-s t-m\" x=\"16.0\" y=\"184.0\" text-anchor=\"start\">holder B</text><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger</text><line class=\"ln\" x1=\"140.0\" y1=\"262.0\" x2=\"600.0\" y2=\"262.0\"/><line class=\"ln\" x1=\"140.0\" y1=\"258.0\" x2=\"140.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"140.0\" y=\"280.0\" text-anchor=\"middle\">1 s</text><line class=\"ln\" x1=\"255.0\" y1=\"258.0\" x2=\"255.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"255.0\" y=\"280.0\" text-anchor=\"middle\">2 s</text><line class=\"ln\" x1=\"370.0\" y1=\"258.0\" x2=\"370.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"370.0\" y=\"280.0\" text-anchor=\"middle\">3 s</text><line class=\"ln\" x1=\"485.0\" y1=\"258.0\" x2=\"485.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"485.0\" y=\"280.0\" text-anchor=\"middle\">4 s</text><line class=\"ln\" x1=\"600.0\" y1=\"258.0\" x2=\"600.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"600.0\" y=\"280.0\" text-anchor=\"middle\">5 s</text><rect class=\"box-dim\" x=\"140.0\" y=\"45.0\" width=\"242.1\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"261.0\" y=\"60.0\" text-anchor=\"middle\">lease 1, holder A</text><text class=\"t-s t-bad\" x=\"376.1\" y=\"88.0\" text-anchor=\"end\">lease 1 ran out at 3,105 ms</text><rect class=\"box\" x=\"140.0\" y=\"111.0\" width=\"59.8\" height=\"18.0\" rx=\"8.0\"/><line class=\"ln-a\" x1=\"197.5\" y1=\"106.0\" x2=\"197.5\" y2=\"134.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"148.0\" text-anchor=\"middle\">check: 1.6 s left</text><rect class=\"box-bad\" x=\"199.8\" y=\"109.0\" width=\"182.3\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"290.9\" y=\"124.0\" text-anchor=\"middle\">stopped</text><text class=\"t-s t-m\" x=\"260.8\" y=\"184.0\" text-anchor=\"middle\">asks every 100 ms: refused</text><rect class=\"box-a\" x=\"146.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"157.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"169.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"180.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"192.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><line class=\"ln-d\" x1=\"382.1\" y1=\"30.0\" x2=\"382.1\" y2=\"248.0\"/><text class=\"t-s t-a\" x=\"382.1\" y=\"22.0\" text-anchor=\"middle\">3,105 ms</text></svg>",
+            "say": "At 1,520 ms the JVM stops A's thread. No renewal arrives, so at 3,105 ms the service lets lease 1 run out, which is exactly its job. A can't notice: none of its code has run since 1,520 ms."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"B gets lease 2 at 3,155 ms and its first update lands at 3,320 ms\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"60.0\" text-anchor=\"start\">lease service</text><text class=\"t-s t-m\" x=\"16.0\" y=\"124.0\" text-anchor=\"start\">holder A</text><text class=\"t-s t-m\" x=\"16.0\" y=\"184.0\" text-anchor=\"start\">holder B</text><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger</text><line class=\"ln\" x1=\"140.0\" y1=\"262.0\" x2=\"600.0\" y2=\"262.0\"/><line class=\"ln\" x1=\"140.0\" y1=\"258.0\" x2=\"140.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"140.0\" y=\"280.0\" text-anchor=\"middle\">1 s</text><line class=\"ln\" x1=\"255.0\" y1=\"258.0\" x2=\"255.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"255.0\" y=\"280.0\" text-anchor=\"middle\">2 s</text><line class=\"ln\" x1=\"370.0\" y1=\"258.0\" x2=\"370.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"370.0\" y=\"280.0\" text-anchor=\"middle\">3 s</text><line class=\"ln\" x1=\"485.0\" y1=\"258.0\" x2=\"485.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"485.0\" y=\"280.0\" text-anchor=\"middle\">4 s</text><line class=\"ln\" x1=\"600.0\" y1=\"258.0\" x2=\"600.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"600.0\" y=\"280.0\" text-anchor=\"middle\">5 s</text><rect class=\"box-dim\" x=\"140.0\" y=\"45.0\" width=\"242.1\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"261.0\" y=\"60.0\" text-anchor=\"middle\">lease 1, holder A</text><text class=\"t-s t-bad\" x=\"376.1\" y=\"88.0\" text-anchor=\"end\">lease 1 ran out at 3,105 ms</text><rect class=\"box-ok\" x=\"387.8\" y=\"45.0\" width=\"212.2\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"493.9\" y=\"60.0\" text-anchor=\"middle\">lease 2, holder B</text><rect class=\"box\" x=\"140.0\" y=\"111.0\" width=\"59.8\" height=\"18.0\" rx=\"8.0\"/><line class=\"ln-a\" x1=\"197.5\" y1=\"106.0\" x2=\"197.5\" y2=\"134.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"148.0\" text-anchor=\"middle\">check: 1.6 s left</text><rect class=\"box-bad\" x=\"199.8\" y=\"109.0\" width=\"207.0\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"303.3\" y=\"124.0\" text-anchor=\"middle\">stopped</text><text class=\"t-s t-m\" x=\"260.8\" y=\"184.0\" text-anchor=\"middle\">asks every 100 ms: refused</text><rect class=\"box-ok\" x=\"387.8\" y=\"171.0\" width=\"19.0\" height=\"18.0\" rx=\"8.0\"/><rect class=\"box-a\" x=\"146.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"157.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"169.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"180.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"192.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"404.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><line class=\"ln-d\" x1=\"406.8\" y1=\"30.0\" x2=\"406.8\" y2=\"248.0\"/><text class=\"t-s t-a\" x=\"406.8\" y=\"22.0\" text-anchor=\"middle\">3,320 ms</text></svg>",
+            "say": "3,155 ms: B's next request finds no valid lease, and the service grants lease 2. At 3,320 ms B's first update lands. The ledger has no reason to doubt it: B really is the holder."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"B writes 13 updates while A stays stopped until 4,520 ms\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"60.0\" text-anchor=\"start\">lease service</text><text class=\"t-s t-m\" x=\"16.0\" y=\"124.0\" text-anchor=\"start\">holder A</text><text class=\"t-s t-m\" x=\"16.0\" y=\"184.0\" text-anchor=\"start\">holder B</text><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger</text><line class=\"ln\" x1=\"140.0\" y1=\"262.0\" x2=\"600.0\" y2=\"262.0\"/><line class=\"ln\" x1=\"140.0\" y1=\"258.0\" x2=\"140.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"140.0\" y=\"280.0\" text-anchor=\"middle\">1 s</text><line class=\"ln\" x1=\"255.0\" y1=\"258.0\" x2=\"255.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"255.0\" y=\"280.0\" text-anchor=\"middle\">2 s</text><line class=\"ln\" x1=\"370.0\" y1=\"258.0\" x2=\"370.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"370.0\" y=\"280.0\" text-anchor=\"middle\">3 s</text><line class=\"ln\" x1=\"485.0\" y1=\"258.0\" x2=\"485.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"485.0\" y=\"280.0\" text-anchor=\"middle\">4 s</text><line class=\"ln\" x1=\"600.0\" y1=\"258.0\" x2=\"600.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"600.0\" y=\"280.0\" text-anchor=\"middle\">5 s</text><rect class=\"box-dim\" x=\"140.0\" y=\"45.0\" width=\"242.1\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"261.0\" y=\"60.0\" text-anchor=\"middle\">lease 1, holder A</text><text class=\"t-s t-bad\" x=\"376.1\" y=\"88.0\" text-anchor=\"end\">lease 1 ran out at 3,105 ms</text><rect class=\"box-ok\" x=\"387.8\" y=\"45.0\" width=\"212.2\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"493.9\" y=\"60.0\" text-anchor=\"middle\">lease 2, holder B</text><rect class=\"box\" x=\"140.0\" y=\"111.0\" width=\"59.8\" height=\"18.0\" rx=\"8.0\"/><line class=\"ln-a\" x1=\"197.5\" y1=\"106.0\" x2=\"197.5\" y2=\"134.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"148.0\" text-anchor=\"middle\">check: 1.6 s left</text><rect class=\"box-bad\" x=\"199.8\" y=\"109.0\" width=\"345.0\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"372.3\" y=\"124.0\" text-anchor=\"middle\">stopped for 3 s</text><text class=\"t-s t-m\" x=\"260.8\" y=\"184.0\" text-anchor=\"middle\">asks every 100 ms: refused</text><rect class=\"box-ok\" x=\"387.8\" y=\"171.0\" width=\"157.0\" height=\"18.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"466.3\" y=\"184.0\" text-anchor=\"middle\">holds lease 2</text><rect class=\"box-a\" x=\"146.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"157.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"169.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"180.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"192.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"404.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"416.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"427.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"439.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"450.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"462.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"473.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"485.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"496.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"508.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"519.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"531.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"542.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><line class=\"ln-d\" x1=\"544.8\" y1=\"30.0\" x2=\"544.8\" y2=\"248.0\"/><text class=\"t-s t-a\" x=\"544.8\" y=\"22.0\" text-anchor=\"middle\">4,520 ms</text></svg>",
+            "say": "B writes every 100 ms. At 4,520 ms A's thread runs again. From inside, nothing happened: A is still in the middle of building the update it started after its check."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 290\" role=\"img\" aria-label=\"At 4,530 ms the ledger applies A's update under the expired lease 1, after B's\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"16.0\" y=\"60.0\" text-anchor=\"start\">lease service</text><text class=\"t-s t-m\" x=\"16.0\" y=\"124.0\" text-anchor=\"start\">holder A</text><text class=\"t-s t-m\" x=\"16.0\" y=\"184.0\" text-anchor=\"start\">holder B</text><text class=\"t-s t-m\" x=\"16.0\" y=\"234.0\" text-anchor=\"start\">ledger</text><line class=\"ln\" x1=\"140.0\" y1=\"262.0\" x2=\"600.0\" y2=\"262.0\"/><line class=\"ln\" x1=\"140.0\" y1=\"258.0\" x2=\"140.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"140.0\" y=\"280.0\" text-anchor=\"middle\">1 s</text><line class=\"ln\" x1=\"255.0\" y1=\"258.0\" x2=\"255.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"255.0\" y=\"280.0\" text-anchor=\"middle\">2 s</text><line class=\"ln\" x1=\"370.0\" y1=\"258.0\" x2=\"370.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"370.0\" y=\"280.0\" text-anchor=\"middle\">3 s</text><line class=\"ln\" x1=\"485.0\" y1=\"258.0\" x2=\"485.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"485.0\" y=\"280.0\" text-anchor=\"middle\">4 s</text><line class=\"ln\" x1=\"600.0\" y1=\"258.0\" x2=\"600.0\" y2=\"266.0\"/><text class=\"t-s t-m\" x=\"600.0\" y=\"280.0\" text-anchor=\"middle\">5 s</text><rect class=\"box-dim\" x=\"140.0\" y=\"45.0\" width=\"242.1\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"261.0\" y=\"60.0\" text-anchor=\"middle\">lease 1, holder A</text><text class=\"t-s t-bad\" x=\"376.1\" y=\"88.0\" text-anchor=\"end\">lease 1 ran out at 3,105 ms</text><rect class=\"box-ok\" x=\"387.8\" y=\"45.0\" width=\"212.2\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"493.9\" y=\"60.0\" text-anchor=\"middle\">lease 2, holder B</text><rect class=\"box\" x=\"140.0\" y=\"111.0\" width=\"59.8\" height=\"18.0\" rx=\"8.0\"/><line class=\"ln-a\" x1=\"197.5\" y1=\"106.0\" x2=\"197.5\" y2=\"134.0\"/><text class=\"t-s t-a\" x=\"197.5\" y=\"148.0\" text-anchor=\"middle\">check: 1.6 s left</text><rect class=\"box-bad\" x=\"199.8\" y=\"109.0\" width=\"345.0\" height=\"22.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"372.3\" y=\"124.0\" text-anchor=\"middle\">stopped for 3 s</text><rect class=\"box\" x=\"544.8\" y=\"111.0\" width=\"5.2\" height=\"18.0\" rx=\"2.6\"/><text class=\"t-s t-m\" x=\"260.8\" y=\"184.0\" text-anchor=\"middle\">asks every 100 ms: refused</text><rect class=\"box-ok\" x=\"387.8\" y=\"171.0\" width=\"158.1\" height=\"18.0\" rx=\"8.0\"/><text class=\"t-s\" x=\"466.9\" y=\"184.0\" text-anchor=\"middle\">holds lease 2</text><rect class=\"box-a\" x=\"146.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"157.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"169.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"180.6\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-a\" x=\"192.1\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"404.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"416.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"427.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"439.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"450.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"462.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"473.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"485.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"496.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"508.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"519.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"531.3\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-ok\" x=\"542.8\" y=\"220.0\" width=\"4.0\" height=\"20.0\" rx=\"2.0\"/><rect class=\"box-bad\" x=\"545.0\" y=\"217.0\" width=\"7.0\" height=\"26.0\" rx=\"3.5\"/><text class=\"t-s t-bad\" x=\"536.0\" y=\"212.0\" text-anchor=\"end\">A's update under lease 1</text><line class=\"ln-d\" x1=\"546.0\" y1=\"30.0\" x2=\"546.0\" y2=\"248.0\"/><text class=\"t-s t-a\" x=\"546.0\" y=\"22.0\" text-anchor=\"middle\">4,530 ms</text></svg>",
+            "say": "4,530 ms: A finishes, writes, and the ledger applies the update on top of B's 13, about 1.4 s after lease 1 ran out. A learns that its lease is gone at its next check, 100 ms too late to matter."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch one pause turn into a stale write",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, run the demo. It replays the run from the stepper on the lab's simulator, with the network fixed at 5 ms so the times are easy to follow. Before you read the output, predict: at what time does A's update land, and is B's lease valid then?",
+          "Run it again with `-Pargs='careful'`. The careful holder checks its lease a second time, after the work and right before sending. Predict what happens to A's update now.",
+          "Run it with `-Pargs='careful 1562'`, which starts the same 3-second pause 42 ms later, after A's second check, while the update is being sent."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.TimelineDemoKt -q\n./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.TimelineDemoKt -q -Pargs='careful'\n./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.TimelineDemoKt -q -Pargs='careful 1562'",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.TimelineDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l04/demo/TimelineDemo.kt"
+        },
+        "expect": "The naive run:\n\n```text\nholder: naive; A stops at 1,520 ms for 3,000 ms\n  1,470 ms  ledger applies A's update under lease 1, inside its lease\n  1,520 ms  A stops: a 3,000 ms pause begins\n  3,160 ms  B holds lease 2 and believes it lasts until 5,160 ms\n  3,320 ms  ledger applies B's updates under lease 2, every 100 ms until 4,420 ms (12 of them)\n  4,520 ms  A runs again, and has no idea it stopped\n  4,520 ms  A sees that lease 1 has run out\n  4,520 ms  ledger applies B's update under lease 2, inside its lease\n  4,530 ms  ledger applies A's update under lease 1, AFTER its lease ran out at 3,105 ms\nstale writes: 1; landed after a newer holder's write: 1\n```\n\nA's update lands at 4,530 ms, under a lease that ran out at 3,105 ms, after B's updates. A \"sees that lease 1 has run out\" at 4,520 ms, at the next tick of its loop, but the write was already on its way: the step that was due before the pause runs first. With `careful`, the second check catches it:\n\n```text\nholder: careful, 200 ms margin; A stops at 1,520 ms for 3,000 ms\n  ...\n  4,520 ms  A runs again, and has no idea it stopped\n  4,520 ms  A drops its update: the check before sending failed\n  4,520 ms  A sees that lease 1 has run out\n  4,520 ms  ledger applies B's update under lease 2, inside its lease\nstale writes: 0; landed after a newer holder's write: 0\n```\n\nWith `careful 1562`, the pause falls after the last check, and the stale write gets through again:\n\n```text\nholder: careful, 200 ms margin; A stops at 1,562 ms for 3,000 ms\n  ...\n  4,562 ms  A runs again, and has no idea it stopped\n  4,562 ms  A sees that lease 1 has run out\n  4,567 ms  ledger applies A's update under lease 1, AFTER its lease ran out at 3,105 ms\nstale writes: 1; landed after a newer holder's write: 1\n```\n\n(Lines before the pause are the same in all three runs and are trimmed here.) The second check only moved the gap."
+      },
+      "refs": [
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition, chapter 9 (process pauses)",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Garbage collection stops every thread, for far less time than it used to",
+      "body": "The best-known reason a JVM thread stops is the garbage collector. To free memory, a collector has to find which objects are still reachable. The simplest safe way is to stop every application thread so nothing changes the object graph while it looks: a **stop-the-world pause**. The JVM brings each thread to a safepoint (a point in the code where the JVM knows exactly what the thread holds), runs the collector, and lets them go. While it lasts, nothing of yours runs: not the request handler, not the lease-renewal thread, not the heartbeat that lesson 2's failure detector is listening for.\n\nHow long that takes depends on the collector and on how much is live. The Try it measures it with 1 GB heaps and about 300 MB of live objects that keep being replaced. On a 12-core laptop, Serial, which does all of its work inside pauses with one thread, stopped the world for 360 to 570 ms each time it compacted the old generation. G1, the default collector since JDK 9, marks most of the heap while your threads run and pauses to copy objects; its longest pauses were 67 to 93 ms (its default pause target, `MaxGCPauseMillis`, is 200 ms). ZGC's own log reported a longest pause of about 0.02 ms.\n\nZGC gets there by doing the expensive work, marking and moving objects, while your threads run. Its stated goal is to never stop application threads for more than a millisecond, with pause times that don't grow with the heap, from a few hundred megabytes to 16 TB. It became production-ready in JDK 15 and generational (young and old objects collected separately) in JDK 21; generational is the default since JDK 23, and JDK 24 removed the old mode. Shenandoah, OpenJDK's other low-pause collector, got a production generational mode in JDK 25. Concurrent Mark Sweep, the low-pause collector that old tuning guides still describe, was removed in JDK 14. On JDK 25 the realistic choices are G1, or ZGC or Shenandoah when pauses matter more than throughput.\n\nSo ZGC makes the problem go away? Look at the Try it's other columns. ZGC's own pauses were 0.02 ms, yet the measuring thread still saw stalls of 5 to 65 ms across runs, because the collector isn't the only thing between a thread and a CPU: ZGC's concurrent threads, the allocating thread, the OS scheduler and everything else on the laptop compete for the same cores. And when a program allocates faster than ZGC can reclaim memory, its threads wait for memory to be freed; ZGC logs these as allocation stalls. A low-pause collector makes long pauses rarer. The next section's causes don't care which collector you run.",
+      "try": {
+        "title": "Measure what each collector costs your thread",
+        "minutes": 3,
+        "steps": [
+          "Run the demo from the `labs` folder. It starts three child JVMs with a 1 GB heap (Serial, G1 and ZGC), keeps about 300 MB live, replaces objects at random for 2.5 seconds, and has one thread sleep 1 ms in a loop and record how late it wakes up. It takes about 10 seconds.",
+          "Before it finishes, predict the ZGC row: will the thread's longest stall match ZGC's longest pause from its own log?",
+          "Run it twice more and compare. Which numbers move, and which stay put?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.GcPauseDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.GcPauseDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l04/demo/GcPauseDemo.kt"
+        },
+        "expect": "One run on a 12-core MacBook with JDK 25:\n\n```text\ncollector   GC log: longest pause   your thread: longest stall   99.9th pct   stalls over 10 ms\nSerial               360.763 ms                    360.7 ms      360.7 ms               7\nG1                    89.390 ms                    103.4 ms       86.5 ms              24\nZGC                    0.022 ms                      8.7 ms        6.9 ms               0\n```\n\nSerial's pause is one long full collection, and the thread feels all of it. G1's pauses are shorter and more frequent. ZGC's log says its pauses were about 20 microseconds, yet the thread still woke up 8.7 ms late at worst. In three runs here, Serial ranged from 360 to 570 ms and ZGC's thread stall from 9 to 62 ms, while ZGC's own pauses stayed near 0.02 ms. The GC log tells you about the collector; only a measurement from inside your thread tells you how long your code didn't run. Your numbers depend on the CPU, the core count and what else the machine is doing."
+      },
+      "refs": [
+        {
+          "title": "The Z Garbage Collector (OpenJDK wiki)",
+          "url": "https://wiki.openjdk.org/display/zgc/Main",
+          "kind": "docs"
+        },
+        {
+          "title": "JEP 490: ZGC, remove the non-generational mode",
+          "url": "https://openjdk.org/jeps/490",
+          "kind": "docs"
+        },
+        {
+          "title": "JEP 363: remove the Concurrent Mark Sweep collector",
+          "url": "https://openjdk.org/jeps/363",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "The hypervisor, the kernel and the disk can stop you too",
+      "body": "Every cause below stops a process from the outside, as a collector does, and none of them shows up as a GC pause:\n\n- The hypervisor. A cloud VM shares a physical machine with other VMs. While the hypervisor runs another guest on your core, your guest stops; Linux reports that time as steal (`st` in `top` and `vmstat`). Clouds also move running VMs between hosts. Google Compute Engine says the blackout of a live migration is typically well under a second, and that it can push the guest's clock forward by up to 5 seconds.\n- CPU quotas. A container that has used its CPU quota for the current period (100 ms by default) doesn't run again until the next one starts, as the OS track's lesson on CPU scheduling showed. A JVM whose GC threads burn the quota early stops every thread for the rest of the period.\n- Memory. If the machine swaps, touching a page that was moved to disk is a page fault that waits for a disk read (the OS track's lesson on virtual memory). Under memory pressure a machine can spend most of its time swapping, which is why database and JVM hosts usually run without swap.\n- Signals. `SIGSTOP`, or Ctrl-Z in a shell, stops a process until `SIGCONT` arrives (the OS track's lesson on processes and signals). An engineer who presses Ctrl-Z in the wrong terminal, or attaches a debugger, stops the process the same way.\n- Disk I/O. A thread that writes synchronously waits for the disk, and on a network block device such as EBS, for the network too.\n\nThe last one can hide inside a \"GC pause\". LinkedIn's engineers saw G1 pauses of 4.17 seconds on an 8 GB heap whose collections normally took under a second, and a CMS pause of 11.45 seconds that used almost no CPU. The collector wasn't the problem. During the stop-the-world phase the JVM writes a line to its GC log, and that `write()` was stuck behind background disk traffic: the kernel flushing dirty pages, as in the OS track's lesson on writeback and fsync. In one reproduction, 1.47 s of a 1.59 s pause was the blocked `write()` and 0.12 s was collection. Moving the GC log to tmpfs or a faster disk brought every pause under 0.25 s. The log line itself shows it: with `-Xlog:gc+cpu` every collection reports `User`, `Sys` and `Real` time. A parallel collector normally uses more CPU time than wall time. A pause whose `Real` is far above `User` plus `Sys` was spent waiting.\n\nContainers add a wrinkle that matters for the Try it. Inside its PID namespace, a container's first process is PID 1, and PID 1 receives a signal sent from inside the namespace only if it installed a handler for it. No process can install a handler for `SIGSTOP`, so `kill -STOP 1` inside a container does nothing. From outside, `docker pause` freezes every process in the container through the cgroup freezer, and the processes can't tell.",
+      "try": {
+        "title": "Freeze a lease holder from outside",
+        "minutes": 5,
+        "steps": [
+          "From the `labs` folder, start `PauseMeter` in the lab box, in a container named `pausebox`. It holds a pretend 2-second lease, renews it below 1 second, and every 100 ms checks, works for 80 ms and \"writes\". The lease is a deadline on the monotonic clock, so it runs out on time even while the program is stopped, like a lease kept by another machine. It prints only when something unusual happens.",
+          "When it says `Pause me now`, freeze it from a second terminal on your Mac, for 5 seconds and then for 3. Predict what it prints after each pause, and in which order.",
+          "Now try stopping PID 1 from inside a container, and a JVM that isn't PID 1."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "terminal 1, from the labs folder",
+          "src": "docker compose -f env/labbox.yml run --rm --name pausebox box java sim/src/demo/java/sfz/dist/l04/demo/PauseMeter.java\n\n# terminal 2, on the Mac\ndocker pause pausebox; sleep 5; docker unpause pausebox\ndocker pause pausebox; sleep 3; docker unpause pausebox\n\n# afterwards, in one terminal\ndocker compose -f env/labbox.yml run --rm box bash -c 'kill -STOP 1; echo \"still running: PID 1 ignored SIGSTOP\"; java sim/src/demo/java/sfz/dist/l04/demo/PauseMeter.java & sleep 3; kill -STOP $!; sleep 4; kill -CONT $!; sleep 2; kill $!'",
+          "file": "labs/sim/src/demo/java/sfz/dist/l04/demo/PauseMeter.java"
+        },
+        "expect": "From the two `docker pause` runs:\n\n```text\nholding a 2 s lease; checking, working 80 ms and writing every 100 ms. Pause me now.\nSTALE WRITE: checked with 1,181 ms left, wrote 3,929 ms after the lease ran out.\nloop gap: 5,147 ms since the last turn (expected 100). The wall clock moved 5,147 ms.\nSTALE WRITE: checked with 1,168 ms left, wrote 1,953 ms after the lease ran out.\nloop gap: 3,143 ms since the last turn (expected 100). The wall clock moved 3,144 ms.\n```\n\nBoth pauses happened to land during the 80 ms of work, between the check and the write, which is 80% of each turn. If yours lands in the other 20%, you see `lease lost: it ran out ... ms ago` instead, at the next check. Either way the program learns about the pause only after it resumes, and the stale write is reported before the gap because the work that was under way finishes first. The wall clock moved as much as the monotonic one: a frozen container's clock keeps running. The last command prints `still running: PID 1 ignored SIGSTOP`, then a `loop gap` of about 4,000 ms and either a `STALE WRITE` or a `lease lost` line: `kill -STOP` works on the JVM, which is not PID 1."
+      },
+      "refs": [
+        {
+          "title": "Eliminating large JVM GC pauses caused by background IO traffic (LinkedIn)",
+          "url": "https://www.linkedin.com/blog/engineering/archive/eliminating-large-jvm-gc-pauses-caused-by-background-io-traffic",
+          "kind": "read"
+        },
+        {
+          "title": "Live migration process (Google Compute Engine)",
+          "url": "https://docs.cloud.google.com/compute/docs/instances/live-migration-process",
+          "kind": "docs"
+        },
+        {
+          "title": "pid_namespaces(7): signals to init",
+          "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html",
+          "kind": "docs"
+        },
+        {
+          "title": "docker container pause",
+          "url": "https://docs.docker.com/reference/cli/docker/container/pause/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A process can't measure its own pause in time to act on it",
+      "body": "Can A protect itself? It has a monotonic clock and can read it after every step, and it does notice the pause: the next reading is 3 seconds later than the one before. But it notices after the fact, on the first instruction after the pause, and the step it was in the middle of runs first. Whatever was already decided, an update half built or a request already in the socket, goes ahead. A process can measure its own pause exactly and still only learn about it too late. Its sense of elapsed time is something it reconstructs the next time it looks.\n\nWhat A can do is make the window smaller. The lab's careful holder does three things.\n\nIt counts its lease from the moment it sent the request, never from the moment it handled the reply. The service starts the lease when the request arrives, which is after A sent it, so counting from the send can only make A's deadline earlier than the real one. The naive holder counts from the reply. When a renewal reply waits out a 3-second pause in its socket, the naive holder believes it has 2 full seconds left on a lease that ran out while it was stopped. In the lab's run of that case, that one mistake produces 13 stale writes in a row.\n\nIt checks again right before sending, after the work, as the Try it in section 1 showed. A pause during the 60 ms of work is caught there. Only a pause in the 5 ms after the last check gets through.\n\nIt keeps a margin: no write when less than the margin is left.\n\nThe Try it runs the lab's sweep: pauses of one length, arriving at random about every 5 seconds on both holders, 20 runs of ten minutes each. With 3-second pauses, the naive holder made 1,282 stale writes and the careful one 88, about 14 times fewer. The margin hardly mattered: 88 at 0, 200 and 500 ms. A holder that renews below 1 second always has 1 to 2 seconds left, so any pause that hurts is longer than that, and longer than any margin it could afford. A 10-second lease made 3- and 5-second pauses harmless and let 8-second ones through. Every holder-side fix moves the threshold. None removes it: a pause that starts after the last check and outlasts what is left of the lease always gets its write through, and 64 of the careful holder's 88 stale writes landed on top of a newer holder's update.",
+      "try": {
+        "title": "Sweep pause lengths against the holders",
+        "minutes": 3,
+        "steps": [
+          "Run the sweep from the `labs` folder. It takes about two seconds: 800 runs of ten virtual minutes each.",
+          "Before reading, predict two rows: at 500 ms pauses, does any holder write stale? At 3,000 ms, how much does the careful holder save?",
+          "Find the row where the 10-second lease stops protecting you, and say why it's that row."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "from the labs folder",
+          "src": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.DamageDemoKt -q",
+          "run": "./gradlew :sim:demo -Pmain=sfz.dist.l04.demo.DamageDemoKt -q",
+          "file": "labs/sim/src/demo/kotlin/sfz/dist/l04/demo/DamageDemo.kt"
+        },
+        "expect": "```text\nstale writes in 20 runs of 10 minutes; lease 2 s unless marked, work 60 ms, send 5 ms\npause ms          naive     careful 0   careful 200   careful 500 careful, 10 s\n     250              0             0             0             0             0\n     500              2             0             0             0             0\n   1,000            141            10             8             7             0\n   1,500            816            63            62            65             0\n   2,000          1,407            94            94            94             0\n   3,000          1,282            88            88            88             0\n   5,000          1,222            89            89            89             0\n   8,000            951            74            74            74            24\n\nnaive        with 3 s pauses: 85,884 writes, 1,282 stale, 942 of those landed after a newer holder's write\ncareful 200  with 3 s pauses: 84,729 writes, 88 stale, 64 of those landed after a newer holder's write\n```\n\nBelow about 1 second nothing goes wrong, because a renewing holder always has more than that left. The naive holder's 2 stale writes at 500 ms come from late renewal replies, which counting from the send removes. Above 1 second the careful holder is about 14 times better, and a margin of 0, 200 or 500 ms makes no difference. The 10-second lease is clean up to 5 seconds and fails at 8, because it is renewed below 5 seconds. The simulator is deterministic, so you get exactly these numbers."
+      },
+      "refs": [
+        {
+          "title": "Jepsen: etcd 3.4.3 (lock-guarded updates lost under pauses)",
+          "url": "https://jepsen.io/analyses/etcd-3.4.3",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Hard real-time systems remove the pauses, at a price servers won't pay",
+      "body": "Some software can't accept any of this. A pacemaker that stops for a garbage collection, or an anti-lock braking controller that waits behind a disk write, has failed at the one thing it is for. These are **hard real-time systems**: every response has a deadline, and a missed deadline counts as a failure of the whole system.\n\nThey meet the deadlines by removing the causes of pauses rather than tolerating them. A real-time operating system schedules each task with a guaranteed slice of CPU in every interval. Each routine has a known worst-case running time, and the system is designed so that the worst cases add up to less than the deadline. Memory is allocated up front, or by a real-time collector whose work per interval is bounded. The hardware is dedicated, with no other tenants. Then a great deal of testing and measurement shows that the deadlines hold.\n\nThat costs a lot, and it lowers throughput, because the system keeps spare capacity so that the worst case still fits. Real-time in this sense means predictable, not fast, and it has nothing to do with the \"real-time\" dashboards of a web app. For a payments service running JVMs on shared cloud machines it isn't an option. Servers have to assume that any process can stop at any instruction for any length of time.\n\nSo the safety of a lease can't depend on the holder stopping in time. It has to be checked by something that doesn't pause along with the holder, and the obvious candidate is the resource being written. The ledger in this lesson accepted every write. In lesson 5 the lease service hands out a number that grows with every grant, the ledger remembers the highest one it has seen, and A's late write is refused."
+    }
+  ],
+  "analogy": "A night-shift nurse checks the chart at 02:00: the next dose is due, and her shift runs until 03:00, so she has time. She goes to fetch the medicine and falls asleep in the supply room until 04:00. At 03:00 the day nurse took over and gave the dose. The night nurse wakes, feels as if a minute has passed, and gives the dose again. Her check was correct, and it was an hour old by the time she acted on it. The hospital doesn't fix this by asking nurses to stay awake. It fixes it at the bedside: the medication record shows the 03:00 dose, and the cart refuses to release a second one. The analogy breaks on the waking up. A person who has slept usually feels it and looks at the clock. A process resumes in the middle of an instruction with nothing at all to suggest that time has passed.",
+  "in_your_world": "Kafka already applies this lesson to you. If your consumer stops polling for longer than `max.poll.interval.ms`, because of a long GC or a slow call to the card issuer, the group coordinator gives its partitions to another consumer. When it resumes, it finishes the batch it was processing, including the writes to Oracle, and only its commit fails with a `CommitFailedException`. Temporal works the same way: an activity that doesn't heartbeat within its heartbeat timeout is retried on another worker while the paused one may still complete its side effect, so activities that move money need idempotency keys. In Kubernetes, a Quarkus pod with a CPU limit is throttled when it uses its quota early in a 100 ms period, and the GC threads count against that quota. Watch `nr_throttled` in the pod's `cpu.stat`, and log GC with `-Xlog:gc,gc+cpu` so you can tell collection from waiting.",
+  "mistake": "The common mistake is to treat the holder's own check as the safety mechanism: renew with plenty of margin, check the lease right before writing, move to ZGC, and call the lock safe. It passes every test, because tests don't pause for 3 seconds at the worst moment, and it looks like a `ReentrantLock` you already trust. In production, a migration, a throttled container or a GC log stuck behind disk writes stops the holder after its last check, and the write lands under someone else's lease. Treat the holder-side checks as a way to make stale writes rare. Make the resource refuse them, which is lesson 5, and measure pauses from inside the process so you know how rare they are.",
+  "compare": {
+    "title": "The naive holder and the careful one, from the lab",
+    "a": {
+      "label": "Naive",
+      "lang": "kotlin",
+      "title": "Policy.kt (given)",
+      "src": "object Naive : HolderPolicy {\n    // counts the lease from the moment it handled the reply\n    override fun believedExpiry(sentAt: Long, handledAt: Long, ttlMs: Long) = handledAt + ttlMs\n\n    // checks once, at the start of the tick\n    override fun mayStartWork(now: Long, believedExpiry: Long) = now < believedExpiry\n\n    // and never looks again before the write leaves\n    override fun maySendWrite(now: Long, believedExpiry: Long) = true\n}"
+    },
+    "b": {
+      "label": "Careful",
+      "lang": "kotlin",
+      "title": "Policy.kt (your lab answer)",
+      "src": "class Careful(val marginMs: Long) : HolderPolicy {\n    // the service started the lease after sentAt, so this deadline is never late\n    override fun believedExpiry(sentAt: Long, handledAt: Long, ttlMs: Long) = sentAt + ttlMs\n\n    override fun mayStartWork(now: Long, believedExpiry: Long) = believedExpiry - now >= marginMs\n\n    // look again after the work, as late as possible\n    override fun maySendWrite(now: Long, believedExpiry: Long) = believedExpiry - now >= marginMs\n}"
+    },
+    "note": "Same loop, same pauses. The careful holder makes its deadline conservative and moves its last check from before the 60 ms of work to after it, so a pause during the work is caught. In the lab's sweep that cuts stale writes about 14 times with 3-second pauses. Neither version can see a pause that starts after its last check, and that is where the remaining stale writes come from."
+  },
+  "worked": {
+    "title": "A payment worker stopped for 4 seconds: find out what stopped it",
+    "steps": [
+      {
+        "say": "Log GC with CPU times, so each collection says how much of its pause was work. A parallel collector normally uses more CPU time than wall time: here 0.27 s of CPU in 0.03 s of real time (from the Try it's G1 child).",
+        "code": "java -Xlog:gc,gc+cpu:file=/var/log/payments/gc.log ...\n\n[0.268s][info][gc       ] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 451M->306M(1024M) 36.061ms\n[0.268s][info][gc,cpu   ] GC(1) User=0.21s Sys=0.06s Real=0.03s",
+        "lang": "text"
+      },
+      {
+        "say": "Read the suspicious line the same way. A 4-second `Real` with almost no `User` or `Sys` means the threads were stopped and the collector was waiting. Look at what the JVM writes during the pause: if the GC log sits on a disk shared with busy writers, move it to tmpfs or a separate disk, as LinkedIn did.",
+        "code": "-Xlog:gc,gc+cpu:file=/dev/shm/gc.log      # tmpfs: the log write can't block on disk writeback",
+        "lang": "text"
+      },
+      {
+        "say": "Check the container's CPU quota. In a container limited to half a CPU (`--cpus 0.5`) and running a busy loop for 3 seconds, every one of 31 periods was throttled, 1.5 s in all: 50 ms of running, then 50 ms of nothing.",
+        "code": "$ cat /sys/fs/cgroup/cpu.max\n50000 100000\n$ cat /sys/fs/cgroup/cpu.stat\nusage_usec 1561745\nnr_periods 31\nnr_throttled 31\nthrottled_usec 1510500\n(output trimmed)",
+        "lang": "text"
+      },
+      {
+        "say": "Check steal time on the host or VM: the `st` column. Here, on Docker Desktop's VM, it is 0; on a crowded cloud host it isn't.",
+        "code": "$ vmstat 1 3\nprocs -----------memory---------- ---swap-- -----io---- -system-- -------cpu-------\n r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st gu\n 0  0   2884 4409996 276068 2687648    0    0     0     0 25824 50148  0  2 97  0  0  0\n(output trimmed)",
+        "lang": "text"
+      },
+      {
+        "say": "Measure stalls from inside the process, the way the Try it's hiccup thread does, and export the worst one as a metric. It catches every cause at once, including the ones no log mentions.",
+        "code": "val worstStallMs = AtomicLong()\nthread(isDaemon = true, name = \"stall-meter\") {\n    while (true) {\n        val t0 = System.nanoTime()\n        Thread.sleep(1)\n        val lateMs = (System.nanoTime() - t0) / 1_000_000 - 1\n        worstStallMs.accumulateAndGet(lateMs, ::maxOf)   // publish and reset it once a minute\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Write down the worst pause you've measured, then design as if the next one will be longer. Any lease or leader check stays an optimization, and the resource it protects must refuse writes from an old holder (lesson 5).",
+        "code": "worst stall last 30 days: 4.2 s (GC log write behind writeback, fixed)\nlease TTL: 10 s, renew below 5 s   -> pauses under 5 s are harmless\nanything longer: the ledger must refuse the write",
+        "lang": "text"
+      }
+    ]
+  },
+  "lab": {
+    "title": "Measure what pauses do to a lease holder",
+    "minutes": 15,
+    "files": [
+      "labs/sim/src/main/kotlin/sfz/dist/l04/Damage.kt",
+      "labs/sim/src/main/kotlin/sfz/dist/l04/Policy.kt"
+    ],
+    "run": "./gradlew :sim:test --tests 'sfz.dist.l04.*'",
+    "steps": [
+      "Run the tests from the `labs` folder. No Docker needed. All 15 fail with `NotImplementedError`.",
+      "Read `World.kt`, which is given: a lease service that grants 2-second leases with a new id each time, a ledger that accepts every write, and two holders that renew below 1 second and check, work for 60 ms and write every 100 ms. Every step of a holder goes through `step()`, so a step due during a pause runs when the pause ends. Then read `Naive` in `Policy.kt`: it is the holder from section 1.",
+      "In `Damage.kt`, write `staleWrites` (judge each write by the lease service's record, at the moment it landed) and `clobbers`. The first three tests in `DamageTest` pass.",
+      "Write `sweep`. All of `DamageTest` passes: no stale writes with 250 ms pauses, more than 100 with 1.5-second pauses, and more again with 3-second ones.",
+      "In `Policy.kt`, write `Careful`'s three functions. `MitigationTest` and `PausePropertyTest` pass. Read `a pause after the last check gets through whatever the margin`: no change to the holder can make that test fail.",
+      "Experiment: make `Careful.believedExpiry` count from `handledAt` again and see which test fails, and by how much."
+    ],
+    "hints": [
+      "`run.writes.filter { !run.leases.getValue(it.leaseId).validAt(it.landedAt) }`.",
+      "In `clobbers`, keep `var newest = 0`; a write with `leaseId < newest` is a clobber; then `newest = maxOf(newest, w.leaseId)`.",
+      "`pauseLengths.associateWith { p -> seeds.sumOf { s -> staleWrites(simulate(base.copy(seed = s, pauseMs = p), policy)).size } }`.",
+      "`Careful.believedExpiry` is `sentAt + ttlMs`. Both checks are `believedExpiry - now >= marginMs`."
+    ],
+    "done_when": "All 15 tests in `sfz.dist.l04` pass."
+  },
+  "drill": {
+    "title": "The careful holder from memory",
+    "minutes": 4,
+    "prompt": "Close the lab. Write the careful holder's three rules as a Kotlin class implementing `HolderPolicy`, then one comment saying which pause none of them can catch, and why.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "class Careful(val marginMs: Long) : HolderPolicy {\n    // count from the send: the service started the lease later, so this is never late\n    override fun believedExpiry(sentAt: Long, handledAt: Long, ttlMs: Long) = sentAt + ttlMs\n\n    override fun mayStartWork(now: Long, believedExpiry: Long) = believedExpiry - now >= marginMs\n\n    // check again after the work, right before sending\n    override fun maySendWrite(now: Long, believedExpiry: Long) = believedExpiry - now >= marginMs\n}\n// A pause that starts after maySendWrite returns true and outlasts what is left of the lease:\n// no code of the holder runs during it, so nothing in the holder can stop the write it already decided to send."
+    }
+  },
+  "recap": [
+    "Seen from outside, a process can stop between any two instructions for any length of time, and from inside it can't tell. Every check-then-act on a lease has a gap a pause can land in.",
+    "Stop-the-world GC is the famous cause and a shrinking one: on JDK 25, ZGC's own pauses are well under a millisecond (generational by default since JDK 23), G1's are tens of milliseconds, and CMS is gone since JDK 14.",
+    "The rest don't care about the collector: hypervisor steal and live migration, CPU-quota throttling, swapping, `SIGSTOP`, and synchronous I/O, such as LinkedIn's 4 to 11 second \"GC\" pauses that were GC-log writes stuck behind disk traffic.",
+    "A holder measures its own pause only after it resumes. Counting the lease from the send and checking again right before writing cut stale writes about 14 times in the lab, but a pause after the last check still gets through.",
+    "Hard real-time systems remove pauses with dedicated hardware, bounded worst cases and no unbounded allocation, at a price servers don't pay. Servers must let the resource refuse late writes instead (lesson 5)."
+  ],
+  "quiz": [
+    {
+      "q": "From lesson 2: a failure detector with a 3-second timeout declares worker A dead during A's 4-second GC pause and gives A's work to worker B. What does A do when the pause ends?",
+      "options": [
+        "It sees the timeout in its logs and stops before doing anything else",
+        "It carries on from the instruction where it stopped, including any write it was about to make, until something tells it otherwise",
+        "The JVM throws an exception in every thread to report the pause",
+        "Nothing: a GC pause doesn't stop the heartbeat thread, so A was never declared dead"
+      ],
+      "answer": 1,
+      "why": "The pause is invisible from inside: A resumes exactly where it was and finishes what it had started. The timeout fired on B's side, not A's, and nothing in A's process ran to notice it. A stop-the-world pause stops every application thread, heartbeats included, which is why the detector fired. The JVM doesn't report pauses to your code.",
+      "from": "dist-02"
+    },
+    {
+      "q": "A payment worker's GC log shows `Pause Young ... 4170ms` followed by `User=0.09s Sys=0.01s Real=4.17s`. Collections usually take 30 ms. What is the most likely cause?",
+      "options": [
+        "The heap is too small, so the collector had to copy too much",
+        "Too many parallel GC threads competing with each other",
+        "The threads were stopped and the JVM was waiting on something else, such as a GC-log write blocked behind disk traffic",
+        "Switching to ZGC would remove this pause"
+      ],
+      "answer": 2,
+      "why": "A collector that is working uses CPU: a parallel one usually shows more User time than Real time. 0.1 s of CPU in 4.17 s of wall time means the pause was waiting, which is LinkedIn's case: the JVM's own log write was stuck behind page-cache writeback. A collector that needs to copy too much burns CPU. ZGC writes logs too, so if the log is the problem, changing the collector doesn't fix it; moving the log does."
+    },
+    {
+      "q": "Which of these pauses would switching from Serial or G1 to ZGC actually remove?",
+      "options": [
+        "A 400 ms stop-the-world compaction of the old generation",
+        "A 600 ms blackout while the cloud live-migrates the VM",
+        "50 ms of every 100 ms period, once the container uses its CPU quota",
+        "A page fault that waits for a swapped-out page to come back from disk"
+      ],
+      "answer": 0,
+      "why": "ZGC moves compaction out of the pause, so a 400 ms compaction becomes concurrent work. The other three stop the process from outside the JVM: the hypervisor, the cgroup CPU controller and the kernel's memory manager don't care which collector runs, and none of them appears in a GC log."
+    },
+    {
+      "q": "The lab's careful holder counts its lease from the send, checks again right before sending, and keeps a 500 ms margin. Which 3-second pause can still make it write after its lease ran out?",
+      "options": [
+        "A pause during the 60 ms of work between the first check and the second",
+        "A pause that holds a renewal reply in the socket",
+        "A 300 ms pause anywhere in the loop",
+        "A pause that starts after the second check, while the write is being sent"
+      ],
+      "answer": 3,
+      "why": "The second check catches a pause during the work, and counting from the send means a late reply can't stretch the deadline. A 300 ms pause is shorter than the 1 to 2 seconds a renewing holder always has left. A pause that starts after the last check is invisible to the holder: no code of its own runs until the write is already on its way. That is the case the lab's `a pause after the last check gets through whatever the margin` test pins down."
+    },
+    {
+      "q": "You run `kill -STOP 1` inside a container to freeze its JVM for a test, and nothing happens. Why, and what works instead?",
+      "options": [
+        "SIGSTOP needs root inside the container; add `--privileged`",
+        "PID 1 in a PID namespace gets a signal from inside only if it installed a handler, and no process can handle SIGSTOP; pause it from outside with `docker pause`",
+        "Containers block all signals; only `docker kill` can deliver one",
+        "The JVM catches SIGSTOP and ignores it; use SIGKILL"
+      ],
+      "answer": 1,
+      "why": "The kernel protects a namespace's init process from signals sent inside the namespace unless it has a handler, and SIGSTOP can't have one. Privilege doesn't change that. A signal from the host's namespace is delivered, and `docker pause` freezes the whole container through the cgroup freezer. A JVM that isn't PID 1 stops normally. No process can catch or ignore SIGSTOP."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does a stop-the-world pause stop?",
+      "back": "Every application thread in the JVM, including the threads that renew leases and send heartbeats, while the collector works."
+    },
+    {
+      "front": "ZGC's pause-time goal, and since when is it generational by default?",
+      "back": "Never stop application threads for more than a millisecond, whatever the heap size (up to 16 TB). Generational by default since JDK 23; the old mode was removed in JDK 24."
+    },
+    {
+      "front": "Name four pauses that don't come from the garbage collector.",
+      "back": "Hypervisor steal or live migration, CPU-quota throttling in a container, swapping (page faults to disk), SIGSTOP, and synchronous disk or network I/O."
+    },
+    {
+      "front": "In a GC log, what does `Real` far above `User` + `Sys` mean?",
+      "back": "The pause was spent waiting, not collecting: for example a GC-log write blocked behind disk writeback, as LinkedIn found."
+    },
+    {
+      "front": "Why can't a holder catch its own pause in time?",
+      "back": "It only sees the gap on the next clock reading after it resumes, and the step it was in the middle of, such as a write, runs first."
+    },
+    {
+      "front": "Why count a lease from the moment the request was sent?",
+      "back": "The service starts the lease when the request arrives, which is later, so the holder's deadline can only be early. A reply delayed by a pause can't make an old lease look fresh."
+    },
+    {
+      "front": "Why does `kill -STOP 1` do nothing inside a container?",
+      "back": "PID 1 of a namespace receives signals from inside only if it has a handler, and SIGSTOP can't have one. Use `docker pause` from outside."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Lease",
+      "plain": "A lock that runs out by itself after a set time unless its holder renews it."
+    },
+    {
+      "term": "Stop-the-world pause",
+      "plain": "A pause in which the JVM stops every application thread, usually so the garbage collector can work."
+    },
+    {
+      "term": "Safepoint",
+      "plain": "A point in the code where the JVM knows exactly what a thread holds, so it can stop it there."
+    },
+    {
+      "term": "Steal time",
+      "plain": "Time your virtual CPU was ready to run but the hypervisor ran another guest on the physical core."
+    },
+    {
+      "term": "CPU throttling",
+      "plain": "A cgroup stopping a container's threads for the rest of a period once they have used its CPU quota."
+    },
+    {
+      "term": "Stale write",
+      "plain": "A write that reaches the resource after the writer's lease ran out."
+    },
+    {
+      "term": "Hard real-time system",
+      "plain": "A system where every response has a deadline and missing one counts as a failure, built so that pauses can't happen."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"We moved the payout worker to ZGC and renew its 10-second lease with 5 seconds to spare, so two workers can't write the same ledger any more.\" Explain what is still wrong, and what you would measure.",
+    "answer": "ZGC took garbage collection off the list of long pauses, but not the other causes: a live migration, CPU throttling in the pod, swapping, a SIGSTOP or a write blocked on a busy disk can all stop the worker for seconds, and none of them is a GC. Renewing with 5 seconds to spare means a pause shorter than 5 seconds is harmless, which is good, but a longer one still lets the lease run out while the worker is stopped. The worker can't notice in time: it checks the lease, gets stopped, and when it resumes it finishes the write it had already decided to make. Checking again right before writing makes the window smaller, not zero. So I'd measure the longest stall from inside the process with a stall-meter thread, check `nr_throttled` and steal time, and keep the GC log on tmpfs. And I'd make the ledger refuse writes from an old lease holder, which is what fencing tokens do, so that a long pause costs a refused write instead of a corrupted ledger."
+  },
+  "deeper": {
+    "minutes": 10,
+    "body": "**Time to safepoint.** A stop-the-world pause starts only when every thread has reached a safepoint, so one thread that takes long to get there holds up all the others. `-Xlog:safepoint` prints each safepoint with `Reaching safepoint`, `At safepoint` and `Total` in nanoseconds; in the Try it's G1 child, reaching took about 3 microseconds and the collection itself 36 ms. A thread stuck in a long loop without a safepoint poll used to be the classic way to make reaching slow.\n\n**Pauses that only stop one thread.** The first use of a class makes the JVM read it from a JAR on disk, and the first calls of a method run in the interpreter before the JIT compiles it. Both happen at unpredictable moments early in a process's life, which is one reason a freshly started pod has worse tail latency than a warm one.\n\n**Pauses that hide from you.** `docker pause` uses the cgroup freezer, and the frozen processes can't observe it. A laptop that sleeps with its lid closed is the same experiment at a larger scale: every process resumes, and only the clocks show that time passed.\n\n**The numbers to compare against.** Jepsen's 2020 test of etcd 3.4.3 locks used 2-second leases, five clients and a pause every 5 seconds, and lost about 18% of the updates the lock was supposed to protect. Lesson 5 starts from that result. For the book's framing of pauses, leases and real-time systems, see Designing Data-Intensive Applications, 2nd edition, chapter 9."
+  },
+  "sources": [
+    {
+      "title": "Eliminating large JVM GC pauses caused by background IO traffic (LinkedIn Engineering)",
+      "url": "https://www.linkedin.com/blog/engineering/archive/eliminating-large-jvm-gc-pauses-caused-by-background-io-traffic"
+    },
+    {
+      "title": "The Z Garbage Collector (OpenJDK wiki)",
+      "url": "https://wiki.openjdk.org/display/zgc/Main"
+    },
+    {
+      "title": "Live migration process (Google Compute Engine documentation)",
+      "url": "https://docs.cloud.google.com/compute/docs/instances/live-migration-process"
+    },
+    {
+      "title": "pid_namespaces(7), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html"
+    },
+    {
+      "title": "Designing Data-Intensive Applications, 2nd edition, chapter 9",
+      "url": "https://dataintensive.net/"
+    }
+  ]
+}
