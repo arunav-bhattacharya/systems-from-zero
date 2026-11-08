@@ -544,12 +544,14 @@
     const pick = st[qi];
     const answered = pick !== undefined;
     const src = q.from && L[q.from] ? `<span class="tag from">From: ${esc(L[q.from].title)}</span>` : "";
-    return `<div class="qcard" id="q-${esc(key)}-${qi}">
+    // the warm-up is a guess, so its options are a calm radio group: one ring per answer, no boxes
+    const warm = !!opt.warm;
+    return `<div class="qcard${warm ? " warm" : ""}" id="q-${esc(key)}-${qi}">
       <div class="qn">${opt.num ? `<span class="label">Q${qi + 1}</span>` : ""}${src}${opt.lessonTag || ""}</div>
       <div class="q prose" style="max-width:none">${q.q}</div>
-      <div class="opts" role="group">${q.options.map((o, k) => {
+      <div class="opts${answered ? " done" : ""}" role="${warm ? "radiogroup" : "group"}"${warm ? ' aria-label="Your guess"' : ""}>${q.options.map((o, k) => {
         const cls = answered ? (k === q.answer ? "right" : k === pick ? "wrong" : "") : "";
-        return `<button class="opt ${cls}" data-act="answer" data-key="${esc(key)}" data-qi="${qi}" data-k="${k}" ${answered ? "disabled" : ""}><span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`;
+        return `<button class="opt ${cls}" data-act="answer" data-key="${esc(key)}" data-qi="${qi}" data-k="${k}"${warm ? ` role="radio" aria-checked="${pick === k}"` : ""} ${answered ? "disabled" : ""}>${warm ? '<span class="ring" aria-hidden="true"></span>' : ""}<span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`;
       }).join("")}</div>
       ${answered ? `<div class="why"><b>${pick === q.answer ? (opt.warm ? "Good guess." : "Right.") : opt.warm ? `Not quite. The answer is ${"ABCD"[q.answer]}.` : `Not this one. The answer is ${"ABCD"[q.answer]}.`}</b> ${q.why}${opt.warm ? " Keep it in mind as you read." : ""}</div>` : ""}
     </div>`;
