@@ -13,12 +13,22 @@ import java.time.Duration
 class UdpEchoTest {
     private val loopback = InetAddress.getLoopbackAddress()
 
+    /**
+     * The server sends the reply and then counts it, on its own thread, so the client can hold the reply
+     * a moment before `echoed` goes up. Wait briefly for the count instead of reading it at once.
+     */
+    private fun UdpEchoServer.echoedSoon(atLeast: Int, within: Duration = Duration.ofSeconds(2)): Int {
+        val deadline = System.nanoTime() + within.toNanos()
+        while (echoed < atLeast && System.nanoTime() < deadline) Thread.sleep(5)
+        return echoed
+    }
+
     @Test
     fun `the echo server sends a datagram back to whoever sent it`() {
         UdpEchoServer().use { server ->
             val answer = udpRequest(InetSocketAddress(loopback, server.port), "AUTH 4242 100.00".toByteArray(), Duration.ofSeconds(2))
             assertThat(answer?.decodeToString()).isEqualTo("AUTH 4242 100.00")
-            assertThat(server.echoed).isEqualTo(1)
+            assertThat(server.echoedSoon(1)).isEqualTo(1)
         }
     }
 
@@ -57,7 +67,7 @@ class UdpEchoTest {
             }
             clients.forEach { it.join() }
             assertThat(answers).containsEntry("from A", "from A").containsEntry("from B", "from B")
-            assertThat(server.echoed).isEqualTo(2)
+            assertThat(server.echoedSoon(2)).isEqualTo(2)
         }
     }
 
