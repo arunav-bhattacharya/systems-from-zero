@@ -1,0 +1,113 @@
+WEBVTT
+
+1
+00:00:02.700 --> 00:00:09.064
+A payments service keeps merchant names in Oracle, and copies of them in Redis, a cache in memory.
+
+2
+00:00:09.267 --> 00:00:13.903
+The rule so far: commit to the database, then delete the cached copy.
+
+3
+00:00:14.133 --> 00:00:16.139
+That rule still has a hole.
+
+4
+00:00:16.139 --> 00:00:20.152
+Reader A, a fraud check, asks Redis for merchant m-17.
+
+5
+00:00:20.152 --> 00:00:23.049
+Redis has nothing for it, so it misses.
+
+6
+00:00:23.400 --> 00:00:27.162
+It reads the row from Oracle: version 1, with the old name.
+
+7
+00:00:27.162 --> 00:00:31.499
+Then it stalls before storing it, say in a garbage collection pause.
+
+8
+00:00:31.700 --> 00:00:35.952
+Meanwhile, the writer renames the merchant and commits version 2.
+
+9
+00:00:36.167 --> 00:00:39.084
+Then it deletes the cached copy, as the rule says.
+
+10
+00:00:39.084 --> 00:00:42.409
+There's nothing there yet, so the delete removes nothing.
+
+11
+00:00:42.600 --> 00:00:48.111
+Now reader A's pause ends, and it stores what it read: version 1, kept for an hour.
+
+12
+00:00:48.300 --> 00:00:51.550
+Reader B asks for the merchant and gets the old name.
+
+13
+00:00:51.550 --> 00:00:56.271
+So does every request for the next hour, and no write is coming to delete it.
+
+14
+00:00:56.500 --> 00:00:57.743
+This is a stale set.
+
+15
+00:00:57.743 --> 00:01:03.276
+Reader A's read came before the commit, and its write to the cache came after the delete.
+
+16
+00:01:03.433 --> 00:01:05.256
+The race is rare per request.
+
+17
+00:01:05.256 --> 00:01:10.913
+When Meta measured, about one cache write in a million was still wrong five minutes later.
+
+18
+00:01:11.133 --> 00:01:15.594
+Redis forgot the delete, because deleting an empty key leaves no trace.
+
+19
+00:01:15.594 --> 00:01:18.421
+The fix gives the delete something to cancel.
+
+20
+00:01:18.633 --> 00:01:19.534
+Run it again.
+
+21
+00:01:19.534 --> 00:01:26.327
+On the miss, reader A also takes the key's lease: a random token, stored in Redis next to the key.
+
+22
+00:01:26.500 --> 00:01:28.958
+Reader A reads version 1, then stalls.
+
+23
+00:01:28.958 --> 00:01:33.873
+The writer commits version 2, then deletes the value and the lease together.
+
+24
+00:01:34.067 --> 00:01:37.449
+Reader A's pause ends, and it tries to fill the key.
+
+25
+00:01:37.449 --> 00:01:41.936
+A small script checks for its token and stores the value in one step.
+
+26
+00:01:41.936 --> 00:01:44.668
+The token is gone, so the fill is refused.
+
+27
+00:01:44.867 --> 00:01:50.719
+Reader B misses, takes its own lease, reads version 2, and fills the cache with the new name.
+
+28
+00:01:50.900 --> 00:01:56.112
+Every write into the cache must hold the key's lease, and every delete takes the lease away.
