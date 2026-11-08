@@ -2,7 +2,8 @@
 
 The site is static: `web/index.html` plus one JSON file per lesson in `web/lessons/` and the fonts.
 `wrangler.jsonc` in the repo root tells Cloudflare to serve the `web/` folder as a Worker with static assets.
-There is no server code and no sign-in: anyone with the link can read every lesson, and each visitor's
+The only code is `site/worker.js`, which runs for `/video/*` and answers HTTP range requests (206 Partial Content),
+so the videos play in Safari and seek in every browser. There is no sign-in: anyone with the link can read every lesson, and each visitor's
 progress is saved in their own browser.
 
 Cloudflare's dashboard changes now and then, so button names may differ a little from these steps.
