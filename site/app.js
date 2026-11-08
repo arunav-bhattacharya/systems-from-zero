@@ -544,14 +544,14 @@
     const pick = st[qi];
     const answered = pick !== undefined;
     const src = q.from && L[q.from] ? `<span class="tag from">From: ${esc(L[q.from].title)}</span>` : "";
-    // the warm-up is a guess, so its options are a calm radio group: one ring per answer, no boxes
+    // every question's options are a calm radio group: one ring per answer, no boxes
     const warm = !!opt.warm;
     return `<div class="qcard${warm ? " warm" : ""}" id="q-${esc(key)}-${qi}">
       <div class="qn">${opt.num ? `<span class="label">Q${qi + 1}</span>` : ""}${src}${opt.lessonTag || ""}</div>
       <div class="q prose" style="max-width:none">${q.q}</div>
-      <div class="opts${answered ? " done" : ""}" role="${warm ? "radiogroup" : "group"}"${warm ? ' aria-label="Your guess"' : ""}>${q.options.map((o, k) => {
+      <div class="opts radio${answered ? " done" : ""}" role="radiogroup" aria-label="${warm ? "Your guess" : "Your answer"}">${q.options.map((o, k) => {
         const cls = answered ? (k === q.answer ? "right" : k === pick ? "wrong" : "") : "";
-        return `<button class="opt ${cls}" data-act="answer" data-key="${esc(key)}" data-qi="${qi}" data-k="${k}"${warm ? ` role="radio" aria-checked="${pick === k}"` : ""} ${answered ? "disabled" : ""}>${warm ? '<span class="ring" aria-hidden="true"></span>' : ""}<span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`;
+        return `<button class="opt ${cls}" data-act="answer" data-key="${esc(key)}" data-qi="${qi}" data-k="${k}" role="radio" aria-checked="${pick === k}" ${answered ? "disabled" : ""}><span class="ring" aria-hidden="true"></span><span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`;
       }).join("")}</div>
       ${answered ? `<div class="why"><b>${pick === q.answer ? (opt.warm ? "Good guess." : "Right.") : opt.warm ? `Not quite. The answer is ${"ABCD"[q.answer]}.` : `Not this one. The answer is ${"ABCD"[q.answer]}.`}</b> ${q.why}${opt.warm ? " Keep it in mind as you read." : ""}</div>` : ""}
     </div>`;
@@ -713,7 +713,7 @@
     if (d.kind === "mcq") {
       const answered = rs.pick !== undefined;
       return `<div class="rv">${meta}<div class="qcard"><span class="label">A question you missed before</span><div class="q prose" style="max-width:none">${d.q.q}</div>
-        <div class="opts">${d.q.options.map((o, k) => `<button class="opt ${answered ? (k === d.q.answer ? "right" : k === rs.pick ? "wrong" : "") : ""}" data-act="rv-pick" data-k="${k}" ${answered ? "disabled" : ""}><span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`).join("")}</div>
+        <div class="opts radio${answered ? " done" : ""}" role="radiogroup" aria-label="Your answer">${d.q.options.map((o, k) => `<button class="opt ${answered ? (k === d.q.answer ? "right" : k === rs.pick ? "wrong" : "") : ""}" data-act="rv-pick" data-k="${k}" role="radio" aria-checked="${answered && rs.pick === k}" ${answered ? "disabled" : ""}><span class="ring" aria-hidden="true"></span><span class="key">${"ABCD"[k]}</span><span>${o}</span></button>`).join("")}</div>
         ${answered ? `<div class="why"><b>${rs.pick === d.q.answer ? "Right." : `The answer is ${"ABCD"[d.q.answer]}.`}</b> ${d.q.why}</div>` : ""}</div>
         ${answered ? `<div class="row"><button class="btn" data-act="rv-grade" data-g="${rs.pick === d.q.answer ? 3 : 1}">Next card</button></div>` : ""}</div>`;
     }
