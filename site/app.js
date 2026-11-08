@@ -18,7 +18,7 @@
 
   /* ---------------- storage ---------------- */
   const KEY = "sfz-v1";
-  const blank = () => ({ v: 1, theme: null, code: "both", done: {}, undone: {}, paceAt: "", quiz: {}, tquiz: {}, cards: {}, explain: {}, days: {}, pace: 5, open: {}, openPart: {}, timer: null, seenSetup: false });
+  const blank = () => ({ v: 1, theme: null, code: "both", done: {}, undone: {}, paceAt: "", quiz: {}, tquiz: {}, cards: {}, explain: {}, days: {}, pace: 5, open: {}, openPart: {}, tocHidden: false, timer: null, seenSetup: false });
   let S = blank();
   try { S = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) { /* private window or blocked storage */ }
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ } };
@@ -410,7 +410,7 @@
     }
     const done = isDone(l.id);
     const toc = [];
-    let h = `<div class="lgrid"><article>
+    let h = `<div class="lgrid${S.tocHidden ? " toc-off" : ""}"><article>
       <header class="lhead">${crumb}<h1>${esc(l.title)}</h1><p class="goal">${l.goal}</p>
         <div class="donebar">${done ? `<span class="done-pill">■ Done</span><button class="btn ghost sm" data-act="undone" data-id="${l.id}">Mark not done</button>` : `<button class="btn ghost sm" data-act="done" data-id="${l.id}">Mark lesson done</button>`}
         <button class="btn ghost sm" data-act="timer">Start a 40-minute session</button></div>
@@ -491,7 +491,11 @@
     h += `<section class="block"><div class="score"><div><span class="label">Finished?</span><div style="font:400 24px var(--display)">${done ? "This lesson is done." : "Tick it off. The plan moves with you."}</div></div>
       ${done ? `<button class="btn ghost" data-act="undone" data-id="${l.id}">Mark not done</button>` : `<button class="btn" data-act="done" data-id="${l.id}">Mark lesson done</button>`}</div></section>`;
     h += pager(prev, next) + `</article>
-      <aside class="toc" aria-label="On this page"><span class="label">On this page</span><ul>${toc.map(([id, label, n]) => `<li data-toc="${id}"><button data-act="scroll" data-id="${id}">${n ? `<span class="label" style="margin-right:6px">${n}</span>` : ""}${label}</button></li>`).join("")}</ul></aside></div>`;
+      <aside class="toc" aria-label="On this page">
+        <div class="toc-full"><div class="toc-head"><span class="label">On this page</span><button class="toc-btn" data-act="toc" aria-expanded="${!S.tocHidden}" aria-label="Hide the contents and widen the lesson" title="Hide contents"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
+        <ul>${toc.map(([id, label, n]) => `<li data-toc="${id}"><button data-act="scroll" data-id="${id}">${n ? `<span class="label" style="margin-right:6px">${n}</span>` : ""}${label}</button></li>`).join("")}</ul></div>
+        <button class="toc-btn toc-open" data-act="toc" aria-expanded="${!S.tocHidden}" aria-label="Show the contents" title="Show contents"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M2.5 4h7M2.5 8h7M2.5 12h7M14 4.5 11.5 8l2.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+      </aside></div>`;
     return h;
   }
   // the web build ships lesson bodies as separate files (lessons/<id>.json); the preview inlines them
@@ -904,6 +908,15 @@
       case "lang": { const top = a.getBoundingClientRect().top; setCodePref(a.dataset.lang); scrollBy(0, a.getBoundingClientRect().top - top); break; }
       case "answer": onAnswer(a.dataset.key, +a.dataset.qi, +a.dataset.k); break;
       case "retake": delete pageState.quiz[a.dataset.key]; delete pageState.quiz[a.dataset.key + ":retry"]; render(true); break;
+      case "toc": {
+        // hide or show the contents column; the lesson takes the space, and the choice is remembered
+        S.tocHidden = !S.tocHidden; save();
+        const g = a.closest(".lgrid");
+        if (g) { g.classList.toggle("toc-off", S.tocHidden); $$("[data-act=toc]", g).forEach((b) => b.setAttribute("aria-expanded", String(!S.tocHidden))); }
+        const next = g && $(S.tocHidden ? ".toc-open" : ".toc-full .toc-btn", g);
+        if (next) next.focus({ preventScroll: true });
+        break;
+      }
       case "scroll": { const el = document.getElementById(id); if (el) el.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }); break; }
       case "copy": copyText(a.dataset.text, a); break;
       case "copy-code": { const pre = a.closest(".codebox").querySelector("pre"); copyText(pre.innerText, a); break; }
