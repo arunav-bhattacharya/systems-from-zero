@@ -18,7 +18,7 @@
 
   /* ---------------- storage ---------------- */
   const KEY = "sfz-v1";
-  const blank = () => ({ v: 1, theme: null, code: "both", done: {}, undone: {}, paceAt: "", quiz: {}, tquiz: {}, cards: {}, explain: {}, days: {}, pace: 5, open: {}, timer: null, seenSetup: false });
+  const blank = () => ({ v: 1, theme: null, code: "both", done: {}, undone: {}, paceAt: "", quiz: {}, tquiz: {}, cards: {}, explain: {}, days: {}, pace: 5, open: {}, openPart: {}, timer: null, seenSetup: false });
   let S = blank();
   try { S = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || "{}")); } catch (e) { /* private window or blocked storage */ }
   const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { /* storage unavailable */ } };
@@ -179,6 +179,11 @@
     timer: '<svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 7.5V11l2.4 1.6M8 2.2h4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
   };
   const brandMark = '<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">' + [[8, 6, 1], [6, 10, 0.78], [4, 14, 0.56], [2, 18, 0.36]].map(([x, w, o], i) => `<rect x="${x}" y="${3 + i * 4.6}" width="${w}" height="2.6" rx="1.3" fill="var(--ember)" fill-opacity="${o}"/>`).join("") + '</svg>';
+  // a small play icon next to any lesson that has a narrated video
+  const vicon = (id) => {
+    const n = (L[id] && L[id].vids) || 0;
+    return n ? `<svg class="vicon" viewBox="0 0 16 12" width="16" height="12" role="img" aria-label="${n === 1 ? "Has a video" : `Has ${n} videos`}"><title>${n === 1 ? "Has a narrated video" : `Has ${n} narrated videos`}</title><rect x=".6" y=".6" width="14.8" height="10.8" rx="2.6" fill="none" stroke="currentColor" stroke-width="1.2"/><path d="M6.4 3.5v5L10.5 6z" fill="currentColor"/></svg>` : "";
+  };
   const cells = (ids, big) => `<span class="draft" aria-hidden="true">${ids.map((id) => `<i class="cell${big ? " lg" : ""} ${cellState(id)}"></i>`).join("")}</span>`;
   function codeBox(c, title) {
     if (!c) return "";
@@ -239,18 +244,26 @@
       ${item("glossary", "Glossary")}
       ${item("setup", "Set up the labs")}
     </div>
-    <div class="navsec"><span class="label">Tracks · ${doneCount()} of ${ORDER.length} lessons done</span>
+    <div class="navsec"><div class="navrow"><span class="label">Tracks · ${doneCount()} of ${ORDER.length} lessons done</span>
+      <span class="xall"><button data-act="expand-all">Expand all</button><button data-act="collapse-all">Collapse all</button></span></div>
     <input class="field filter" id="lesson-filter" type="search" placeholder="Find a lesson" aria-label="Find a lesson" value="${esc(filterText)}"></div>`;
     let lastPart = null;
     for (const t of C.tracks) {
       const open = filterText ? true : S.open[t.id] ?? (t.id === curTrack || (!curTrack && t.id === nxTrack));
       const shown = t.lessons.filter((id) => !filterText || L[id].title.toLowerCase().includes(filterText.toLowerCase()));
       if (filterText && !shown.length) continue;
-      if (PART[t.part] && t.part !== lastPart) { lastPart = t.part; h += `<div class="partsec"><span class="label">Part ${roman(PART[t.part].idx)} · ${esc(PART[t.part].title)}</span></div>`; }
+      const p = PART[t.part];
+      const partOpen = !p || filterText ? true : (S.openPart || {})[t.part] ?? true;
+      if (p && t.part !== lastPart) {
+        lastPart = t.part;
+        const ids = C.tracks.filter((x) => x.part === t.part).flatMap((x) => x.lessons);
+        h += `<button class="partsec" data-act="toggle-part" data-id="${t.part}" aria-expanded="${partOpen}"><span class="label">Part ${roman(p.idx)} · ${esc(p.title)}</span><span class="pcount tnum">${ids.filter((id) => S.done[id]).length}/${ids.length}</span><span class="chev" aria-hidden="true"></span></button>`;
+      }
+      if (!partOpen) continue;
       h += `<div class="trk" style="--trk: var(--c${t.idx})"><button data-act="toggle-track" data-id="${t.id}" aria-expanded="${open}">
           <span class="tn">${pad(t.idx)}</span><span class="tt">${esc(t.title)}</span><span></span>${cells(t.lessons)}</button>
         ${open ? `<ul><li><button data-go="track-${t.id}" class="${cur === "track-" + t.id ? "on" : ""}"><span class="cell" style="visibility:hidden"></span>Track overview</button></li>
-          ${shown.map((id) => `<li><button data-go="${id}" class="${cur === id ? "on" : ""}"><i class="cell ${cellState(id)}"></i><span>${esc(L[id].title)}</span></button></li>`).join("")}</ul>` : ""}
+          ${shown.map((id) => `<li><button data-go="${id}" class="${cur === id ? "on" : ""}"><i class="cell ${cellState(id)}"></i><span>${esc(L[id].title)}</span>${vicon(id)}</button></li>`).join("")}</ul>` : ""}
       </div>`;
     }
     h += `<p class="label" style="padding:18px 20px 0;line-height:1.6">Progress is saved in this browser. Move it between devices from Plan and progress.</p>`;
@@ -660,11 +673,12 @@
   /* ---------------- track ---------------- */
   function trackPage(t) {
     const best = S.tquiz[t.id];
-    return `<header class="lhead" style="--trk: var(--c${t.idx})"><div class="crumb"><span class="label trk-l">Track ${pad(t.idx)} · ${t.lessons.length} lessons · labs/${esc(t.lab)}</span></div>
+    const nv = t.lessons.filter((id) => L[id].vids).length;
+    return `<header class="lhead" style="--trk: var(--c${t.idx})"><div class="crumb"><span class="label trk-l">Track ${pad(t.idx)} · ${t.lessons.length} lessons${nv ? ` · ${nv} with video` : ""} · ${(t.labs || [t.lab]).map((m) => "labs/" + esc(m)).join(", ")}</span></div>
       <h1>${esc(t.title)}</h1><p class="goal">${esc(t.short)}</p>${cells(t.lessons, true)}</header>
       ${t.intro ? `<div class="prose" style="margin-bottom:34px">${t.intro}</div>` : ""}
       <section class="block" style="margin-top:0"><span class="label">Lessons</span><div class="plan-list">
-        ${t.lessons.map((id) => { const l = L[id]; return `<div class="pr"><span class="d">${wdShort(id)}</span><i class="cell ${cellState(id)}"></i><button data-go="${id}">${esc(l.title)}${l.ready ? "" : ' <span class="label">being written</span>'}</button><span class="label">${S.quiz[id] != null ? `quiz ${S.quiz[id]}/5` : ""}</span></div>`; }).join("")}
+        ${t.lessons.map((id) => { const l = L[id]; return `<div class="pr"><span class="d">${wdShort(id)}</span><i class="cell ${cellState(id)}"></i><button data-go="${id}">${esc(l.title)}${vicon(id)}${l.ready ? "" : ' <span class="label">being written</span>'}</button><span class="label">${S.quiz[id] != null ? `quiz ${S.quiz[id]}/5` : ""}</span></div>`; }).join("")}
       </div></section>
       ${t.cheatsheet ? `<section class="block"><span class="label">Cheat sheet</span><h2>The track on one page</h2><div class="prose" style="max-width:none">${t.cheatsheet}</div></section>` : ""}
       ${t.recap.length ? `<section class="block"><div class="recap"><span class="label">Remember from this track</span><ul class="prose" style="max-width:none">${t.recap.map((r) => `<li>${r}</li>`).join("")}</ul></div></section>` : ""}
@@ -875,6 +889,13 @@
       case "close-menu": mobileOpen = false; render(true); break;
       case "theme": S.theme = effectiveTheme() === "dark" ? "light" : "dark"; document.documentElement.setAttribute("data-theme", S.theme); save(); render(true); break;
       case "toggle-track": { const el = a.closest(".trk"); const open = a.getAttribute("aria-expanded") === "true"; S.open[id] = !open; save(); sidebar(route()); void el; break; }
+      case "toggle-part": { S.openPart = S.openPart || {}; S.openPart[id] = a.getAttribute("aria-expanded") !== "true"; save(); sidebar(route()); break; }
+      case "expand-all": case "collapse-all": {
+        const on = act === "expand-all";
+        S.openPart = Object.fromEntries(PARTS.map((p) => [p.id, on]));
+        S.open = Object.fromEntries(C.tracks.map((t) => [t.id, on]));
+        save(); sidebar(route()); break;
+      }
       case "done": setDone(id, true); break;
       case "undone": setDone(id, false); break;
       case "hint": pageState.hints[id] = (pageState.hints[id] || 0) + 1; render(true); break;

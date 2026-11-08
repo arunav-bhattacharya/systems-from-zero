@@ -223,6 +223,10 @@ def compile_course():
             "recap": [inline(x) for x in T.get("recap", [])], "quiz": [mcq(q) for q in T.get("quiz", [])],
         })
     attach_videos(out["lessons"])
+    # how many narrated videos each lesson has, so lesson lists can show a video icon without loading the body
+    for l in out["lessons"].values():
+        if l.get("ready"):
+            l["vids"] = sum(1 for s in l.get("sections", []) if s.get("video")) + len(l.get("videos", []))
     return out
 
 
@@ -268,7 +272,7 @@ def page(course, mode):
             + "</body>\n</html>\n")
 
 
-CORE = {"id", "track", "n", "title", "ready", "minutes", "goal", "quiz", "cards", "terms"}
+CORE = {"id", "track", "n", "title", "ready", "minutes", "goal", "quiz", "cards", "terms", "vids"}
 
 
 def split(course):
