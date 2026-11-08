@@ -274,7 +274,9 @@
   /* ---------------- router ---------------- */
   const route = () => {
     const h = location.hash.slice(1) || "home";
-    if (REDIR[h]) { history.replaceState(null, "", "#" + REDIR[h]); return REDIR[h]; }
+    // only ids that no longer exist are redirected: some old ids (sql-06 to sql-10) are new lessons' ids now
+    const live = L[h] || (h.startsWith("track-") && T[h.slice(6)]);
+    if (REDIR[h] && !live) { history.replaceState(null, "", "#" + REDIR[h]); return REDIR[h]; }
     return h;
   };
   function render(keepScroll) {
