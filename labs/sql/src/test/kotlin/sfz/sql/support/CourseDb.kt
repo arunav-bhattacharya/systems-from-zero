@@ -47,6 +47,17 @@ object CourseDb {
         return conn
     }
 
+    /**
+     * A new connection that logs in as [user] with [password] (lesson 15). It reaches the server
+     * through the container's port mapping, so pg_hba.conf's last line applies,
+     * `host all all all scram-sha-256`, and a wrong password fails with SQLSTATE 28P01.
+     */
+    fun connectAs(user: String, password: String): Connection {
+        val conn = DriverManager.getConnection(container.jdbcUrl, user, password)
+        conn.createStatement().use { it.execute("SET TIME ZONE 'UTC'") }
+        return conn
+    }
+
     private fun load(c: PostgreSQLContainer) {
         DriverManager.getConnection(c.jdbcUrl, c.username, c.password).use { conn ->
             conn.createStatement().use { st ->

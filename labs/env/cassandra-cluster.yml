@@ -4,9 +4,14 @@
 #   docker compose -f env/cassandra-cluster.yml exec cass1 cqlsh         a CQL prompt on node 1 (cass2, cass3 work too)
 #   docker compose -f env/cassandra-cluster.yml stop cass3               "fail" a node; `start cass3` brings it back
 #   docker compose -f env/cassandra-cluster.yml down -v                  stop all three and delete the data
-# CQL files in env/cassandra/ are mounted read-only at /sfz, so `cqlsh -f /sfz/<file>.cql` loads one.
+# Lesson nosql-14 adds two optional nodes, each behind a Compose profile, so the commands above never start them:
+#   docker compose -f env/cassandra-cluster.yml --profile grow up -d cass4   a fourth node joins dc1 (bootstrap)
+#   docker compose -f env/cassandra-cluster.yml --profile dc2 up -d cass5    one node in a second datacenter, dc2
+#   docker compose -f env/cassandra-cluster.yml --profile grow --profile dc2 down -v   stop everything, delete the data
+#   (a plain `down -v` leaves cass4 or cass5 running if you started them)
+# CQL files and scripts in env/cassandra/ are mounted read-only at /sfz, so `cqlsh -f /sfz/<file>.cql` loads one.
 # No host ports: talk to the nodes through `exec`, so this file never clashes with env/cassandra.yml.
-# Memory: three small heaps, about 1 GB per container, about 3 GB in all.
+# Memory: three small heaps, about 1 GB per container, about 3 GB in all (4 GB with cass4 or cass5).
 name: sfz-cassandra-cluster
 
 x-node: &node
@@ -18,7 +23,7 @@ x-node: &node
     - bash
     - -c
     - "grep -q '^dynamic_snitch:' /etc/cassandra/cassandra.yaml || echo 'dynamic_snitch: false' >> /etc/cassandra/cassandra.yaml; exec docker-entrypoint.sh cassandra -f"
-  environment:
+  environment: &env
     CASSANDRA_CLUSTER_NAME: sfz-ring
     CASSANDRA_SEEDS: cass1                       # new nodes ask cass1 who is in the ring
     CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
@@ -53,3 +58,29 @@ services:
     hostname: cass3
     depends_on:
       cass2: { condition: service_healthy }
+
+  # Lesson nosql-14: a fourth node in dc1, started only with --profile grow. It isn't a seed, so it
+  # bootstraps: it picks 16 tokens and streams the data for its new ranges from the current owners.
+  cass4:
+    <<: *node
+    hostname: cass4
+    profiles: [grow]
+    depends_on:
+      cass3: { condition: service_healthy }
+
+  # Lesson nosql-14: one node in a second datacenter, dc2, started only with --profile dc2.
+  # A node in a NEW datacenter starts with auto_bootstrap: false, so it joins the ring without
+  # streaming anything; once the keyspace has replicas in dc2, `nodetool rebuild -- dc1` copies them.
+  cass5:
+    <<: *node
+    hostname: cass5
+    profiles: [dc2]
+    entrypoint:
+      - bash
+      - -c
+      - "grep -q '^dynamic_snitch:' /etc/cassandra/cassandra.yaml || { echo 'dynamic_snitch: false'; echo 'auto_bootstrap: false'; } >> /etc/cassandra/cassandra.yaml; exec docker-entrypoint.sh cassandra -f"
+    environment:
+      <<: *env
+      CASSANDRA_DC: dc2
+    depends_on:
+      cass3: { condition: service_healthy }

@@ -1,0 +1,84 @@
+# PostgreSQL 18 with a streaming standby, for lesson sql-16 (replication, backups and failover).
+#   docker compose -f env/postgres-ha.yml up -d --wait
+#   docker compose -f env/postgres-ha.yml exec primary psql -U sfz -d course     psql on the primary
+#   docker compose -f env/postgres-ha.yml exec standby psql -U sfz -d course     psql on the standby (read-only)
+#   docker compose -f env/postgres-ha.yml down -v                                stop and delete all data
+#
+# primary   initdb, then postgres-ha/initdb: role "replicator" (REPLICATION), a pg_hba.conf line for it,
+#           the physical replication slot "standby1", and database "course" with the course schema and seed.
+#           Every finished WAL segment is copied to the volume "archive" (archive_mode = on).
+# standby   on first start, clones the primary with pg_basebackup -R (standby.signal and primary_conninfo)
+#           through slot "standby1", then runs as a hot standby that streams and replays the primary's WAL.
+# restore   only with --profile pitr: point-in-time recovery from the base backup in /archive/base plus
+#           the archived WAL, up to TARGET_TIME. See postgres-ha/restore-start.sh and lesson sql-16.
+#
+# No ports are published: use "exec" as above, so this file never clashes with env/postgres.yml.
+name: sfz-postgres-ha
+services:
+  primary:
+    image: postgres:18
+    hostname: primary
+    environment:
+      POSTGRES_USER: sfz
+      POSTGRES_PASSWORD: sfz
+      POSTGRES_DB: sfz
+    command: ["bash", "/ha/primary-start.sh"]
+    mem_limit: 512m
+    shm_size: 128m
+    volumes:
+      - ./postgres-ha:/ha:ro
+      - ./postgres-ha/initdb:/docker-entrypoint-initdb.d:ro
+      - ./postgres/course:/seed/course:ro
+      - primary-data:/var/lib/postgresql
+      - archive:/archive
+    healthcheck:
+      # over TCP: the image's first-start init runs a temporary server on the Unix socket only
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sfz -d course"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  standby:
+    image: postgres:18
+    hostname: standby
+    environment:
+      PGPASSWORD: replicator            # for pg_basebackup; -R copies it into primary_conninfo
+    command: ["bash", "/ha/standby-start.sh"]
+    depends_on:
+      primary:
+        condition: service_healthy
+    mem_limit: 512m
+    shm_size: 128m
+    volumes:
+      - ./postgres-ha:/ha:ro
+      - standby-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sfz -d course"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  restore:
+    profiles: ["pitr"]
+    image: postgres:18
+    hostname: restore
+    environment:
+      TARGET_TIME: ${TARGET_TIME:-}     # recovery_target_time, e.g. TARGET_TIME='2026-11-08 02:30:00+00'
+    command: ["bash", "/ha/restore-start.sh"]
+    mem_limit: 512m
+    shm_size: 128m
+    volumes:
+      - ./postgres-ha:/ha:ro
+      - restore-data:/var/lib/postgresql
+      - archive:/archive:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sfz -d course"]
+      interval: 2s
+      timeout: 3s
+      retries: 90
+
+volumes:
+  primary-data:
+  standby-data:
+  restore-data:
+  archive:

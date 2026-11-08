@@ -1,14 +1,14 @@
 # Systems from Zero
 
-A 97-lesson course on the systems under a backend service: networks, operating systems, SQL databases, how a database works inside, NoSQL databases, Kafka, Redis and big data. One lesson a day, about 40 minutes each, with a lab you run on your laptop and tests that tell you when it works.
+A 105-lesson course on the systems under a backend service: networks, operating systems, SQL databases, how a database works inside, NoSQL databases, Kafka, Redis and big data. One lesson a day, about 40 minutes each, with a lab you run on your laptop and tests that tell you when it works.
 
 | # | Track | Lessons | Lab project |
 |---|---|---|---|
 | 1 | Computer networking | 12 | `labs/net` |
 | 2 | Operating systems | 12 | `labs/os` |
-| 3 | Relational databases and SQL | 14 | `labs/sql` |
+| 3 | Relational databases and SQL (including running PostgreSQL: configuration, roles, replication, backups) | 16 | `labs/sql` |
 | 4 | Database internals | 12 | `labs/internals` |
-| 5 | NoSQL databases | 12 | `labs/nosql` |
+| 5 | NoSQL databases (then inside each store: Cassandra's ring and gossip, MongoDB sharding, DynamoDB, Neo4j, OpenSearch, and how to set each up) | 18 | `labs/nosql` |
 | 6 | Kafka with Java and Kotlin | 12 | `labs/kafka` |
 | 7 | Redis with Java and Kotlin | 11 | `labs/redis` |
 | 8 | Big data: Spark and the lakehouse | 12 | `labs/bigdata` |
@@ -17,7 +17,7 @@ Each lesson has a warm-up question to answer before reading, 3 to 5 short sectio
 
 The site also has:
 
-- **Narrated animations**: 19 short videos (2560x1440, about two minutes each) on the hardest mechanisms, from the TCP handshake and page faults to B+tree splits, Raft-style replication, consumer rebalancing and Iceberg snapshots. Each sits at the top of the section it explains, with captions.
+- **Narrated animations**: 23 short videos (2560x1440, about two minutes each) on the hardest mechanisms, from the TCP handshake and page faults to B+tree splits, consumer rebalancing, Cassandra gossip, MongoDB sharding, PostgreSQL failover and Iceberg snapshots. Each sits at the top of the section it explains, with captions.
 - **Review**: spaced-repetition flashcards (FSRS-4.5 scheduler). Each finished lesson adds 5 to 7 cards, and every quiz question you miss joins them.
 - **Mixed practice**: quiz questions drawn from all finished lessons.
 - **Plan**: lessons laid out as Week N, Day N at 3 to 7 study days a week, and copy/paste sync between devices.

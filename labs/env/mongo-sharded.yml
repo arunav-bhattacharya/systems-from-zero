@@ -1,0 +1,101 @@
+# MongoDB 9.0 as a small SHARDED cluster, for lesson nosql-15:
+#   cfg1     the config server replica set `cfg` (one member): the cluster's map of chunks to shards
+#   shard1   shard replica set `shard1` (one member)
+#   shard2   shard replica set `shard2` (one member)
+#   mongos   the router your application talks to
+#   docker compose -f env/mongo-sharded.yml up -d --wait              start it (about 30 seconds; healthy once both shards are added)
+#   docker compose -f env/mongo-sharded.yml exec mongos mongosh sfz   a mongosh prompt on the router, database sfz
+#   docker compose -f env/mongo-sharded.yml exec shard1 mongosh sfz   a prompt on one shard directly (to see what it holds)
+#   docker compose -f env/mongo-sharded.yml down -v                   stop everything and delete the data
+# Each replica set has ONE member to keep the cluster small; production uses three per set.
+# The healthchecks build the cluster: each mongod initiates its own replica set, and the mongos
+# healthcheck runs env/mongo/sharded-init.js, which adds both shards.
+# No host ports, so this file never clashes with env/mongo.yml or env/mongo-rs.yml.
+# Scripts in env/mongo/ are mounted read-only at /sfz.
+# Memory: three mongods at 512 MB (WiredTiger cache 0.25 GB each) and one mongos at 256 MB, about 1.8 GB.
+name: sfz-mongo-sharded
+
+x-mongod: &mongod
+  image: mongo:9.0
+  mem_limit: 512m
+  volumes:
+    - ./mongo:/sfz:ro
+
+services:
+  cfg1:
+    <<: *mongod
+    hostname: cfg1
+    command: ["mongod", "--configsvr", "--replSet", "cfg", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    healthcheck:
+      # the first check creates the config server replica set; healthy once cfg1 is its primary
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          let s; try { s = rs.status() } catch (e) {
+          rs.initiate({_id: 'cfg', configsvr: true, members: [{_id: 0, host: 'cfg1:27017'}]}); throw new Error('initiated') }
+          if (s.myState !== 1) throw new Error('not primary yet')
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s
+
+  shard1:
+    <<: *mongod
+    hostname: shard1
+    command: ["mongod", "--shardsvr", "--replSet", "shard1", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          let s; try { s = rs.status() } catch (e) {
+          rs.initiate({_id: 'shard1', members: [{_id: 0, host: 'shard1:27017'}]}); throw new Error('initiated') }
+          if (s.myState !== 1) throw new Error('not primary yet')
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s
+
+  shard2:
+    <<: *mongod
+    hostname: shard2
+    command: ["mongod", "--shardsvr", "--replSet", "shard2", "--port", "27017", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25"]
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          let s; try { s = rs.status() } catch (e) {
+          rs.initiate({_id: 'shard2', members: [{_id: 0, host: 'shard2:27017'}]}); throw new Error('initiated') }
+          if (s.myState !== 1) throw new Error('not primary yet')
+      interval: 3s
+      timeout: 10s
+      retries: 40
+      start_period: 5s
+
+  mongos:
+    image: mongo:9.0
+    hostname: mongos
+    mem_limit: 256m
+    # a router keeps no data: it reads the cluster's map from the config servers and caches it
+    command: ["mongos", "--configdb", "cfg/cfg1:27017", "--port", "27017", "--bind_ip_all"]
+    volumes:
+      - ./mongo:/sfz:ro
+    depends_on:
+      cfg1: { condition: service_healthy }
+      shard1: { condition: service_healthy }
+      shard2: { condition: service_healthy }
+    healthcheck:
+      # adds shard1 and shard2 the first time; healthy once the cluster lists both
+      test: ["CMD", "mongosh", "--quiet", "--file", "/sfz/sharded-init.js"]
+      interval: 3s
+      timeout: 20s
+      retries: 40
+      start_period: 5s
