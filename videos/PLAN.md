@@ -51,3 +51,15 @@ sql-01 NULL and three-valued logic, sql-05 correlated subqueries, batch-13 idemp
 found-06, model-01, model-03, model-04, model-07, model-09, store-02, store-13, store-14, cache-03, enc-01,
 enc-04, dist-07, dist-08, cons-06, msg-11, stream-02, stream-08, batch-01, batch-04, batch-09, batch-10,
 batch-14, batch-15, derive-02, derive-06, sql-10, os-08, net-05, net-06
+
+## Progress log
+
+- Round 1 shipped so far (2026-11-15): repl-02, repl-08, msg-07, cons-05, cons-01, dist-02; store-01, store-03,
+  store-07, os-09, txn-02, txn-03; net-08, cache-05, shard-01, shard-04, batch-05, batch-06 (74 videos live).
+  Still running: streams/derived/encoding maker (stream-03, stream-05, derive-01, derive-05, enc-03, dist-04).
+- Round 2 started (usage 11%): maker E net-10 tls-handshake, net-11 http-versions, net-03 nat, net-12 lb-retries,
+  os-02 fork-exec, os-11 epoll; maker F os-07 cow-oom, os-12 namespaces-cgroups, cache-01 hit-ratio,
+  model-02 access-patterns, model-05 wide-column, model-06 embed-vs-reference; maker G sql-02 normalization,
+  sql-04 group-by-rollup, sql-07 gaps-islands, sql-08 keyset-pagination, sql-09 upsert-race, store-08 hnsw.
+  Maker H (start when the round 1 maker finishes): store-09 volcano-vs-vector, store-10 join-order,
+  store-11 column-compression, store-12 view-maintenance, batch-08 skew-aqe, batch-12 iceberg-deletes.
