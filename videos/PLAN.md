@@ -72,3 +72,4 @@ batch-14, batch-15, derive-02, derive-06, sql-10, os-08, net-05, net-06
 - Maker G shipped (sql-02, sql-04, sql-07, sql-08, sql-09, store-08); round 2 complete; 104 videos live. Maker L started: os-10 inodes, net-02 arp, net-04 routing, sql-01 null-logic, sql-05 correlated-subquery, batch-13 backfills.
 - Maker J shipped (cache-08, cache-09, cache-10, shard-08, shard-09, txn-06); 110 videos live. Posters set by hand: token-bucket POSTER=64, rdb-aof POSTER=49.
 - Maker I shipped (msg-03, msg-05, msg-06, msg-09, msg-12, cache-04); 116 videos live. Posters: segments-compaction 108, retry-topics 101.5, redis-streams 74.8, hyperloglog 117.
+- Maker L shipped (os-10, net-02, net-04, sql-01, sql-05, batch-13); 122 videos live. Only maker K (txn-08, repl-06, found-05, os-03, os-04, os-05) left in round 3.
