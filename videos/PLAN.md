@@ -9,7 +9,7 @@ Makers follow `videos/MAKER_BRIEF.md`; four makers run at once, six videos each,
 
 1. Add each video to `content/videos.json` (slug, scene, lesson, section, title); check the mp4, jpg and vtt
    exist, the section index is in range and not already used by another video.
-2. `python3 site/validate.py --all`, then `python3 site/build.py`.
+2. `/usr/local/bin/python3 site/validate.py --all`, then `/usr/local/bin/python3 site/build.py` (that interpreter has markdown and pygments; Homebrew's python3 does not).
 3. `git add videos/scenes videos/captions web/video content/videos.json web/index.html web/lessons`, commit, and
    push with `git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main`.
 4. `npx wrangler deploy`. New video URLs can 404 for a few seconds; then check each with a range request (206).
