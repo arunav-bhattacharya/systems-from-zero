@@ -64,3 +64,7 @@ batch-14, batch-15, derive-02, derive-06, sql-10, os-08, net-05, net-06
   Maker H (start when the round 1 maker finishes): store-09 volcano-vs-vector, store-10 join-order,
   store-11 column-compression, store-12 view-maintenance, batch-08 skew-aqe, batch-12 iceberg-deletes.
 - Round 1 complete (2026-11-15): stream-03, stream-05, derive-01, derive-05, enc-03, dist-04 shipped; 80 videos live. Maker H started.
+- Maker H shipped (store-09, store-10, store-11, store-12, batch-08, batch-12); 86 videos live.
+- Round 3 maker I started (usage 17%): msg-03 segments-compaction, msg-05 keys-partitions, msg-06 idempotent-producer, msg-09 retry-topics, msg-12 redis-streams, cache-04 hyperloglog.
+- Round 3 still to assign: cache-08 token bucket, cache-09 RDB fork and AOF, cache-10 Redis Cluster slots, shard-08 DynamoDB partitions, shard-09 query then fetch, txn-06 WATCH and MULTI, txn-08 DynamoDB transactions, repl-06 CRDT text, found-05 storage and compute, os-03 threads, os-04 scheduling, os-05 futexes, os-10 inodes, net-02 ARP, net-04 routing, sql-01 NULL logic, sql-05 correlated subqueries, batch-13 idempotent backfills.
+- Maker E shipped (net-10, net-11, net-03, net-12, os-02, os-11); 92 videos live. Maker J started: cache-08 token-bucket, cache-09 rdb-aof, cache-10 cluster-slots, shard-08 dynamodb-partitions, shard-09 query-then-fetch, txn-06 watch-multi.
