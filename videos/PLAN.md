@@ -63,3 +63,4 @@ batch-14, batch-15, derive-02, derive-06, sql-10, os-08, net-05, net-06
   sql-04 group-by-rollup, sql-07 gaps-islands, sql-08 keyset-pagination, sql-09 upsert-race, store-08 hnsw.
   Maker H (start when the round 1 maker finishes): store-09 volcano-vs-vector, store-10 join-order,
   store-11 column-compression, store-12 view-maintenance, batch-08 skew-aqe, batch-12 iceberg-deletes.
+- Round 1 complete (2026-11-15): stream-03, stream-05, derive-01, derive-05, enc-03, dist-04 shipped; 80 videos live. Maker H started.
