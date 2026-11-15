@@ -1,0 +1,105 @@
+WEBVTT
+
+1
+00:00:02.700 --> 00:00:11.073
+The card network sends two messages for one payment: the authorization, which is pending, and then the capture, which succeeded.
+
+2
+00:00:11.073 --> 00:00:13.167
+Both carry the same payment uid.
+
+3
+00:00:13.333 --> 00:00:17.873
+After a Kafka rebalance, two consumers handle them at the same moment.
+
+4
+00:00:17.873 --> 00:00:22.413
+The obvious code checks first: if the uid isn't stored yet, insert it.
+
+5
+00:00:22.633 --> 00:00:26.373
+Both checks run before either insert, and both find nothing.
+
+6
+00:00:26.567 --> 00:00:27.557
+So both insert.
+
+7
+00:00:27.557 --> 00:00:34.623
+Without a unique constraint, the table now holds one payment twice, and settlement pays the merchant twice.
+
+8
+00:00:34.833 --> 00:00:38.357
+The course schema has a unique index on the uid.
+
+9
+00:00:38.357 --> 00:00:39.311
+Run it again.
+
+10
+00:00:39.311 --> 00:00:45.477
+A inserts first, and B's insert finds A's uncommitted entry in the index, and waits.
+
+11
+00:00:45.733 --> 00:00:49.245
+A commits, and B fails with a duplicate key error.
+
+12
+00:00:49.245 --> 00:00:56.691
+One row, but the error aborts B's whole transaction, a batch of 500 messages, and the capture never lands.
+
+13
+00:00:56.867 --> 00:00:58.244
+The trouble is the gap.
+
+14
+00:00:58.244 --> 00:01:03.216
+The check and the write are two steps, and the other consumer can act between them.
+
+15
+00:01:03.400 --> 00:01:06.280
+INSERT with ON CONFLICT makes them one step.
+
+16
+00:01:06.280 --> 00:01:11.648
+There is no separate check: the insert asks the unique index itself, as it writes.
+
+17
+00:01:11.900 --> 00:01:12.640
+Replay it.
+
+18
+00:01:12.640 --> 00:01:14.713
+A inserts the authorization.
+
+19
+00:01:14.713 --> 00:01:18.341
+B's insert hits A's entry in the index and waits.
+
+20
+00:01:18.500 --> 00:01:21.993
+When A commits, B's conflict turns into an update.
+
+21
+00:01:21.993 --> 00:01:23.810
+Pending becomes succeeded.
+
+22
+00:01:23.810 --> 00:01:25.347
+No error, and one row.
+
+23
+00:01:25.500 --> 00:01:27.910
+EXCLUDED is the row B tried to insert.
+
+24
+00:01:27.910 --> 00:01:33.364
+The WHERE keeps a late authorization from setting a succeeded payment back to pending.
+
+25
+00:01:33.567 --> 00:01:37.941
+A check in a separate statement can be out of date before you act on it.
+
+26
+00:01:37.941 --> 00:01:42.497
+Let the unique index decide, with the check and the write in one statement.
