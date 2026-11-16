@@ -35,6 +35,9 @@ class IndexesTest {
                     st.execute("CREATE SCHEMA lab11")
                     // same columns, defaults, checks, primary key and unique index; no foreign keys
                     st.execute("CREATE TABLE lab11.payments (LIKE public.payments INCLUDING ALL)")
+                    // the plan checks below depend on the planner's statistics; keep autovacuum from
+                    // re-sampling the table mid-run, so every test sees the same estimates
+                    st.execute("ALTER TABLE lab11.payments SET (autovacuum_enabled = off)")
                     // 200,000 payments every 75 seconds from 1 January (to about 22 June).
                     // Merchants 1 to 5 share almost all of them; 6 and 8 get one in a thousand each.
                     st.execute(
@@ -49,7 +52,12 @@ class IndexesTest {
                         FROM generate_series(1, 200000) AS g
                         """,
                     )
-                    // statistics for the planner, and a visibility map for index-only scans
+                    // statistics for the planner, and a visibility map for index-only scans. ANALYZE
+                    // normally samples 30,000 rows; merchant 6 is 0.1% of the table, so its estimated
+                    // count, and the plan chosen, moved from run to run (once a Bitmap Heap Scan). A
+                    // target of 1,000 samples 300,000 rows, more than the table has, so the estimates
+                    // are exact and the same every time.
+                    st.execute("SET default_statistics_target = 1000")
                     st.execute("VACUUM (ANALYZE) lab11.payments")
                 }
             }
