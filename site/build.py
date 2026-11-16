@@ -6,7 +6,7 @@
 
 Needs: pip install markdown pygments
 """
-import base64, html, json, pathlib, re, sys
+import base64, html, json, pathlib, re, sys, urllib.parse
 
 import markdown
 from pygments import highlight
@@ -230,23 +230,30 @@ def compile_course():
     return out
 
 
-# the faces of the "from zero" family, served with the site (web) or inlined (preview); code uses the
-# reader's SF Mono (Apple's licence doesn't allow bundling it), with GitHub's fallback list
+# the faces of the "from zero" family, served with the site (web) or inlined (preview), all under the
+# SIL Open Font License: Literata for reading, IBM Plex Sans for headings and controls, JetBrains Mono
+# for code, and CMU Serif inside the figures, where it matches the lettering of the videos
 FONTS = [
-    ("Instrument Serif", "normal", 400, "instrument-serif-400.woff2"), ("Instrument Serif", "italic", 400, "instrument-serif-400i.woff2"),
-    ("Newsreader", "normal", 400, "newsreader-400.woff2"), ("Newsreader", "italic", 400, "newsreader-400i.woff2"),
-    ("Newsreader", "normal", 600, "newsreader-600.woff2"), ("Newsreader", "italic", 600, "newsreader-600i.woff2"),
-    ("Inter", "normal", 400, "inter-400.woff2"), ("Inter", "normal", 500, "inter-500.woff2"), ("Inter", "normal", 600, "inter-600.woff2"),
+    ("Literata", "normal", 400, "literata-400.woff2"), ("Literata", "italic", 400, "literata-400i.woff2"),
+    ("Literata", "normal", 600, "literata-600.woff2"), ("Literata", "italic", 600, "literata-600i.woff2"),
+    ("IBM Plex Sans", "normal", 400, "ibm-plex-sans-400.woff2"), ("IBM Plex Sans", "normal", 500, "ibm-plex-sans-500.woff2"),
+    ("IBM Plex Sans", "normal", 600, "ibm-plex-sans-600.woff2"),
+    ("JetBrains Mono", "normal", 400, "jetbrains-mono-400.woff2"), ("JetBrains Mono", "normal", 600, "jetbrains-mono-600.woff2"),
     ("CMU Serif", "normal", 400, "cmu-serif-400.woff2"), ("CMU Serif", "italic", 400, "cmu-serif-400i.woff2"),
 ]
+
+
+# the tab icon is the brand mark: four layers, the stack under a service, in the wine accent
+ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><rect width="16" height="16" rx="3" fill="#fdfdfb"/>'
+        + "".join(f'<rect x="{x}" y="{y}" width="{w}" height="2" rx="1" fill="#7b2d43" fill-opacity="{o}"/>'
+                  for x, y, w, o in [(6, 2.2, 4, 1), (4.5, 5.6, 7, .78), (3, 9, 10, .56), (1.5, 12.4, 13, .36)]) + "</svg>")
 
 
 def font_css(inline):
     out = []
     for fam, style, weight, f in FONTS:
         src = ("data:font/woff2;base64," + base64.b64encode((SITE / "fonts" / f).read_bytes()).decode()) if inline else f"/fonts/{f}"
-        adj = "size-adjust:98%;" if fam == "Newsreader" else ""
-        out.append(f"@font-face{{font-family:'{fam}';font-style:{style};font-weight:{weight};font-display:swap;{adj}src:url({src}) format('woff2')}}")
+        out.append(f"@font-face{{font-family:'{fam}';font-style:{style};font-weight:{weight};font-display:swap;src:url({src}) format('woff2')}}")
     return "".join(out)
 
 
@@ -265,7 +272,7 @@ def page(course, mode):
         return body
     return ('<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
             '<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">\n'
-            '<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23ffffff%22/%3E%3Crect x=%226%22 y=%222.2%22 width=%224%22 height=%222%22 rx=%221%22 fill=%22%2317784a%22/%3E%3Crect x=%224.5%22 y=%225.6%22 width=%227%22 height=%222%22 rx=%221%22 fill=%22%2317784a%22 fill-opacity=%22.78%22/%3E%3Crect x=%223%22 y=%229%22 width=%2210%22 height=%222%22 rx=%221%22 fill=%22%2317784a%22 fill-opacity=%22.56%22/%3E%3Crect x=%221.5%22 y=%2212.4%22 width=%2213%22 height=%222%22 rx=%221%22 fill=%22%2317784a%22 fill-opacity=%22.36%22/%3E%3C/svg%3E">\n'
+            f'<link rel="icon" href="data:image/svg+xml,{urllib.parse.quote(ICON)}">\n'
             + body.replace("</title>", "</title>", 1).split("\n<div id=\"app\">")[0]
             + '\n</head>\n<body>\n<div id="app"></div>\n'
             + body.split('<div id="app"></div>\n', 1)[1]
