@@ -217,6 +217,7 @@
     <header class="top">
       <button class="iconbtn" data-act="menu" aria-label="Show or hide contents">${icon.menu}</button>
       <button class="brand" data-go="home" aria-label="Systems from Zero home">${brandMark}<b>Systems <i>from zero</i></b></button>
+      <nav class="topnav" aria-label="Pages">${[["home", "Today"], ["review", "Review"], ["practice", "Mixed practice"], ["plan", "Plan and progress"], ["sheets", "Cheat sheets"], ["glossary", "Glossary"], ["setup", "Set up the labs"]].map(([go, label]) => `<button data-go="${go}" class="${route() === go ? "on" : ""}">${label}</button>`).join("")}</nav>
       <span class="spacer"></span>
       <button class="chip ${due ? "" : "quiet"}" data-go="review" title="Spaced review"><span class="dot"></span><span class="tnum">${due}</span><span class="hide-sm">&nbsp;due</span></button>
       <button class="iconbtn" data-act="timer" aria-label="Focus timer" title="40-minute focus timer">${icon.timer}</button>
@@ -234,17 +235,7 @@
     const nx = nextUp();
     const nxTrack = nx ? L[nx].track : null;
     const due = dueIds().length;
-    const item = (go, label, extra = "") => `<button data-go="${go}" class="${cur === go ? "on" : ""}">${label}${extra}</button>`;
-    let h = `<div class="nav">
-      ${item("home", "Today")}
-      ${item("review", "Review", `<span class="count tnum">${due} due</span>`)}
-      ${item("practice", "Mixed practice")}
-      ${item("plan", "Plan and progress")}
-      ${item("sheets", "Cheat sheets")}
-      ${item("glossary", "Glossary")}
-      ${item("setup", "Set up the labs")}
-    </div>
-    <div class="navsec"><div class="navrow"><span class="label">Tracks · ${doneCount()} of ${ORDER.length} lessons done</span>
+    let h = `<div class="navsec"><div class="navrow"><span class="label">Tracks · ${doneCount()} of ${ORDER.length} lessons done</span>
       <span class="xall"><button data-act="expand-all">Expand all</button><button data-act="collapse-all">Collapse all</button></span></div>
     <input class="field filter" id="lesson-filter" type="search" placeholder="Find a lesson" aria-label="Find a lesson" value="${esc(filterText)}"></div>`;
     let lastPart = null;
