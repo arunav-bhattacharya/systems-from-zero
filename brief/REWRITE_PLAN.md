@@ -95,3 +95,16 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
 - hnsw-search is rendered (1440p, 13.1 MiB, script and scene in place, uncommitted) but held back: check_audio
   heard "bike rental" in the first line as "by grantal" and "PostgreSQL" once as "posters". Listen to both, add
   SAY rules if they're real, re-render, then ship. Title: "Nearest by meaning: walking a graph from the top layer down".
+
+## Parked at the 60% stop (2026-11-17, weekly usage 58%)
+
+Done and live: all 158 lessons and 17 track pages; 46 of 140 videos remade at 1440p
+(found 5/5, net 10/10, os 11/11, sql 9/9, model 4/5, store 7/13).
+
+Resume after the weekly reset (2026-11-21 21:00 UTC), in this order:
+1. graph-hops (model-08): finish from its QUICK draft (see the note above).
+2. hnsw-search (store-08): rendered; check the two flagged words, then ship (see the note above).
+3. store-09..13: volcano-vs-vector, join-order, column-compression, view-maintenance, graph-records.
+4. Then cache (10), enc (5), repl (8), shard (9), txn (8), dist (7), cons (6), msg (12), stream (7), batch (11),
+   derive (4): 87 videos. At most 4 makers at once; each maker takes 4 videos (about an hour each batch).
+Ship with the clean-worktree script, keep every mp4 under 24 MiB, and check live byte sizes after CI deploys.
