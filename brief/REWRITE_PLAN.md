@@ -57,3 +57,22 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
 - Weekly usage was refreshed to 0% (user: "Try now"). Wave 2 started: remakes of the 14 Foundations and networking
   videos (4 makers) and the os and sql text (8 writers, task sheet `brief/WRITER_TASK.md`). Cost seen in wave 1:
   roughly 0.7% of a week per lesson and 2% per remade video.
+- Shipped: SQL (10 lessons and track page) and Operating systems (12 lessons and track page). Usage 9%.
+  Shipping now builds and deploys from a clean worktree at the committed state (`git worktree add --detach`),
+  then fast-forwards main, so half-edited lessons and half-rendered videos in the main checkout never go live.
+  Running: the 14 found and net video remakes, model and store text, cache and enc text.
+- Shipped text: Data models, Storage engines, Encoding, Caching (all lessons and track pages). Text is now done for
+  found, net, os, sql, model, store, cache and enc (83 lessons + 8 track pages). Part III text is being written.
+- Shipped videos: derived-data plus 8 more (tail-fanout, retry-storm, home-timeline, storage-compute,
+  net-encapsulation, arp, nat, routing), each 4 to 5 minutes at 1440p. Usage 19%.
+- Video queue (at most 4 makers at once: this 12-core machine hit a load of 50 with 4 makers and 14 writers):
+  running: net-07..12 (2 makers), os videos 1-4 and 5-8 (2 makers). Next: inodes-links, epoll, namespaces-cgroups;
+  then sql (9), model (5), store (13), cache (10), enc (5), then Part III and Part IV as their text lands.
+  Ship script: build and deploy from a clean worktree (see the note above).
+- The session runs at most 20 agents at once. Part IV writers started: msg-01..03, msg-04..06, msg-07..09,
+  msg-10..12 + track, stream-01..03. Queued (start one per free slot, in this order): stream-04..06,
+  stream-07..08 + track, batch-01..03, batch-04..06, batch-07..09, batch-10..12, batch-13..15 + track,
+  derive-01..03, derive-04..06 + track. Video makers keep 4 of the 20 slots.
+- Shipped videos so far: all 5 Foundations and all 10 networking videos.
+- Part III shipped: Replication, Partitioning, Transactions, Faults time and truth, Consistency and consensus
+  (39 lessons and 5 track pages). Text is live for 13 of 17 tracks (117 lessons). All 14 Part IV writers running.
