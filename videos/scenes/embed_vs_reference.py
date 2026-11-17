@@ -1,31 +1,19 @@
 from sfz import *
 
-SAY.insert(0, (r"\bM-0042's\b", "M 42's"))
-SAY.insert(0, (r"\bM-0042\b", "M 42"))
-SAY.insert(0, (r"\b6,837\b", "68 37"))
+# Amounts are said the way people say them; captions keep the digits.
+SAY.insert(0, (r"\b68\.37\b", "sixty-eight thirty-seven"))
+SAY.insert(0, (r"\b8\.37\b", "eight thirty-seven"))
+SAY.insert(0, (r"\b(\d+)\.00\b", r"\1"))
+SAY.insert(0, (r"\bversion 4\.0\b", "version four point oh"))
 
-DT = 2.1                               # top of every document box
-LX0, LW = -4.5, 5.8                    # the payment document: left edge, width
-RX0, RW = 2.1, 4.45                    # the right column: refunds, then the merchant
-SCR = np.array([0.4, 3.0, 0])          # the payment screen
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+TILL_X, TILL_Y = -5.35, [1.35, -1.05]
+DX0, DX1 = -3.5, 6.5
+DCX = (DX0 + DX1) / 2
+TOP_Y, CAP_Y, BAR_Y, QY = 3.3, -2.45, -2.8, -3.2
+DOC_Y = [2.25, 1.8, 1.35, 0.9]                     # the version-2 document's four lines
+DOC_T, DOC_B = 2.65, 0.5
+CARD_Y = [-0.55, -1.0, -1.45]                      # the one-update card's three lines
 
 
 class Base(VoiceScene):
@@ -55,7 +43,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.2):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -84,219 +72,392 @@ class Base(VoiceScene):
             self.wait(after)
 
 
-def arr(a, b, color=GREY_B, sw=2.5):
-    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
-    n = np.linalg.norm(b - a)
-    return Arrow(a, b, buff=0.04, stroke_width=sw, color=color, max_tip_length_to_length_ratio=0.2 / n,
-                 max_stroke_width_to_length_ratio=20)
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def ly(i, top=DT):
-    return top - 0.33 - i * 0.37
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def dl(x0, i, text, indent=1, color=WHITE, top=DT):
-    return left_at(M(text, 15, color), x0 + 0.25 + indent * 0.35, ly(i, top))
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
 
 
-def dbox(x0, w, n, color=GREY_B, top=DT):
-    h = 0.66 + (n - 1) * 0.37
-    r = RoundedRectangle(corner_radius=0.12, width=w, height=h, stroke_color=color, stroke_width=2.5).set_fill(BLACK, 1)
-    return r.move_to([x0 + w / 2, top - h / 2, 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def dot_to(a, b, color=YELLOW_M, rt=0.7):
+    d = Dot(radius=0.08, color=color).move_to(a)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.15))
+
+
+def framed(x0, x1, top, bot, color, a=0.08, sw=2.5):
+    return RoundedRectangle(corner_radius=0.12, width=x1 - x0, height=top - bot, stroke_color=color, stroke_width=sw).set_fill(
+        fillc(color, a), 1).move_to([(x0 + x1) / 2, (top + bot) / 2, 0])
+
+
+# ---- the pieces ----
+def till(k):
+    y = TILL_Y[k]
+    b = RoundedRectangle(corner_radius=0.12, width=2.3, height=1.25, stroke_color=WHITE, stroke_width=2.5).set_fill(BLACK, 1).move_to([TILL_X, y, 0])
+    lab = T(f"till {k + 1}", 22).move_to([TILL_X, y + 0.3, 0])
+    t = T("refund 60.00", 19, GOLD_M)
+    btn = VGroup(RoundedRectangle(corner_radius=0.08, width=t.width + 0.3, height=0.42, stroke_color=GOLD_M, stroke_width=2).set_fill(
+        fillc(GOLD_M, 0.25), 1), t).move_to([TILL_X, y - 0.27, 0])
+    btn[1].move_to(btn[0])
+    return VGroup(b, lab, btn)
+
+
+def under(k):
+    return np.array([TILL_X, TILL_Y[k] - 0.92, 0])
+
+
+def doc_line(i, s, color=WHITE):
+    """One line of the document; leading spaces become an indent (Text drops them)."""
+    ind = len(s) - len(s.lstrip(" "))
+    m = fit(M(s.lstrip(" "), 20, color), DX1 - DX0 - 0.8 - ind * 0.155)
+    return left_at(m, DX0 + 0.35 + ind * 0.155, DOC_Y[i])
 
 
 class EmbedVsReference(Base):
-    """model-06, section 0 (with model-02's embed-or-reference rule): pay-81002 for 6,837. Refunds in their own collection
-    need two reads, and two refunds of 6,000 can both get in (12,000). Embedded with a running total, one guarded updateOne
-    is atomic: the first refund wins, the second changes nothing. The shared merchant is referenced by id: no copies, one
-    more read. Embedding every payment in the merchant grows without end (40,000 a day, 16 MB in under three days), so
-    reference it and keep a capped summary of three."""
+    """model-06, section 0. A bakery payment of 68.37 (pay-81002) and two tills pressing refund 60.00 in the same second;
+    the rule: refunds never add up to more than the payment. Version 1 references: a refunds collection; both tills check
+    "none yet" and write, so 120.00 is refunded. The paper receipt you must hold to write on, with a running total.
+    Version 2 embeds the refunds and refundedMinor in the payment's document; a write to one document is atomic, so one
+    guarded update gives modifiedCount 1, then 0. Embed what's read and changed together and stays small, reference what
+    grows; 16 MB; transactions since 4.0 cost more. The moral, and a check (a third refund of 8.37 fits exactly)."""
+
+    def cap(self, s, color=GREY_B, size=22):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def total(self, s, color=WHITE):
+        new = right_at(T(f"refunded so far: {s}", 22, color), 6.25, QY)
+        old, self.tm = self.tm, new
+        return [swap(old, new)]
+
+    def note(self, k, s, color=GREY_B, mono=False):
+        new = (M(s, 17, color) if mono else T(s, 18, color)).move_to(under(k))
+        old, self.notes[k] = self.notes[k], new
+        return [swap(old, new)]
+
+    def clear_notes(self):
+        out = [FadeOut(n) for n in self.notes if n is not None]
+        self.notes = [None, None]
+        return out
+
+    def set_line(self, i, s, color=WHITE):
+        new = doc_line(i, s, color)
+        old, self.doc[i] = self.doc[i], new
+        return [swap(old, new, RIGHT)]
+
+    def set_card(self, i, s, color=WHITE):
+        new = left_at(T(s, 20, color), DX0 + 0.35, CARD_Y[i])
+        fit(new, DX1 - DX0 - 0.6)
+        left_at(new, DX0 + 0.35, CARD_Y[i])
+        old, self.card[i] = self.card[i], new
+        return [swap(old, new)]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar, rate_func=linear), run_time=secs)
 
     def construct(self):
-        self.title_card("Embed or reference", "what goes inside a document, and what stays outside")
+        self.capm = self.tm = None
+        self.notes = [None, None]
+        self.title_card("Two tills, one receipt", "embed what must change together")
 
-        # ---- 1. the payment document -------------------------------------------------------------------------------
-        scr = mbox("payment screen", WHITE, h=0.55, size=17).move_to(SCR)
-        P = [dl(LX0, 0, '{ _id: "pay-81002",', 0), dl(LX0, 1, "amountMinor: 6837,"), dl(LX0, 2, 'status: "SETTLED",'),
-             dl(LX0, 3, 'merchantId: "M-0042" }')]
-        pb = dbox(LX0, LW, 4)
-        pl = left_at(T("payments collection", 16, GREY_B), LX0, 2.35)
-        ra1 = arr([SCR[0] - 0.4, SCR[1] - 0.29, 0], [-0.9, DT + 0.03, 0], GREY_B)
-        reads = ValueTracker(1)
-        rc = always_redraw(lambda: right_at(T(f"reads per screen: {int(round(reads.get_value()))}", 18,
-                                              GREY_B if reads.get_value() < 1.5 else GOLD_M), -1.2, SCR[1]))
-        self.steps("A payment screen shows a payment, its refunds and its merchant. In MongoDB one record, a document, "
-                   "can hold a whole tree. So what goes inside the payment, and what stays outside?", [
-            (lambda: [FadeIn(scr)], 0.5),
-            "In MongoDB",
-            (lambda: [FadeIn(pb), FadeIn(pl), LaggedStart(*[FadeIn(x, shift=0.1 * RIGHT) for x in P], lag_ratio=0.2)], 1.2),
-            (lambda: [GrowArrow(ra1), FadeIn(rc)], 0.6),
-            "So what goes",
-            (lambda: [glow(pb, GOLD_M, 1.01)], 0.9),
+        # ---------------- scene 1: two tills, one payment ----------------
+        tills = [till(0), till(1)]
+        pay = VGroup(T("a party order", 22, GREY_B), M("pay-81002", 26), T("68.37", 44, WHITE)).arrange(DOWN, buff=0.2).move_to([DCX, 0.4, 0])
+        qbox = RoundedRectangle(corner_radius=0.1, width=13.0, height=0.56, stroke_color=GREY_C, stroke_width=2).set_fill(BLACK, 1).move_to([0, QY, 0])
+        strip_l = left_at(T("pay-81002: a payment of 68.37", 22), -6.25, QY)
+        self.steps("A bakery customer paid 68.37 for a party order, then brought most of it back.", [
+            (lambda: [FadeIn(pay, shift=0.1 * UP)], 0.8),
+            "brought most",
+            (lambda: [FadeIn(qbox), FadeIn(strip_l), *self.total("0.00")], 0.7),
+        ])
+        self.steps("Two staff members, at two tills, each press refund 60.00, in the same second.", [
+            "at two tills",
+            (lambda: [LaggedStart(*[FadeIn(t, shift=0.15 * RIGHT) for t in tills], lag_ratio=0.3)], 0.9),
+            "each press",
+            (lambda: [glow(tills[0][2][0], YELLOW_M, 1.1), glow(tills[1][2][0], YELLOW_M, 1.1)], 0.8),
+        ])
+        rule = VGroup(RoundedRectangle(corner_radius=0.08, width=9.2, height=0.5, stroke_color=WHITE, stroke_width=2).set_fill(BLACK, 1),
+                      T("the rule: refunds never add up to more than the payment", 22)).move_to([0, TOP_Y, 0])
+        rule[1].move_to(rule[0])
+        q = T("only one should go through. How?", 26, YELLOW_M).move_to([DCX, -1.3, 0])
+        self.steps("The rule is that refunds never add up to more than the payment. So only one of these should go through. "
+                   "How does the database make sure?", [
+            (lambda: [FadeIn(rule, shift=0.1 * DOWN)], 0.7),
+            "So only one",
+            (lambda: [FadeIn(q, shift=0.1 * UP)], 0.6),
         ])
 
-        # ---- 2. version 1: refunds in their own collection ----------------------------------------------------------
-        def refdoc(rid, top):
-            ls = [dl(RX0, 0, f'{{ _id: "{rid}",', 0, top=top), dl(RX0, 1, 'paymentId: "pay-81002",', top=top),
-                  dl(RX0, 2, "amountMinor: 6000 }", top=top)]
-            return VGroup(dbox(RX0, RW, 3, top=top), *ls)
-
-        r1 = refdoc("ref-1", DT)
-        r2 = refdoc("ref-2", 0.45)
-        rl = right_at(T("refunds collection", 16, GREY_B), RX0 + RW, 2.35)
-        ra2 = arr([SCR[0] + 0.5, SCR[1] - 0.29, 0], [RX0 + 0.8, DT + 0.03, 0], GREY_B)
-        self.steps("Version one copies the tables. Refunds get their own collection, so the screen needs two reads.", [
-            (lambda: [FadeIn(rl), FadeIn(r1[0])], 0.6),
-            "so the screen",
-            (lambda: [GrowArrow(ra2), reads.animate.set_value(2)], 0.7),
-            (lambda: [travel(ra1, YELLOW_M, 0.5), travel(ra2, YELLOW_M, 0.5)], 0.6),
+        # ---------------- scene 2: separate records ----------------
+        rows = VGroup(*[framed(DX0 + 0.8, DX0 + 4.6, 1.9 - k * 0.6, 1.45 - k * 0.6, c) for k, c in enumerate([BLUE_M, GOLD_M, GOLD_M])])
+        rlab = VGroup(T("payment row", 18), T("refund row", 18, GOLD_M), T("refund row", 18, GOLD_M))
+        for r, l in zip(rows, rlab):
+            l.move_to(r)
+        tbl = VGroup(T("table: payments", 17, GREY_B).next_to(rows[0], RIGHT, buff=0.3), T("table: refunds", 17, GREY_B).next_to(rows[1], RIGHT, buff=0.3))
+        self.steps("The habit from SQL databases is separate records. A payment is one row, each refund is a row in another table, "
+                   "and the screen joins them back together.", [
+            (lambda: [FadeOut(pay), FadeOut(q)], 0.6),
+            "A payment is one row",
+            (lambda: [FadeIn(rows[0]), FadeIn(rlab[0]), FadeIn(tbl[0])], 0.6),
+            "each refund",
+            (lambda: [FadeIn(VGroup(rows[1:], rlab[1:])), FadeIn(tbl[1])], 0.6),
+            "joins them",
+            (lambda: [rows[1].animate.next_to(rows[0], DOWN, buff=0.04), rlab[1].animate.move_to(rows[0].get_center() + 0.49 * DOWN),
+                      rows[2].animate.next_to(rows[0], DOWN, buff=0.53), rlab[2].animate.move_to(rows[0].get_center() + 0.98 * DOWN)], 0.8),
+        ])
+        pbox = framed(DX0, DX1, 2.65, 1.35, BLUE_M).set_z_index(-1)
+        plab = left_at(T("payments collection", 19, BLUE_M), DX0 + 0.3, 2.35)
+        pdoc = left_at(M('{ _id: "pay-81002", status: "SETTLED", amountMinor: 6837 }', 19), DX0 + 0.35, 1.75)
+        rbox = framed(DX0, DX1, 0.95, -1.75, GOLD_M).set_z_index(-1)
+        rlab2 = left_at(T("refunds collection", 19, GOLD_M), DX0 + 0.3, 0.65)
+        empty = left_at(T("no refunds yet", 19, GREY_C), DX0 + 0.35, 0.05)
+        self.steps("MongoDB, a free database program, can do the same. It stores each record as a document: names and values inside "
+                   "curly braces, shaped like JSON, a common text format. A set of documents is a collection.", [
+            (lambda: [FadeOut(VGroup(rows, rlab, tbl))], 0.5),
+            "It stores each record",
+            (lambda: [FadeIn(pdoc, shift=0.1 * UP)], 0.7),
+            "curly braces",
+            (lambda: [*self.cap("a document: names and values inside curly braces", WHITE)], 0.5),
+            "A set of documents",
+            (lambda: [FadeIn(pbox), FadeIn(plab), *self.cap("a collection: a set of documents", BLUE_M)], 0.7),
+        ])
+        self.steps("So version one: a payments collection, and a refunds collection where each refund holds its payment's id. "
+                   "That's called referencing. The screen now needs two reads.", [
+            "and a refunds collection",
+            (lambda: [FadeIn(rbox), FadeIn(rlab2), FadeIn(empty)], 0.7),
+            "That's called referencing",
+            (lambda: self.cap("version 1, referencing: each refund holds its payment's id", GOLD_M), 0.6),
+            "two reads",
+            (lambda: [dot_to(np.array([DCX, -2.0, 0]), pbox.get_bottom() + 0.1 * UP, WHITE), dot_to(np.array([DCX + 2.5, -2.0, 0]), rbox.get_bottom() + 0.1 * UP, WHITE)], 0.9),
         ])
 
-        # ---- 3. the race across two documents ---------------------------------------------------------------------------
-        bad = T("refunded: 12,000 of 6,837", 20, RED_M).move_to([RX0 + RW / 2, -1.45, 0])
-        self.steps("Worse, two refunds of 6,000 arrive at once for this payment of 6,837. Each one checks the refunds, "
-                   "finds none, and inserts. Now 12,000 is refunded.", [
-            "Each one checks",
-            (lambda: [*[FadeIn(x) for x in r1[1:]]], 0.6),
-            (lambda: [FadeIn(r2)], 0.6),
-            "Now 12,000",
-            (lambda: [FadeIn(bad, shift=0.1 * UP), r1[0].animate.set_stroke(RED_M), r2[0].animate.set_stroke(RED_M)], 0.7),
+        # ---------------- scene 3: check, then write ----------------
+        rd = [left_at(M('{ paymentId: "pay-81002", amountMinor: 6000 }', 19, GOLD_M), DX0 + 0.35, y) for y in (0.05, -0.6)]
+        self.steps("Each till checks the rule, then writes. Till one reads the refunds: none yet, so 60.00 fits. "
+                   "Till two reads at the same moment: none yet, 60.00 fits.", [
+            (lambda: self.uncap(), 0.4),
+            "Till one reads",
+            (lambda: [dot_to(tills[0].get_right(), empty.get_left() + 0.1 * LEFT), dot_to(tills[1].get_right(), empty.get_left() + 0.1 * LEFT)], 0.8),
+            "none yet, so",
+            (lambda: self.note(0, "none yet: 60.00 fits", GREEN_M), 0.5),
+            "Till two reads",
+            (lambda: self.note(1, "none yet: 60.00 fits", GREEN_M), 0.5),
+        ])
+        self.steps("Both write. What does the bakery refund in total? Pause and guess.", [
+            (lambda: [FadeOut(empty), FadeIn(rd[0], shift=0.2 * RIGHT), FadeIn(rd[1], shift=0.2 * RIGHT)], 0.8),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        rx = tick(False, 0.16).move_to(rule[0].get_right() + 0.35 * RIGHT)
+        self.steps("120.00, on a payment of 68.37. The bakery's accountant would like a word.", [
+            (lambda: [*self.uncap(), *self.total("120.00", RED_M), Create(rx), rule[0].animate.set_stroke(RED_M)], 0.8),
+            "The bakery's accountant",
+            (lambda: [Indicate(self.tm, color=RED_M, scale_factor=1.08)], 0.8),
+        ])
+        self.steps("The check and the write were two steps, on two documents, and the other till slipped in between. "
+                   "The usual cure is a lock around everything, or a multi-document transaction: "
+                   "a group of writes that happen together, or not at all.", [
+            "two steps",
+            (lambda: self.cap("check, then write: two steps, and the other till slipped in between", RED_M), 0.6),
+            "The usual cure",
+            (lambda: self.cap("the usual cure: a lock around everything, or a multi-document transaction", WHITE), 0.6),
+            "a group of writes",
+            (lambda: self.cap("a transaction: a group of writes that happen together, or not at all", GREY_B), 0.6),
         ])
 
-        # ---- 4. version 2: embed --------------------------------------------------------------------------------------
-        P3 = dl(LX0, 3, 'merchantId: "M-0042",')
-        P4 = dl(LX0, 4, "refundedMinor: 0,", color=GREEN_M)
-        P5 = dl(LX0, 5, "refunds: [ ] }", color=GREEN_M)
-        pb2 = dbox(LX0, LW, 6, GREEN_M)
-        self.steps("Stopping that takes a transaction across two documents. Version two puts the refunds inside the "
-                   "payment, next to a running total.", [
-            (lambda: [glow(bad, RED_M, 1.0)], 0.7),
-            "Version two",
-            (lambda: [FadeOut(r1), FadeOut(r2), FadeOut(bad), FadeOut(rl), FadeOut(ra2), reads.animate.set_value(1)], 0.7),
-            (lambda: [Transform(pb, pb2), ReplacementTransform(P[3], P3)], 0.6),
-            "next to",
-            (lambda: [FadeIn(P4, shift=0.1 * RIGHT), FadeIn(P5, shift=0.1 * RIGHT)], 0.7),
+        # ---------------- scene 4: the receipt ----------------
+        RX, RW = 0.4, 3.8
+        paper = RoundedRectangle(corner_radius=0.06, width=RW, height=4.4, stroke_color=GREY_A, stroke_width=2.5).set_fill("#141414", 1)
+        paper.move_to([RX, 0.4, 0])
+        rc = [T("bakery receipt", 22).move_to([RX, 2.25, 0]),
+              VGroup(left_at(T("party order", 19), RX - RW / 2 + 0.3, 1.65), right_at(M("68.37", 20), RX + RW / 2 - 0.3, 1.65)),
+              DashedLine([RX - RW / 2 + 0.25, 1.3, 0], [RX + RW / 2 - 0.25, 1.3, 0], dash_length=0.08, stroke_width=1.5, color=GREY_C),
+              left_at(T("refunds:", 18, GREY_B), RX - RW / 2 + 0.3, 0.95),
+              DashedLine([RX - RW / 2 + 0.25, -0.55, 0], [RX + RW / 2 - 0.25, -0.55, 0], dash_length=0.08, stroke_width=1.5, color=GREY_C)]
+        rtot = VGroup(left_at(T("refunded so far", 19), RX - RW / 2 + 0.3, -0.95), right_at(M("0.00", 20), RX + RW / 2 - 0.3, -0.95))
+        receipt = VGroup(paper, *rc, rtot)
+        sbox = framed(4.2, 6.4, 0.6, -1.75, GOLD_M, 0.06)
+        slab = T("box of loose slips", 17, GOLD_M).move_to([5.3, 0.3, 0])
+        self.steps("Think of the paper receipt instead. Write each refund on the receipt itself, with a running total at the bottom.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(pbox, plab, pdoc, rbox, rlab2, *rd, rx)), rule[0].animate.set_stroke(WHITE),
+                      *self.clear_notes(), *self.total("0.00")], 0.8),
+            "Think of the paper",
+            (lambda: [FadeIn(receipt, shift=0.1 * UP)], 0.8),
+            "with a running total",
+            (lambda: [Indicate(rtot, color=YELLOW_M)], 0.8),
+        ])
+        hold = Line(tills[0].get_right(), paper.get_left(), stroke_width=4, color=YELLOW_M)
+        self.steps("To write on it, you have to hold it, and only one person can hold it at a time.", [
+            "you have to hold it",
+            (lambda: [receipt.animate.shift(1.3 * LEFT)], 0.7),
+            "only one person",
+            (lambda: [*self.cap("only one hand on the receipt at a time", WHITE)], 0.5),
+        ])
+        hold1 = Line(tills[0].get_right() + 0.05 * RIGHT, [RX - 1.3 - RW / 2 - 0.05, TILL_Y[0], 0], stroke_width=4, color=YELLOW_M)
+        hold2 = Line(tills[1].get_right() + 0.05 * RIGHT, [RX - 1.3 - RW / 2 - 0.05, TILL_Y[1], 0], stroke_width=4, color=YELLOW_M)
+        line1 = VGroup(left_at(T("refund", 19, GREEN_M), RX - 1.3 - RW / 2 + 0.5, 0.45), right_at(M("60.00", 20, GREEN_M), RX - 1.3 + RW / 2 - 0.3, 0.45))
+        tot60 = right_at(M("60.00", 20, GREEN_M), RX - 1.3 + RW / 2 - 0.3, -0.95)
+        self.steps("Till one takes the receipt, sees nothing refunded, writes 60.00, and the total becomes 60.00.", [
+            (lambda: [*self.uncap(), Create(hold1), paper.animate.set_stroke(YELLOW_M, 3)], 0.6),
+            "sees nothing",
+            (lambda: [Indicate(rtot[1], color=YELLOW_M)], 0.6),
+            "writes 60.00",
+            (lambda: [FadeIn(line1, shift=0.1 * RIGHT)], 0.6),
+            "and the total",
+            (lambda: [swap(rtot[1], tot60)], 0.6),
+        ])
+        self.steps("Till two gets it next, and 60 more on top of 60 is more than 68.37. Nothing to write.", [
+            (lambda: [FadeOut(hold1), Create(hold2)], 0.6),
+            "and 60 more",
+            (lambda: self.cap("60.00 + 60.00 = 120.00, more than 68.37", RED_M), 0.6),
+            "Nothing to write",
+            (lambda: [*self.note(1, "nothing to write", GREY_B)], 0.5),
+        ])
+        slips = VGroup(*[RoundedRectangle(corner_radius=0.04, width=1.3, height=0.32, stroke_color=GOLD_M, stroke_width=1.8).set_fill(
+            fillc(GOLD_M, 0.3), 1).move_to([5.3, -0.5 - k * 0.5, 0]).rotate((k - 0.5) * 0.12) for k in range(2)])
+        self.steps("The refunds collection was a box of loose slips: anyone can check the box, and anyone can drop a slip in.", [
+            (lambda: [FadeOut(hold2), paper.animate.set_stroke(GREY_A, 2.5), *self.uncap(), *self.clear_notes(), FadeIn(sbox), FadeIn(slab)], 0.7),
+            "anyone can check",
+            (lambda: [dot_to(tills[0].get_right(), sbox.get_left()), dot_to(tills[1].get_right(), sbox.get_left())], 0.8),
+            "anyone can drop",
+            (lambda: [LaggedStart(*[FadeIn(s, shift=0.3 * DOWN) for s in slips], lag_ratio=0.3)], 0.8),
         ])
 
-        # ---- 5. one atomic update ------------------------------------------------------------------------------------------
-        u = VGroup(left_at(M("filter: refundedMinor + 6000 <= amountMinor", 15, GOLD_M), LX0, -1.95),
-                   left_at(M("update: push the refund, add 6000", 15, GOLD_M), LX0, -2.33))
-        ul = left_at(T("one updateOne, atomic for one document", 18, GREY_B), LX0, -1.55)
-        self.steps("One read returns everything. And a write to one document is atomic: one update checks that the total "
-                   "plus 6,000 stays within the amount, pushes the refund, and adds to the total.", [
-            (lambda: [travel(ra1, YELLOW_M, 0.6)], 0.7),
-            "And a write",
-            (lambda: [FadeIn(ul)], 0.6),
-            "one update checks",
-            (lambda: [FadeIn(u[0], shift=0.1 * UP)], 0.6),
-            "pushes the refund",
-            (lambda: [FadeIn(u[1], shift=0.1 * UP)], 0.6),
+        # ---------------- scene 5: one document, one write ----------------
+        dbox = framed(DX0, DX1, DOC_T, DOC_B, BLUE_M).set_z_index(-1)
+        self.doc = [doc_line(0, '{ _id: "pay-81002", status: "SETTLED",'), doc_line(1, "  amountMinor: 6837,"),
+                    doc_line(2, "  refundedMinor: 0,", YELLOW_M), doc_line(3, "  refunds: [ ] }", YELLOW_M)]
+        dlab = right_at(T("one document", 19, BLUE_M), DX1 - 0.3, DOC_Y[0])
+        self.steps("Version two does what the receipt does. The refunds go inside the payment's document, in a list, next to a running total. "
+                   "That's called embedding.", [
+            (lambda: [FadeOut(VGroup(sbox, slab, slips, line1, tot60)), receipt.animate.set_opacity(0.0), FadeIn(dbox), FadeIn(self.doc[0]),
+                      FadeIn(self.doc[1]), FadeIn(dlab)], 1.0),
+            "in a list",
+            (lambda: [FadeIn(self.doc[3], shift=0.1 * RIGHT)], 0.6),
+            "next to a running total",
+            (lambda: [FadeIn(self.doc[2], shift=0.1 * RIGHT)], 0.6),
+            "That's called embedding",
+            (lambda: [*self.cap("version 2, embedding: the refunds live inside the payment", BLUE_M)], 0.6),
+        ])
+        self.remove(receipt)
+        self.steps("And in MongoDB, a write to one document is atomic: it happens completely or not at all, and no other write slips in halfway.", [
+            "is atomic",
+            (lambda: [*self.cap("atomic: completely or not at all, and nothing slips in halfway", WHITE), glow(dbox, BLUE_M, 1.01)], 0.8),
+        ])
+        cbox = framed(DX0, DX1, -0.15, -1.8, GREEN_M, 0.06).set_z_index(-1)
+        self.card = [left_at(T("one update, on one document", 20, GREEN_M), DX0 + 0.35, CARD_Y[0]), None, None]
+        self.steps("So one update does the check and the change together. It changes the payment only if the total plus this refund "
+                   "is at most the amount. Then it adds the refund and raises the total.", [
+            (lambda: [*self.uncap(), FadeIn(cbox), FadeIn(self.card[0])], 0.7),
+            "only if",
+            (lambda: self.set_card(1, "filter: only if refundedMinor + 6000 ≤ amountMinor"), 0.6),
+            "Then it adds",
+            (lambda: self.set_card(2, "change: add the refund to refunds, and 6000 to refundedMinor"), 0.6),
+        ])
+        self.steps("Two refunds of 60.00. How many documents does each one change? Pause and guess.", [
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("One, then zero.", [
+            (lambda: [*self.uncap(), dot_to(tills[0].get_right(), dbox.get_left() + 0.1 * LEFT), *self.set_card(1, "filter: 0 + 6000 ≤ 6837, yes", GREEN_M)], 0.8),
+            (lambda: [*self.set_line(2, "  refundedMinor: 6000,", GREEN_M),
+                      *self.set_line(3, '  refunds: [ { refundId: "ref-1", amountMinor: 6000 } ] }', GREEN_M),
+                      *self.note(0, "modifiedCount: 1", GREEN_M, mono=True), *self.total("60.00", GREEN_M)], 0.8),
+        ], after=0)
+        self.steps("The second's filter no longer matches, so it changes nothing. No error, and no lock you had to take.", [
+            (lambda: [dot_to(tills[1].get_right(), dbox.get_left() + 0.1 * LEFT), *self.set_card(1, "filter: 6000 + 6000 ≤ 6837? no", RED_M)], 0.8),
+            "so it changes nothing",
+            (lambda: [*self.note(1, "modifiedCount: 0", GREY_B, mono=True)], 0.6),
+            "No error",
+            (lambda: [*self.cap("no error, and no lock you had to take", WHITE)], 0.6),
+        ])
+        self.steps("And the screen gets everything in one read.", [
+            (lambda: [dot_to(np.array([DCX, -2.05, 0]), dbox.get_bottom() + 0.1 * UP, WHITE)], 0.9),
         ])
 
-        # ---- 6. the race again ----------------------------------------------------------------------------------------------
-        ca = chip("refund 6,000", GOLD_M, 17).move_to([-5.55, 0.95, 0])
-        cb = chip("refund 6,000", GOLD_M, 17).move_to([-5.55, -0.15, 0])
-        P4b = dl(LX0, 4, "refundedMinor: 6000,", color=GREEN_M)
-        P5b = dl(LX0, 5, "refunds: [", color=GREEN_M)
-        P6 = VGroup(dl(LX0, 6, '{ id: "ref-1", amountMinor: 6000 }', 2, GREEN_M), dl(LX0, 7, "] }", 1, GREEN_M))
-        pb3 = dbox(LX0, LW, 8, GREEN_M)
-        ok1 = left_at(T("first: modified 1", 18, GREEN_M), LX0, -2.8)
-        no2 = left_at(T("second: 6000 + 6000 > 6837, modified 0", 18, RED_M), LX0, -3.2)
-        ga = arr(ca.get_right() + 0.04 * RIGHT, [LX0 - 0.05, ca.get_y(), 0], GOLD_M)
-        gb = arr(cb.get_right() + 0.04 * RIGHT, [LX0 - 0.05, cb.get_y(), 0], GOLD_M)
-        self.steps("Two refunds race again. The first matches and applies. The second's check now fails, "
-                   "12,000 is over 6,837, so it changes nothing.", [
-            (lambda: [FadeIn(ca), FadeIn(cb), GrowArrow(ga), GrowArrow(gb)], 0.8),
-            "The first",
-            (lambda: [travel(ga, GOLD_M, 0.5)], 0.5),
-            (lambda: [Transform(pb, pb3), ReplacementTransform(P4, P4b), ReplacementTransform(P5, P5b), FadeIn(P6), FadeIn(ok1)], 0.8),
-            "The second's",
-            (lambda: [travel(gb, RED_M, 0.5)], 0.5),
-            (lambda: [FadeIn(no2), cb[0].animate.set_stroke(RED_M), gb.animate.set_color(RED_M)], 0.6),
+        # ---------------- scene 6: what goes inside? ----------------
+        emb = VGroup(T("embed", 22, GREEN_M), T("read together, changed together,", 18), T("stays small: a payment's refunds", 18)).arrange(DOWN, buff=0.12)
+        ref = VGroup(T("reference", 22, BLUE_M), T("grows without limit:", 18), T("an account's payments over years", 18)).arrange(DOWN, buff=0.12)
+        emb.move_to([DX0 + 2.6, -0.95, 0])
+        ref.move_to([DX1 - 2.6, -0.95, 0])
+        self.steps("So should everything go inside? No. Embed what's read together, changed together, and stays small. "
+                   "A payment has a handful of refunds at most.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(cbox, *[c for c in self.card if c is not None])), *self.clear_notes()], 0.6),
+            "Embed what's",
+            (lambda: [FadeIn(emb, shift=0.1 * UP)], 0.7),
+            "a handful",
+            (lambda: [Indicate(self.doc[3], color=GREEN_M, scale_factor=1.03)], 0.8),
+        ])
+        self.card = [None, None, None]
+        self.steps("Reference what grows without limit, like an account's payments over the years. A document can be at most 16 megabytes, "
+                   "and a receipt can't be a mile long.", [
+            (lambda: [FadeIn(ref, shift=0.1 * UP)], 0.7),
+            "at most 16",
+            (lambda: self.cap("a document: at most 16 MB", WHITE), 0.6),
+            "a mile long",
+            (lambda: [Wiggle(ref, scale_value=1.04, rotation_angle=0.02 * TAU)], 0.8),
+        ])
+        self.steps("And when two things truly can't share a document, like a transfer between two accounts, MongoDB has multi-document "
+                   "transactions, since version 4.0. Its own docs say they usually cost more than a one-document write.", [
+            "like a transfer",
+            (lambda: self.cap("can't share a document? a transfer between two accounts", GREY_B), 0.6),
+            "MongoDB has",
+            (lambda: self.cap("multi-document transactions, since MongoDB 4.0", WHITE), 0.6),
+            "usually cost more",
+            (lambda: self.cap("usually cost more than a one-document write", WHITE), 0.6),
         ])
 
-        # ---- 7. the merchant is shared: reference it ---------------------------------------------------------------------
-        M_ = [dl(RX0, 0, '{ _id: "M-0042",', 0), dl(RX0, 1, 'name: "Harbour Coffee",'), dl(RX0, 2, 'city: "Utrecht" }')]
-        mb = dbox(RX0, RW, 3, BLUE_M)
-        ml = right_at(T("merchants collection", 16, GREY_B), RX0 + RW, 2.35)
-        refl = DashedLine([-1.15, ly(3), 0], [RX0 - 0.05, ly(0) - 0.1, 0], dash_length=0.08, stroke_width=2, color=BLUE_M)
-        sh = left_at(T("shared by 40,000 payments a day", 17, BLUE_M), RX0, 0.2)
-        self.steps("The merchant is different. Thousands of payments share it, so the payment holds only its id: "
-                   "a reference. A new address is one write, to one document.", [
-            (lambda: [FadeOut(VGroup(ca, cb, ga, gb, ok1, no2, u, ul))], 0.6),
-            (lambda: [FadeIn(mb), FadeIn(ml), *[FadeIn(x) for x in M_]], 0.7),
-            "Thousands of",
-            (lambda: [FadeIn(sh)], 0.5),
-            "only its id",
-            (lambda: [Indicate(P3, color=BLUE_M, scale_factor=1.05), Create(refl)], 0.8),
-            "A new address",
-            (lambda: [Indicate(M_[2], color=BLUE_M, scale_factor=1.08)], 0.8),
-        ])
-
-        # ---- 8. the price: a second read ------------------------------------------------------------------------------------
-        ra3 = arr([SCR[0] + 0.5, SCR[1] - 0.29, 0], [RX0 + 0.8, DT + 0.03, 0], BLUE_M)
-        self.steps("The price is a second read whenever the screen shows the merchant's name.", [
-            (lambda: [GrowArrow(ra3), reads.animate.set_value(2)], 0.7),
-            (lambda: [travel(ra1, YELLOW_M, 0.5), travel(ra3, BLUE_M, 0.5)], 0.6),
-        ])
-
-        # ---- 9. embedding with no end -----------------------------------------------------------------------------------------
-        M2 = dl(RX0, 2, 'city: "Utrecht",')
-        M3 = dl(RX0, 3, "payments: [", color=RED_M)
-        items = [dl(RX0, 4 + j, f'{{ _id: "pay-8{1002 + j * 7}", ... }},', 1.25, GREY_B) for j in range(5)]
-        more = dl(RX0, 9, "... 40,000 more every day", 1.25, RED_M)
-        mb2 = dbox(RX0, RW, 10, RED_M)
-        self.steps("Embedding goes wrong when an array has no end. Put every payment inside its merchant, "
-                   "and M-0042 adds 40,000 a day.", [
-            (lambda: [FadeOut(ra3), FadeOut(refl), FadeOut(sh), reads.animate.set_value(1),
-                      VGroup(pb, P[0], P[1], P[2], P3, P4b, P5b, P6).animate.set_opacity(0.3)], 0.7),
-            "Put every payment",
-            (lambda: [Transform(mb, mb2), Transform(M_[2], M2), FadeIn(M3)], 0.7),
-            (lambda: [LaggedStart(*[FadeIn(x, shift=0.1 * DOWN) for x in items], lag_ratio=0.25)], 1.2),
-            "and M-0042 adds",
-            (lambda: [FadeIn(more)], 0.5),
-        ])
-
-        # ---- 10. the 16 MB limit -----------------------------------------------------------------------------------------------
-        sz = ValueTracker(0.1)
-        szt = always_redraw(lambda: left_at(T(f"document size: {sz.get_value():.1f} MB" + ("  (the limit)" if sz.get_value() > 15.9 else ""),
-                                              19, RED_M if sz.get_value() > 8 else GOLD_M), RX0, -2.75))
-        rd = arr([SCR[0] + 0.5, SCR[1] - 0.29, 0], [RX0 + 0.8, DT + 0.03, 0], RED_M, 5)
-        self.steps("In under three days the document hits MongoDB's 16 MB limit. Long before that, every read of the "
-                   "merchant drags the whole history along.", [
-            (lambda: [FadeIn(szt)], 0.3),
-            (lambda: [sz.animate(rate_func=linear).set_value(16.0)], 2.0),
-            "Long before",
-            (lambda: [GrowArrow(rd)], 0.5),
-            "drags the whole",
-            (lambda: [travel(Line(rd.get_end(), rd.get_start()), RED_M, 1.0), glow(mb, RED_M, 1.0)], 1.1),
-        ])
-        szt.clear_updaters()
-
-        # ---- 11. reference it, keep a capped summary --------------------------------------------------------------------------
-        M3b = dl(RX0, 3, "recentPayments: [", color=GREEN_M)
-        keep = [dl(RX0, 4 + j, f'{{ _id: "pay-8{1030 - j * 7}", ... }}' + ("" if j == 2 else ","), 1.25, GREEN_M) for j in range(3)]
-        keep.append(dl(RX0, 7, "] }", 1, GREEN_M))
-        mb3 = dbox(RX0, RW, 8, GREEN_M)
-        szt2 = left_at(T("document size: about 1 KB, and it stays there", 19, GREEN_M), RX0, -2.75)
-        cap = left_at(M("$push with $slice: -3", 15, GREEN_M), RX0, -2.2)
-        self.steps("So reference what grows without limit: payments stay their own documents. If a screen needs recent "
-                   "payments, keep a summary capped at three.", [
-            (lambda: [FadeOut(rd), VGroup(pb, P[0], P[1], P[2], P3, P4b, P5b, P6).animate.set_opacity(1), *[FadeOut(x) for x in items], FadeOut(more),
-                      Transform(mb, dbox(RX0, RW, 4, BLUE_M)), FadeOut(M3), Transform(szt, szt2)], 0.9),
-            "If a screen",
-            (lambda: [Transform(mb, mb3), FadeIn(M3b), *[FadeIn(k, shift=0.1 * DOWN) for k in keep]], 0.8),
-            "capped at three",
-            (lambda: [FadeIn(cap)], 0.6),
-        ])
-
-        # ---- 12. the sentence to keep -------------------------------------------------------------------------------------------
-        self.steps("Embed what you read and change together, and what stays small. Reference what's shared, "
-                   "or what grows without end.", [
-            (lambda: [glow(pb, GREEN_M, 1.01)], 0.9),
-            "Reference what's",
-            (lambda: [glow(mb, BLUE_M, 1.01), Indicate(P3, color=BLUE_M, scale_factor=1.05)], 0.9),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 7: the moral, and a check ----------------
+        self.steps("So, two tills, one payment. Put what must change together inside one document, and one guarded write settles the race.", [
+            (lambda: [FadeOut(VGroup(emb, ref)), *self.cap("two tills, one payment", GREY_B)], 0.7),
+            "Put what must",
+            (lambda: [*self.cap("what must change together lives in one document", YELLOW_M, 28), glow(dbox, BLUE_M, 1.01)], 0.8),
+            "one guarded write",
+            (lambda: [FadeIn(cbox), *self.set_card(0, "one update, on one document", GREEN_M),
+                      *self.set_card(1, "filter: only if refundedMinor + amount ≤ amountMinor")], 0.7),
+        ], after=0.5)
+        till3 = VGroup(RoundedRectangle(corner_radius=0.08, width=2.6, height=0.46, stroke_color=GOLD_M, stroke_width=2).set_fill(fillc(GOLD_M, 0.25), 1),
+                       T("till 3: refund 8.37", 19, GOLD_M)).move_to([TILL_X, -2.25, 0])
+        till3[1].move_to(till3[0])
+        self.steps("One quick check. After the first refund, a third till tries a refund of 8.37. Does it go through? Pause and think.", [
+            (lambda: self.uncap(), 0.4),
+            "a third till",
+            (lambda: [FadeIn(till3, shift=0.1 * UP)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Yes. 60.00 plus 8.37 is exactly 68.37, and the rule says at most. One document changed, and the payment is fully refunded.", [
+            (lambda: [*self.uncap(), *self.set_card(1, "filter: 6000 + 837 ≤ 6837, yes: equal is allowed", GREEN_M)], 0.7),
+            "and the rule says",
+            (lambda: [Indicate(rule[1], color=YELLOW_M, scale_factor=1.04)], 0.8),
+            "One document changed",
+            (lambda: [*self.set_line(2, "  refundedMinor: 6837,", GREEN_M),
+                      *self.set_line(3, '  refunds: [ { ...6000 }, { amountMinor: 837, ... } ] }', GREEN_M),
+                      *self.total("68.37", GREEN_M)], 0.8),
+        ], after=0.5)
+        self.play(*self.cap("what must change together lives in one document", YELLOW_M, 28), run_time=0.7)
+        self.wait(2.0)

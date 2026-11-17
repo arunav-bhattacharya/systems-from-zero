@@ -1,31 +1,26 @@
 from sfz import *
 
-SAY.insert(0, (r"\bM-0042's\b", "M 42's"))
-SAY.insert(0, (r"\bM-0042\b", "M 42"))
+SAY.insert(0, (r"\bA-1001's\b", "A ten oh one's"))
+SAY.insert(0, (r"\bA-1001\b", "A ten oh one"))
+SAY.insert(0, (r"\bpay-81723\b", "pay eight one seven two three"))
+SAY.insert(0, (r"\bALLOW FILTERING\b", "allow filtering"))
 
-KX, KW = -5.35, 2.3                    # partition key chips: centre x, width
-SX0, DW, DG, BH = -3.85, 1.3, 0.08, 0.55   # partition strips: start x, day block width, gap, height
-MY = [2.3, 1.3, 0.3]                   # map rows
-PX0, PX1, PT, PB = -1.0, 6.5, -0.35, -3.4  # the zoomed partition panel
-GUIDE_X = SX0 + 2.5 * (DW + DG)        # 100,000 rows = 2.5 days of 40,000
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+RC, RR = np.array([-4.2, 0.35, 0]), 1.75          # the ring of nodes (left)
+NODE_DEG = [90, 30, -30, -90, -150, 150]
+TOKEN_DEG = 8
+REPLICAS = [2, 3, 4]                              # the next three nodes clockwise from the token
+DX0, DX1 = -1.3, 6.5                              # the drawer (right)
+DCX = (DX0 + DX1) / 2
+D_T, D_B = 2.45, -1.05
+HEAD_Y = 2.05
+SLOT = [1.5, 0.95, 0.4, -0.15, -0.7]
+TOP_Y, CAP_Y, BAR_Y, QY = 3.3, -2.45, -2.8, -3.2
+READ_X = -1.72                                    # the read arrow, between the ring and the drawer
 
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+ROWS = [("2026-11-07 10:30:12", "pay-81730", "SETTLED"), ("2026-11-07 09:40:27", "pay-81720", "FAILED"),
+        ("2026-11-07 08:15:03", "pay-81701", "SETTLED"), ("2026-11-06 23:59:58", "pay-81655", "SETTLED")]
+NEW = ("2026-11-07 09:00:00", "pay-81723", "AUTHORIZED")
 
 
 class Base(VoiceScene):
@@ -55,7 +50,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.2):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -84,233 +79,458 @@ class Base(VoiceScene):
             self.wait(after)
 
 
-def arr(a, b, color=GREY_B, sw=2.5):
-    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
-    n = np.linalg.norm(b - a)
-    return Arrow(a, b, buff=0.04, stroke_width=sw, color=color, max_tip_length_to_length_ratio=0.2 / n,
-                 max_stroke_width_to_length_ratio=20)
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def key(text, y, color=WHITE):
-    r = RoundedRectangle(corner_radius=0.08, width=KW, height=BH, stroke_color=color, stroke_width=2.5).set_fill(fillc(color), 1)
-    r.move_to([KX, y, 0])
-    return VGroup(r, M(text, 17).move_to([KX, y, 0]))
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def day_x(i):
-    return SX0 + i * (DW + DG) + DW / 2
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
 
 
-def day(i, y, label, color=GOLD_M, x=None):
-    x = day_x(i) if x is None else x
-    r = Rectangle(width=DW, height=BH, stroke_color=color, stroke_width=2).set_fill(color, 0.22).move_to([x, y, 0])
-    return VGroup(r, T(label, 15).move_to([x, y, 0]))
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def bar(w, y, label):
-    r = Rectangle(width=w, height=BH, stroke_color=GREY_B, stroke_width=2).set_fill(GREY_B, 0.15).move_to([SX0 + w / 2, y, 0])
-    return VGroup(r, T(label, 15, GREY_B).move_to(r))
+def on_ring(deg, r=RR):
+    return RC + r * np.array([np.cos(np.radians(deg)), np.sin(np.radians(deg)), 0])
 
 
-def link_arrow(y):
-    return arr([KX + KW / 2 + 0.04, y, 0], [SX0 - 0.02, y, 0], GREY_B, 2)
+# ---- the pieces ----
+def node(k):
+    b = RoundedRectangle(corner_radius=0.08, width=1.0, height=0.42, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1)
+    return VGroup(b, T(f"node {k + 1}", 17)).move_to(on_ring(NODE_DEG[k]))
 
 
-ROWS_P = [("09:59:41", "pay-81402", "SETTLED"), ("09:59:58", "pay-81405", "SETTLED"), ("10:00:02", "pay-81411", "CAPTURED"),
-          ("10:00:09", "pay-81412", "SETTLED"), ("...", "", ""), ("10:14:57", "pay-81780", "FAILED"),
-          ("10:15:06", "pay-81783", "SETTLED")]
+def row(slot, data, color=WHITE):
+    tm, pid, st = data
+    y = SLOT[slot]
+    r = RoundedRectangle(corner_radius=0.08, width=DX1 - DX0 - 0.3, height=0.42, stroke_color=GREY_C, stroke_width=1.5).set_fill(BLACK, 1)
+    r.move_to([DCX, y, 0])
+    return VGroup(r, left_at(M(tm, 19, color), DX0 + 0.35, y), left_at(M(pid, 19, color), DX0 + 3.85, y),
+                  left_at(M(st, 19, color), DX0 + 5.55, y))
 
 
-def panel(title):
-    r = RoundedRectangle(corner_radius=0.14, width=PX1 - PX0, height=PT - PB, stroke_color=GOLD_M, stroke_width=2.5)
-    r.set_fill(BLACK, 1).move_to([(PX0 + PX1) / 2, (PT + PB) / 2, 0])
-    h = left_at(T(title, 18, GOLD_M), PX0 + 0.3, PT - 0.3)
-    rows = VGroup()
-    for i, (tm, p, st) in enumerate(ROWS_P):
-        y = PT - 0.7 - i * 0.33
-        if tm == "...":
-            rows.add(VGroup(left_at(T("... every payment from 10:00 to 10:15", 16, GREY_B), PX0 + 1.1, y)))
-        else:
-            rows.add(VGroup(left_at(M(tm, 16), PX0 + 1.1, y), left_at(M(p, 16, GREY_B), PX0 + 2.75, y),
-                            left_at(M(st, 16, GREY_B), PX0 + 4.55, y)))
-    return r, h, rows
+def lit(r, color):
+    return [r[0].animate.set_stroke(color, 3).set_fill(fillc(color, 0.3), 1), *[t.animate.set_color(color) for t in r[1:]]]
 
 
-def row_y(i):
-    return PT - 0.7 - i * 0.33
+def unlit(r):
+    return [r[0].animate.set_stroke(GREY_C, 1.5).set_fill(BLACK, 1).set_opacity(1), *[t.animate.set_color(WHITE).set_opacity(1) for t in r[1:]]]
+
+
+def drawer_front(k, label):
+    y = [1.85, 0.85, -0.15, -1.15][k]
+    b = RoundedRectangle(corner_radius=0.1, width=DX1 - DX0, height=0.8, stroke_color=BLUE_M, stroke_width=2.5).set_fill(fillc(BLUE_M, 0.1), 1)
+    b.move_to([DCX, y, 0])
+    h = RoundedRectangle(corner_radius=0.06, width=1.1, height=0.16, stroke_color=GREY_B, stroke_width=2).set_fill(GREY_D, 1).move_to([DCX + 1.6, y, 0])
+    return VGroup(b, h, left_at(T(label, 22, GOLD_M if k < 3 else GREY_B), DX0 + 0.35, y))
+
+
+def drawer_box():
+    b = RoundedRectangle(corner_radius=0.14, width=DX1 - DX0, height=D_T - D_B, stroke_color=BLUE_M, stroke_width=3).set_fill(
+        fillc(BLUE_M, 0.08), 1).move_to([DCX, (D_T + D_B) / 2, 0])
+    h = RoundedRectangle(corner_radius=0.06, width=1.1, height=0.16, stroke_color=GREY_B, stroke_width=2).set_fill(GREY_D, 1).move_to(
+        [DCX, D_T + 0.17, 0])
+    return VGroup(b, h)
+
+
+def key_chip(s, color, size=20):
+    t = T(s, size, color)
+    r = RoundedRectangle(corner_radius=0.08, width=t.width + 0.4, height=0.48, stroke_color=color, stroke_width=2).set_fill(fillc(color), 1)
+    return VGroup(r, t.move_to(r))
+
+
+def mini(k):
+    """A small copy of the drawer beside a replica, inside the ring."""
+    c = key_chip("A-1001", GOLD_M, 14)
+    return c.move_to(on_ring(NODE_DEG[k], RR - 0.75))
 
 
 class WideColumn(Base):
-    """model-05, section 0: payments_by_merchant as a map from partition key to partition. M-0042's partition holds its
-    rows sorted by created_at, so 10:00 to 10:15 is one slice (seek, read, stop). Keyed by merchant alone the partition
-    grows forever: 40,000 a day passes the advised 100,000 rows on day three and holds 14.6 million rows (over 2 GB) after
-    a year. Bucketing by day, ((merchant_id, day), created_at), caps each partition at 40,000 rows, about 6 MB; a week of
-    history becomes 7 partitions."""
+    """model-05, section 0. A-1001's 20 newest payments out of 50 million, in Cassandra. A drawer of slips per account,
+    newest at the front: the partition (partition key: account) and its order (clustering columns: created_at newest
+    first, then payment_id). The coordinator hashes A-1001 to the token -4994511478997274402; its place on the ring picks
+    the replicas. A payment from 09:00 written last lands between 09:40 and 08:15; a window 08:00 to 10:00 is one slice
+    (3 read, 3 returned), oldest first is the same slice from the other end. FAILED with no account: no token, refused
+    without ALLOW FILTERING. Partition size: 100,000 rows and 100 MB; by shop alone forever; by day 40,000; the busiest
+    day 432,000; by hour 18,000; a week is 168 partitions. The name wide-column, the PRIMARY KEY line, and a check."""
+
+    def cap(self, s, color=GREY_B, size=22):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def query(self, q, v="", vcolor=GREY_B):
+        out = []
+        nq = left_at(T(q, 21), -6.25, QY) if q else None
+        nv = right_at(T(v, 21, vcolor), 6.25, QY) if v else None
+        for old, new in ((self.qm, nq), (self.vm, nv)):
+            if old is not None and new is not None:
+                out.append(swap(old, new))
+            elif old is not None:
+                out.append(FadeOut(old))
+            elif new is not None:
+                out.append(FadeIn(new, shift=0.1 * UP))
+        self.qm, self.vm = nq, nv
+        return out
+
+    def verdict(self, v, vcolor):
+        nv = right_at(T(v, 21, vcolor), 6.25, QY)
+        old, self.vm = self.vm, nv
+        return [swap(old, nv)]
+
+    def center(self, *lines):
+        g = VGroup(*[M(s, 17, c) for s, c in lines]).arrange(DOWN, buff=0.18).move_to(RC + 0.1 * UP)
+        old, self.cm = self.cm, g
+        return [swap(old, g)] if old is not None else [FadeIn(g)]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar, rate_func=linear), run_time=secs)
 
     def construct(self):
-        self.title_card("Wide-column partitions", "a map of partitions, each a sorted list of rows")
+        self.capm = self.qm = self.vm = self.cm = None
+        self.title_card("One drawer per account", "how Cassandra finds 20 rows in 50 million")
 
-        # ---- 1. the question ------------------------------------------------------------------------------------------
-        q = chip("M-0042's payments, today 10:00 to 10:15", GOLD_M, 20).move_to([0, 3.2, 0])
-        self.steps("A Cassandra table holds 50 million payments. Support asks for merchant M-0042's payments from ten "
-                   "o'clock to ten fifteen today. How does it find them without reading anything else?", [
-            "Support asks",
-            (lambda: [FadeIn(q, shift=0.1 * DOWN)], 0.7),
+        # ---------------- scene 1: twenty out of fifty million ----------------
+        qbox = RoundedRectangle(corner_radius=0.1, width=13.0, height=0.56, stroke_color=GREY_C, stroke_width=2).set_fill(BLACK, 1).move_to([0, QY, 0])
+        big = VGroup(T("50,000,000", 60, WHITE), T("payments", 30, GREY_B)).arrange(DOWN, buff=0.2).move_to([DCX, 0.7, 0])
+        self.steps("Account A-1001 wants its 20 newest payments. The payments company keeps 50 million.", [
+            (lambda: [FadeIn(qbox), *self.query("A-1001: the 20 newest", "?", YELLOW_M)], 0.8),
+            "keeps 50 million",
+            (lambda: [FadeIn(big, shift=0.1 * UP)], 0.8),
+        ])
+        ring = Circle(radius=RR, stroke_color=GREY_D, stroke_width=2).move_to(RC)
+        nodes = [node(k) for k in range(6)]
+        clus = T("one cluster", 20, GREY_B).move_to(RC + 0.1 * UP)
+        self.steps("They live in Cassandra, a free database program that spreads its data over many computers. "
+                   "Each computer is called a node, and together they work as one database, called a cluster.", [
+            "spreads its data",
+            (lambda: [Create(ring), LaggedStart(*[FadeIn(n, scale=0.8) for n in nodes], lag_ratio=0.15)], 1.6),
+            "called a cluster",
+            (lambda: [FadeIn(clus), glow(ring, BLUE_M, 1.02)], 0.8),
+        ])
+        refuse = T("and some questions: refused", 22, RED_M).move_to([DCX, -0.6, 0])
+        self.steps("So how does it hand back 20 rows without touching the other 50 million? And why does it flatly refuse some questions?", [
+            (lambda: [Indicate(big[0], color=WHITE, scale_factor=1.06)], 0.9),
+            "And why",
+            (lambda: [FadeIn(refuse, shift=0.1 * UP)], 0.6),
         ])
 
-        # ---- 2. a map of partitions --------------------------------------------------------------------------------------
-        k = [key("M-0017", MY[0]), key("M-0042", MY[1], GOLD_M), key("M-0108", MY[2])]
-        la = [link_arrow(y) for y in MY]
-        b17 = bar(2.6, MY[0], "M-0017's rows")
-        b108 = bar(3.6, MY[2], "M-0108's rows")
-        days = [day(i, MY[1], f"Nov {i + 1}") for i in range(7)]
-        kh = T("partition key", 17, GREY_B).move_to([KX, 2.95, 0])
-        ph = left_at(T("partition: every row for that key", 17, GREY_B), SX0, 2.95)
-        self.steps("A Cassandra table is a map. Its key is the partition key, here the merchant. "
-                   "Each value is a partition: every row for that merchant.", [
-            (lambda: [FadeOut(q)], 0.4),
-            "Its key is",
-            (lambda: [LaggedStart(*[FadeIn(x, shift=0.1 * RIGHT) for x in k], lag_ratio=0.25), FadeIn(kh)], 1.0),
-            "Each value",
-            (lambda: [*[GrowArrow(a) for a in la], FadeIn(ph)], 0.5),
-            (lambda: [FadeIn(b17), FadeIn(b108), LaggedStart(*[FadeIn(d, shift=0.1 * RIGHT) for d in days], lag_ratio=0.15)], 1.3),
+        # ---------------- scene 2: a drawer per account ----------------
+        fronts = [drawer_front(0, "A-1001"), drawer_front(1, "A-2002"), drawer_front(2, "A-3003"), drawer_front(3, "... one drawer per account")]
+        self.steps("Picture an office with a drawer of payment slips for each account, filed by date, newest at the front.", [
+            (lambda: [FadeOut(big), FadeOut(refuse), *self.query("", "")], 0.6),
+            "a drawer",
+            (lambda: [LaggedStart(*[FadeIn(f, shift=0.1 * UP) for f in fronts], lag_ratio=0.2)], 1.2),
+        ])
+        box = drawer_box()
+        head = left_at(T("partition A-1001, newest first", 21, GOLD_M), DX0 + 0.3, HEAD_Y)
+        self.rows = [row(i, ROWS[i]) for i in range(4)]
+        self.steps("To find A-1001's newest slips, you open one drawer and lift the front few out. The other drawers stay shut.", [
+            "you open one drawer",
+            (lambda: [glow(fronts[0][0], YELLOW_M, 1.02)], 0.6),
+            (lambda: [*[FadeOut(f) for f in fronts[1:]], ReplacementTransform(fronts[0][0], box[0]), ReplacementTransform(fronts[0][1], box[1]),
+                      ReplacementTransform(fronts[0][2], head)], 1.0),
+            "lift the front few",
+            (lambda: [LaggedStart(*[FadeIn(r, shift=0.1 * DOWN) for r in self.rows], lag_ratio=0.2)], 1.0),
+            "The other drawers",
+            (lambda: [*self.cap("the other drawers stay shut", GREY_B)], 0.5),
+        ])
+        pk = key_chip("partition key: account_id", GOLD_M)
+        ck = key_chip("clustering columns: created_at, newest first, then payment_id", GREEN_M)
+        VGroup(pk, ck).arrange(RIGHT, buff=0.3).move_to([0, TOP_Y, 0])
+        self.steps("Cassandra keeps rows the same way. The drawer is called a partition. Every row with the same account goes into it, "
+                   "so the account is the partition key.", [
+            "The drawer is called",
+            (lambda: [*self.cap("drawer = partition", BLUE_M, 24), glow(box[0], BLUE_M, 1.01)], 0.7),
+            "so the account",
+            (lambda: [*self.cap("the account = partition key", GOLD_M, 24), FadeIn(pk, shift=0.1 * DOWN), Indicate(head, color=GOLD_M)], 0.8),
+        ])
+        self.steps("The order inside comes from the clustering columns: the time it was created, newest first, then the payment id, "
+                   "to break ties.", [
+            "The order inside",
+            (lambda: [*self.cap("date order inside = clustering columns", GREEN_M, 24), FadeIn(ck, shift=0.1 * DOWN)], 0.8),
+            "the time it was created",
+            (lambda: [LaggedStart(*[r[1].animate(rate_func=there_and_back).set_color(GREEN_M) for r in self.rows], lag_ratio=0.25)], 1.2),
+            "then the payment id",
+            (lambda: [LaggedStart(*[r[2].animate(rate_func=there_and_back).set_color(GREEN_M) for r in self.rows], lag_ratio=0.25)], 1.0),
         ])
 
-        # ---- 3. hash to the replicas ----------------------------------------------------------------------------------------
-        hq = VGroup(mbox("M-0042", GOLD_M, h=0.55, size=17), T("hash", 17, GREY_B), chip("a token on the ring", GREY_B, 17),
-                    T("picks", 17, GREY_B), chip("3 nodes hold this partition", BLUE_M, 17)).arrange(RIGHT, buff=0.3)
-        hq.move_to([0.4, -1.4, 0])
-        self.steps("Cassandra hashes the partition key to pick the nodes that hold its partition, usually three. "
-                   "A query that names the merchant goes only to them.", [
-            (lambda: [FadeIn(hq[0]), FadeIn(hq[1])], 0.6),
-            (lambda: [FadeIn(hq[2], shift=0.1 * RIGHT)], 0.5),
+        # ---------------- scene 3: which node holds the drawer? ----------------
+        self.steps("But which node holds the drawer? The node that takes your request, called the coordinator, hashes the partition key.", [
+            (lambda: [*self.uncap(), FadeOut(clus)], 0.5),
+            "called the coordinator",
+            (lambda: [nodes[0][0].animate.set_stroke(WHITE, 4), *self.cap("coordinator: the node that takes your request", WHITE)], 0.7),
+            "hashes",
+            (lambda: self.center(("hash('A-1001')", GOLD_M)), 0.6),
+        ])
+        tok = Dot(radius=0.11, color=YELLOW_M).move_to(RC)
+        self.steps("It turns A-1001 into a big whole number called a token, always the same for the same key.", [
+            "a big whole number",
+            (lambda: self.center(("hash('A-1001')", GOLD_M), ("-4994511478997274402", YELLOW_M)), 0.7),
+            "called a token",
+            (lambda: [*self.cap("token: a number worked out from the partition key", YELLOW_M)], 0.6),
+        ])
+        ticks = VGroup(*[Line(on_ring(d, RR - 0.08), on_ring(d, RR + 0.08), stroke_width=2, color=GREY_C) for d in range(0, 360, 15)])
+        self.steps("Picture every possible token around a circle, with each node in charge of some stretches of it.", [
+            (lambda: [Create(ticks), ring.animate.set_stroke(GREY_B, 2.5)], 1.0),
+            "with each node",
+            (lambda: [LaggedStart(*[glow(n[0], BLUE_M, 1.08) for n in nodes], lag_ratio=0.15)], 1.4),
+        ])
+        minis = [mini(k) for k in REPLICAS]
+        self.steps("The token's place picks the nodes that keep a copy of the drawer, usually three, called replicas. Only they get asked.", [
+            (lambda: [FadeIn(tok)], 0.2),
+            (lambda: [tok.animate.move_to(on_ring(TOKEN_DEG))], 0.9),
             "usually three",
-            (lambda: [FadeIn(hq[3]), FadeIn(hq[4], shift=0.1 * RIGHT)], 0.6),
-            "goes only",
-            (lambda: [glow(k[1][0], GOLD_M), *[glow(d[0], GOLD_M, 1.03) for d in days]], 1.0),
+            (lambda: [*self.center(), LaggedStart(*[n[0].animate.set_stroke(GOLD_M, 3.5).set_fill(fillc(GOLD_M, 0.3), 1) for n in
+                                                     (nodes[k] for k in REPLICAS)], lag_ratio=0.3)], 1.0),
+            "called replicas",
+            (lambda: self.cap("replicas: the nodes that keep a copy of the partition", GOLD_M), 0.6),
+            "Only they",
+            (lambda: [*[n.animate.set_opacity(0.35) for k, n in enumerate(nodes) if k not in REPLICAS and k != 0]], 0.6),
+        ])
+        self.steps("Where the office picture breaks: paper has one copy, and each replica holds the whole drawer.", [
+            "paper has one copy",
+            (lambda: self.cap("paper: one copy.  Cassandra: the whole drawer on each replica", WHITE), 0.6),
+            "each replica holds",
+            (lambda: [LaggedStart(*[FadeIn(m, scale=0.6) for m in minis], lag_ratio=0.3)], 1.0),
         ])
 
-        # ---- 4. rows sorted by the clustering key ------------------------------------------------------------------------------
-        pr, ph2, prow = panel("partition M-0042, rows sorted by created_at")
-        zl = DashedLine([day_x(6), MY[1] - BH / 2, 0], [day_x(6), PT, 0], dash_length=0.08, stroke_width=2, color=GOLD_M)
-        ck = left_at(T("clustering key: created_at", 17, GOLD_M), -6.4, -1.25)
-        self.steps("Inside a partition, rows are sorted by the clustering key, here the time the payment was created. "
-                   "That's the order they sit in, in memory and on disk.", [
-            (lambda: [FadeOut(hq)], 0.5),
-            (lambda: [glow(days[6][0], GOLD_M, 1.05), Create(zl)], 0.6),
-            (lambda: [FadeIn(pr), FadeIn(ph2)], 0.6),
-            "sorted by",
-            (lambda: [LaggedStart(*[FadeIn(r, shift=0.1 * UP) for r in prow], lag_ratio=0.12), FadeIn(ck)], 1.3),
+        # ---------------- scene 4: where does a late slip go? ----------------
+        r = self.rows
+        self.steps("Now open the drawer. Four payments, newest first. The 20 newest are the first 20 rows; here, all four.", [
+            (lambda: [*self.uncap(), *[n.animate.set_opacity(1) for n in nodes], nodes[0][0].animate.set_stroke(GREY_B, 2.5),
+                      *self.query("A-1001: the 20 newest")], 0.7),
+            "Four payments",
+            (lambda: [glow(box[0], BLUE_M, 1.01)], 0.7),
+            "the first 20 rows",
+            (lambda: [LaggedStart(*[AnimationGroup(*lit(x, GREEN_M)) for x in r], lag_ratio=0.25)], 1.0),
+            "all four",
+            (lambda: self.verdict("reads the first rows: all 4 here", GREEN_M), 0.5),
+        ])
+        newc = row(2, NEW, YELLOW_M)
+        newc[0].set_stroke(YELLOW_M, 3).set_fill(fillc(YELLOW_M, 0.25), 1)
+        newc.move_to([DCX, TOP_Y - 0.0, 0])
+        self.steps("A new payment arrives, timed nine o'clock, and written last. Where does it go? Pause and guess.", [
+            (lambda: [*[a for x in r for a in unlit(x)], *self.query("a new payment, timed 09:00, written last")], 0.6),
+            "A new payment",
+            (lambda: [FadeOut(VGroup(pk, ck)), FadeIn(newc, shift=0.2 * DOWN)], 0.7),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Between nine forty and eight fifteen. Only the account was hashed. The time says where inside the drawer it goes, "
+                   "and no other row is rewritten.", [
+            (lambda: [*self.uncap(), r[2].animate.move_to([DCX, SLOT[3], 0]), r[3].animate.move_to([DCX, SLOT[4], 0])], 0.7),
+            (lambda: [newc.animate.move_to([DCX, SLOT[2], 0])], 0.8),
+            "Only the account",
+            (lambda: [Indicate(head, color=GOLD_M), *self.cap("only the account is hashed; the time picks the place", WHITE)], 0.8),
+            "no other row",
+            (lambda: self.verdict("lands in its sorted place · rows rewritten: none", GREEN_M), 0.6),
+        ])
+        self.rows = r = [r[0], r[1], newc, r[2], r[3]]
+        ghost = row(4, NEW, GREY_C)
+        ghost.move_to([DCX, SLOT[4] - 0.85, 0])
+        gx = Line(ghost.get_left() + 0.2 * RIGHT, ghost.get_right() + 0.2 * LEFT, stroke_width=3, color=RED_M)
+        self.steps("If you guessed the bottom, that's the spreadsheet habit: add at the end, sort when you read. "
+                   "Here the order is how rows sit, in memory and on disk.", [
+            (lambda: [*unlit(newc), *self.cap("the spreadsheet habit: add at the end, sort when you read", GREY_B)], 0.5),
+            "add at the end",
+            (lambda: [FadeIn(ghost, shift=0.1 * UP)], 0.5),
+            "Here the order",
+            (lambda: [Create(gx), *self.cap("the order is how rows sit, in memory and on disk", WHITE)], 0.6),
+            (lambda: [FadeOut(VGroup(ghost, gx))], 0.5),
         ])
 
-        # ---- 5. one slice ---------------------------------------------------------------------------------------------------
-        seek = arr([PX0 + 0.15, row_y(2) + 0.0, 0], [PX0 + 0.95, row_y(2), 0], GREEN_M, 3)
-        sl = Rectangle(width=PX1 - PX0 - 1.0, height=0.33 * 3 + 0.3, stroke_color=GREEN_M, stroke_width=2.5).set_fill(GREEN_M, 0.1)
-        sl.move_to([PX0 + 0.5 + (PX1 - PX0 - 1.0) / 2, (row_y(2) + row_y(5)) / 2, 0])
-        stop = left_at(T("stop", 16, RED_M), PX0 + 0.3, row_y(6))
-        cnt = left_at(T("one partition, one slice", 18, GREEN_M), -6.4, -1.8)
-        self.steps("So ten o'clock to ten fifteen is one contiguous slice. The node seeks to the first row at ten o'clock, "
-                   "and reads until it passes ten fifteen.", [
-            (lambda: [prow[0].animate.set_opacity(0.35), prow[1].animate.set_opacity(0.35)], 0.5),
-            "The node seeks",
-            (lambda: [GrowArrow(seek)], 0.5),
-            "and reads",
-            (lambda: [GrowFromEdge(sl, UP)], 1.2),
-            "until it passes",
-            (lambda: [FadeIn(stop), prow[6].animate.set_opacity(0.35), FadeIn(cnt)], 0.6),
+        # ---------------- scene 5: this morning is one slice ----------------
+        down = Arrow([READ_X, SLOT[1] + 0.2, 0], [READ_X, SLOT[3] - 0.2, 0], buff=0, stroke_width=4, color=GREEN_M,
+                     max_tip_length_to_length_ratio=0.12, max_stroke_width_to_length_ratio=12)
+        self.steps("So ask for this morning, from eight to ten. The node jumps to the first row before ten, reads on while rows are inside "
+                   "the window, and stops at the first row before eight.", [
+            (lambda: [*self.uncap(), *self.query("A-1001, from 08:00 to 10:00"), FadeIn(VGroup(pk, ck))], 0.6),
+            "jumps to",
+            (lambda: [*lit(r[1], GREEN_M)], 0.5),
+            "reads on",
+            (lambda: [GrowArrow(down), *lit(r[2], GREEN_M)], 0.6),
+            (lambda: [*lit(r[3], GREEN_M)], 0.4),
+            "stops at",
+            (lambda: [glow(r[4][0], RED_M, 1.02)], 0.7),
+        ])
+        self.steps("Three rows read, three returned. The ten thirty row and yesterday's row are never touched.", [
+            (lambda: self.verdict("one slice: 3 read, 3 returned", GREEN_M), 0.6),
+            "never touched",
+            (lambda: [r[0].animate.set_opacity(0.3), r[4].animate.set_opacity(0.3)], 0.6),
+        ])
+        up = Arrow([READ_X, SLOT[3] - 0.2, 0], [READ_X, SLOT[1] + 0.2, 0], buff=0, stroke_width=4, color=GREEN_M,
+                   max_tip_length_to_length_ratio=0.12, max_stroke_width_to_length_ratio=12)
+        self.steps("Oldest first? Same three rows, read from the other end. Still no sort.", [
+            (lambda: [*self.query("same window, oldest first")], 0.5),
+            "read from the other end",
+            (lambda: [ReplacementTransform(down, up)], 0.7),
+            "Still no sort",
+            (lambda: self.verdict("same slice, other end · sort step: none", GREEN_M), 0.6),
         ])
 
-        # ---- 6. it grows forever ---------------------------------------------------------------------------------------------
-        NW = 0.6
-
-        def narrow(i, color=GOLD_M):
-            x = SX0 + i * (NW + 0.06) + NW / 2
-            r = Rectangle(width=NW, height=BH, stroke_color=color, stroke_width=2).set_fill(color, 0.22).move_to([x, MY[1], 0])
-            return VGroup(r, T(" ", 10).move_to(r).set_opacity(0))
-
-        more = [narrow(7 + i) for i in range(8)]
-        fwd = T("forever", 17, RED_M).move_to([SX0 + 15 * (NW + 0.06) - 0.35, MY[1] + 0.48, 0])
-        gx2 = SX0 + 2.5 * (NW + 0.06)
-        guide = DashedLine([GUIDE_X, MY[1] + 0.42, 0], [GUIDE_X, MY[1] - 0.42, 0], dash_length=0.07, stroke_width=2.5, color=RED_M)
-        gl = T("100,000 rows: the advised limit", 15, RED_M).move_to([GUIDE_X, MY[1] - 0.52 - 0.04, 0])
-        grow = ValueTracker(280000)
-        gtxt = always_redraw(lambda: left_at(T(f"M-0042's partition: {int(grow.get_value()):,} rows", 20,
-                                               RED_M if grow.get_value() > 100000 else GOLD_M), -6.4, -1.25))
-        size = left_at(T("after a year: 14.6 million rows, over 2 GB", 20, RED_M), -6.4, -1.8)
-        strip = VGroup(*[d for d in days])
-        self.steps("But a merchant never stops taking payments. At 40,000 a day, this partition passes the advised "
-                   "100,000 rows on day three. After a year it holds 14 million rows, over 2 GB.", [
-            (lambda: [FadeOut(VGroup(pr, ph2, prow, seek, sl, stop, zl)), FadeOut(ck), FadeOut(cnt)], 0.6),
-            "At 40,000",
-            (lambda: [FadeIn(gtxt)], 0.4),
-            "this partition passes",
-            (lambda: [Create(guide), FadeIn(gl), glow(days[2][0], RED_M, 1.05)], 0.8),
-            "After a year",
-            (lambda: [*[Transform(days[i], narrow(i)) for i in range(7)], guide.animate.set_x(gx2), gl.animate.set_x(gx2)], 0.7),
-            (lambda: [LaggedStart(*[FadeIn(m, shift=0.2 * LEFT) for m in more], lag_ratio=0.15), FadeIn(fwd),
-                      grow.animate.set_value(14600000)], 1.4),
-            (lambda: [FadeIn(size, shift=0.1 * UP)], 0.5),
+        # ---------------- scene 6: the question it refuses ----------------
+        self.steps("Now the question it refuses. Every failed payment, without naming an account. No account, no token, no drawer.", [
+            (lambda: [FadeOut(up), *[a for x in r for a in unlit(x)], *self.query("every FAILED payment, any account")], 0.7),
+            "No account",
+            (lambda: [*self.center(("no account:", RED_M), ("no token", RED_M)), FadeOut(tok)], 0.6),
+            "no drawer",
+            (lambda: [*[n[0].animate.set_stroke(GREY_B, 2.5).set_fill(BLACK, 1) for n in nodes], FadeOut(VGroup(*minis))], 0.6),
         ])
-        gtxt.clear_updaters()
-
-        # ---- 7. a partition never splits ----------------------------------------------------------------------------------
-        self.steps("A partition never splits across nodes. Its three replicas carry all of it, and it never stops growing.", [
-            (lambda: [glow(k[1][0], RED_M)], 0.8),
-            "and it never",
-            (lambda: [*[glow(d[0], RED_M, 1.04) for d in days + more]], 1.0),
+        self.steps("The only plan is to open every drawer on every node. So CQL, the language you query Cassandra in, refuses, "
+                   "unless you add two words: ALLOW FILTERING.", [
+            "open every drawer",
+            (lambda: [LaggedStart(*[n[0].animate(rate_func=there_and_back).set_stroke(RED_M, 5).set_fill(fillc(RED_M, 0.4), 1) for n in nodes],
+                                  lag_ratio=0.15), LaggedStart(*[x[0].animate(rate_func=there_and_back).set_stroke(RED_M, 4) for x in r], lag_ratio=0.15)], 1.6),
+            "So CQL",
+            (lambda: self.cap("CQL: the language you query Cassandra in", GREY_B), 0.5),
+            "unless you add",
+            (lambda: self.verdict("refused, unless ALLOW FILTERING", RED_M), 0.6),
+        ])
+        self.steps("That's the database asking: are you sure? You're about to open every drawer in the building.", [
+            (lambda: self.cap("ALLOW FILTERING: “are you sure? every drawer, every node”", WHITE), 0.6),
+        ])
+        self.steps("So the rules follow from the picture. The partition key needs an equals, or there's no token. "
+                   "Clustering columns can be limited only from the left. And a different question gets a different table.", [
+            "The partition key needs",
+            (lambda: [*self.cap("partition key: needs =, or there's no token", GOLD_M), glow(pk[0], GOLD_M, 1.03)], 0.7),
+            "Clustering columns",
+            (lambda: [*self.cap("clustering columns: limited only from the left", GREEN_M), glow(ck[0], GREEN_M, 1.02)], 0.7),
+            "And a different",
+            (lambda: self.cap("a different question gets a different table", WHITE), 0.6),
         ])
 
-        # ---- 8. bucket by day ------------------------------------------------------------------------------------------------------
-        nk = [key(f"M-0042, Nov {5 + i}", MY[i], GOLD_M) for i in range(3)]
-        nb = [day(0, MY[i], f"Nov {5 + i}") for i in range(3)]
-        nla = [link_arrow(y) for y in MY]
-        guide2 = DashedLine([GUIDE_X, MY[0] + 0.42, 0], [GUIDE_X, MY[2] - 0.42, 0], dash_length=0.07, stroke_width=2.5, color=GREY_B)
-        gl2 = left_at(T("100,000 rows", 15, GREY_B), GUIDE_X + 0.12, MY[0] + 0.25)
-        cap = left_at(T("each partition: at most 40,000 rows, about 6 MB", 20, GREEN_M), -6.4, -1.25)
-        pk = VGroup(left_at(M("PRIMARY KEY ((merchant_id, day),", 15, GOLD_M), -6.4, -1.8),
-                    left_at(M("created_at)", 15, GOLD_M), -6.4 + 1.47, -2.15))
-        dots = VGroup(*[Dot(radius=0.04, color=GREY_B).move_to([KX, MY[2] - 0.45 - 0.13 * j, 0]) for j in range(3)])
-        self.steps("The fix is a bucket. Make the partition key the merchant and the day. Every day starts a new partition, "
-                   "so none holds more than 40,000 rows, about 6 MB.", [
-            (lambda: [FadeOut(size), FadeOut(gtxt), FadeOut(gl), FadeOut(guide), FadeOut(fwd), FadeIn(pk)], 0.6),
-            "Every day starts",
-            (lambda: [*[FadeOut(d) for d in days[:4] + more], FadeOut(k[1]), FadeOut(la[1]),
-                      FadeOut(b17), FadeOut(b108), FadeOut(la[0]), FadeOut(la[2]), FadeOut(k[0]), FadeOut(k[2]),
-                      *[ReplacementTransform(days[4 + i], nb[i]) for i in range(3)]], 1.2),
-            (lambda: [*[FadeIn(x, shift=0.1 * RIGHT) for x in nk], *[GrowArrow(a) for a in nla]], 0.7),
-            "so none holds",
-            (lambda: [Create(guide2), FadeIn(gl2), FadeIn(cap)], 0.8),
+        # ---------------- scene 7: how big can a drawer get? ----------------
+        BASE, SC = -1.0, 3.0 / 432000
+        xs = [-6.0, -4.75, -3.5, -2.25]
+
+        def bar(k, n, color):
+            h = n * SC
+            return Rectangle(width=0.55, height=h, stroke_color=color, stroke_width=2).set_fill(fillc(color, 0.6), 1).move_to(
+                [xs[k], BASE + h / 2, 0])
+
+        axis = Line([-6.5, BASE, 0], [-1.7, BASE, 0], stroke_width=2, color=GREY_B)
+        lim_y = BASE + 100000 * SC
+        lim = DashedLine([-6.5, lim_y, 0], [-1.7, lim_y, 0], dash_length=0.1, stroke_width=2.5, color=YELLOW_M)
+        lim_t = T("100,000 rows", 17, YELLOW_M).move_to([xs[1], lim_y + 0.24, 0])
+
+        def lab(k, a, b, color):
+            return VGroup(T(a, 16, GREY_B), T(b, 16, color)).arrange(DOWN, buff=0.1).move_to([xs[k], BASE - 0.45, 0])
+
+        forever = VGroup(Rectangle(width=0.55, height=2.9, stroke_color=RED_M, stroke_width=2).set_fill(fillc(RED_M, 0.6), 1).move_to(
+            [xs[0], BASE + 1.45, 0]), Arrow([xs[0], BASE + 2.6, 0], [xs[0], BASE + 3.3, 0], buff=0, stroke_width=4, color=RED_M,
+                                             max_tip_length_to_length_ratio=0.35))
+        b_day, b_peak, b_hour = bar(1, 40000, GREEN_M), bar(2, 432000, RED_M), bar(3, 18000, GREEN_M)
+        labs = [lab(0, "shop alone", "forever", RED_M), lab(1, "shop + day", "40,000", GREEN_M), lab(2, "busiest day", "432,000", RED_M),
+                lab(3, "shop + hour", "18,000", GREEN_M)]
+        self.steps("One more catch. A drawer never splits across nodes, and the Cassandra docs advise under 100,000 rows and 100 megabytes.", [
+            (lambda: [*self.uncap(), *self.query("", ""), FadeOut(VGroup(ring, ticks, *nodes)), *([FadeOut(self.cm)] if self.cm else [])], 0.8),
+            "A drawer never splits",
+            (lambda: [*self.cap("a partition never splits across nodes", WHITE), glow(box[0], BLUE_M, 1.01)], 0.7),
+            "advise under",
+            (lambda: [Create(axis), Create(lim), FadeIn(lim_t), *self.cap("the docs: under 100,000 rows and 100 MB", YELLOW_M)], 0.8),
+        ])
+        self.cm = None
+        self.steps("Its size is the write rate times how long the key stays the same. Key a shop's payments by shop alone, "
+                   "and the drawer grows forever.", [
+            (lambda: self.cap("rows in a partition = write rate × how long the key stays the same", WHITE), 0.6),
+            "by shop alone",
+            (lambda: [GrowFromEdge(forever[0], DOWN), FadeIn(labs[0])], 1.0),
+            (lambda: [GrowArrow(forever[1])], 0.5),
+        ])
+        self.steps("Add the day: 40,000 payments a day, about 6 megabytes. Fine.", [
+            "Add the day",
+            (lambda: [GrowFromEdge(b_day, DOWN), FadeIn(labs[1])], 0.8),
+            "about 6",
+            (lambda: self.cap("shop + day: 40,000 rows, about 6 MB at 150 bytes a row", GREEN_M), 0.6),
+        ])
+        self.steps("But on the busiest day of the year, the biggest shop takes 5 a second: 432,000 rows. One drawer per hour gives 18,000.", [
+            "the biggest shop",
+            (lambda: [GrowFromEdge(b_peak, DOWN), FadeIn(labs[2])], 1.0),
+            "432,000",
+            (lambda: self.cap("5 a second × 86,400 seconds = 432,000 rows", RED_M), 0.6),
+            "One drawer per hour",
+            (lambda: [GrowFromEdge(b_hour, DOWN), FadeIn(labs[3]), *self.cap("one partition per hour: 18,000 rows", GREEN_M)], 0.8),
+        ])
+        self.steps("The price: a week of history is now 168 drawers, read in parallel and merged. Size it for your busiest key.", [
+            (lambda: self.cap("the price: a week = 7 day partitions, or 168 hour partitions, merged", WHITE), 0.6),
+            "Size it",
+            (lambda: [*self.cap("size it for your busiest key, not your average one", YELLOW_M, 24), glow(b_peak, RED_M, 1.05)], 0.8),
         ])
 
-        # ---- 9. the query still reads one slice ---------------------------------------------------------------------------------------
-        pr2, ph3, prow2 = panel("partition (M-0042, Nov 7), sorted by created_at")
-        zl2 = DashedLine(nb[2][0].get_corner(DR), [PX0, PT - 0.25, 0], dash_length=0.08, stroke_width=2, color=GOLD_M)
-        sl2 = sl.copy()
-        self.steps("The ten o'clock query names the merchant and today: still one partition, one slice.", [
-            (lambda: [FadeOut(cap), glow(nk[2][0], GOLD_M)], 0.6),
-            (lambda: [Create(zl2), FadeIn(pr2), FadeIn(ph3), FadeIn(prow2)], 0.8),
-            "one partition",
-            (lambda: [GrowFromEdge(sl2, UP)], 0.9),
+        # ---------------- scene 8: the name, the key, and a check ----------------
+        chart = VGroup(axis, lim, lim_t, forever, b_day, b_peak, b_hour, *labs)
+        self.steps("This shape gives the family its name, wide-column, because one partition can hold a great many rows.", [
+            (lambda: [FadeOut(chart), *self.cap("wide-column: one partition can hold a great many rows", WHITE)], 0.8),
+            "a great many rows",
+            (lambda: [glow(box[0], BLUE_M, 1.01)], 0.8),
         ])
-
-        # ---- 10. the price ------------------------------------------------------------------------------------------------------------
-        wk = left_at(T("a week of history: 7 partitions", 20, GOLD_M), -6.4, -1.25)
-        wk2 = left_at(T("read in parallel and merged", 18, GREY_B), -6.4, -2.75)
-        self.steps("The price: a week of history is now seven partitions, read in parallel and merged.", [
-            (lambda: [FadeIn(wk, shift=0.1 * UP), *[glow(b[0], GOLD_M, 1.05) for b in nb], FadeIn(dots)], 0.9),
-            "read in parallel",
-            (lambda: [FadeIn(wk2)], 0.6),
+        self.steps("It has nothing to do with a column store, which keeps each column's values together. Deep drawer would have been a better name.", [
+            (lambda: self.cap("not a column store, which keeps each column's values together", GREY_B), 0.6),
+            "Deep drawer",
+            (lambda: [*self.cap("“deep drawer” would have been a better name", WHITE)], 0.6),
         ])
-
-        # ---- 11. the sentence to keep --------------------------------------------------------------------------------------------------
-        self.steps("A Cassandra table is a map of partitions, each a sorted list of rows. Pick a partition key that every "
-                   "query names, and that stops growing.", [
-            (lambda: [*[glow(x[0], GOLD_M) for x in nk]], 0.9),
-            "each a sorted",
-            (lambda: [glow(sl2, GREEN_M, 1.02)], 0.9),
-            "and that stops",
-            (lambda: [glow(guide2, GREEN_M, 1.0), *[glow(b[0], GREEN_M, 1.05) for b in nb]], 0.9),
+        code = VGroup(M("PRIMARY KEY ((", 24), M("account_id", 24, GOLD_M), M("), ", 24), M("created_at, payment_id", 24, GREEN_M), M(")", 24))
+        code.arrange(RIGHT, buff=0.06).move_to([0, TOP_Y, 0])
+        for part in code:
+            part.align_to(code[0], DOWN)
+        self.steps("Here's the key, read from the inside out. Inside the double brackets, which drawer. After it, the order inside.", [
+            (lambda: [*self.uncap(), Succession(FadeOut(VGroup(pk, ck), shift=0.1 * UP), FadeIn(code, shift=0.1 * UP))], 1.0),
+            "Inside the double",
+            (lambda: [Indicate(code[1], color=GOLD_M), Indicate(head, color=GOLD_M)], 0.8),
+            "After it",
+            (lambda: [Indicate(code[3], color=GREEN_M)], 0.8),
         ])
-        self.wait(0.6)
+        ring2 = VGroup(ring, ticks, *nodes)
+        for n in nodes:
+            n[0].set_stroke(GREY_B, 2.5).set_fill(BLACK, 1)
+            n.set_opacity(0.5)
+        ring.set_stroke(opacity=0.5)
+        ticks.set_stroke(opacity=0.5)
+        self.steps("So the partition key picks the drawer, the clustering columns pick the place in it, and a good question opens one drawer "
+                   "and lifts out one run.", [
+            (lambda: [FadeIn(ring2)], 0.6),
+            "picks the drawer",
+            (lambda: [glow(box[0], GOLD_M, 1.01)], 0.7),
+            "pick the place",
+            (lambda: [LaggedStart(*[x[1].animate(rate_func=there_and_back).set_color(GREEN_M) for x in r], lag_ratio=0.2)], 1.0),
+            "lifts out one run",
+            (lambda: [*self.cap("one drawer, one run", YELLOW_M, 28), *[a for x in r[1:4] for a in lit(x, GREEN_M)]], 0.8),
+        ])
+        self.steps("One quick check. A query names A-1001 and payment pay-81723, but no time. One run, or refused? Pause and think.", [
+            (lambda: [*self.uncap(), *[a for x in r[1:4] for a in unlit(x)]], 0.4),
+            "A query names",
+            (lambda: [*self.query("A-1001 and pay-81723, no time", "?", YELLOW_M)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Refused. The rows are in time order, so an id with no time isn't one run. Without ALLOW FILTERING, CQL says no.", [
+            (lambda: [*self.uncap(), *self.verdict("refused, unless ALLOW FILTERING", RED_M)], 0.5),
+            "The rows are in time order",
+            (lambda: [LaggedStart(*[x[1].animate(rate_func=there_and_back).set_color(GREEN_M) for x in r], lag_ratio=0.2)], 1.0),
+            "an id with no time",
+            (lambda: [LaggedStart(*[x[0].animate(rate_func=there_and_back).set_stroke(RED_M, 4) for x in r], lag_ratio=0.15),
+                      *self.cap("payment_id without created_at: not one run", RED_M)], 1.2),
+        ], after=0.5)
+        self.play(*self.cap("the partition key picks the drawer; the clustering columns pick the place", YELLOW_M, 24), run_time=0.7)
+        self.wait(2.0)
