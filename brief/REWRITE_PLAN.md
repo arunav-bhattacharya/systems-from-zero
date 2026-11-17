@@ -49,3 +49,8 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
   after their current lesson. Still to do in these tracks: found-04 (an unreviewed draft script is in
   `brief/drafts/found-04-unreviewed.py`), the track pages `content/tracks/found.json` and `net.json`, and every
   video. The pilot video (derived-data) was in progress.
+- 2026-11-16 (end of day): found-04 and the track pages `found.json` and `net.json` rewritten, so the text of
+  Foundations and Computer networking is complete. Pilot video derived-data remade (5:02 at 1440p, script in
+  `videos/scripts/derived-data.md`) and shipped. Usage about 90%: stopped for the week.
+  **Next (after the reset):** remake the other 4 Foundations videos and the 10 networking videos (they still
+  tell the old story), then text for os, sql, model and onward in course order.
