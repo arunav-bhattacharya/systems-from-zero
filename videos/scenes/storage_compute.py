@@ -1,34 +1,28 @@
 from sfz import *
 
-XS = {1: -4.8, 2: -1.6, 3: 1.6, 4: 4.8}
-X3 = {1: -3.2, 2: 0.0, 3: 3.2}
-NW = 2.8
-N1Y, N1H = 0.45, 3.4                 # phase one: a node with its own disk
-N2Y, N2H = 2.35, 1.5                 # phase two: compute only
-BANDY, BANDH, BANDW = -1.45, 1.9, 12.8
-NOTE_Y = -3.2
-ZX = {"a": -4.3, "b": 0.0, "c": 4.3}
-CPY_Y = -1.3
-DBY = 2.45
+SAY.insert(0, (r"\bMySQL\b", "my S Q L"))
+SAY.insert(0, (r"\bI/Os\b", "I Os"))
+SAY.insert(0, (r"\b0\.95\b", "zero point nine five"))
+SAY.insert(0, (r"\b7\.4\b", "seven point four"))
+SAY.insert(0, (r"\b7\.7\b", "seven point seven"))
+
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+K, KW, KH = np.array([-4.75, 0.4, 0]), 2.9, 2.6          # the kitchen, later the database instance (compute)
+SH, SH_W, SH_H = np.array([-4.75, -0.25, 0]), 2.3, 0.95  # its shelf, later its cache
+WX0, WX1, WY0, WY1 = 0.0, 6.3, -1.3, 2.2                 # the warehouse, later the storage fleet
+COL_W = (WX1 - WX0) / 3
+ROWS = [0.95, -0.2]
+CP_W, CP_H = 1.5, 0.75
+LINK_Y = 0.4
+STAT_Y, BAR_Y, CAP_Y = -1.85, -2.55, -3.2
 
 
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+def col_x(z):
+    return WX0 + COL_W * (z + 0.5)
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0, back=False):
-    """A dot that runs along a line (or back along it) and stays invisible until its turn."""
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0).set_z_index(6)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
+def copy_c(z, r):
+    return np.array([col_x(z), ROWS[r], 0])
 
 
 class Base(VoiceScene):
@@ -84,285 +78,357 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
-
-def rrect(w, h, c, color=WHITE, sw=3, fill=None):
-    r = RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=sw)
-    return r.set_fill(fill if fill is not None else fillc(color), 1).move_to(c)
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
 
-class Node:
-    """A shared-nothing node: its own CPU and memory, and its own disk with partitions on it."""
-
-    def __init__(self, i, x, parts):
-        self.i, self.x = i, x
-        self.outer = rrect(NW, N1H, [x, N1Y, 0], WHITE, fill=BLACK)
-        self.title = T(f"node {i}", 24).move_to([x, N1Y + N1H / 2 - 0.35, 0])
-        self.cpu = VGroup(rrect(2.3, 0.6, [x, N1Y + 0.85, 0], BLUE_M, 2.5), T("CPU, memory", 20).move_to([x, N1Y + 0.85, 0]))
-        self.disk = VGroup(rrect(2.3, 1.45, [x, N1Y - 0.75, 0], GREY_B, 2.5),
-                           T("disk", 18, GREY_B).move_to([x, N1Y - 0.25, 0]))
-        self.parts = {}
-        for k, p in enumerate(parts):
-            self.parts[p] = part(p).move_to(self.slot(k, len(parts)))
-
-    def slot(self, k, n):
-        dx = 0 if n == 1 else (-0.5 if k == 0 else 0.5)
-        return np.array([self.x + dx, N1Y - 0.9, 0])
-
-    def body(self):
-        return VGroup(self.outer, self.title, self.cpu, self.disk)
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def part(p, color=GOLD_M):
-    return chip(p, color, 22).set_z_index(5)
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def band_slot(k):
-    return np.array([-3.75 + 1.5 * k, BANDY - 0.2, 0])
+def swap(old, new, d=UP):
+    """Replace one label with another: the old one leaves before the new one arrives, so they never overlap."""
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def compute(i, x, color=WHITE, label=None):
-    o = rrect(NW, N2H, [x, N2Y, 0], color, fill=BLACK)
-    t = T(label or f"node {i}", 24).move_to([x, N2Y + 0.38, 0])
-    c = VGroup(rrect(2.4, 0.55, [x, N2Y - 0.25, 0], BLUE_M, 2.5), fit(T("CPU, memory, cache", 18), 2.1).move_to([x, N2Y - 0.25, 0]))
-    return VGroup(o, t, c)
+def chip_at(text, color, at, size=16):
+    t = M(text, size, color)
+    r = RoundedRectangle(corner_radius=0.06, width=t.width + 0.24, height=0.36, stroke_color=color, stroke_width=2).set_fill(BLACK, 1)
+    return VGroup(r, t).move_to(at)
 
 
-def note(s, color=GREY_B):
-    return chip(s, color, 21).move_to([0, NOTE_Y, 0])
-
-
-def copy_box(name, color=WHITE):
-    x = ZX[name[0]] + (-0.85 if name[1] == "1" else 0.85)
-    if name == "c3":
-        x = ZX["c"] + 0.85
-    r = rrect(1.45, 0.85, [x, CPY_Y, 0], color, 2.5)
-    return VGroup(r, M(name, 22).move_to([x, CPY_Y, 0]))
+def travel_to(m, pts, rt):
+    """Move a chip along a list of points, then fade it."""
+    path = VMobject().set_points_as_corners([np.array(p) for p in pts])
+    return Succession(MoveAlongPath(m, path, rate_func=smooth, run_time=rt), FadeOut(m, run_time=0.15))
 
 
 class StorageCompute(Base):
-    """found-05, section 2 (with section 1's shared nothing): three nodes each own a disk and two of six partitions; adding
-    node 4 means copying two partitions (400 GB, invented) onto it. Separating storage from compute puts the partitions in
-    a storage service and lets compute come and go. Aurora: 10 GB segments, six copies, two per zone in three zones; a
-    write counts at 4 copies, a read needs 3 (3 + 4 > 6). Lose zone a: writes go on; lose c2 as well: writes stop, reads
-    work, nothing committed is lost; a new copy takes about 10 s on a 10 Gbit/s link."""
+    """found-05, section 2. A rented cloud computer's own disk vanishes with it. The café kitchen and its shelf; a
+    warehouse down the road (a network disk) that survives, at the price of a trip per read or write; a database's
+    log notes and 8 KB pages, mirrored to a second zone: 7.4 I/Os a transaction. Send only the slip: the log is the
+    database (Aurora): 35 times the transactions at 0.95 I/Os each. Six copies in three zones, write 4, read 3: a
+    zone fails, then a disk; nothing saved is lost; a 10-second repair. The price, the moral and a check."""
+
+    # --- small state helpers: each returns animations and updates what is on screen ---
+    def cap(self, s, color=GREY_B, size=24):
+        new = (T(s, size, color) if isinstance(s, str) else s)
+        fit(new, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def status(self, alive):
+        w_ok, r_ok = alive >= 4, alive >= 3
+        g = VGroup(T(f"copies left: {alive}", 22, WHITE),
+                   VGroup(T("write needs 4", 22, GREY_B), tick(w_ok, 0.14)).arrange(RIGHT, buff=0.18),
+                   VGroup(T("read needs 3", 22, GREY_B), tick(r_ok, 0.14)).arrange(RIGHT, buff=0.18)).arrange(RIGHT, buff=0.6)
+        return self.put("status", fit(g, 6.3).move_to([(WX0 + WX1) / 2, STAT_Y, 0]))
 
     def construct(self):
-        self.title_card("Separating storage from compute", "data in a shared service, compute that comes and goes")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Where the payments live", "storage apart from compute, and six copies in three zones")
 
-        layout = {1: ["P1", "P2"], 2: ["P3", "P4"], 3: ["P5", "P6"]}
-        nd = {i: Node(i, X3[i], layout[i]) for i in (1, 2, 3)}
-        self.steps("The payments database runs on three nodes. Each has its own CPUs, memory and disk, "
-                   "and its disk holds two of six partitions. They share nothing but the network.", [
-            (lambda: [LaggedStart(*[FadeIn(nd[i].body(), shift=0.1 * UP) for i in nd], lag_ratio=0.25)], 1.2),
-            "and its disk",
-            (lambda: [LaggedStart(*[FadeIn(p, scale=0.8) for i in nd for p in nd[i].parts.values()], lag_ratio=0.12)], 1.0),
-            "They share nothing",
-            (lambda: [*[glow(nd[i].outer, WHITE, 1.02) for i in nd]], 0.9),
+        # ---------------- scene 1: the symptom ----------------
+        kb = RoundedRectangle(corner_radius=0.16, width=KW, height=KH, stroke_color=BLUE_M, stroke_width=3).set_fill(fillc(BLUE_M), 1).move_to(K)
+        k_t = T("rented computer", 24).move_to(K + [0, KH / 2 - 0.38, 0])
+        sh = RoundedRectangle(corner_radius=0.1, width=SH_W, height=SH_H, stroke_color=GOLD_M, stroke_width=2.5).set_fill(fillc(GOLD_M), 1).move_to(SH)
+        sh_t = T("its own disk", 20).move_to(SH + [0, 0.2, 0])
+        sh_s = T("today's payments", 16, GREY_B).move_to(SH + [0, -0.2, 0])
+        self.lab["k"], self.lab["sh"], self.lab["shs"] = k_t, sh_t, sh_s
+        self.steps("A payments company rents a computer in the cloud to run its database. "
+                   "That computer comes with its own disk, and the day's payments are written there.", [
+            "rents a computer",
+            (lambda: [FadeIn(kb), FadeIn(k_t)], 0.8),
+            "its own disk",
+            (lambda: [FadeIn(sh), FadeIn(sh_t), FadeIn(sh_s)], 0.7),
+        ])
+        boom = tick(False, 0.45).move_to(K + [0, 0.1, 0])
+        self.steps("Then the computer fails, or the cloud moves it to another machine. Its disk goes with it.", [
+            "fails",
+            (lambda: [kb.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), Create(boom)], 0.7),
+            "Its disk goes",
+            (lambda: [VGroup(sh, sh_t, sh_s).animate.set_opacity(0.1)], 0.8),
+        ])
+        qm = T("?", 64, YELLOW_M).move_to([2.0, 0.4, 0])
+        self.steps("So where should a database keep the payments it must never lose?", [
+            (lambda: [FadeIn(qm, scale=0.6)], 0.6),
+        ], after=0.5)
+
+        # ---------------- scene 2: the kitchen and the warehouse ----------------
+        boom2 = tick(False, 0.45).move_to(K + [0, 0.1, 0])
+        self.steps("Picture the café kitchen. Its shelf holds the ingredients. If the kitchen burns down, the shelf goes with it. "
+                   "That's the rented computer and its own disk.", [
+            (lambda: [FadeOut(qm), FadeOut(boom), kb.animate.set_stroke(BLUE_M).set_fill(fillc(BLUE_M), 1),
+                      sh.animate.set_opacity(1), *self.put("k", T("kitchen", 24).move_to(k_t)),
+                      *self.put("sh", T("shelf", 20).move_to(sh_t)), *self.put("shs", T("ingredients", 16, GREY_B).move_to(sh_s))], 1.0),
+            "burns down",
+            (lambda: [Create(boom2), kb.animate.set_stroke(RED_M)], 0.6),
+            "That's the rented",
+            (lambda: [FadeOut(boom2), kb.animate.set_stroke(BLUE_M)], 0.6),
+        ])
+        wb = RoundedRectangle(corner_radius=0.16, width=WX1 - WX0, height=WY1 - WY0, stroke_color=TEAL_M, stroke_width=3) \
+            .set_fill(fillc(TEAL_M, 0.08), 1).move_to([(WX0 + WX1) / 2, (WY0 + WY1) / 2, 0])
+        w_t = T("warehouse", 24).move_to([(WX0 + WX1) / 2, WY1 + 0.35, 0])
+        link = Arrow([K[0] + KW / 2 + 0.08, LINK_Y, 0], [WX0 - 0.08, LINK_Y, 0], buff=0, stroke_width=3, color=GREY_B,
+                     max_tip_length_to_length_ratio=0.08)
+        link_t = T("down the road", 18, GREY_B).move_to([(K[0] + KW / 2 + WX0) / 2, LINK_Y - 0.3, 0])
+        cps = {}
+
+        def copy_box(z, r, color=TEAL_M):
+            b = RoundedRectangle(corner_radius=0.08, width=CP_W, height=CP_H, stroke_color=color, stroke_width=2.5).set_fill(fillc(color), 1)
+            return VGroup(b, M(f"{'abc'[z]}{r + 1}", 20).move_to(b)).move_to(copy_c(z, r))
+
+        cps[(0, 0)] = copy_box(0, 0)
+        self.lab.update(w=w_t, link=link_t)
+        self.steps("So keep the stock in a warehouse down the road. A fire in the kitchen loses nothing. "
+                   "In the cloud, that's a network disk. It lives on the provider's storage machines, and it survives.", [
+            "a warehouse",
+            (lambda: [FadeIn(wb), FadeIn(w_t), GrowArrow(link), FadeIn(link_t), FadeIn(cps[(0, 0)], scale=0.8)], 1.0),
+            "A fire",
+            (lambda: [glow(cps[(0, 0)][0], TEAL_M, 1.08)], 0.8),
+            "a network disk",
+            (lambda: [*self.put("w", T("network disk", 24).move_to(w_t)), *self.put("link", T("the network", 18, GREY_B).move_to(link_t))], 0.7),
+        ])
+        self.steps("The catch: every fetch is now a trip down the road. Every read or write is a call over the network.", [
+            (lambda: [travel_to(chip_at("read", WHITE, link.get_start()), [link.get_start(), link.get_end(), copy_c(0, 0)], 1.0)], 1.2),
+            (lambda: [travel_to(chip_at("write", WHITE, link.get_start()), [link.get_start(), link.get_end(), copy_c(0, 0)], 1.0)], 1.2),
         ])
 
-        n4 = Node(4, XS[4], [])
-        move = note("before node 4 can help: copy 2 partitions, 400 GB", RED_M)
+        # ---------------- scene 3: a database makes a lot of trips ----------------
+        cps[(1, 0)] = copy_box(1, 0)
+        zl = VGroup(*[T(f"zone {'abc'[z]}", 18, GREY_B).move_to([col_x(z), WY1 - 0.3, 0]) for z in range(3)])
+        seps = VGroup(*[DashedLine([WX0 + COL_W * z, WY1 - 0.1, 0], [WX0 + COL_W * z, WY0 + 0.1, 0], dash_length=0.08,
+                                   stroke_width=1.5, color=GREY_D) for z in (1, 2)])
 
-        def spread():
-            out = []
-            for i in (1, 2, 3):
-                g = VGroup(nd[i].body(), *nd[i].parts.values())
-                out.append(g.animate.shift((XS[i] - X3[i]) * RIGHT))
-                nd[i].x = XS[i]
-            return out
+        def trip(text, color, target, rt=0.9):
+            c = chip_at(text, color, link.get_start())
+            return travel_to(c, [link.get_start(), link.get_end(), copy_c(*target)], rt)
 
-        self.steps("Month end needs more CPU. Add node 4, and before it can help, "
-                   "two partitions, 400 gigabytes, must be copied onto it.", [
-            (lambda: spread(), 0.8),
-            "Add node 4",
-            (lambda: [FadeIn(n4.body(), shift=0.1 * UP)], 0.6),
-            "two partitions",
-            (lambda: [nd[2].parts["P4"].animate(path_arc=-0.9).move_to(n4.slot(0, 2)),
-                      nd[3].parts["P6"].animate(path_arc=-0.9).move_to(n4.slot(1, 2))], 1.4),
-            (lambda: [FadeIn(move, shift=0.1 * UP)], 0.6),
+        self.steps("And a database makes a lot of trips. It saves each change twice. First a short note at the end of its log, "
+                   "a file it only adds to, so a crash loses nothing. Later, the changed pages, the blocks its tables live in, often 8 kilobytes each.", [
+            "a short note",
+            (lambda: [trip("note", BLUE_M, (0, 0))], 1.1),
+            "Later, the changed",
+            (lambda: [trip("page 8 KB", GOLD_M, (0, 0), 1.2)], 1.3),
+            (lambda: [trip("page 8 KB", GOLD_M, (0, 0), 1.2)], 1.3),
         ])
-        n4.parts = {"P4": nd[2].parts.pop("P4"), "P6": nd[3].parts.pop("P6")}
-
-        back = note("compute and data grow and shrink together", GREY_A)
-        self.steps("Removing it later moves them back. Compute and data grow and shrink together.", [
-            (lambda: [n4.parts["P4"].animate(path_arc=0.9).move_to(nd[2].slot(1, 2)),
-                      n4.parts["P6"].animate(path_arc=0.9).move_to(nd[3].slot(1, 2))], 1.4),
-            (lambda: [FadeOut(n4.body()), FadeOut(move)], 0.6),
-            "Compute and data",
-            (lambda: [FadeIn(back, shift=0.1 * UP)], 0.6),
+        self.steps("Now keep a mirror in a second availability zone, a separate building with its own power and network. Every trip happens twice.", [
+            "a mirror",
+            (lambda: [FadeIn(zl), Create(seps), FadeIn(cps[(1, 0)], scale=0.8)], 0.9),
+            "Every trip",
+            (lambda: [LaggedStart(trip("note", BLUE_M, (0, 0)), trip("note", BLUE_M, (1, 0)), trip("page 8 KB", GOLD_M, (0, 0)),
+                                  trip("page 8 KB", GOLD_M, (1, 0)), lag_ratio=0.3)], 2.0),
         ])
-        nd[2].parts["P4"] = n4.parts.pop("P4")
-        nd[3].parts["P6"] = n4.parts.pop("P6")
+        io = VGroup(T("I/Os per", 20, GREY_B), T("transaction: 7.4", 20, RED_M)).arrange(DOWN, buff=0.1).move_to([(K[0] + KW / 2 + WX0) / 2, 1.35, 0])
+        self.steps("Amazon counted. A mirrored MySQL database, a popular free one, needed 7.4 reads or writes to storage for each transaction. "
+                   "Each of those is called an I/O.", [
+            "needed 7.4",
+            (lambda: [*self.put("io", io), *self.cap("mirrored MySQL: 7.4 trips to storage per transaction", RED_M)], 0.7),
+            "called an I/O",
+            (lambda: self.cap("I/O: one read or write to storage", WHITE), 0.6),
+        ])
+        self.steps("Wouldn't it be nice to send just the short note?", [
+            (lambda: self.cap("send just the short note?", YELLOW_M), 0.6),
+        ], after=0.5)
 
-        band = rrect(BANDW, BANDH, [0, BANDY, 0], TEAL_M)
-        blab = T("storage service", 22, TEAL_M)
-        blab.move_to([BANDW / 2 - 0.25 - blab.width / 2, BANDY - BANDH / 2 + 0.3, 0])
-        parts = {p: nd[i].parts[p] for i in nd for p in nd[i].parts}
-        order = ["P1", "P2", "P3", "P4", "P5", "P6"]
-        cmp = {i: compute(i, XS[i]) for i in (1, 2, 3)}
-        links = {i: DashedLine([XS[i], N2Y - N2H / 2 - 0.05, 0], [XS[i], BANDY + BANDH / 2 + 0.05, 0], dash_length=0.1,
-                               stroke_width=2, color=GREY_B) for i in (1, 2, 3, 4)}
-        self.steps("Now split them. The data moves to a storage service on its own machines. "
-                   "Compute nodes read it over the network, and keep only a cache.", [
-            (lambda: [FadeOut(back)], 0.5),
-            "The data moves",
-            (lambda: [FadeIn(band), FadeIn(blab), *[parts[p].animate.move_to(band_slot(k)) for k, p in enumerate(order)],
-                      *[FadeOut(nd[i].disk) for i in nd],
-                      *[ReplacementTransform(a, b) for i in nd for a, b in zip((nd[i].outer, nd[i].title, nd[i].cpu), cmp[i])]], 1.3),
-            "Compute nodes",
-            (lambda: [*[glow(cmp[i][0], BLUE_M, 1.03) for i in nd]], 0.8),
-            "over the network",
-            (lambda: [*[Create(links[i]) for i in (1, 2, 3)]], 0.7),
+        # ---------------- scene 4: send only the slip ----------------
+        self.steps("Back to the kitchen. The cook sends the warehouse only a slip: used two eggs. "
+                   "The warehouse clerks update their own stock pages from the slips. The kitchen keeps only today's ingredients on its shelf.", [
+            (lambda: [*self.uncap(), *self.put("w", T("warehouse", 24).move_to(w_t)), *self.put("link", T("down the road", 18, GREY_B).move_to(link_t))], 0.6),
+            "only a slip",
+            (lambda: [LaggedStart(trip("slip", BLUE_M, (0, 0)), trip("slip", BLUE_M, (1, 0)), lag_ratio=0.2)], 1.2),
+            "update their own",
+            (lambda: [glow(cps[(0, 0)][0], TEAL_M, 1.08), glow(cps[(1, 0)][0], TEAL_M, 1.08)], 0.9),
+            "keeps only",
+            (lambda: [*self.put("shs", T("today's ingredients", 16, GREY_B).move_to(sh_s)), glow(sh, GOLD_M, 1.05)], 0.8),
+        ])
+        self.steps("Now map it. The kitchen is the database instance, the computer doing the work, called compute. "
+                   "The warehouse is a fleet of storage machines.", [
+            "The kitchen is",
+            (lambda: [*self.put("k", T("database: compute", 20).move_to(k_t)), glow(kb, BLUE_M, 1.02)], 0.7),
+            "The warehouse is",
+            (lambda: [*self.put("w", T("storage machines", 24).move_to(w_t)), *self.put("link", T("the network", 18, GREY_B).move_to(link_t))], 0.7),
+        ])
+        pages = [chip_at("page", GOLD_M, copy_c(z, 0) + [0, -0.62, 0]) for z in (0, 1)]
+        self.steps("The slip is a redo log record, a short note saying what a change did. "
+                   "The storage machines build the 8 kilobyte pages themselves, so pages never cross the network on a write.", [
+            (lambda: [trip("redo record", BLUE_M, (0, 0), 1.1)], 1.2),
+            "build the 8",
+            (lambda: [*self.cap("the storage machines build the 8 KB pages from the notes", WHITE),
+                      *[FadeIn(pg, shift=0.1 * UP) for pg in pages]], 0.8),
+        ])
+        self.steps("And the shelf is only a cache, a quick copy that can be refilled.", [
+            (lambda: [*self.put("sh", T("cache", 20).move_to(sh_t)), *self.put("shs", T("a quick copy", 16, GREY_B).move_to(sh_s)),
+                      *[FadeOut(pg) for pg in pages]], 0.7),
+        ])
+        self.steps("This is called separating storage from compute. Amazon's Aurora, a cloud database built from MySQL, "
+                   "sums it up in one line: the log is the database.", [
+            (lambda: self.cap("separating storage from compute", WHITE), 0.6),
+            "the log is the",
+            (lambda: self.cap("Aurora: the log is the database", YELLOW_M, 28), 0.7),
         ])
 
-        c4 = compute(4, XS[4], GREEN_M)
-        free = note("adding compute moves no data", GREEN_M)
-        self.steps("Now adding compute moves no data. A new node reads what it needs and helps at once, "
-                   "and later it just stops.", [
-            (lambda: [FadeIn(c4, shift=0.1 * DOWN)], 0.6),
-            (lambda: [Create(links[4])], 0.4),
-            "reads what it needs",
-            (lambda: [flow(links[4], GOLD_M, 0.7, back=True)], 0.7),
-            (lambda: [FadeIn(free, shift=0.1 * UP)], 0.5),
-            "and later",
-            (lambda: [FadeOut(c4), FadeOut(links[4])], 0.7),
+        # ---------------- scene 5: the numbers ----------------
+        self.steps("Same 30-minute test, same size of machine. Mirrored MySQL: 780,000 transactions, at 7.4 I/Os each. "
+                   "Aurora: 27 million, at 0.95 I/Os each.", [
+            (lambda: self.cap("30 minutes of writes, same machine size", WHITE), 0.6),
+            "Mirrored MySQL",
+            (lambda: self.cap("mirrored MySQL: 780,000 transactions, 7.4 I/Os each", RED_M), 0.6),
+            "Aurora: 27",
+            (lambda: [*self.cap("Aurora: 27,378,000 transactions, 0.95 I/Os each", GREEN_M),
+                      *self.put("io", VGroup(T("I/Os per", 20, GREY_B), T("transaction: 0.95", 20, GREEN_M)).arrange(DOWN, buff=0.1).move_to(io))], 0.7),
+        ])
+        self.steps("That's 35 times the transactions, with 7.7 times fewer I/Os each. And Aurora was keeping six copies of the data. "
+                   "More breakfasts, fewer trips.", [
+            (lambda: self.cap("35 times the transactions,  7.7 times fewer I/Os each", GREEN_M), 0.6),
+            "six copies",
+            (lambda: [*[FadeIn(cps.setdefault(k, copy_box(*k)), scale=0.8) for k in [(0, 1), (1, 1), (2, 0), (2, 1)]],
+                      *self.cap("while keeping six copies", WHITE)], 0.9),
         ])
 
-        dur_note = note("now the storage service holds the only durable copy", GOLD_M)
-        self.steps("Now the storage service holds the only durable copy. It must survive a dead disk, "
-                   "even a lost availability zone: a separate site with its own power.", [
-            (lambda: [FadeOut(free), FadeIn(dur_note, shift=0.1 * UP)], 0.7),
-            (lambda: [glow(band, GOLD_M, 1.02)], 0.9),
-        ])
-
-        db = VGroup(rrect(3.6, 1.1, [0, DBY, 0], BLUE_M), T("database instance", 24).move_to([0, DBY + 0.19, 0]),
-                    T("its memory: only a cache", 18, GREY_B).move_to([0, DBY - 0.24, 0]))
-        zones = {z: rrect(3.95, 2.1, [ZX[z], BANDY + 0.05, 0], GREY_B, 2, fill=BLACK) for z in ZX}
-        zlab = {z: T(f"zone {z}", 22, GREY_B).move_to([ZX[z], BANDY - 0.75, 0]) for z in ZX}
-        names = ["a1", "a2", "b1", "b2", "c1", "c2"]
-        cp = {n: copy_box(n) for n in names}
-        seg = T("one 10 GB segment, six copies", 22, TEAL_M).move_to([0, 0.35, 0])
-        self.steps("Amazon's Aurora does this. It cuts the data into 10 gigabyte segments, "
-                   "and keeps six copies of each, two in each of three zones.", [
-            (lambda: [FadeOut(dur_note), *[FadeOut(links[i]) for i in (1, 2, 3)], FadeOut(cmp[2]), FadeOut(cmp[3]),
-                      *[ReplacementTransform(a, b) for a, b in zip(cmp[1], db)]], 0.9),
-            "It cuts",
-            (lambda: [*[FadeOut(parts[p]) for p in order], FadeOut(blab), ReplacementTransform(band, VGroup(*zones.values())),
-                      FadeIn(seg)], 1.0),
-            "and keeps six",
-            (lambda: [LaggedStart(*[FadeIn(cp[n], scale=0.9) for n in names], lag_ratio=0.15)], 1.1),
+        # ---------------- scene 6: six copies, three zones, quorums ----------------
+        self.steps("Six copies, kept how? Aurora cuts the data into 10-gigabyte segments. Each segment has six copies, two in each of three zones.", [
+            (lambda: [*self.uncap(), *self.drop("io")], 0.4),
+            "10-gigabyte",
+            (lambda: self.cap("one 10 GB segment: six copies, two in each of three zones", WHITE), 0.6),
             "two in each",
-            (lambda: [*[FadeIn(zlab[z]) for z in ZX]], 0.6),
+            (lambda: [LaggedStart(*[glow(cps[(z, r)][0], TEAL_M, 1.08) for z in range(3) for r in range(2)], lag_ratio=0.15)], 1.2),
         ])
 
-        lines = {n: Line([cp[n][0].get_center()[0] * 0.18, DBY - 0.6, 0], cp[n][0].get_top() + 0.08 * UP, stroke_width=2,
-                         color=GREY_D) for n in names}
-        wst = T("write: 0 of 6", 26).move_to([-3.0, NOTE_Y, 0])
-        fast = ["b1", "a1", "c1", "b2"]
-        self.steps("On a commit, the database sends only a short log record, never whole pages. "
-                   "The write counts once four copies have it, and the slow two catch up later.", [
-            (lambda: [FadeOut(seg), *[Create(lines[n]) for n in names]], 0.6),
-            "sends only",
-            (lambda: [*[flow(lines[n], BLUE_M, 0.8) for n in fast]], 0.8),
-            "The write counts",
-            (lambda: [FadeIn(wst)], 0.3),
-            *[(lambda n=n, k=k: [cp[n][0].animate.set_stroke(GREEN_M).set_fill(fillc(GREEN_M), 1),
-                                Transform(wst, T(f"write: {k + 1} of 6", 26, GREEN_M if k == 3 else WHITE).move_to(wst))], 0.35)
-              for k, n in enumerate(fast)],
-            (lambda: [Transform(wst, T("write: 4 of 6, committed", 26, GREEN_M).move_to([-3.0, NOTE_Y, 0]))], 0.4),
-            "and the slow two",
-            (lambda: [*[flow(lines[n], BLUE_M, 0.8) for n in ("a2", "c2")]], 0.8),
-            (lambda: [*[cp[n][0].animate.set_stroke(GREEN_M).set_fill(fillc(GREEN_M), 1) for n in ("a2", "c2")]], 0.5),
+        def acks(n):
+            ks = [(z, r) for z in range(3) for r in range(2)]
+            return [LaggedStart(*[trip("redo", BLUE_M, k, 0.8) for k in ks], lag_ratio=0.08)]
+
+        self.steps("A write counts once four copies have it. A read needs three. "
+                   "Those numbers are quorums: how many copies must answer before an operation counts.", [
+            (lambda: acks(6), 1.4),
+            "A write counts",
+            (lambda: self.status(6), 0.6),
+            "Those numbers",
+            (lambda: self.cap("quorum: how many copies must answer before an operation counts", YELLOW_M), 0.6),
         ])
 
-        rst = T("read: 3 of 6", 26, BLUE_M).move_to([3.3, NOTE_Y, 0])
-        reads = ["a2", "c2", "c1"]
-        self.steps("A read asks three copies. Any three overlap any four, since three plus four is more than six, "
-                   "so a read always finds the newest write.", [
-            (lambda: [FadeIn(rst)], 0.4),
-            (lambda: [*[flow(lines[n], BLUE_M, 0.7, back=True) for n in reads]], 0.7),
+        # ---------------- scene 7: a zone fails, then a disk ----------------
+        xs = {}
+
+        def kill(k):
+            xs[k] = tick(False, 0.2).move_to(copy_c(*k))
+            return [cps[k][0].animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), cps[k][1].animate.set_opacity(0.3), Create(xs[k])]
+
+        self.steps("Now a whole zone fails. Its power, its network, or a bad change that hits every machine in it. "
+                   "Two copies gone. Can we still write? Pause and guess.", [
+            (lambda: self.uncap(), 0.3),
+            "a whole zone",
+            (lambda: [*kill((0, 0)), *kill((0, 1))], 0.8),
+            "Two copies gone",
+            (lambda: [*self.put("status", VGroup(T("copies left: 4", 22, WHITE), T("write?", 22, YELLOW_M), T("read?", 22, YELLOW_M))
+                                .arrange(RIGHT, buff=0.6).move_to([(WX0 + WX1) / 2, STAT_Y, 0]))], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        alive = [(1, 0), (1, 1), (2, 0), (2, 1)]
+        self.steps("Yes. Four copies are left, and a write needs four.", [
+            (lambda: [*self.uncap(), *self.status(4), LaggedStart(*[trip("redo", BLUE_M, k, 0.8) for k in alive], lag_ratio=0.1)], 1.2),
+        ])
+        self.steps("Then, while that zone is down, a disk in zone c dies. Three left. Writes stop. Reads still work.", [
+            "a disk in zone c",
+            (lambda: kill((2, 1)), 0.7),
+            "Three left",
+            (lambda: self.status(3), 0.6),
+        ])
+        self.stamp("three-left")
+        self.steps("Did we lose a saved write? No. Every saved write reached four copies. "
+                   "Any three copies include at least one of those four, because three plus four is more than six.", [
+            "Every saved write",
+            (lambda: self.cap("every saved write: on 4 copies.   any 3 copies overlap them: 3 + 4 > 6", WHITE), 0.7),
             "Any three",
-            (lambda: [*[cp[n][0].animate.set_stroke(BLUE_M, width=6) for n in reads]], 0.5),
-            "so a read",
-            (lambda: [glow(cp["c1"][0], GOLD_M, 1.12)], 0.9),
+            (lambda: [LaggedStart(*[glow(cps[k][0], GREEN_M, 1.08) for k in [(1, 0), (1, 1), (2, 0)]], lag_ratio=0.2)], 1.0),
+        ])
+        newc = copy_box(0, 0, GREEN_M)
+
+        def copy_dot():
+            d = Dot(radius=0.07, color=GREEN_M).move_to(copy_c(1, 0))
+            return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(copy_c(1, 0), copy_c(0, 0)), run_time=0.5), FadeOut(d, run_time=0.1))
+        self.steps("Meanwhile, the storage fleet copies the segment onto a new machine. Ten gigabytes take about 10 seconds. "
+                   "That's why the segments are small. Aurora can't stop disks failing, but it can repair them fast.", [
+            (lambda: [FadeOut(xs[(0, 0)]), FadeOut(cps[(0, 0)])], 0.4),
+            "copies the segment",
+            (lambda: [FadeIn(newc, scale=0.8),
+                      LaggedStart(*[copy_dot() for _ in range(4)], lag_ratio=0.25)], 1.6),
+            "Ten gigabytes",
+            (lambda: [*self.status(4), *self.cap("10 GB over a 10 Gbit/s link: about 10 seconds", GREEN_M)], 0.7),
+            "Aurora can't",
+            (lambda: self.cap("you can't stop disks failing; you can repair them fast", WHITE), 0.6),
         ])
 
-        def kill(n):
-            x = tick(False, 0.28).move_to(cp[n][0].get_center()).set_z_index(6)
-            return [cp[n][0].animate.set_stroke(RED_M, width=3).set_fill(fillc(RED_M), 1), cp[n][1].animate.set_color(GREY_D),
-                    lines[n].animate.set_color(RED_M).set_opacity(0.3), Create(x)], x
-
-        def plain():
-            return [cp[n][0].animate.set_stroke(WHITE, width=2.5).set_fill(BLACK, 1) for n in names]
-
-        xa = {}
-        alive = ["b1", "b2", "c1", "c2"]
-
-        def zone_a():
-            out = []
-            for n in ("a1", "a2"):
-                an, x = kill(n)
-                xa[n] = x
-                out += an
-            return out + [zones["a"].animate.set_stroke(RED_M), zlab["a"].animate.set_color(RED_M)]
-
-        self.steps("Now a whole zone fails. Two copies are gone, four are left, and writes carry on.", [
-            (lambda: [FadeOut(rst), *plain(), Transform(wst, T("write: needs 4", 26).move_to([-3.0, NOTE_Y, 0]))], 0.5),
-            "Now a whole zone",
-            (lambda: zone_a(), 0.8),
-            "and writes carry on",
-            (lambda: [*[flow(lines[n], BLUE_M, 0.7) for n in alive]], 0.7),
-            (lambda: [*[cp[n][0].animate.set_stroke(GREEN_M) for n in alive],
-                      Transform(wst, T("write: 4 of 6, committed", 26, GREEN_M).move_to([-3.0, NOTE_Y, 0]))], 0.5),
+        # ---------------- scene 8: the price ----------------
+        self.steps("The price is a network trip on every write. Newer designs go further. They keep the durable copy in object storage, "
+                   "cheap file storage like Amazon S3, to save on fees for bytes that cross between zones. They pay with slower writes.", [
+            (lambda: [self.cap("the price: a network trip on every write", WHITE)[0], glow(link, RED_M, 1.0)], 0.7),
+            "object storage",
+            (lambda: self.cap("newer designs: the durable copy in object storage, like Amazon S3", WHITE), 0.6),
+            "They pay",
+            (lambda: self.cap("cheaper across zones, slower writes", GOLD_M), 0.6),
         ])
 
-        xc = {}
-
-        def c2_dies():
-            an, x = kill("c2")
-            xc["c2"] = x
-            return an
-
-        rst2 = T("read: 3 of 6", 26, GREEN_M).move_to([3.3, NOTE_Y, 0])
-        self.steps("Then the disk under c2 dies. With three left, writes stop, "
-                   "but reads still work, and nothing committed is lost.", [
-            (lambda: [*[cp[n][0].animate.set_stroke(WHITE) for n in ("b1", "b2", "c1")]], 0.4),
-            "under c2",
-            (lambda: c2_dies(), 0.8),
-            "writes stop",
-            (lambda: [Transform(wst, T("write: 3 of 6, stopped", 26, RED_M).move_to([-3.0, NOTE_Y, 0]))], 0.6),
-            "but reads",
-            (lambda: [FadeIn(rst2), *[flow(lines[n], GREEN_M, 0.7, back=True) for n in ("b1", "b2", "c1")]], 0.7),
-            "and nothing committed",
-            (lambda: [*[glow(cp[n][0], GREEN_M, 1.08) for n in ("b1", "b2", "c1")]], 0.9),
+        # ---------------- scene 9: the moral, and a check ----------------
+        self.steps("So where should the payments live? Not on a computer that can vanish. In the warehouse: six copies, in three buildings. "
+                   "The kitchen's shelf is only a cache.", [
+            (lambda: self.cap("where should the payments live?", WHITE), 0.5),
+            "In the warehouse",
+            (lambda: [glow(wb, TEAL_M, 1.01)], 0.9),
+            "The kitchen's shelf",
+            (lambda: [glow(sh, GOLD_M, 1.05)], 0.8),
         ])
-
-        c3 = copy_box("c3", GREEN_M)
-        rep = ArcBetweenPoints(cp["c1"][0].get_top() + 0.05 * UP, c3[0].get_top() + 0.05 * UP, angle=-PI / 2, stroke_width=3,
-                               color=GREEN_M)
-        rlab = T("new copy: 10 GB, about 10 s", 26, GREEN_M).move_to([3.3, NOTE_Y, 0])
-        lines["c3"] = Line([c3[0].get_center()[0] * 0.18, DBY - 0.6, 0], c3[0].get_top() + 0.08 * UP, stroke_width=2, color=GREY_D)
-
-        def arc_flow():
-            d = Dot(radius=0.08, color=GREEN_M).move_to(rep.get_start()).set_opacity(0).set_z_index(6)
-            return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, rep, run_time=0.9), FadeOut(d, run_time=0.15))
-        self.steps("A new copy of the 10 gigabyte segment takes about ten seconds, "
-                   "and with four copies again, writes resume.", [
-            (lambda: [FadeOut(cp["c2"]), FadeOut(xc["c2"]), FadeOut(lines["c2"])], 0.5),
-            (lambda: [FadeIn(c3, scale=0.9)], 0.5),
-            (lambda: [Create(rep), ReplacementTransform(rst2, rlab)], 0.5),
-            (lambda: [arc_flow()], 1.1),
-            "and with four",
-            (lambda: [FadeOut(rep), Create(lines["c3"]), c3[0].animate.set_stroke(WHITE).set_fill(BLACK, 1),
-                      Transform(wst, T("write: 4 of 6, committed", 26, GREEN_M).move_to([-3.0, NOTE_Y, 0]))], 0.6),
-        ])
-
-        self.steps("Put the durable copy in a storage service, and compute can come and go. "
-                   "Always ask where the durable copy lives, and what is only a cache.", [
-            (lambda: [*[glow(zones[z], TEAL_M, 1.02) for z in ZX]], 1.0),
-            "and compute",
-            (lambda: [glow(db[0], BLUE_M)], 0.9),
-            "and what is only",
-            (lambda: [Indicate(db[2], color=BLUE_M)], 0.9),
-        ])
-        self.wait(0.6)
+        self.steps("Where is the durable copy, and what is only a cache? Ask that first, of any system.", [
+            (lambda: self.cap("where is the durable copy, and what is only a cache?", YELLOW_M, 28), 0.7),
+        ], after=0.6)
+        boom3 = tick(False, 0.45).move_to(K + [0, 0.1, 0])
+        self.steps("One quick check. The database instance crashes: the kitchen burns down. What's lost? Pause and think.", [
+            "crashes",
+            (lambda: [kb.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), Create(boom3), *self.cap("the instance crashes: what's lost?", WHITE)], 0.7),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Only the shelf, a cache. Every saved change is in the warehouse. A new instance starts, and refills its shelf.", [
+            (lambda: [*self.cap("only the cache. every saved change is in storage.", GREEN_M, 28), VGroup(sh, self.lab["sh"], self.lab["shs"]).animate.set_opacity(0.15)], 0.7),
+            "A new instance",
+            (lambda: [FadeOut(boom3), kb.animate.set_stroke(BLUE_M).set_fill(fillc(BLUE_M), 1)], 0.6),
+            "refills its shelf",
+            (lambda: [travel_to(chip_at("page", GOLD_M, copy_c(1, 0)), [copy_c(1, 0), link.get_end(), link.get_start()], 1.0)], 1.2),
+            (lambda: [VGroup(sh, self.lab["sh"], self.lab["shs"]).animate.set_opacity(1)], 0.5),
+        ], after=0.3)
+        self.play(*self.cap("where is the durable copy, and what is only a cache?", YELLOW_M, 28), run_time=0.7)
+        self.wait(2.0)

@@ -1,480 +1,483 @@
 {
- "id": "cache-02",
- "title": "Inside an in-memory store: how Redis executes commands",
- "minutes": 40,
- "goal": "By the end you can explain why an in-memory store is fast even next to a database whose pages are all cached, how one Redis thread runs every command in turn, predict when one slow command stalls every other client, and connect to Redis from Java and Kotlin.",
- "warmup": {
-  "q": "Researchers loaded a whole order-processing benchmark into the memory of a disk-based database engine, so no transaction ever waited for the disk, and counted the CPU instructions each transaction ran. Where did most of them go?",
-  "options": [
-   "Waiting for the disk anyway, because the engine still reads pages from its files",
-   "The real work: reading and updating the rows the transaction touched",
-   "Bookkeeping built for disk: finding pages in the buffer pool, latches, locks and log records",
-   "Copying data between the kernel and the database's memory"
-  ],
-  "answer": 2,
-  "why": "Harizopoulos and colleagues measured Shore, a classic disk-based engine, with all of its data in RAM. About a third of the instructions went to the buffer manager, and roughly 14%, 16% and 12% to latching, locking and logging. About 1/60 of the instructions did the transaction's useful work. No disk reads happened, so the first option can't be it, and with everything in memory there was no copying from the kernel either. An in-memory store is fast mainly because it drops that machinery. This lesson starts there, then opens up Redis as the example."
- },
- "sections": [
-  {
-   "h": "An in-memory store is fast because it skips the disk format, not only the disk",
-   "body": "Lesson 1 put a cache in front of a database. Push the idea further: if the whole dataset fits in RAM, the store can live in memory and use the disk only to survive a restart. Would that beat a database that already has every page cached?\n\nIt does, by a wide margin, and not for the reason most people guess. In 2008 Harizopoulos, Abadi, Madden and Stonebraker loaded an order-processing benchmark (TPC-C) into the memory of Shore, a classic disk-based engine, so no transaction ever waited for the disk. Then they counted CPU instructions. About a third went to the buffer manager, the code that finds and pins pages (the Storage track's lesson on the buffer pool). About 14% went to latches, 16% to the lock manager and 12% to building log records. Only about 1/60 of the instructions did the transaction's useful work, and stripping the rest made the engine about 20 times faster. So an **in-memory store** keeps data as ordinary in-memory structures, such as a hash table whose entries point straight at values, and never translates them to and from a page layout. If it uses the disk at all, it appends a log or writes a snapshot on the side (lesson 9), and reads never come from that copy.\n\nRedis is the best-known store built this way, and it answers a problem you already have. Twenty pods of a payment service handle card authorizations. A client retries a payment with the same idempotency key, the retry lands on a different pod, and that pod must answer \"have I seen `idem:7f3a`?\" A `HashMap` in each pod can't, because pod 3's memory is invisible to pod 11. The database can, for the price of a query per check. You want one map that every pod shares, in memory, over the network.\n\nThe simplest version is a server holding a `HashMap<String, byte[]>` behind `SET key value` and `GET key`. It breaks as soon as clients change values: two pods counting a card's authorizations both `GET` 41 and both `SET` 42 (the worked example loses four increments in five this way). So the server should know the shape of each value and change it itself. A **key** is a name such as `payment:42`, and its value has a type: a string, a hash (a small map of fields), a list, a set, a sorted set, and more in lessons 3 and 4. `INCR auths:card:7` adds one on the server, `HINCRBY payment:43 amount 50` changes one field, and a command that doesn't fit the type fails with `WRONGTYPE`. Types like these are easy to offer when everything lives in memory, and hard to build on disk pages.\n\nMemory makes Redis fast, and the network decides how fast. On my laptop a `GET` from the JVM to the Redis container took about 214 microseconds end to end, and Redis spent about half a microsecond of it running the command. That is lesson 1's ladder again: the round trip is the expensive rung.\n\nThe licenses changed twice, so know which server you run. Redis was BSD-licensed up to 7.2. In March 2024 Redis Ltd announced that 7.4 and later would ship under the source-available RSALv2 and SSPLv1, and eight days later the Linux Foundation launched Valkey, a BSD fork of Redis 7.2.4 backed by AWS, Google Cloud, Oracle and others. Redis 8.0 added AGPLv3 as a third choice. Today Redis Open Source is at 8.10.3 (the labs pin `redis:8.10.3`) and Valkey at 9.1.3. Dragonfly, which speaks the same protocol with a different threading design, moved in v2.1 (November 2026) to its own source-available license, free in production up to 100 vCPUs. Everything in this lesson works on Redis and Valkey alike, and this track names the version whenever a command needs Redis 8.",
-   "try": {
-    "title": "Start Redis and poke it",
-    "minutes": 4,
-    "steps": [
-     "From the `labs` folder, start the server: `docker compose -f env/redis.yml up -d`.",
-     "Open a prompt with `docker compose -f env/redis.yml exec redis redis-cli` and type the commands below, one at a time.",
-     "Before the last three, predict: what does `TYPE` say, and what happens when you `GET` a hash?",
-     "Leave the server running for the rest of the lesson. When you are done for the day, stop it and delete its data with `docker compose -f env/redis.yml down -v`."
+  "id": "cache-02",
+  "title": "Inside an in-memory store: how Redis executes commands",
+  "minutes": 40,
+  "goal": "By the end, you can explain why a store that keeps everything in memory is fast, follow how Redis runs every command in turn on one thread, predict when one slow command makes everyone wait, and connect to Redis from Java and Kotlin.",
+  "opening": "Picture a small post office with one clerk and six windows. The clerk serves the first window, then the second, and so on round the room, finishing each job before starting the next. Most jobs take seconds, so the queues stay short. Then a customer asks for four hundred parcels to be weighed, and every window waits.\n\nRedis, a program that keeps data in memory and answers requests over the network, works much like that clerk. A single thread, one line of work inside the program, runs every command, one at a time. It's easy to hear \"one thread\" and think \"slow\", and to reach for more threads when it stalls. Both instincts miss what's going on.\n\nWhy caches work showed that a copy kept close by answers most lookups, and that the copy often lives in Redis. In this lesson, we'll see why a store in memory is fast, follow its one thread through many clients, freeze it with one slow command, and connect from Java and Kotlin. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "Researchers took a classic database program built to keep its data on disk, and loaded all of the data into memory, so it never had to wait for the disk. Then they counted the instructions the CPU ran for each order in a standard test. Where did most of the instructions go?",
+    "options": [
+      "Waiting for the disk anyway, because the program still read its files",
+      "The real work: reading and changing the records each order needed",
+      "Bookkeeping built for disks: finding blocks of data in memory, locks, and a log for recovering from crashes",
+      "Copying data between the operating system and the program"
     ],
-    "code": {
-     "lang": "text",
-     "title": "at the redis-cli prompt",
-     "src": "PING\nSET payment:42 approved\nGET payment:42\nINCR auths:today\nINCR auths:today\nHSET payment:43 status approved amount 1250 currency EUR\nHINCRBY payment:43 amount 50\nTYPE payment:43\nGET payment:43\nINFO server"
-    },
-    "expect": "`PING` answers `PONG` and `GET payment:42` prints `\"approved\"`. The two `INCR`s print `(integer) 1` and `(integer) 2`: the key didn't exist, so Redis started from 0. `HSET` prints `(integer) 3` (three new fields) and `HINCRBY` prints `(integer) 1300`, computed on the server. `TYPE payment:43` says `hash`, and `GET payment:43` fails with `(error) WRONGTYPE Operation against a key holding the wrong kind of value`. In the `INFO server` output, find `redis_version:8.10.3` and `multiplexing_api:epoll`: the server asks the Linux kernel's epoll which sockets have data. That is the loop in the next section."
-   },
-   "refs": [
-    {
-     "title": "Harizopoulos et al., OLTP Through the Looking Glass, and What We Found There (SIGMOD 2008)",
-     "url": "https://faculty.cc.gatech.edu/~jarulraj/courses/4420-s19/papers/02-inmemory/hstore-lookingglass.pdf",
-     "kind": "read"
-    },
-    {
-     "title": "Designing Data-Intensive Applications, 2nd edition, chapter 4 (keeping everything in memory)",
-     "url": "https://dataintensive.net/",
-     "kind": "read"
-    },
-    {
-     "title": "Redis licenses",
-     "url": "https://redis.io/legal/licenses/",
-     "kind": "read"
-    },
-    {
-     "title": "Linux Foundation launches Valkey",
-     "url": "https://www.linuxfoundation.org/press/linux-foundation-launches-open-source-valkey-community",
-     "kind": "read"
-    }
-   ]
+    "answer": 2,
+    "why": "Harizopoulos and colleagues measured Shore, a classic disk-based database, with all of its data in RAM. About a third of the instructions went to the code that manages pages in memory, and roughly 14%, 16% and 12% to latches, locks and the log. About 1/60 did the order's useful work. No disk reads happened, so the first option can't be it, and with everything in memory there was no copying from the operating system either. The second option is the tempting one, because work is what you'd expect a program to spend its time on. A store that lives in memory is fast mainly because it drops that bookkeeping. The first section starts there."
   },
-  {
-   "h": "One thread runs every command, one after another",
-   "body": "Now the server has thousands of clients, each on its own TCP connection, all sending commands at once. How should one server process serve them?\n\nThe obvious design is one thread per connection, the way a classic Java servlet container works. Each thread reads its client's command, runs it and writes the reply. It breaks in two places. Ten thousand connections need ten thousand threads, each with its own stack, and the operating system spends its time switching between them. Worse, two threads can now touch the same key at the same moment. `INCR auths:card:7` from two threads is the `count++` race again (both read 41, both write 42, one update is lost), this time inside the server, so every key needs a lock and every command pays for locking, even when nobody else is near its key.\n\nRedis goes the other way: one thread runs every command. A single thread must never sit waiting on one quiet socket, so it asks the kernel instead, through a system call (a request a program makes to the operating system). On Linux that call is `epoll_wait`: \"here are 10,000 sockets; tell me which ones have bytes ready, and let me sleep until at least one does.\" Then the thread serves only those. This loop is the **event loop**, and it repeats four steps:\n\n1. Ask the kernel which client sockets have bytes waiting. If none do, sleep until one does.\n2. For each ready client, read the bytes and cut them into complete commands.\n3. Run each command against memory, to the end, and put the reply in that client's output buffer.\n4. Before sleeping again, write the queued replies back to the sockets.\n\nStep 3 is the base model for this whole track. Commands from different clients never overlap. While `INCR auths:card:7` runs, nothing else can read or write anything. So every single command is atomic: it happens as one step, and no client ever sees it half done. Fifty pods calling `INCR` on one key never lose an update, and Redis needs no locks to promise that. Nobody else is running.\n\nThe price is the same fact seen from the other side. A command that takes 1.5 seconds holds the only thread for 1.5 seconds, and every other client waits, whatever key it wants. On the lab server a `GET` costs about half a microsecond of that thread's time, so one 1.5-second command costs as much as three million `GET`s. The usual culprits are commands whose cost grows with the size of a key: `KEYS *` over the whole keyspace, `HGETALL` or `SMEMBERS` on a key with a million entries, `DEL` of a huge key, and long Lua scripts. A Lua script is a small program that Redis runs as one command (the Transactions track's lesson on serial execution puts them to work); here it is just the easiest way to keep Redis busy.\n\nStep through the loop below with three clients. The last two frames show one slow script freezing the others.",
-   "stepper": {
-    "title": "The event loop serves three clients",
-    "intro": "Click Next to follow one pass of the loop, then a slow script.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Three clients have sent INCR, GET and SET; the event loop is asleep in epoll_wait\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-m\" x=\"32\" y=\"94\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s\" x=\"330\" y=\"146\" text-anchor=\"middle\">asleep in epoll_wait</text><text class=\"t-s t-m\" x=\"330\" y=\"168\" text-anchor=\"middle\">using no CPU</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">41</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
-      "say": "Three clients have each sent one command. The bytes sit in each socket's receive buffer in the kernel. The main thread is asleep in `epoll_wait` and uses no CPU."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop wakes, sees three readable sockets and parses client A's INCR\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">being read</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s\" x=\"330\" y=\"146\" text-anchor=\"middle\">epoll: A, B, C readable</text><text class=\"t-s t-a\" x=\"330\" y=\"168\" text-anchor=\"middle\">read + parse A</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">41</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"69\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
-      "say": "The kernel wakes the loop: three sockets are readable. The loop reads A's bytes and parses them into one complete command, `INCR auths:today`."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop executes INCR to completion: auths:today goes from 41 to 42 and the reply is queued for A\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">INCR auths:today</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s t-a\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"58\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
-      "say": "The loop executes `INCR` from start to finish: read 41, add 1, store 42. No other command can run during that half a microsecond, so nobody ever sees a half-done increment. The reply `:42` goes into A's output buffer. It is not sent yet."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop reads and runs client B's GET and queues its reply\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-a\" x=\"32\" y=\"178\" text-anchor=\"start\">reply ok queued</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">GET card:7</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"153\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"108\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
-      "say": "Next client. The loop reads B's `GET card:7`, runs it and queues the reply. If B had sent three commands, they would run in the order B sent them."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop runs client C's SET; three commands have now run one after another\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s\" x=\"32\" y=\"178\" text-anchor=\"start\">reply ok queued</text><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-a\" x=\"32\" y=\"262\" text-anchor=\"start\">reply +OK queued</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">SET card:9 blocked</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-a\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"237\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
-      "say": "Then C's `SET`. Three commands from three connections ran one after another, each to completion, on one thread."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Before sleeping again, the loop writes all queued replies to the three sockets\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-ok\" x=\"32\" y=\"94\" text-anchor=\"start\">got :42</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-ok\" x=\"32\" y=\"178\" text-anchor=\"start\">got ok</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-ok\" x=\"32\" y=\"262\" text-anchor=\"start\">got +OK</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">write all replies</text><text class=\"t-s t-m\" x=\"330\" y=\"168\" text-anchor=\"middle\">then epoll_wait again</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"153\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"237\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0.1 ms</text></svg>",
-      "say": "Before it sleeps again, the loop writes every queued reply to its socket. With `io-threads` above 1, I/O threads would do this writing, and the reading and parsing from the second frame. The main thread would still execute every command."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Client A runs a 1.5 second Lua script; client B's GET arrives and sits unread\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">EVAL busy 1500 ms</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">script running</text><rect class=\"box-bad\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET payment:42</text><text class=\"t-s t-bad\" x=\"32\" y=\"178\" text-anchor=\"start\">sent at 300 ms: unread</text><rect class=\"box-dim\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">(nothing sent)</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\"></text><rect class=\"box-bad\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-bad\" x=\"330\" y=\"146\" text-anchor=\"middle\">inside the script</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">EVAL (1,500 ms)</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 300 ms</text></svg>",
-      "say": "Now A sends a Lua script that spins for 1.5 seconds. At 300 ms, B sends `GET payment:42`. B's bytes reach the kernel, but the only thread that could read them is busy inside the script. B waits."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The script ends at 1,500 ms; only then does the loop read and answer B's GET\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">EVAL busy 1500 ms</text><text class=\"t-s t-ok\" x=\"32\" y=\"94\" text-anchor=\"start\">got (integer) 1</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET payment:42</text><text class=\"t-s t-bad\" x=\"32\" y=\"178\" text-anchor=\"start\">answered 1,200 ms late</text><rect class=\"box-dim\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">(nothing sent)</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\"></text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">GET payment:42</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"153\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"208\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 1,500 ms</text></svg>",
-      "say": "At 1,500 ms the script returns. Only now does the loop read B's `GET`, which costs about half a microsecond of work. B waited 1,200 ms for it. Every client that sent anything during the script waited the same way, whatever key it asked for."
-     }
+  "sections": [
+    {
+      "h": "Why a store that lives in memory is fast: no machinery built for disks",
+      "body": "Let's start with a problem the payments program from Why caches work runs into. It runs as several copies on several servers, so that one crash doesn't stop the card readers. When a card reader gets no answer, it sends the same payment again, and the retry may reach a different copy. That copy must answer one question fast: have I already charged this payment? A `HashMap` inside each copy can't tell, because one copy can't see another's memory. The database can, for the price of a query on every check. What the copies need is one map they all share, kept in memory, on the network.\n\nWould such a store beat a database that already holds all of its data in memory? It does, by a wide margin, and not for the reason most people guess. In 2008, Harizopoulos, Abadi, Madden and Stonebraker tested Shore, a classic database program built for disks. They loaded TPC-C, a standard test that imitates a company taking orders, into its memory, so no order ever waited for the disk. Then they counted the CPU's instructions. About a third went to the buffer manager, the code that finds pages (fixed-size blocks of data) in memory and holds them in place. The buffer pool, in the Storage engines track, built one. About 14% went to latches, short locks that stop two threads from changing one page at once. Another 16% went to locks on records, and 12% to writing the log that lets the program recover from a crash. Only about 1/60 of the instructions did the order's useful work, and stripping the rest made the program about 20 times faster.\n\nSo an **in-memory store** keeps its data as plain structures in memory, such as a hash table (the structure inside a `HashMap`) whose entries point straight at their values, and never turns them into pages and back. If it uses the disk at all, it writes a log or a snapshot on the side (Persistence and replication, lesson 9), and reads never come from that copy. Redis is the best-known store built this way.\n\nThe simplest shared map is a server holding a `HashMap<String, byte[]>` behind two commands, `SET key value` and `GET key`. It breaks as soon as the copies change values. Say two copies count a card's payments today. Both `GET` 41, both add one, and both `SET` 42, so one payment goes uncounted. (The worked example loses four counts in five this way.) So the server should know the shape of each value and change it itself. A **key** is a name such as `payment:42`, and its value has a type. Redis has strings, hashes (small maps of fields), lists, sets, sorted sets, and more in the next two lessons. `INCR auths:card:7` adds one on the server. `HINCRBY payment:43 amount 50` changes one field of a hash. A command that doesn't fit the value's type fails with `WRONGTYPE`. Types like these are easy to offer when everything lives in memory, and hard to build on pages of a disk.\n\nMemory makes Redis fast, and the network decides how fast. On the lab machine, a `GET` from a Java program to Redis took about 214 microseconds from start to finish. Redis spent about half a microsecond of that running the command. That's the ladder from Why caches work again: the round trip is the expensive rung.\n\nYou'll meet Redis's twin, too. Redis was free software under the BSD license up to version 7.2. In March 2024, the company behind it moved 7.4 and later to licenses that let anyone read the code but limit how other companies may sell it as a service. Eight days later, the Linux Foundation launched Valkey, a fork (an independent copy) of Redis 7.2.4 under BSD, backed by AWS, Google Cloud and others. Redis 8.0 added AGPLv3, a free license, as a third choice. Today, Redis Open Source is at 8.10.3 (the labs pin `redis:8.10.3`) and Valkey at 9.1.3. Everything in this lesson works on both.\n\nOne server, and thousands of programs sending it commands at once. Next, we'll see how it serves them all.",
+      "try": {
+        "title": "Start Redis and poke it",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start the server: `docker compose -f env/redis.yml up -d`. Docker is a tool that runs programs in sealed boxes called containers, and this command starts Redis 8.10.3 in one, in the background.",
+          "Open a prompt with `docker compose -f env/redis.yml exec redis redis-cli`. `redis-cli` is Redis's own command-line tool: you type a command, and it prints the reply. Type the commands below, one at a time.",
+          "Before the last three, predict: what does `TYPE` say, and what happens when you `GET` a hash?",
+          "Leave the server running for the rest of the lesson. When you're done for the day, stop it and delete its data with `docker compose -f env/redis.yml down -v`."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "PING\nSET payment:42 approved\nGET payment:42\nINCR auths:today\nINCR auths:today\nHSET payment:43 status approved amount 1250 currency EUR\nHINCRBY payment:43 amount 50\nTYPE payment:43\nGET payment:43\nINFO server"
+        },
+        "expect": "`PING` answers `PONG`, and `GET payment:42` prints `\"approved\"`. The two `INCR`s print `(integer) 1` and `(integer) 2`: the key didn't exist, so Redis started from 0. `HSET` prints `(integer) 3` (three new fields), and `HINCRBY` prints `(integer) 1300`, worked out on the server. `TYPE payment:43` says `hash`, and `GET payment:43` fails with `(error) WRONGTYPE Operation against a key holding the wrong kind of value`. In the long `INFO server` output, find `redis_version:8.10.3` and `multiplexing_api:epoll`. The second line says how Redis watches many connections at once: through epoll, a feature of Linux. The next section opens that up."
+      },
+      "refs": [
+        {
+          "title": "Harizopoulos et al., OLTP Through the Looking Glass, and What We Found There (SIGMOD 2008)",
+          "url": "https://faculty.cc.gatech.edu/~jarulraj/courses/4420-s19/papers/02-inmemory/hstore-lookingglass.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "Designing Data-Intensive Applications, 2nd edition, chapter 4 (keeping everything in memory)",
+          "url": "https://dataintensive.net/",
+          "kind": "read"
+        },
+        {
+          "title": "Redis licenses",
+          "url": "https://redis.io/legal/licenses/",
+          "kind": "read"
+        },
+        {
+          "title": "Linux Foundation launches Valkey",
+          "url": "https://www.linuxfoundation.org/press/linux-foundation-launches-open-source-valkey-community",
+          "kind": "read"
+        }
+      ],
+      "aside": {
+        "title": "So is Redis a cache or a database?",
+        "body": "It can be either, and the difference is in how you use it. When Redis holds copies of rows from a database, like the shop details in Why caches work, it's a cache: lose it, and the program fills it again. When it holds the only copy, like the note that a payment was already charged, it's the system of record, the place where the fact lives. Redis can write its data to disk so that a restart doesn't lose it, and lesson 9 shows how. Choose the settings for the job: a cache can afford to forget, and a record can't."
+      }
+    },
+    {
+      "h": "One thread runs every command, one after another, to the end",
+      "body": "Now the server has thousands of clients: programs connected to it over the network, all sending commands. A connection is an open line between two programs, and each client has its own. How should one server program serve them all?\n\nThe obvious design gives each connection its own thread, its own line of work. A program can run many threads at once, on different CPU cores or by taking turns. Each thread reads its client's command, runs it and writes the reply. This breaks in two places. Ten thousand connections need ten thousand threads, each with memory of its own, and the operating system spends much of its time switching between them. Worse, two threads can now touch the same key at the same moment. Two `INCR auths:card:7` commands both read 41, both write 42, and one count is lost: the race from the last section, now inside the server. To stop it, every key needs a lock, a marker that lets only one thread in at a time. Then every command pays for locking, even when nobody else is near its key.\n\nRedis goes the other way: one thread runs every command, like the clerk. But that thread must never sit waiting on one quiet connection while others have work. So it asks the operating system instead, through a system call, a request a program makes to the operating system. On Linux, that call is `epoll_wait`: \"here are 10,000 connections; tell me which ones have bytes waiting, and let me sleep until at least one does.\" Then the thread serves only those. This loop is the **event loop**, and it repeats four steps:\n\n1. Ask the operating system which connections have bytes waiting. If none do, sleep until one does.\n2. For each ready client, read the bytes and cut them into complete commands.\n3. Run each command against memory, to the end, and put the reply in that client's outgoing buffer, a holding area for bytes not yet sent.\n4. Before sleeping again, send the waiting replies.\n\nStep 3 is the picture to keep for the whole track. Commands from different clients never overlap. While `INCR auths:card:7` runs, nothing else can read or write anything. So every single command is **atomic**: it happens as one step, and no client ever sees it half done. Fifty copies of the payments program calling `INCR` on one key never lose a count, and Redis needs no locks to promise that. Nobody else is running.\n\nThe price is the same fact seen from the other side. A command that takes 1.5 seconds holds the only thread for 1.5 seconds, and every other client waits, whatever key it wants. On the lab server, a `GET` costs about half a microsecond of that thread's time, so one 1.5-second command costs as much as three million `GET`s. The usual culprits are commands whose cost grows with the size of a key. `KEYS *` lists every key on the server. `HGETALL` and `SMEMBERS` read a whole key, which may hold a million entries. `DEL` of a huge key frees all of it at once. And a long Lua script holds the thread until it ends. A Lua script is a small program, in the Lua language, that Redis runs as one command. (Serial execution, in the Transactions track, puts scripts to work.) Here a script is the easiest way to keep Redis busy on purpose.\n\nThe post office picture holds, and it breaks only on speed. A clerk needs a minute per customer, and Redis about half a microsecond. So queues that would be hopeless at a post office stay invisible in Redis, until one slow request arrives. **One thread runs every command to the end. A slow command makes everyone wait.**\n\nStep through the loop below with three clients; its last two frames show one slow script freezing the others. After that, we'll ask what Redis's other threads are for.",
+      "stepper": {
+        "title": "The event loop serves three clients",
+        "intro": "Click Next to follow one pass of the loop, then a slow script.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Three clients have sent INCR, GET and SET; the event loop is asleep in epoll_wait\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-m\" x=\"32\" y=\"94\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s\" x=\"330\" y=\"146\" text-anchor=\"middle\">asleep in epoll_wait</text><text class=\"t-s t-m\" x=\"330\" y=\"168\" text-anchor=\"middle\">using no CPU</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">41</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
+            "say": "Three clients have each sent one command. The bytes wait inside the operating system, one buffer per connection. The main thread is asleep in `epoll_wait` and uses no CPU."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop wakes, sees three readable sockets and parses client A's INCR\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">being read</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s\" x=\"330\" y=\"146\" text-anchor=\"middle\">epoll: A, B, C readable</text><text class=\"t-s t-a\" x=\"330\" y=\"168\" text-anchor=\"middle\">read + parse A</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">41</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"69\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
+            "say": "The operating system wakes the loop: three connections have bytes waiting. The loop reads A's bytes and cuts them into one complete command, `INCR auths:today`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop executes INCR to completion: auths:today goes from 41 to 42 and the reply is queued for A\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-m\" x=\"32\" y=\"178\" text-anchor=\"start\">sent, waiting</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">INCR auths:today</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s t-a\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"58\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
+            "say": "The loop runs `INCR` from start to finish: read 41, add 1, store 42. No other command can run during that half a microsecond, so nobody ever sees a half-done increment. The reply `:42` goes into A's outgoing buffer. It isn't sent yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop reads and runs client B's GET and queues its reply\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-a\" x=\"32\" y=\"178\" text-anchor=\"start\">reply ok queued</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\">sent, waiting</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">GET card:7</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-m\" x=\"484\" y=\"180\" text-anchor=\"start\">(none)</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"153\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"108\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
+            "say": "Next client. The loop reads B's `GET card:7`, runs it and queues the reply. If B had sent three commands, they would run in the order B sent them."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The loop runs client C's SET; three commands have now run one after another\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s\" x=\"32\" y=\"94\" text-anchor=\"start\">reply :42 queued</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s\" x=\"32\" y=\"178\" text-anchor=\"start\">reply ok queued</text><rect class=\"box-a\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-a\" x=\"32\" y=\"262\" text-anchor=\"start\">reply +OK queued</text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">SET card:9 blocked</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s t-a\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"237\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0 ms</text></svg>",
+            "say": "Then C's `SET`. Three commands from three connections ran one after another, each to the end, on one thread."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Before sleeping again, the loop writes all queued replies to the three sockets\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">INCR auths:today</text><text class=\"t-s t-ok\" x=\"32\" y=\"94\" text-anchor=\"start\">got :42</text><rect class=\"box\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET card:7</text><text class=\"t-s t-ok\" x=\"32\" y=\"178\" text-anchor=\"start\">got ok</text><rect class=\"box\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">SET card:9 blocked</text><text class=\"t-s t-ok\" x=\"32\" y=\"262\" text-anchor=\"start\">got +OK</text><rect class=\"box\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">write all replies</text><text class=\"t-s t-m\" x=\"330\" y=\"168\" text-anchor=\"middle\">then epoll_wait again</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"69\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"153\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"230\" y1=\"151\" x2=\"192\" y2=\"237\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 0.1 ms</text></svg>",
+            "say": "Before it sleeps again, the loop sends every queued reply. With `io-threads` above 1, I/O threads would do this sending, and the reading and cutting from the second frame. The main thread would still run every command."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"Client A runs a 1.5 second Lua script; client B's GET arrives and sits unread\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box-a\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">EVAL busy 1500 ms</text><text class=\"t-s t-a\" x=\"32\" y=\"94\" text-anchor=\"start\">script running</text><rect class=\"box-bad\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET payment:42</text><text class=\"t-s t-bad\" x=\"32\" y=\"178\" text-anchor=\"start\">sent at 300 ms: unread</text><rect class=\"box-dim\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">(nothing sent)</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\"></text><rect class=\"box-bad\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-bad\" x=\"330\" y=\"146\" text-anchor=\"middle\">inside the script</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">EVAL (1,500 ms)</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 300 ms</text></svg>",
+            "say": "Now A sends a Lua script that spins for 1.5 seconds. At 300 ms, B sends `GET payment:42`. B's bytes reach the operating system, but the only thread that could read them is busy inside the script. B waits."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 300\" role=\"img\" aria-label=\"The script ends at 1,500 ms; only then does the loop read and answer B's GET\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"105\" y=\"22\" text-anchor=\"middle\">clients</text><text class=\"t-s t-m\" x=\"330\" y=\"22\" text-anchor=\"middle\">main thread</text><text class=\"t-s t-m\" x=\"545\" y=\"22\" text-anchor=\"middle\">memory</text><rect class=\"box\" x=\"20\" y=\"36\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"56\" text-anchor=\"start\">client A</text><text class=\"t-s t-code\" x=\"32\" y=\"76\" text-anchor=\"start\">EVAL busy 1500 ms</text><text class=\"t-s t-ok\" x=\"32\" y=\"94\" text-anchor=\"start\">got (integer) 1</text><rect class=\"box-a\" x=\"20\" y=\"120\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"140\" text-anchor=\"start\">client B</text><text class=\"t-s t-code\" x=\"32\" y=\"160\" text-anchor=\"start\">GET payment:42</text><text class=\"t-s t-bad\" x=\"32\" y=\"178\" text-anchor=\"start\">answered 1,200 ms late</text><rect class=\"box-dim\" x=\"20\" y=\"204\" width=\"170\" height=\"66\" rx=\"8\"/><text class=\"t\" x=\"32\" y=\"224\" text-anchor=\"start\">client C</text><text class=\"t-s t-code\" x=\"32\" y=\"244\" text-anchor=\"start\">(nothing sent)</text><text class=\"t-s t-m\" x=\"32\" y=\"262\" text-anchor=\"start\"></text><rect class=\"box-a\" x=\"230\" y=\"96\" width=\"200\" height=\"110\" rx=\"8\"/><text class=\"t\" x=\"330\" y=\"120\" text-anchor=\"middle\">event loop</text><text class=\"t-s t-a\" x=\"330\" y=\"146\" text-anchor=\"middle\">execute</text><text class=\"t-s t-code\" x=\"330\" y=\"168\" text-anchor=\"middle\">GET payment:42</text><rect class=\"box\" x=\"470\" y=\"36\" width=\"150\" height=\"234\" rx=\"8\"/><text class=\"t-s t-code\" x=\"484\" y=\"62\" text-anchor=\"start\">auths:today</text><text class=\"t-s\" x=\"484\" y=\"80\" text-anchor=\"start\">42</text><text class=\"t-s t-code\" x=\"484\" y=\"112\" text-anchor=\"start\">card:7</text><text class=\"t-s\" x=\"484\" y=\"130\" text-anchor=\"start\">ok</text><text class=\"t-s t-code\" x=\"484\" y=\"162\" text-anchor=\"start\">card:9</text><text class=\"t-s\" x=\"484\" y=\"180\" text-anchor=\"start\">blocked</text><text class=\"t-s t-code\" x=\"484\" y=\"212\" text-anchor=\"start\">payment:42</text><text class=\"t-s\" x=\"484\" y=\"230\" text-anchor=\"start\">approved</text><line class=\"ln-a\" x1=\"190\" y1=\"153\" x2=\"228\" y2=\"151\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"432\" y1=\"151\" x2=\"468\" y2=\"208\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"330\" y=\"292\" text-anchor=\"middle\">t = 1,500 ms</text></svg>",
+            "say": "At 1,500 ms the script returns. Only now does the loop read B's `GET`, which costs about half a microsecond of work. B waited 1,200 ms for it. Every client that sent anything during the script waited the same way, whatever key it asked for."
+          }
+        ]
+      },
+      "try": {
+        "title": "Freeze the server with one script",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals (windows where you type commands) in the `labs` folder. In terminal 2, type this, but don't press Enter yet: `docker compose -f env/redis.yml exec redis redis-cli GET payment:42`.",
+          "In terminal 1, run the command below. Its Lua script spins on the server's CPU for 3,000 ms. Switch to terminal 2 at once and press Enter. Predict: when does `\"approved\"` appear?",
+          "Run the script again with `7000` in place of `3000`, then the GET. Wait. When the GET gives up, stop the script from terminal 2: `docker compose -f env/redis.yml exec redis redis-cli SCRIPT KILL`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "terminal 1",
+          "src": "docker compose -f env/redis.yml exec redis redis-cli EVAL \"local stop = os.clock() + ARGV[1] / 1000 while os.clock() < stop do end return 1\" 0 3000"
+        },
+        "expect": "The GET hangs, and prints `\"approved\"` a moment after terminal 1 prints `(integer) 1`. A different connection and an unrelated key made no difference. With 7000 ms the GET doesn't wait to the end. At the 5-second mark, it fails with `(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.` Five seconds is the default `busy-reply-threshold`. From then on, Redis pauses the script now and then to answer other clients, but only with that error, so that you can send `SCRIPT KILL`. It prints `OK`, and terminal 1 gets `(error) ERR Script killed by user with SCRIPT KILL...`. The kill works only because the script hasn't written anything. A script that has written can only be stopped with `SHUTDOWN NOSAVE`, which stops the whole server."
+      },
+      "refs": [
+        {
+          "title": "Scripting with Lua",
+          "url": "https://redis.io/docs/latest/develop/programmability/eval-intro/",
+          "kind": "docs"
+        },
+        {
+          "title": "Diagnosing latency issues",
+          "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Redis has several threads, and still only one runs commands",
+      "body": "If one thread runs everything, two questions follow. Some jobs are slow by nature: writing a copy of 2 GB of data to disk, or freeing the memory of a key with ten million members. Who does those without freezing the loop? And the server has 8 or 16 CPU cores. Is one thread really all Redis uses?\n\nFor the slow chores, Redis hands the work to helpers that never run commands. The settings file that ships with Redis 8.10, `redis.conf`, calls Redis \"mostly single threaded\":\n\n- Background threads, named `bio_*` (background I/O, for input and output), close files and free memory. One of them also pushes Redis's log of writes, its record of every change, onto the disk with `fsync`, the system call that makes the disk really store the bytes. Delete a huge key with `UNLINK`, and it returns at once while a background thread frees the memory. Plain `DEL` frees it on the main thread, while everyone waits.\n- To save a snapshot of the whole dataset, Redis starts a copy of itself with `fork`, the system call that copies a running program. That child process writes the file, while the parent keeps serving clients (lesson 9).\n\nFor the cores, look at where the time goes for a small command. Running a `GET` takes half a microsecond. Reading the request from the connection, cutting it into a command and writing the reply are system calls plus copying, and together they often cost more than the command itself. So Redis 6 added **I/O threads**: helpers that do steps 2 and 4 of the loop, reading, cutting and writing, for many connections in parallel. The main thread still runs every command in step 3. Redis 8.0 shipped a new version of them.\n\nI/O threads are off by default: the setting `io-threads 1` means the main thread does all the reading and writing itself. The settings file says to turn them on only on machines with 4 or more cores, and to leave one core spare. That's 3 I/O threads on 4 cores, and 7 on 8. Redis measured up to 112% more throughput (requests handled per second) for 8.0, with 8 I/O threads on a server with many cores. That's the company's own test, and the gain depends on the mix of commands.\n\nWhat I/O threads can't do is run two commands at once, or make one command faster. They help a server that spends its time moving bytes for many small commands over thousands of connections. They do nothing for one slow `HGETALL`. So when someone says \"add threads\", first ask which step of the loop is busy.\n\nOther servers that work like Redis, such as Valkey, draw the line in other places, and Go deeper compares three of them. Whichever thread does the reading, the bytes follow one format. Next, we'll read it.",
+      "try": {
+        "title": "Count the server's threads",
+        "minutes": 4,
+        "steps": [
+          "List the threads of the running server with the command below. Inside its container, the server is process 1 (a process is a running program). Linux keeps one folder per thread under `/proc/1/task`, and the file `comm` in each holds the thread's name.",
+          "Start a throwaway server with four I/O threads: `docker run --rm -d --name sfz-io4 -m 128m redis:8.10.3 redis-server --io-threads 4`. List its threads with the same loop, using `docker exec sfz-io4` in place of `docker compose -f env/redis.yml exec redis`.",
+          "Try to change it while it runs: `docker exec sfz-io4 redis-cli CONFIG SET io-threads 2`. Then remove it: `docker rm -f sfz-io4`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "terminal",
+          "src": "docker compose -f env/redis.yml exec redis sh -c 'for t in /proc/1/task/*; do cat $t/comm; done'"
+        },
+        "expect": "The default server lists six threads: `redis-server` (the main thread, the only one that runs commands), `bio_close_file`, `bio_aof`, `bio_lazy_free`, and two `jemalloc_bg_thd`. Those last two belong to jemalloc, the code inside Redis that hands out memory. The `--io-threads 4` server adds `io_thd_1`, `io_thd_2` and `io_thd_3`; the main thread counts as I/O thread 0. `CONFIG SET io-threads 2` fails with `can't set immutable config`: you pick the number of I/O threads when the server starts."
+      },
+      "refs": [
+        {
+          "title": "redis.conf for Redis 8.10 (see THREADED I/O)",
+          "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf",
+          "kind": "docs"
+        },
+        {
+          "title": "Redis 8 is now GA",
+          "url": "https://redis.io/blog/redis-8-ga/",
+          "kind": "read"
+        },
+        {
+          "title": "Valkey 8.0 release candidate (I/O threading)",
+          "url": "https://valkey.io/blog/valkey-8-0-0-rc1/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Commands travel as RESP, and clients now speak RESP3",
+      "body": "A connection carries a stream of bytes with no gaps or markers in it. If a client sends two commands quickly, the server may receive both in one read, or half of one. So both sides need a rule for where one command ends and the next begins.\n\nThe simplest rule is lines of text: `SET payment:42 approved`, then a newline. Redis still accepts that from a person typing into a raw connection. It breaks as soon as a value contains a space or a newline, and values do. A value might be a JSON document (a common text format for structured data), a saved Java object, or any bytes at all. Quoting rules would force the server to inspect every byte of every value.\n\nThe fix is to send each length first. That's **RESP**, the Redis serialization protocol: the agreed format for turning commands and replies into bytes. A command is an array of strings, each with its length in bytes in front:\n\n```text\n*2\\r\\n$3\\r\\nGET\\r\\n$10\\r\\npayment:42\\r\\n\n```\n\nRead it as: an array (`*`) of 2 elements, a 3-byte string (`$3`) `GET`, and a 10-byte string `payment:42`. `\\r\\n` is a carriage return and a line feed, the two characters that end a line. Because the server knows each length in advance, it reads exactly that many bytes and never looks inside them. The first byte of a reply says what kind of reply it is: `+OK` is a short status, `:42` a whole number, `$8` an 8-byte string, `$-1` no value, and `-ERR` an error.\n\nThat version is RESP2, the standard since Redis 2.0. It has one gap: structured replies come back as flat lists. `HGETALL` returns `status`, `approved`, `amount`, `1250`, and the client has to know to pair them up. RESP3, available since Redis 6.0, adds real maps (`%`), sets (`~`), decimal numbers, true and false, a null (`_`), and push messages, which the server sends without being asked. Client-side caching, where Redis tells a program that its own copy is out of date, relies on those. Every connection starts in RESP2 and switches when the client sends `HELLO 3`.\n\nBoth client libraries in this track, Jedis and Lettuce, send `HELLO 3` when they connect. Jedis 8 made that its default, and falls back to RESP2 if the server refuses. You'll rarely look at RESP yourself. You need it when a program between your code and Redis breaks the traffic, when a reply's type surprises your code, or when you read a recording of network traffic.\n\nNobody should write RESP by hand, though. Next, we'll pick a library that writes it for us.",
+      "try": {
+        "title": "Talk RESP over a plain connection",
+        "minutes": 4,
+        "steps": [
+          "Run `RespDemo` (Java) or `RespDemoKt` (Kotlin) from the `labs` folder. It opens a plain network connection (a socket) to port 6379, the number Redis listens on, with no library at all. It sends commands as raw RESP and prints every byte both ways, with `\\r\\n` made visible.",
+          "Before you look, predict the reply bytes for `INCR auths:today` and for `INCR payment:42`.",
+          "Compare `HGETALL payment:45` and `GET payment:404` before and after `HELLO 3`. What changed?"
+        ],
+        "code": {
+          "lang": "java",
+          "title": "RespDemo.java",
+          "src": "package sfz.cache.l02.demo;\n\nimport java.io.IOException;\nimport java.io.InputStream;\nimport java.io.OutputStream;\nimport java.net.Socket;\nimport java.nio.charset.StandardCharsets;\n\n/** Speaks RESP to Redis over a plain socket, with no client library, and prints every byte. */\npublic class RespDemo {\n    public static void main(String[] args) throws IOException {\n        try (Socket socket = new Socket(\"localhost\", 6379)) {\n            OutputStream out = socket.getOutputStream();\n            InputStream in = socket.getInputStream();\n            send(out, in, \"PING\");\n            send(out, in, \"SET\", \"payment:42\", \"approved\");\n            send(out, in, \"GET\", \"payment:42\");\n            send(out, in, \"GET\", \"payment:404\");\n            send(out, in, \"INCR\", \"auths:today\");\n            send(out, in, \"INCR\", \"payment:42\");\n            send(out, in, \"HSET\", \"payment:45\", \"status\", \"approved\", \"amount\", \"1250\");\n            send(out, in, \"HGETALL\", \"payment:45\");\n            send(out, in, \"HELLO\", \"3\");                    // switch this connection to RESP3\n            send(out, in, \"HGETALL\", \"payment:45\");\n            send(out, in, \"GET\", \"payment:404\");\n        }\n    }\n\n    // a command is an array of bulk strings: *<count>, then $<length> and the bytes of each word\n    static void send(OutputStream out, InputStream in, String... words) throws IOException {\n        StringBuilder cmd = new StringBuilder(\"*\" + words.length + \"\\r\\n\");\n        for (String w : words) {\n            cmd.append('$').append(w.getBytes(StandardCharsets.UTF_8).length).append(\"\\r\\n\").append(w).append(\"\\r\\n\");\n        }\n        out.write(cmd.toString().getBytes(StandardCharsets.UTF_8));\n        out.flush();\n        // good enough for a demo: on loopback a short reply arrives in one read\n        byte[] buf = new byte[8192];\n        int n = in.read(buf);\n        System.out.println(\"> \" + show(cmd.toString(), 200));\n        System.out.println(\"< \" + show(new String(buf, 0, n, StandardCharsets.UTF_8), 90));\n    }\n\n    static String show(String s, int max) {\n        String visible = s.replace(\"\\r\\n\", \"\\\\r\\\\n\");\n        return visible.length() <= max ? visible : visible.substring(0, max) + \"... (\" + s.length() + \" bytes)\";\n    }\n}\n",
+          "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.RespDemo",
+          "file": "labs/redis/src/demo/java/sfz/cache/l02/demo/RespDemo.java",
+          "alt": {
+            "lang": "kotlin",
+            "title": "RespDemo.kt",
+            "src": "package sfz.cache.l02.demo\n\nimport java.io.InputStream\nimport java.io.OutputStream\nimport java.net.Socket\n\n/** Speaks RESP to Redis over a plain socket, with no client library, and prints every byte. */\nfun main() {\n    Socket(\"localhost\", 6379).use { socket ->\n        val out = socket.getOutputStream()\n        val inp = socket.getInputStream()\n        send(out, inp, \"PING\")\n        send(out, inp, \"SET\", \"payment:42\", \"approved\")\n        send(out, inp, \"GET\", \"payment:42\")\n        send(out, inp, \"GET\", \"payment:404\")\n        send(out, inp, \"INCR\", \"auths:today\")\n        send(out, inp, \"INCR\", \"payment:42\")\n        send(out, inp, \"HSET\", \"payment:45\", \"status\", \"approved\", \"amount\", \"1250\")\n        send(out, inp, \"HGETALL\", \"payment:45\")\n        send(out, inp, \"HELLO\", \"3\")                    // switch this connection to RESP3\n        send(out, inp, \"HGETALL\", \"payment:45\")\n        send(out, inp, \"GET\", \"payment:404\")\n    }\n}\n\n// a command is an array of bulk strings: *<count>, then $<length> and the bytes of each word\nprivate fun send(out: OutputStream, inp: InputStream, vararg words: String) {\n    val cmd = buildString {\n        append(\"*${words.size}\\r\\n\")\n        for (w in words) append(\"$${w.toByteArray().size}\\r\\n$w\\r\\n\")\n    }\n    out.write(cmd.toByteArray())\n    out.flush()\n    // good enough for a demo: on loopback a short reply arrives in one read\n    val buf = ByteArray(8192)\n    val n = inp.read(buf)\n    println(\"> \" + show(cmd, 200))\n    println(\"< \" + show(String(buf, 0, n), 90))\n}\n\nprivate fun show(s: String, max: Int): String {\n    val visible = s.replace(\"\\r\\n\", \"\\\\r\\\\n\")\n    return if (visible.length <= max) visible else visible.take(max) + \"... (${s.length} bytes)\"\n}\n",
+            "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.RespDemoKt",
+            "file": "labs/redis/src/demo/kotlin/sfz/cache/l02/demo/RespDemo.kt"
+          }
+        },
+        "expect": "`PING` gets `+PONG\\r\\n`, and the first `INCR auths:today` gets `:1\\r\\n` (higher if you ran the first Try it). `INCR payment:42` gets `-ERR value is not an integer or out of range\\r\\n`. Before `HELLO 3`, `HGETALL payment:45` returns a flat array, `*4\\r\\n$6\\r\\nstatus\\r\\n...`, and the client has to pair the items up itself. After it, the same command returns a map, `%2\\r\\n...`, holding two field-value pairs. A missing key is `$-1\\r\\n` in RESP2 and `_\\r\\n` in RESP3. The reply to `HELLO 3` is itself a map of about 690 bytes (the exact size depends on your connection's id number) that starts with the server's name, `version 8.10.3` and `proto 3`."
+      },
+      "refs": [
+        {
+          "title": "Redis serialization protocol specification",
+          "url": "https://redis.io/docs/latest/develop/reference/protocol-spec/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "This track uses Jedis, and Lettuce where Kotlin needs it",
+      "body": "Nobody wants to count bytes by hand, so programs talk to Redis through a client library: code you add to your program that writes and reads RESP for you. Java has two popular ones, Jedis and Lettuce, and the choice that matters inside them is how your program's threads share connections.\n\nThe first design is a pool. The library keeps several connections open. A call borrows one, sends one command, waits for the reply and gives the connection back. While one thread waits, others use other connections. Every call blocks its thread: the thread stops and waits for one round trip. Threads queue when all the connections are busy. Jedis's pool holds at most 8 connections unless you configure more, so 200 threads on 8 connections take turns. This is Jedis.\n\nThe second design is multiplexing: one connection shared by every thread. Calls write their commands onto the same connection back to back, without waiting for each other. Redis answers the commands on a connection in the order they arrived, so the library keeps a queue of callers and hands each reply to the next caller in line. One connection carries thousands of calls at once. The cost is that your code gets something to wait on instead of a plain value. It might be a future (an object that will hold the answer later), a callback, or a paused coroutine, Kotlin's light way to wait without blocking a thread. This is Lettuce.\n\nJedis 8.0.2 gives you one `RedisClient`, built with `RedisClient.builder()`, with the pool behind it. Lettuce 7.9.0 offers four styles of call: plain blocking calls, futures (`RedisFuture`), a style built on a library called Project Reactor, which treats answers as streams of events, and Kotlin coroutines. The coroutine style needs two extra libraries and one annotation in your code, and the compare below shows them.\n\n**This track teaches with Jedis.** One call is one command and one reply, so your code matches what you'd type at the `redis-cli` prompt, line for line. The lessons stay about Redis instead of about futures. Lettuce shows up where it changes the picture: Kotlin coroutines, and many calls sharing one connection.\n\nOne trap: both libraries name their main class `RedisClient`. In a file that uses both, write one of them with its full package name, as the Try it below does. Here's Jedis, in Java and then in Kotlin:\n\n```java\nRedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build();\nredis.set(\"payment:42\", \"approved\");\nString status = redis.get(\"payment:42\");          // blocks until the reply arrives\n```\n\n```kotlin\nval redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()\nredis.set(\"payment:42\", \"approved\")\nval status: String? = redis.get(\"payment:42\")     // GET of a missing key returns null\n```\n\nNow a program can talk to Redis. Next, we'll ask which types to store, and what each one costs in memory.",
+      "try": {
+        "title": "Ask the server who connected",
+        "minutes": 3,
+        "steps": [
+          "Run `ClientsDemo` (Java) or `ClientsDemoKt` (Kotlin). Each one does the same `GET` through both libraries, then asks the server for its list of connections. The Java version uses Lettuce's futures, and the Kotlin version its coroutines.",
+          "Read the last two lines. They're the server's own view of each connection, from the command `CLIENT LIST`."
+        ],
+        "code": {
+          "lang": "java",
+          "title": "ClientsDemo.java",
+          "src": "package sfz.cache.l02.demo;\n\nimport io.lettuce.core.RedisFuture;\nimport io.lettuce.core.api.StatefulRedisConnection;\nimport io.lettuce.core.api.async.RedisAsyncCommands;\nimport redis.clients.jedis.RedisClient;\n\nimport java.util.concurrent.TimeUnit;\nimport java.util.regex.Matcher;\nimport java.util.regex.Pattern;\n\n/** The same GET through Jedis (blocking) and Lettuce (async), then how each one connected. */\npublic class ClientsDemo {\n    public static void main(String[] args) throws Exception {\n        // Jedis 8: one RedisClient, a pool of connections behind it, blocking calls\n        try (RedisClient jedis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()) {\n            jedis.set(\"payment:42\", \"approved\");\n            System.out.println(\"Jedis   GET payment:42 -> \" + jedis.get(\"payment:42\"));\n\n            // Lettuce 7: one connection shared by every caller, calls return futures\n            io.lettuce.core.RedisClient lettuce = io.lettuce.core.RedisClient.create(\"redis://localhost:6379\");\n            try (StatefulRedisConnection<String, String> conn = lettuce.connect()) {\n                RedisAsyncCommands<String, String> async = conn.async();\n                RedisFuture<String> reply = async.get(\"payment:42\");        // returns at once\n                System.out.println(\"Lettuce GET payment:42 -> \" + reply.get(1, TimeUnit.SECONDS));\n\n                // ask the server how each library connected\n                String list = async.clientList().get(1, TimeUnit.SECONDS);\n                Pattern fields = Pattern.compile(\"(resp=\\\\d+) (lib-name=\\\\S+) (lib-ver=\\\\S+)\");\n                for (String line : list.split(\"\\n\")) {\n                    Matcher m = fields.matcher(line);\n                    if (m.find() && !m.group(2).equals(\"lib-name=\")) {\n                        System.out.println(m.group(1) + \" \" + m.group(2) + \" \" + m.group(3));\n                    }\n                }\n            } finally {\n                lettuce.shutdown();\n            }\n        }\n    }\n}\n",
+          "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.ClientsDemo",
+          "file": "labs/redis/src/demo/java/sfz/cache/l02/demo/ClientsDemo.java",
+          "alt": {
+            "lang": "kotlin",
+            "title": "ClientsDemo.kt",
+            "src": "package sfz.cache.l02.demo\n\nimport io.lettuce.core.ExperimentalLettuceCoroutinesApi\nimport io.lettuce.core.api.coroutines\nimport kotlinx.coroutines.runBlocking\nimport redis.clients.jedis.RedisClient\n\n/** The same GET through Jedis (blocking) and Lettuce (coroutines), then how each one connected. */\n@OptIn(ExperimentalLettuceCoroutinesApi::class)\nfun main() {\n    // Jedis 8: one RedisClient, a pool of connections behind it, blocking calls\n    RedisClient.builder().hostAndPort(\"localhost\", 6379).build().use { jedis ->\n        jedis.set(\"payment:42\", \"approved\")\n        println(\"Jedis   GET payment:42 -> \" + jedis.get(\"payment:42\"))\n\n        // Lettuce 7: one connection shared by every caller; coroutines suspend instead of blocking\n        val lettuce = io.lettuce.core.RedisClient.create(\"redis://localhost:6379\")\n        try {\n            lettuce.connect().use { conn ->\n                val redis = conn.coroutines()\n                val list = runBlocking {\n                    println(\"Lettuce GET payment:42 -> \" + redis.get(\"payment:42\"))   // suspends\n                    redis.clientList().orEmpty()        // ask the server how each library connected\n                }\n                val fields = Regex(\"\"\"(resp=\\d+) (lib-name=\\S+) (lib-ver=\\S+)\"\"\")\n                list.lineSequence()\n                    .mapNotNull { fields.find(it) }\n                    .filter { it.groupValues[2] != \"lib-name=\" }\n                    .forEach { println(it.groupValues.drop(1).joinToString(\" \")) }\n            }\n        } finally {\n            lettuce.shutdown()\n        }\n    }\n}\n",
+            "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.ClientsDemoKt",
+            "file": "labs/redis/src/demo/kotlin/sfz/cache/l02/demo/ClientsDemo.kt"
+          }
+        },
+        "expect": "Both versions print `approved` twice, then `resp=3 lib-name=jedis lib-ver=8.0.2` and `resp=3 lib-name=Lettuce lib-ver=7.9.0.RELEASE/1d7b2b2`. Both libraries switched to RESP3 with `HELLO 3`, and both told the server their name and version with `CLIENT SETINFO`. So on a Redis that many programs share, `CLIENT LIST` shows which library and version every connection uses."
+      },
+      "refs": [
+        {
+          "title": "Jedis v7 to v8 migration guide",
+          "url": "https://redis.github.io/jedis/migration-guides/v7-to-v8/",
+          "kind": "docs"
+        },
+        {
+          "title": "Lettuce Kotlin API",
+          "url": "https://redis.github.io/lettuce/user-guide/kotlin-api/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "compare": {
+    "title": "Lettuce from Java and from Kotlin: one connection, two styles",
+    "java": {
+      "title": "PaymentStatus.java",
+      "src": "// Lettuce async: every call returns a RedisFuture at once\nRedisClient client = RedisClient.create(\"redis://localhost:6379\");\ntry (StatefulRedisConnection<String, String> conn = client.connect()) {\n    RedisAsyncCommands<String, String> redis = conn.async();\n    RedisFuture<String> status = redis.get(\"payment:42\");\n    RedisFuture<Long> auths = redis.incr(\"auths:today\");\n    // both commands are already on the wire; now wait for the replies\n    System.out.println(status.get(1, TimeUnit.SECONDS) + \" \" + auths.get(1, TimeUnit.SECONDS));\n} finally {\n    client.shutdown();\n}"
+    },
+    "kotlin": {
+      "title": "PaymentStatus.kt",
+      "src": "// Lettuce coroutines: calls suspend instead of returning futures\n@OptIn(ExperimentalLettuceCoroutinesApi::class)\nsuspend fun printStatus(client: RedisClient) {\n    client.connect().use { conn ->\n        val redis = conn.coroutines()\n        coroutineScope {\n            val status = async { redis.get(\"payment:42\") }\n            val auths = async { redis.incr(\"auths:today\") }\n            println(\"${status.await()} ${auths.await()}\")\n        }\n    }\n}"
+    },
+    "note": "Both versions put two commands on one connection before waiting for either reply, so the `INCR` doesn't wait a whole round trip for the `GET`. Java does it with futures, objects that hold an answer once it arrives. Kotlin does it with coroutines, `async` and `await`, and the code reads from top to bottom. The coroutine style is a layer over Lettuce's reactive style, which is built on Project Reactor. That's why it needs the libraries `kotlinx-coroutines-core` and `kotlinx-coroutines-reactive`, and the annotation `@ExperimentalLettuceCoroutinesApi`, which says you accept an API that may still change. Jedis code looks the same in both languages: it blocks, so there's nothing to translate."
+  },
+  "worked": {
+    "title": "Count payments from eight threads without losing any",
+    "steps": [
+      {
+        "say": "A nightly job counts today's payments in Redis. Eight worker threads share one Jedis `RedisClient`, and each one reads the counter, adds 1 and writes it back. Predict what it prints after 8,000 calls.",
+        "code": "RedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build();\nExecutorService pool = Executors.newFixedThreadPool(8);\nfor (int i = 0; i < 8_000; i++) {\n    pool.submit(() -> {\n        String v = redis.get(\"auths:today\");                  // 1. read\n        long n = v == null ? 0 : Long.parseLong(v);           // 2. add\n        redis.set(\"auths:today\", String.valueOf(n + 1));      // 3. write\n    });\n}\npool.shutdown();\npool.awaitTermination(1, TimeUnit.MINUTES);\nSystem.out.println(redis.get(\"auths:today\"));",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "val redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()\nval pool = Executors.newFixedThreadPool(8)\nrepeat(8_000) {\n    pool.submit {\n        val v: String? = redis.get(\"auths:today\")             // 1. read\n        val n = v?.toLong() ?: 0L                             // 2. add\n        redis.set(\"auths:today\", (n + 1).toString())          // 3. write\n    }\n}\npool.shutdown()\npool.awaitTermination(1, TimeUnit.MINUTES)\nprintln(redis.get(\"auths:today\"))"
+      },
+      {
+        "say": "Three runs against the lab server printed 1,611, then 1,654, then 1,628. About four counts in five vanished. Each command was atomic, but the pair wasn't. Between one thread's `GET` and its `SET`, the event loop ran other threads' commands, so several threads read the same old value and wrote the same new one. It's the race from the first section, with a network round trip widening the gap.",
+        "code": "",
+        "lang": ""
+      },
+      {
+        "say": "Let the server do the read, the add and the write as one command. `INCR` runs to the end inside the loop, so nothing can come between its read and its write. The same job now prints 8000 on every run.",
+        "code": "for (int i = 0; i < 8_000; i++) {\n    pool.submit(() -> redis.incr(\"auths:today\"));   // one command: read, add and write on the server\n}",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "repeat(8_000) {\n    pool.submit { redis.incr(\"auths:today\") }       // one command: read, add and write on the server\n}"
+      },
+      {
+        "say": "With Lettuce, all 8,000 `INCR`s can share a single connection, with no pool of threads at all. In Java, each `incr` returns a future at once, and `CompletableFuture.allOf` waits for all of them. In Kotlin, 8,000 coroutines each pause until their reply arrives, while the commands queue up on the one connection. The Kotlin version took about 230 ms on the lab server (it depends on your machine and Docker) and printed 8000.",
+        "code": "RedisAsyncCommands<String, String> redis = conn.async();\nList<CompletableFuture<Long>> calls = new ArrayList<>();\nfor (int i = 0; i < 8_000; i++) calls.add(redis.incr(\"auths:today\").toCompletableFuture());\nCompletableFuture.allOf(calls.toArray(new CompletableFuture[0])).join();\nSystem.out.println(redis.get(\"auths:today\").get());   // 8000",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "val redis = conn.coroutines()\ncoroutineScope {\n    repeat(8_000) { launch { redis.incr(\"auths:today\") } }   // 8,000 coroutines, one connection\n}\nprintln(redis.get(\"auths:today\"))   // 8000"
+      }
     ]
-   },
-   "try": {
-    "title": "Freeze the server with one script",
+  },
+  "lab": {
+    "title": "Model the event loop, then catch the real one blocking",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/redis/src/main/kotlin/sfz/cache/l02/EventLoop.kt",
+      "labs/redis/src/main/java/sfz/cache/l02/SlowScriptProbe.java"
+    ],
+    "run": "./gradlew :redis:test --tests 'sfz.cache.l02.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder with the command above. All eight fail. Five are in `EventLoopTest`, a model of the loop that needs no Docker. Three are in `SlowScriptProbeTest`, which run against a real Redis 8.10 that Testcontainers, a library for tests, starts in a container for you.",
+      "Write `EventLoop.runUntilIdle()` in `EventLoop.kt`. The comment above it lists the four steps. The model counts time in ticks of a clock. Take the snapshot of arrived commands once per pass, before you run any of them.",
+      "Run `./gradlew :redis:test --tests 'sfz.cache.l02.EventLoopTest'` until its five tests pass. Read the test `a command that arrives during a pass waits for the next pass`: the real loop behaves the same way.",
+      "Write `timeGet` and `timeGetDuringScript` in `SlowScriptProbe.java`. Start the script on the `scripts` client in a background thread, sleep `HEAD_START_MS`, time the `GET` on the `app` client, then wait for the script to finish.",
+      "Run all eight tests. The Docker tests take a few seconds, because they block the server on purpose."
+    ],
+    "hints": [
+      "`pending.filter { it.arrivedAt <= clock }` gives you the snapshot. Loop over `clients`, and inside that over the snapshot's entries for that client, so each client's commands keep their order.",
+      "If nothing has arrived, set `clock = pending.minOf { it.arrivedAt }` and go round again. Without that, an idle loop spins forever and the test runs out of time.",
+      "`CompletableFuture.supplyAsync(() -> scripts.eval(BUSY_SCRIPT, 0, String.valueOf(scriptMillis)))` runs the script in the background. Call `join()` on it before you return, so a script error fails the call."
+    ],
+    "done_when": "All eight tests in `sfz.cache.l02` pass."
+  },
+  "drill": {
+    "title": "Write the slow-script probe from memory",
     "minutes": 5,
-    "steps": [
-     "Open two terminals in the `labs` folder. In terminal 2, type this but don't press Enter yet: `docker compose -f env/redis.yml exec redis redis-cli GET payment:42`.",
-     "In terminal 1, run the command below. Its Lua script spins on the server's CPU for 3,000 ms. Switch to terminal 2 at once and press Enter. Predict: when does `\"approved\"` appear?",
-     "Run the script again with `7000` in place of `3000`, then the GET. Wait. When the GET gives up, stop the script from terminal 2: `docker compose -f env/redis.yml exec redis redis-cli SCRIPT KILL`."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "terminal 1",
-     "src": "docker compose -f env/redis.yml exec redis redis-cli EVAL \"local stop = os.clock() + ARGV[1] / 1000 while os.clock() < stop do end return 1\" 0 3000"
-    },
-    "expect": "The GET hangs, and prints `\"approved\"` a moment after terminal 1 prints `(integer) 1`. A different connection and an unrelated key made no difference. With 7000 ms the GET doesn't wait to the end: at the 5-second mark it fails with `(error) BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.` Five seconds is the default `busy-reply-threshold`. From then on Redis pauses the script now and then to answer other clients, but only with that error, so that you can send `SCRIPT KILL`. It prints `OK`, and terminal 1 gets `(error) ERR Script killed by user with SCRIPT KILL...`. The kill works only because the script has not written anything. A script that has written can only be stopped with `SHUTDOWN NOSAVE`."
-   },
-   "refs": [
-    {
-     "title": "Scripting with Lua",
-     "url": "https://redis.io/docs/latest/develop/programmability/eval-intro/",
-     "kind": "docs"
-    },
-    {
-     "title": "Diagnosing latency issues",
-     "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
-     "kind": "docs"
+    "prompt": "Close the lab. In a blank file, write `timeGetDuringScript(scripts, app, key, millis)`. It starts a busy Lua script on one client in the background, waits 200 ms, times a `GET` on the other client, waits for the script, and returns the GET's milliseconds. Write the Lua too. Then compare with the answer. Did you remember why the script needs its own thread?",
+    "answer": {
+      "lang": "java",
+      "src": "static final String BUSY = \"local stop = os.clock() + tonumber(ARGV[1]) / 1000 while os.clock() < stop do end return 1\";\n\nstatic long timeGetDuringScript(RedisClient scripts, RedisClient app, String key, long millis) throws InterruptedException {\n    CompletableFuture<Object> script = CompletableFuture.supplyAsync(\n            () -> scripts.eval(BUSY, 0, String.valueOf(millis)));   // eval blocks a pool thread, not us\n    Thread.sleep(200);                                               // head start: the script is running\n    long t0 = System.nanoTime();\n    app.get(key);                                                    // waits for the script to end\n    long ms = (System.nanoTime() - t0) / 1_000_000;\n    script.join();\n    return ms;\n}",
+      "alt": {
+        "lang": "kotlin",
+        "src": "const val BUSY = \"local stop = os.clock() + tonumber(ARGV[1]) / 1000 while os.clock() < stop do end return 1\"\n\nfun timeGetDuringScript(scripts: RedisClient, app: RedisClient, key: String, millis: Long): Long {\n    val script = CompletableFuture.supplyAsync { scripts.eval(BUSY, 0, millis.toString()) }   // eval blocks a pool thread\n    Thread.sleep(200)                       // head start: the script is running\n    val t0 = System.nanoTime()\n    app.get(key)                            // waits for the script to end\n    val ms = (System.nanoTime() - t0) / 1_000_000\n    script.join()\n    return ms\n}"
+      }
     }
-   ]
   },
-  {
-   "h": "Redis has several threads, and still only one runs commands",
-   "body": "If one thread runs everything, two questions follow. Some jobs are slow by nature: writing a snapshot of 2 GB of data to disk, or freeing the memory of a key with ten million members. Who does those without freezing the loop? And the machine has 8 or 16 cores. Is one thread really all Redis uses?\n\nFor the slow jobs, Redis hands the work to helpers that never run commands. The `redis.conf` file that ships with 8.10 calls Redis \"mostly single threaded\":\n\n- Background threads, named `bio_*` for background I/O, close files, push Redis's on-disk log of writes from memory onto the disk with `fsync`, and free memory for `UNLINK` and `FLUSHALL ASYNC`. Deleting a huge key with `UNLINK` returns at once. Plain `DEL` frees the memory on the main thread while everyone waits.\n- To save a snapshot of the whole dataset, Redis starts a copy of itself with `fork`, and that child process writes the file while the parent keeps serving clients (lesson 9).\n\nFor the cores, look at where the time goes for a small command. Running a `GET` takes half a microsecond. Reading the request from the socket, parsing it and writing the reply are system calls into the kernel plus copying, and together they often cost more than the command. So Redis 6 added **I/O threads**: helpers that do steps 2 and 4 of the loop (read, parse, write) for many connections in parallel, while the main thread still runs every command in step 3. Redis 8.0 shipped a new implementation of them.\n\nI/O threads are off by default: `io-threads 1` means the main thread does all the I/O itself. The config file says to enable them only on machines with 4 or more cores, and to leave one core spare: 3 I/O threads on 4 cores, 7 on 8. Redis measured up to 112% more throughput for 8.0 with 8 I/O threads on a multi-core Intel server. That is a vendor benchmark, and the gain depends on the command mix.\n\nWhat I/O threads can't do is run two commands at once or make one command faster. They help a server that spends its time moving bytes for many small commands over thousands of connections. They do nothing for a slow `HGETALL`. When someone says \"just add threads\", first ask which step of the loop is busy.\n\nOther servers draw the line elsewhere. Valkey 8.0 reworked its I/O threads to run alongside the main thread and hand it commands in batches, and its announcement reports up to 1.2 million requests a second on one AWS instance, up from 380,000 (again a vendor figure). Execution is still one thread. Dragonfly splits the keyspace into shards, one per thread, so every core executes commands for its own keys. That buys throughput, and the price is coordination whenever one command touches keys in two shards. Memcached, the older pure cache, runs several worker threads over one shared table guarded by locks, and stores only plain byte values.",
-   "try": {
-    "title": "Count the server's threads",
-    "minutes": 4,
-    "steps": [
-     "List the threads of the running server with the command below. Linux keeps one folder per thread under `/proc/1/task`, and `comm` holds the thread's name.",
-     "Start a throwaway server with four I/O threads: `docker run --rm -d --name sfz-io4 -m 128m redis:8.10.3 redis-server --io-threads 4`. List its threads with the same loop, using `docker exec sfz-io4` in place of `docker compose -f env/redis.yml exec redis`.",
-     "Try to change it at run time: `docker exec sfz-io4 redis-cli CONFIG SET io-threads 2`. Then remove it: `docker rm -f sfz-io4`."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "terminal",
-     "src": "docker compose -f env/redis.yml exec redis sh -c 'for t in /proc/1/task/*; do cat $t/comm; done'"
-    },
-    "expect": "The default server lists six threads: `redis-server` (the main thread, the only one that runs commands), `bio_close_file`, `bio_aof`, `bio_lazy_free`, and two `jemalloc_bg_thd` that belong to the memory allocator. The `--io-threads 4` server adds `io_thd_1`, `io_thd_2` and `io_thd_3`; the main thread counts as I/O thread 0. `CONFIG SET io-threads 2` fails with `can't set immutable config`: you pick the I/O thread count when the server starts."
-   },
-   "refs": [
+  "recap": [
+    "A store that lives in memory is fast mainly because it keeps data in plain structures. It skips the page handling, latches, locks and log records that a disk-based database runs even when all of its data is in memory.",
+    "Redis keeps typed values (strings, hashes, lists, sets, sorted sets) in memory, and commands such as `INCR` change them on the server, so a client rarely has to read, change and write back.",
+    "One thread runs every command, one after another, each to the end. That makes every single command atomic, without any locks.",
+    "The same fact is the limit: one slow command (`KEYS *`, `HGETALL` on a huge hash, a long Lua script) makes every other client wait. Background threads, a forked child and optional I/O threads (`io-threads`, off by default) do side work and never run commands, so more threads can't fix it.",
+    "Clients speak RESP, which sends the length of every piece before its bytes. Jedis 8 and Lettuce 7.9 switch to RESP3 with `HELLO 3`. This track teaches with Jedis's blocking `RedisClient`, and uses Lettuce for Kotlin coroutines and shared connections.",
+    "Redis 8 comes under RSALv2, SSPLv1 or AGPLv3, and is at 8.10.3 now. Valkey (9.1.3) is the BSD-licensed fork, and both run everything in this lesson."
+  ],
+  "closing": "We started with a post office clerk who serves every window in turn. Redis works the same way: one thread finishes each command before it starts the next. That makes every command atomic, and it lets one slow command hold up everyone.\n\nWith the lab server running, type `SLOWLOG GET` at the `redis-cli` prompt. It lists the commands that took longer than 10 ms, and how long each one took. Run this lesson's slow script first, and watch it turn up there.\n\nNext, we'll look at the types Redis stores, and find out why one more item can make a key ten times bigger.",
+  "quiz": [
     {
-     "title": "redis.conf for Redis 8.10 (see THREADED I/O)",
-     "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf",
-     "kind": "docs"
+      "q": "From Why caches work: on the lab server, a `GET` took about 214 µs from start to finish, and Redis spent about half a microsecond of it running the command. The payments program sends 20 `GET`s one after another for each payment. Where does the time go, and what would cut it?",
+      "options": [
+        "Round trips: about 4 ms of waiting for 10 µs of work. Fetching all 20 keys in one round trip (`MGET`, or a pipeline) would cut it",
+        "Running the commands: a faster CPU for Redis would cut it",
+        "Reading RESP: switching the clients to RESP3 would cut it",
+        "Redis's single thread: turning on `io-threads` would cut it"
+      ],
+      "answer": 0,
+      "why": "Twenty round trips in a row at about 214 µs is about 4.3 ms, against about 10 µs of running commands. The network rung of the ladder from Why caches work dominates. One `MGET` (a command that reads many keys at once) or a pipeline (sending many commands before reading any reply) pays one round trip for all 20. A faster CPU or RESP3 shaves the tiny part. I/O threads spread the reading and writing over more cores, but they don't remove a single round trip.",
+      "from": "cache-01"
     },
     {
-     "title": "Redis 8 is now GA",
-     "url": "https://redis.io/blog/redis-8-ga/",
-     "kind": "read"
+      "q": "Two copies of the payments program take 100 off the same balance at the same moment, each with `String v = redis.get(\"balance:7\"); redis.set(\"balance:7\", String.valueOf(Long.parseLong(v) - 100));`. Each command is atomic. Is the balance safe?",
+      "options": [
+        "Yes, because each command is atomic",
+        "No: both copies can read the same balance before either writes, so one of the two changes is lost",
+        "Yes, as long as both copies share one Jedis `RedisClient`",
+        "No, because the `GET` and the `SET` may travel over two different connections from the pool"
+      ],
+      "answer": 1,
+      "why": "Atomic commands don't make a sequence of commands atomic. The loop can run the other copy's `GET` between your `GET` and your `SET`. Use one command that does the whole job (`DECRBY balance:7 100`), or a script or transaction (Serial execution: Redis MULTI, WATCH and Lua, in the Transactions track). Which connection carries each command doesn't matter either. The gap is between two commands on the server, and sharing one client or one connection doesn't close it."
     },
     {
-     "title": "Valkey 8.0 release candidate (I/O threading)",
-     "url": "https://valkey.io/blog/valkey-8-0-0-rc1/",
-     "kind": "read"
+      "q": "For a few seconds every hour, every Redis request gets slow: the slowest 1% take 900 ms instead of 1 ms, whatever key they ask for. During the spike, one CPU core on the Redis server is at 100% and the others are idle. What do you check first?",
+      "options": [
+        "Turn on `io-threads 4` to use the idle cores",
+        "Give the Jedis pool more connections, so more requests are in flight",
+        "Look in `SLOWLOG GET` for one slow command that runs at that time",
+        "Switch the clients to RESP3, so replies are read faster"
+      ],
+      "answer": 2,
+      "why": "Every key slowing down together, with one core busy, is the mark of one long command holding the only thread that runs commands. `SLOWLOG GET`, which lists the commands that took longer than 10 ms, names it. I/O threads and more connections can't help, because the bottleneck is running commands, and that stays on one thread."
+    },
+    {
+      "q": "Which of these does Redis 8.10 do away from the main thread, with its default settings?",
+      "options": [
+        "Running `GET` and `SET`",
+        "Running Lua scripts",
+        "Reading and parsing commands from client connections",
+        "Freeing the memory of a big key deleted with `UNLINK`"
+      ],
+      "answer": 3,
+      "why": "`UNLINK` hands the memory to the `bio_lazy_free` background thread. Commands and scripts always run on the main thread. Reading and parsing move to I/O threads only when you start the server with `io-threads` above 1, and the default is 1. That third option is the trap: it's true only after you change a setting."
+    },
+    {
+      "q": "PostgreSQL, a popular database program, has every page of the `merchants` table in its own memory cache, so finding a shop never touches the disk. Redis holds the same shops as hashes. Why does Redis still need far less CPU work per lookup?",
+      "options": [
+        "It doesn't: once the data is in memory, both do the same work",
+        "Redis squeezes its values smaller, so there's less to read",
+        "PostgreSQL still runs machinery built for disks: finding and holding the page in memory, latches, locks, and reading and planning SQL. Redis looks the key up in a hash table on one thread",
+        "Redis keeps its data in the CPU's caches, and PostgreSQL in RAM"
+      ],
+      "answer": 2,
+      "why": "Having the pages in memory removes the wait for the disk, not the code built around pages. When Harizopoulos and colleagues measured a disk-based database with all its data in RAM, page handling, latches, locks and logging took most of the instructions, and useful work about 1/60. PostgreSQL also reads and plans each SQL question. Redis keeps plain structures in memory and, with one thread running commands, needs no latches or locks. A whole dataset doesn't fit in a CPU's caches, so the last option can't be it."
     }
-   ]
-  },
-  {
-   "h": "Commands travel as RESP, and clients now speak RESP3",
-   "body": "A TCP connection carries a stream of bytes with no boundaries in it. If a client sends two commands quickly, the server may receive both in one read, or half of one. So the server needs a rule for where one command ends and the next begins.\n\nThe simplest rule is text lines: `SET payment:42 approved`, then a newline. Redis still accepts that from someone typing into a raw connection. It breaks as soon as a value contains a space or a newline, and values do: a JSON document, a serialized Java object, any bytes at all. Quoting rules would force the server to inspect every byte of every value.\n\nThe fix is to send each length first. That is **RESP**, the Redis serialization protocol. A command is an array of strings, each with its length in bytes in front:\n\n```text\n*2\\r\\n$3\\r\\nGET\\r\\n$10\\r\\npayment:42\\r\\n\n```\n\nRead it as: an array (`*`) of 2 elements, a 3-byte string (`$3`) `GET`, a 10-byte string `payment:42`. `\\r\\n` is a carriage return and a line feed, the line ending. Because the server knows each length up front, it reads exactly that many bytes and never looks inside them. The first byte of a reply says what kind of reply it is: `+OK` is a simple string, `:42` an integer, `$8` an 8-byte string, `$-1` no value, `-ERR` an error.\n\nThat version is RESP2, the standard since Redis 2.0. It has one gap: structured replies come back as flat arrays. `HGETALL` returns `status`, `approved`, `amount`, `1250`, and the client has to know to pair them up. RESP3, available since Redis 6.0, adds real maps (`%`), sets (`~`), doubles, booleans, a null (`_`), and push messages that the server sends without being asked, which client-side caching relies on. Every connection starts in RESP2 and switches when the client sends `HELLO 3`.\n\nBoth Java clients in this track send `HELLO 3` when they connect. Jedis 8 made that its default, and falls back to RESP2 if the server refuses. You will rarely look at RESP. You need it when a proxy mangles traffic, when a reply type surprises your code, or when you read a packet capture.",
-   "try": {
-    "title": "Talk RESP over a plain socket",
-    "minutes": 4,
-    "steps": [
-     "Run `RespDemo` (Java) or `RespDemoKt` (Kotlin) from the `labs` folder. It opens a plain socket to port 6379, sends commands as raw RESP and prints every byte both ways, with `\\r\\n` made visible.",
-     "Before you look, predict the reply bytes for `INCR auths:today` and for `INCR payment:42`.",
-     "Compare `HGETALL payment:45` and `GET payment:404` before and after `HELLO 3`. What changed?"
-    ],
-    "code": {
-     "lang": "java",
-     "title": "RespDemo.java",
-     "src": "package sfz.cache.l02.demo;\n\nimport java.io.IOException;\nimport java.io.InputStream;\nimport java.io.OutputStream;\nimport java.net.Socket;\nimport java.nio.charset.StandardCharsets;\n\n/** Speaks RESP to Redis over a plain socket, with no client library, and prints every byte. */\npublic class RespDemo {\n    public static void main(String[] args) throws IOException {\n        try (Socket socket = new Socket(\"localhost\", 6379)) {\n            OutputStream out = socket.getOutputStream();\n            InputStream in = socket.getInputStream();\n            send(out, in, \"PING\");\n            send(out, in, \"SET\", \"payment:42\", \"approved\");\n            send(out, in, \"GET\", \"payment:42\");\n            send(out, in, \"GET\", \"payment:404\");\n            send(out, in, \"INCR\", \"auths:today\");\n            send(out, in, \"INCR\", \"payment:42\");\n            send(out, in, \"HSET\", \"payment:45\", \"status\", \"approved\", \"amount\", \"1250\");\n            send(out, in, \"HGETALL\", \"payment:45\");\n            send(out, in, \"HELLO\", \"3\");                    // switch this connection to RESP3\n            send(out, in, \"HGETALL\", \"payment:45\");\n            send(out, in, \"GET\", \"payment:404\");\n        }\n    }\n\n    // a command is an array of bulk strings: *<count>, then $<length> and the bytes of each word\n    static void send(OutputStream out, InputStream in, String... words) throws IOException {\n        StringBuilder cmd = new StringBuilder(\"*\" + words.length + \"\\r\\n\");\n        for (String w : words) {\n            cmd.append('$').append(w.getBytes(StandardCharsets.UTF_8).length).append(\"\\r\\n\").append(w).append(\"\\r\\n\");\n        }\n        out.write(cmd.toString().getBytes(StandardCharsets.UTF_8));\n        out.flush();\n        // good enough for a demo: on loopback a short reply arrives in one read\n        byte[] buf = new byte[8192];\n        int n = in.read(buf);\n        System.out.println(\"> \" + show(cmd.toString(), 200));\n        System.out.println(\"< \" + show(new String(buf, 0, n, StandardCharsets.UTF_8), 90));\n    }\n\n    static String show(String s, int max) {\n        String visible = s.replace(\"\\r\\n\", \"\\\\r\\\\n\");\n        return visible.length() <= max ? visible : visible.substring(0, max) + \"... (\" + s.length() + \" bytes)\";\n    }\n}\n",
-     "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.RespDemo",
-     "file": "labs/redis/src/demo/java/sfz/cache/l02/demo/RespDemo.java",
-     "alt": {
-      "lang": "kotlin",
-      "title": "RespDemo.kt",
-      "src": "package sfz.cache.l02.demo\n\nimport java.io.InputStream\nimport java.io.OutputStream\nimport java.net.Socket\n\n/** Speaks RESP to Redis over a plain socket, with no client library, and prints every byte. */\nfun main() {\n    Socket(\"localhost\", 6379).use { socket ->\n        val out = socket.getOutputStream()\n        val inp = socket.getInputStream()\n        send(out, inp, \"PING\")\n        send(out, inp, \"SET\", \"payment:42\", \"approved\")\n        send(out, inp, \"GET\", \"payment:42\")\n        send(out, inp, \"GET\", \"payment:404\")\n        send(out, inp, \"INCR\", \"auths:today\")\n        send(out, inp, \"INCR\", \"payment:42\")\n        send(out, inp, \"HSET\", \"payment:45\", \"status\", \"approved\", \"amount\", \"1250\")\n        send(out, inp, \"HGETALL\", \"payment:45\")\n        send(out, inp, \"HELLO\", \"3\")                    // switch this connection to RESP3\n        send(out, inp, \"HGETALL\", \"payment:45\")\n        send(out, inp, \"GET\", \"payment:404\")\n    }\n}\n\n// a command is an array of bulk strings: *<count>, then $<length> and the bytes of each word\nprivate fun send(out: OutputStream, inp: InputStream, vararg words: String) {\n    val cmd = buildString {\n        append(\"*${words.size}\\r\\n\")\n        for (w in words) append(\"$${w.toByteArray().size}\\r\\n$w\\r\\n\")\n    }\n    out.write(cmd.toByteArray())\n    out.flush()\n    // good enough for a demo: on loopback a short reply arrives in one read\n    val buf = ByteArray(8192)\n    val n = inp.read(buf)\n    println(\"> \" + show(cmd, 200))\n    println(\"< \" + show(String(buf, 0, n), 90))\n}\n\nprivate fun show(s: String, max: Int): String {\n    val visible = s.replace(\"\\r\\n\", \"\\\\r\\\\n\")\n    return if (visible.length <= max) visible else visible.take(max) + \"... (${s.length} bytes)\"\n}\n",
-      "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.RespDemoKt",
-      "file": "labs/redis/src/demo/kotlin/sfz/cache/l02/demo/RespDemo.kt"
-     }
-    },
-    "expect": "`PING` gets `+PONG\\r\\n` and the first `INCR auths:today` gets `:1\\r\\n` (higher if you ran the first Try it). `INCR payment:42` gets `-ERR value is not an integer or out of range\\r\\n`. Before `HELLO 3`, `HGETALL payment:45` returns a flat array, `*4\\r\\n$6\\r\\nstatus\\r\\n...`, and the client has to pair the items up itself. After it, the same command returns a map, `%2\\r\\n...`, holding two field-value pairs. A missing key is `$-1\\r\\n` in RESP2 and `_\\r\\n` in RESP3. The reply to `HELLO 3` is itself a map of about 690 bytes (the exact size depends on your connection id) that starts with the server name, `version 8.10.3` and `proto 3`."
-   },
-   "refs": [
+  ],
+  "flashcards": [
     {
-     "title": "Redis serialization protocol specification",
-     "url": "https://redis.io/docs/latest/develop/reference/protocol-spec/",
-     "kind": "docs"
+      "front": "How many threads run commands in Redis 8?",
+      "back": "One, the main thread. Background threads, a forked child and optional I/O threads do side work, never commands."
+    },
+    {
+      "front": "Why can fifty clients call `INCR` on one key without losing a count?",
+      "back": "The event loop runs each command to the end before it starts the next, so no other command can run between INCR's read and its write."
+    },
+    {
+      "front": "What does `io-threads 4` change?",
+      "back": "Three extra threads, plus the main one, read from connections, cut the bytes into commands and write the replies. Commands still run one at a time on the main thread. You can set it only when the server starts."
+    },
+    {
+      "front": "What happens to other clients while a Lua script runs?",
+      "back": "They wait. After `busy-reply-threshold` (5 s by default), they get BUSY errors until the script ends or someone sends `SCRIPT KILL`."
+    },
+    {
+      "front": "How does a client switch its connection to RESP3?",
+      "back": "It sends `HELLO 3`. Jedis 8 and Lettuce 7.9 both do this when they connect."
+    },
+    {
+      "front": "Why is a store in memory faster than a disk-based database that has all its data in memory?",
+      "back": "It skips the machinery built for disks: page handling, latches, locks and log records. In a 2008 measurement those took most of the instructions, and useful work about 1/60."
     }
-   ]
-  },
-  {
-   "h": "This track uses Jedis, and Lettuce where Kotlin needs it",
-   "body": "Nobody should format RESP by hand, so you use a client library. The choice that matters inside a client is how the threads of your service share TCP connections.\n\nThe first design is a pool. The client keeps several open connections. A call borrows one, sends one command, waits for the reply and gives the connection back. While one thread waits, others use other connections. Every call blocks its thread for one round trip, and threads queue when all connections are busy: Jedis's pool holds at most 8 connections unless you configure more, so 200 request threads on 8 connections take turns. This is Jedis.\n\nThe second design is multiplexing: one connection shared by every thread. Calls write their commands onto the same socket back to back, without waiting for each other. Redis answers the commands on a connection in the order they arrived, so the client keeps a queue of callers and hands each reply to the next caller in line. One connection carries thousands of calls in flight. The cost is that your code gets a future, a callback or a suspended coroutine instead of a plain value. This is Lettuce.\n\nJedis 8.0.2 gives you one `RedisClient`, built with `RedisClient.builder()`, with the pool behind it. Lettuce 7.9.0, built on Netty, has a sync API, an async API that returns `RedisFuture` (a `CompletionStage`), a reactive API on Project Reactor, and a Kotlin coroutines API. The coroutines API is a layer over the reactive one, so it needs both `kotlinx-coroutines-core` and `kotlinx-coroutines-reactive` on the classpath, and an opt-in annotation, `@ExperimentalLettuceCoroutinesApi`.\n\n**This track teaches with Jedis.** One call is one command and one reply, so your code maps line for line onto what you type in `redis-cli`, and the lessons stay about Redis instead of about futures. Lettuce shows up where it changes the picture: Kotlin coroutines, and many calls sharing one connection. If your Quarkus services use the Quarkus Redis extension, that one is built on the Vert.x Redis client and works like Lettuce: non-blocking, few connections.\n\nOne trap: both libraries name their entry class `RedisClient`. In a file that uses both, write one of them with its full package name.\n\n```java\nRedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build();\nredis.set(\"payment:42\", \"approved\");\nString status = redis.get(\"payment:42\");          // blocks until the reply arrives\n```\n\n```kotlin\nval redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()\nredis.set(\"payment:42\", \"approved\")\nval status: String? = redis.get(\"payment:42\")     // GET of a missing key returns null\n```",
-   "try": {
-    "title": "Ask the server who connected",
-    "minutes": 3,
-    "steps": [
-     "Run `ClientsDemo` (Jedis and Lettuce's async API) or `ClientsDemoKt` (Jedis and Lettuce's coroutines). Each does the same GET through both libraries, then asks the server for its list of connections.",
-     "Read the last two lines. They are the server's own view of each connection, from `CLIENT LIST`."
-    ],
-    "code": {
-     "lang": "java",
-     "title": "ClientsDemo.java",
-     "src": "package sfz.cache.l02.demo;\n\nimport io.lettuce.core.RedisFuture;\nimport io.lettuce.core.api.StatefulRedisConnection;\nimport io.lettuce.core.api.async.RedisAsyncCommands;\nimport redis.clients.jedis.RedisClient;\n\nimport java.util.concurrent.TimeUnit;\nimport java.util.regex.Matcher;\nimport java.util.regex.Pattern;\n\n/** The same GET through Jedis (blocking) and Lettuce (async), then how each one connected. */\npublic class ClientsDemo {\n    public static void main(String[] args) throws Exception {\n        // Jedis 8: one RedisClient, a pool of connections behind it, blocking calls\n        try (RedisClient jedis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()) {\n            jedis.set(\"payment:42\", \"approved\");\n            System.out.println(\"Jedis   GET payment:42 -> \" + jedis.get(\"payment:42\"));\n\n            // Lettuce 7: one connection shared by every caller, calls return futures\n            io.lettuce.core.RedisClient lettuce = io.lettuce.core.RedisClient.create(\"redis://localhost:6379\");\n            try (StatefulRedisConnection<String, String> conn = lettuce.connect()) {\n                RedisAsyncCommands<String, String> async = conn.async();\n                RedisFuture<String> reply = async.get(\"payment:42\");        // returns at once\n                System.out.println(\"Lettuce GET payment:42 -> \" + reply.get(1, TimeUnit.SECONDS));\n\n                // ask the server how each library connected\n                String list = async.clientList().get(1, TimeUnit.SECONDS);\n                Pattern fields = Pattern.compile(\"(resp=\\\\d+) (lib-name=\\\\S+) (lib-ver=\\\\S+)\");\n                for (String line : list.split(\"\\n\")) {\n                    Matcher m = fields.matcher(line);\n                    if (m.find() && !m.group(2).equals(\"lib-name=\")) {\n                        System.out.println(m.group(1) + \" \" + m.group(2) + \" \" + m.group(3));\n                    }\n                }\n            } finally {\n                lettuce.shutdown();\n            }\n        }\n    }\n}\n",
-     "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.ClientsDemo",
-     "file": "labs/redis/src/demo/java/sfz/cache/l02/demo/ClientsDemo.java",
-     "alt": {
-      "lang": "kotlin",
-      "title": "ClientsDemo.kt",
-      "src": "package sfz.cache.l02.demo\n\nimport io.lettuce.core.ExperimentalLettuceCoroutinesApi\nimport io.lettuce.core.api.coroutines\nimport kotlinx.coroutines.runBlocking\nimport redis.clients.jedis.RedisClient\n\n/** The same GET through Jedis (blocking) and Lettuce (coroutines), then how each one connected. */\n@OptIn(ExperimentalLettuceCoroutinesApi::class)\nfun main() {\n    // Jedis 8: one RedisClient, a pool of connections behind it, blocking calls\n    RedisClient.builder().hostAndPort(\"localhost\", 6379).build().use { jedis ->\n        jedis.set(\"payment:42\", \"approved\")\n        println(\"Jedis   GET payment:42 -> \" + jedis.get(\"payment:42\"))\n\n        // Lettuce 7: one connection shared by every caller; coroutines suspend instead of blocking\n        val lettuce = io.lettuce.core.RedisClient.create(\"redis://localhost:6379\")\n        try {\n            lettuce.connect().use { conn ->\n                val redis = conn.coroutines()\n                val list = runBlocking {\n                    println(\"Lettuce GET payment:42 -> \" + redis.get(\"payment:42\"))   // suspends\n                    redis.clientList().orEmpty()        // ask the server how each library connected\n                }\n                val fields = Regex(\"\"\"(resp=\\d+) (lib-name=\\S+) (lib-ver=\\S+)\"\"\")\n                list.lineSequence()\n                    .mapNotNull { fields.find(it) }\n                    .filter { it.groupValues[2] != \"lib-name=\" }\n                    .forEach { println(it.groupValues.drop(1).joinToString(\" \")) }\n            }\n        } finally {\n            lettuce.shutdown()\n        }\n    }\n}\n",
-      "run": "./gradlew :redis:demo -Pmain=sfz.cache.l02.demo.ClientsDemoKt",
-      "file": "labs/redis/src/demo/kotlin/sfz/cache/l02/demo/ClientsDemo.kt"
-     }
-    },
-    "expect": "Both versions print `approved` twice, then `resp=3 lib-name=jedis lib-ver=8.0.2` and `resp=3 lib-name=Lettuce lib-ver=7.9.0.RELEASE/1d7b2b2`. Both libraries switched to RESP3 with `HELLO 3`, and both told the server who they are with `CLIENT SETINFO`. On a shared production Redis, `CLIENT LIST` therefore shows which library and version every connection uses."
-   },
-   "refs": [
+  ],
+  "terms": [
     {
-     "title": "Jedis v7 to v8 migration guide",
-     "url": "https://redis.github.io/jedis/migration-guides/v7-to-v8/",
-     "kind": "docs"
+      "term": "In-memory store",
+      "plain": "A store that keeps all its data in RAM as plain structures, and uses the disk only for a log or a snapshot."
     },
     {
-     "title": "Lettuce Kotlin API",
-     "url": "https://redis.github.io/lettuce/user-guide/kotlin-api/",
-     "kind": "docs"
+      "term": "Thread",
+      "plain": "One line of work inside a program. A program can run many threads at once."
+    },
+    {
+      "term": "Event loop",
+      "plain": "A loop that waits for connections with bytes waiting, runs what arrived, and sends the replies. Redis's main thread is one."
+    },
+    {
+      "term": "Atomic",
+      "plain": "Happens as one step. Other clients see it either not started or finished, never halfway."
+    },
+    {
+      "term": "epoll",
+      "plain": "The Linux feature a server uses to ask which of thousands of connections have bytes waiting, without one thread per connection."
+    },
+    {
+      "term": "I/O threads",
+      "plain": "Optional helper threads (`io-threads`) that read, cut and write bytes for the main thread. They never run commands."
+    },
+    {
+      "term": "RESP",
+      "plain": "The Redis serialization protocol: every string goes with its length first, plus whole numbers, arrays and errors. RESP3 adds maps, sets, a null and push messages."
+    },
+    {
+      "term": "Multiplexing",
+      "plain": "Many callers sharing one connection: commands go out back to back, and replies are matched to callers in order."
     }
-   ]
-  }
- ],
- "analogy": "A Redis server is a bank branch with one very fast teller and many doors. Customers queue at their own door. The teller takes the request at the front of each door in turn, finishes it completely, puts the receipt in that door's tray and moves on. No two requests are ever half-done at the same time, so the ledger stays consistent without anyone locking anything. But a customer who asks the teller to count a sack of coins holds up every door. I/O threads are assistants who carry requests to the counter and receipts back, but only the teller touches the ledger. The analogy breaks on speed: a real teller needs a minute per customer, while Redis needs about half a microsecond, so queues that would be hopeless in a bank stay invisible in Redis until one slow request arrives.",
- "in_your_world": "Your payment service probably already uses Redis for idempotency keys, rate limits or a cache of card-issuer responses. All of them share one execution thread with every other service on that Redis. When the fraud team's nightly job runs `KEYS fraud:*` on the shared instance, your authorization path's `GET idem:...` calls wait behind it, and your p99 jumps from 1 ms to however long that command takes. Nothing in your service changed, and the Redis host's CPU graph looks calm: one core is busy and the rest are idle. Two habits follow. Treat every command on a big key as a cost that every client pays. And when Redis latency spikes for all keys at once, look for one slow command first (`SLOWLOG GET`), before you look at the network or ask for more threads.",
- "mistake": "The most common mistake is reading \"single-threaded\" as \"slow\" or \"can't use more cores\", and then fixing the wrong thing. Teams turn on `io-threads` or buy a bigger instance when the real problem is one O(N) command, one whose cost grows with the size of a key: a `KEYS *`, an `HGETALL` on a hash that grew to a million fields, a `DEL` of a huge set, a Lua script that loops over thousands of keys. More cores can't help, because only one thread executes commands. Find the command instead: `SLOWLOG GET` lists every command that took longer than 10 ms (the default `slowlog-log-slower-than` is 10000 microseconds). Then replace it with an incremental one: `SCAN` for `KEYS`, `HSCAN` for `HGETALL`, `UNLINK` for `DEL`, and several smaller keys for one giant key.",
- "compare": {
-  "title": "Lettuce from Java and from Kotlin: one connection, two styles",
-  "java": {
-   "title": "PaymentStatus.java",
-   "src": "// Lettuce async: every call returns a RedisFuture at once\nRedisClient client = RedisClient.create(\"redis://localhost:6379\");\ntry (StatefulRedisConnection<String, String> conn = client.connect()) {\n    RedisAsyncCommands<String, String> redis = conn.async();\n    RedisFuture<String> status = redis.get(\"payment:42\");\n    RedisFuture<Long> auths = redis.incr(\"auths:today\");\n    // both commands are already on the wire; now wait for the replies\n    System.out.println(status.get(1, TimeUnit.SECONDS) + \" \" + auths.get(1, TimeUnit.SECONDS));\n} finally {\n    client.shutdown();\n}"
+  ],
+  "explain_back": {
+    "prompt": "A teammate says: \"Redis has only one thread, so it can't keep up with us. Let's turn on I/O threads so it runs our commands in parallel.\" Explain what's right and what's wrong in that, in your own words.",
+    "answer": "Redis does run commands on one thread, one at a time, each to the end. That's why each command is atomic, and why one slow command makes everyone wait. But one thread is rarely the limit for small commands: a `GET` costs about half a microsecond. I/O threads don't run commands in parallel. They take over reading from connections, cutting the bytes into commands and writing replies, which helps when the server spends its time moving bytes for many connections. If our problem is that every request gets slow now and then, the likely cause is one slow command whose cost grows with the size of a key, and I/O threads won't touch it. I'd check `SLOWLOG GET` first, and replace the slow command with one that works in small steps, such as `SCAN` in place of `KEYS`."
   },
-  "kotlin": {
-   "title": "PaymentStatus.kt",
-   "src": "// Lettuce coroutines: calls suspend instead of returning futures\n@OptIn(ExperimentalLettuceCoroutinesApi::class)\nsuspend fun printStatus(client: RedisClient) {\n    client.connect().use { conn ->\n        val redis = conn.coroutines()\n        coroutineScope {\n            val status = async { redis.get(\"payment:42\") }\n            val auths = async { redis.incr(\"auths:today\") }\n            println(\"${status.await()} ${auths.await()}\")\n        }\n    }\n}"
+  "deeper": {
+    "minutes": 10,
+    "body": "The 2008 measurement is worth reading in full. With its data in memory and logging on, Shore ran about 640 New Order transactions (one kind of order in the test) a second. The authors then removed one piece at a time: logging, locking, latching, then the buffer manager. The fully stripped engine ran about 12,700 a second on one thread, about 20 times faster, and a hand-written program doing only the useful work about 46,500. No single piece dominated, which is why tuning one of them in a disk-based database never closes the gap. H-Store, a research system, and VoltDB after it came from the same group and the same argument. Split the data into parts, run each part's work one job at a time on one thread, and keep everything in memory. *Designing Data-Intensive Applications*, 2nd edition, chapter 4, makes the same point about in-memory databases and cites this paper.\n\nWhy is one thread fast enough? Most commands touch one key and finish in well under a microsecond, and the data is already in RAM. With no second thread, there are no locks to take, and no data passed back and forth between the caches of different CPU cores. For small commands, the expensive part is usually the system calls: one `read` and one `write` per command per client. Pipelining attacks that cost: send many commands, read many replies, and pay for the system calls once (Serial execution, in the Transactions track, uses it). I/O threads spread the same cost over several cores.\n\nThe real loop is a little richer than the lab's model. When a client has sent several commands at once, Redis reads a buffer's worth of bytes and runs every complete command in it before moving on to the next client. That's why a pipelined batch from one client runs back to back, and why a client that sends a huge batch can delay the clients after it in the same pass.\n\nA tip for writing busy scripts. On the lab server, a script that looped on `redis.call('TIME')` until 2,000 ms had passed ran for 5 seconds instead. Inside a script, `TIME` kept returning the moment the script started, and it moved only when the 5-second busy handling began. `os.clock()` measures the CPU time the script has used, which keeps moving, so the lab uses it. A script that waits on the server's clock won't work for the same reason, and you shouldn't want a script that waits anyway.\n\nOther servers that speak Redis's protocol split the work differently. Valkey 8.0 reworked its I/O threads to run alongside the main thread and hand it commands in batches. Its announcement reports up to 1.2 million requests a second on one AWS machine, up from 380,000 (again the makers' own figure). It still runs commands on one thread. Dragonfly splits the keys into shards, one per thread, so every core runs commands for its own keys. That buys throughput, and the price is coordination whenever one command touches keys in two shards. In version 2.1 (November 2026), Dragonfly moved to its own source-available license, free in production up to 100 vCPUs. Memcached, the older pure cache, runs several worker threads over one shared table guarded by locks, and stores only plain bytes.\n\nThe licenses in detail: Redis 7.4 to 7.8 came under RSALv2 or SSPLv1, Redis's own license and MongoDB's, both of which let you read and change the code but restrict offering it as a service. From 8.0, you may also take it under AGPLv3, a free license that asks anyone who offers a changed version over a network to publish their changes. Jedis and Lettuce themselves are under the MIT license.\n\nLettuce is built on Netty, a Java library for network programs. Netty runs an event loop of its own, so a Lettuce connection and the Redis server it talks to work in much the same way.\n\nIf you want the source, `src/ae.c` in the Redis repository is the event loop library (it wraps epoll on Linux and kqueue on macOS), and `src/networking.c` reads commands and writes replies."
   },
-  "note": "Both versions put two commands on one connection before waiting for either reply, so the `INCR` doesn't wait a round trip for the `GET`. Java gets that with futures. Kotlin gets it with `async` and `await`, and the code reads top to bottom. The coroutines API is a layer over Lettuce's reactive API, which is why it needs `kotlinx-coroutines-reactive` on the classpath and an opt-in annotation. Jedis code looks the same in both languages: it blocks, so there is nothing to translate."
- },
- "worked": {
-  "title": "Count authorizations from eight threads without losing any",
-  "steps": [
-   {
-    "say": "A settlement job counts today's authorizations in Redis. Eight worker threads share one Jedis `RedisClient`, and each one reads the counter, adds 1 and writes it back. Predict what it prints after 8,000 calls.",
-    "code": "RedisClient redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build();\nExecutorService pool = Executors.newFixedThreadPool(8);\nfor (int i = 0; i < 8_000; i++) {\n    pool.submit(() -> {\n        String v = redis.get(\"auths:today\");                  // 1. read\n        long n = v == null ? 0 : Long.parseLong(v);           // 2. add\n        redis.set(\"auths:today\", String.valueOf(n + 1));      // 3. write\n    });\n}\npool.shutdown();\npool.awaitTermination(1, TimeUnit.MINUTES);\nSystem.out.println(redis.get(\"auths:today\"));",
-    "lang": "java",
-    "alt_lang": "kotlin",
-    "alt_code": "val redis = RedisClient.builder().hostAndPort(\"localhost\", 6379).build()\nval pool = Executors.newFixedThreadPool(8)\nrepeat(8_000) {\n    pool.submit {\n        val v: String? = redis.get(\"auths:today\")             // 1. read\n        val n = v?.toLong() ?: 0L                             // 2. add\n        redis.set(\"auths:today\", (n + 1).toString())          // 3. write\n    }\n}\npool.shutdown()\npool.awaitTermination(1, TimeUnit.MINUTES)\nprintln(redis.get(\"auths:today\"))"
-   },
-   {
-    "say": "Three runs against the lab server printed 1,611, then 1,654, then 1,628. About four in five increments vanished. Each command was atomic, but the pair was not. Between one thread's `GET` and its `SET`, the event loop ran other threads' commands, so several threads read the same old value and wrote the same new one. It is `count++` again, with a network round trip widening the gap.",
-    "code": "",
-    "lang": ""
-   },
-   {
-    "say": "Let the server do the read, the add and the write as one command. `INCR` runs to completion inside the loop, so nothing can come between its read and its write. The same job now prints 8000 on every run.",
-    "code": "for (int i = 0; i < 8_000; i++) {\n    pool.submit(() -> redis.incr(\"auths:today\"));   // one command: read, add and write on the server\n}",
-    "lang": "java",
-    "alt_lang": "kotlin",
-    "alt_code": "repeat(8_000) {\n    pool.submit { redis.incr(\"auths:today\") }       // one command: read, add and write on the server\n}"
-   },
-   {
-    "say": "With Lettuce, Kotlin can send all 8,000 `INCR`s from coroutines over a single connection, with no thread pool at all. Each `incr` suspends until its reply arrives, and the commands queue up on the one socket. On the lab server this took about 230 ms (it depends on your machine and Docker) and printed 8000. The Java twin uses the async API and waits with `CompletableFuture.allOf`.",
-    "code": "val redis = conn.coroutines()\ncoroutineScope {\n    repeat(8_000) { launch { redis.incr(\"auths:today\") } }   // 8,000 coroutines, one connection\n}\nprintln(redis.get(\"auths:today\"))   // 8000",
-    "lang": "kotlin",
-    "alt_lang": "java",
-    "alt_code": "RedisAsyncCommands<String, String> redis = conn.async();\nList<CompletableFuture<Long>> calls = new ArrayList<>();\nfor (int i = 0; i < 8_000; i++) calls.add(redis.incr(\"auths:today\").toCompletableFuture());\nCompletableFuture.allOf(calls.toArray(new CompletableFuture[0])).join();\nSystem.out.println(redis.get(\"auths:today\").get());   // 8000"
-   }
+  "sources": [
+    {
+      "title": "Harizopoulos, Abadi, Madden and Stonebraker, OLTP Through the Looking Glass, and What We Found There (SIGMOD 2008)",
+      "url": "https://faculty.cc.gatech.edu/~jarulraj/courses/4420-s19/papers/02-inmemory/hstore-lookingglass.pdf"
+    },
+    {
+      "title": "Diagnosing latency issues (Redis docs)",
+      "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/"
+    },
+    {
+      "title": "Redis serialization protocol specification",
+      "url": "https://redis.io/docs/latest/develop/reference/protocol-spec/"
+    },
+    {
+      "title": "redis.conf for Redis 8.10",
+      "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf"
+    },
+    {
+      "title": "Dragonfly v2.1 release notes (the license change)",
+      "url": "https://github.com/dragonflydb/dragonfly/releases/tag/v2.1"
+    }
   ]
- },
- "lab": {
-  "title": "Model the event loop, then catch the real one blocking",
-  "minutes": 15,
-  "needs": [
-   "Docker"
-  ],
-  "files": [
-   "labs/redis/src/main/kotlin/sfz/cache/l02/EventLoop.kt",
-   "labs/redis/src/main/java/sfz/cache/l02/SlowScriptProbe.java"
-  ],
-  "run": "./gradlew :redis:test --tests 'sfz.cache.l02.*'",
-  "steps": [
-   "Run the tests once from the `labs` folder. All eight fail: five in `EventLoopTest`, a model that needs no Docker, and three in `SlowScriptProbeTest`, which run against a real Redis 8.10 container that Testcontainers starts for you.",
-   "Write `EventLoop.runUntilIdle()` in `EventLoop.kt`. The KDoc lists the four steps. Take the snapshot of arrived commands once per pass, before you run any of them.",
-   "Run `./gradlew :redis:test --tests 'sfz.cache.l02.EventLoopTest'` until its five tests pass. Read the test `a command that arrives during a pass waits for the next pass`: the real loop behaves the same way.",
-   "Write `timeGet` and `timeGetDuringScript` in `SlowScriptProbe.java`. Start the script on the `scripts` client in a background thread, sleep `HEAD_START_MS`, time the GET on the `app` client, then wait for the script.",
-   "Run all eight tests. The Docker tests take a few seconds, because they block the server on purpose."
-  ],
-  "hints": [
-   "`pending.filter { it.arrivedAt <= clock }` gives you the snapshot. Loop over `clients`, and inside that over the snapshot entries of that client, so each client's commands keep their order.",
-   "If nothing has arrived, set `clock = pending.minOf { it.arrivedAt }` and go round again. Without that, an idle loop spins forever and the test times out.",
-   "`CompletableFuture.supplyAsync(() -> scripts.eval(BUSY_SCRIPT, 0, String.valueOf(scriptMillis)))` runs the script in the background. Call `join()` on it before you return, so a script error fails the call."
-  ],
-  "done_when": "All eight tests in `sfz.cache.l02` pass."
- },
- "drill": {
-  "title": "Write the slow-script probe from memory",
-  "minutes": 5,
-  "prompt": "Close the lab. In a blank file, write `timeGetDuringScript(scripts, app, key, millis)`: start a busy Lua script on one client in the background, wait 200 ms, time a `GET` on the other client, wait for the script, and return the GET's milliseconds. Write the Lua too. Then compare with the answer. Did you remember why the script needs its own thread?",
-  "answer": {
-   "lang": "java",
-   "src": "static final String BUSY = \"local stop = os.clock() + tonumber(ARGV[1]) / 1000 while os.clock() < stop do end return 1\";\n\nstatic long timeGetDuringScript(RedisClient scripts, RedisClient app, String key, long millis) throws InterruptedException {\n    CompletableFuture<Object> script = CompletableFuture.supplyAsync(\n            () -> scripts.eval(BUSY, 0, String.valueOf(millis)));   // eval blocks a pool thread, not us\n    Thread.sleep(200);                                               // head start: the script is running\n    long t0 = System.nanoTime();\n    app.get(key);                                                    // waits for the script to end\n    long ms = (System.nanoTime() - t0) / 1_000_000;\n    script.join();\n    return ms;\n}",
-   "alt": {
-    "lang": "kotlin",
-    "src": "const val BUSY = \"local stop = os.clock() + tonumber(ARGV[1]) / 1000 while os.clock() < stop do end return 1\"\n\nfun timeGetDuringScript(scripts: RedisClient, app: RedisClient, key: String, millis: Long): Long {\n    val script = CompletableFuture.supplyAsync { scripts.eval(BUSY, 0, millis.toString()) }   // eval blocks a pool thread\n    Thread.sleep(200)                       // head start: the script is running\n    val t0 = System.nanoTime()\n    app.get(key)                            // waits for the script to end\n    val ms = (System.nanoTime() - t0) / 1_000_000\n    script.join()\n    return ms\n}"
-   }
-  }
- },
- "recap": [
-  "An in-memory store is fast mainly because it keeps data in plain memory structures, without the buffer pool, latches, locks and log records a disk-based engine runs even when every page is cached.",
-  "Redis keeps typed data structures in memory, and commands change them on the server, so you rarely read, modify and write back.",
-  "One thread runs every command, one after another, each to completion. That makes every single command atomic without any locks, and lets one slow command (`KEYS *`, `HGETALL` on a huge hash, a long Lua script) stall every client.",
-  "Background threads, a forked child and optional I/O threads (`io-threads`, off by default) do side work and never execute commands. Valkey shares that model; Dragonfly runs one execution thread per shard.",
-  "Clients speak RESP, and Jedis 8 and Lettuce 7.9 switch to RESP3 with `HELLO 3`. This track teaches with Jedis's blocking `RedisClient`, and uses Lettuce for Kotlin coroutines.",
-  "Redis is RSALv2, SSPLv1 or AGPLv3 from 8.0 (8.10.3 now); Valkey (9.1.3) is the BSD fork; Dragonfly moved to a source-available license in v2.1."
- ],
- "quiz": [
-  {
-   "q": "From lesson 1: on the lab server a `GET` took about 214 µs end to end, and Redis spent about half a microsecond of it running the command. A service sends 20 `GET`s one after another for each payment. Where does the time go, and what would cut it?",
-   "options": [
-    "Round trips: about 4 ms of waiting for 10 µs of work. Fetching all 20 keys in one round trip (`MGET`, or a pipeline) would cut it",
-    "Running the commands: a faster CPU for Redis would cut it",
-    "Parsing RESP: switching the clients to RESP3 would cut it",
-    "Redis's single thread: turning on `io-threads` would cut it"
-   ],
-   "answer": 0,
-   "why": "Twenty sequential round trips at about 214 µs is about 4.3 ms, against about 10 µs of command execution: the network rung of lesson 1's ladder dominates. One `MGET` (or a pipeline) pays one round trip for all 20. A faster CPU or RESP3 shaves the tiny part. I/O threads spread socket work over cores but don't remove a single round trip.",
-   "from": "cache-01"
-  },
-  {
-   "q": "Two pods debit the same balance at once with `String v = redis.get(\"balance:7\"); redis.set(\"balance:7\", String.valueOf(Long.parseLong(v) - 100));`. Each command is atomic. Is the debit safe?",
-   "options": [
-    "Yes, because each command is atomic",
-    "No: both pods can read the same balance before either writes, so one debit is lost",
-    "Yes, as long as both pods share one Jedis `RedisClient`",
-    "No, because the `GET` and the `SET` may go over two different pooled connections"
-   ],
-   "answer": 1,
-   "why": "Atomic commands don't make a sequence of commands atomic. The loop can run the other pod's `GET` between your `GET` and your `SET`. Use one command that does the whole job (`DECRBY balance:7 100`), or a script or transaction (the Transactions track's lesson on serial execution). Which connection carries each command doesn't matter either: the gap is between two commands on the server, and sharing one client object or one connection doesn't close it."
-  },
-  {
-   "q": "Your Redis p99 jumps from 1 ms to 900 ms for a few seconds every hour, for every key. During the spike one CPU core is at 100% and the others are idle. What do you check first?",
-   "options": [
-    "Turn on `io-threads 4` to use the idle cores",
-    "Raise the Jedis pool size so more requests are in flight",
-    "Look in `SLOWLOG GET` for one slow command that runs at that time",
-    "Switch the clients to RESP3 so replies parse faster"
-   ],
-   "answer": 2,
-   "why": "Every key slowing down together, with one core pegged, is the signature of one long command holding the only execution thread. `SLOWLOG` names it. I/O threads and more connections can't help, because the bottleneck is command execution, and that stays on one thread."
-  },
-  {
-   "q": "Which of these does Redis 8.10 do off the main thread with its default settings?",
-   "options": [
-    "Executing `GET` and `SET`",
-    "Running Lua scripts",
-    "Reading and parsing commands from client sockets",
-    "Freeing the memory of a big key deleted with `UNLINK`"
-   ],
-   "answer": 3,
-   "why": "`UNLINK` hands the memory to the `bio_lazy_free` background thread. Commands and scripts always run on the main thread. Reading and parsing move to I/O threads only when you start the server with `io-threads` above 1, and the default is 1."
-  },
-  {
-   "q": "PostgreSQL has every page of the merchants table in `shared_buffers`, so reading a merchant never touches the disk. Redis holds the same merchants as hashes. Why does Redis still need far less CPU per lookup?",
-   "options": [
-    "It doesn't: once the data is in memory, both do the same work",
-    "Redis compresses its values, so there is less to read",
-    "PostgreSQL still runs its disk-shaped machinery: finding and pinning the page in the buffer pool, latches, locks, and parsing and planning SQL. Redis looks the key up in a hash table on one thread",
-    "Redis keeps its data in the CPU cache, and PostgreSQL in RAM"
-   ],
-   "answer": 2,
-   "why": "Having the pages in memory removes the disk wait, not the code built around pages. In Harizopoulos and colleagues' measurement of a disk-based engine with all data in RAM, buffer management, latching, locking and logging took most of the instructions, and useful work about 1/60. PostgreSQL adds SQL parsing and planning on top. Redis keeps plain in-memory structures and, with one execution thread, needs no latches or locks. A whole dataset doesn't fit in a CPU cache, so the last option can't be it."
-  }
- ],
- "flashcards": [
-  {
-   "front": "How many threads execute commands in Redis 8?",
-   "back": "One, the main thread. Background threads, a forked child and optional I/O threads do side work, never command execution."
-  },
-  {
-   "front": "Why can fifty clients call `INCR` on one key without losing an update?",
-   "back": "The event loop runs each command to completion before it starts the next, so no other command can run between INCR's read and its write."
-  },
-  {
-   "front": "What does `io-threads 4` change?",
-   "back": "Three extra threads, plus the main one, read sockets, parse commands and write replies. Commands still run one at a time on the main thread. You can set it only at start-up."
-  },
-  {
-   "front": "What happens to other clients while a Lua script runs?",
-   "back": "They wait. After `busy-reply-threshold` (5 s by default) they get BUSY errors until the script ends or someone runs `SCRIPT KILL`."
-  },
-  {
-   "front": "How does a client switch its connection to RESP3?",
-   "back": "It sends `HELLO 3`. Jedis 8 and Lettuce 7.9 both do this when they connect."
-  },
-  {
-   "front": "Why is an in-memory store faster than a disk-based database with every page cached?",
-   "back": "It skips the machinery built for disk: buffer-pool lookups, latches, locks and log records. In a 2008 measurement those took most of the instructions, and useful work about 1/60."
-  }
- ],
- "terms": [
-  {
-   "term": "Event loop",
-   "plain": "A loop that waits for sockets with data, runs what arrived, and writes the replies. Redis's main thread is one."
-  },
-  {
-   "term": "Atomic",
-   "plain": "Happens as one step. Other clients see it either not started or finished, never halfway."
-  },
-  {
-   "term": "epoll",
-   "plain": "The Linux call a server uses to ask which of thousands of sockets have data, without one thread per socket."
-  },
-  {
-   "term": "RESP",
-   "plain": "The Redis serialization protocol: length-prefixed strings, integers, arrays and errors. RESP3 adds maps, sets, a null and push messages."
-  },
-  {
-   "term": "I/O threads",
-   "plain": "Optional threads (`io-threads`) that read, parse and write for the main thread. They never run commands."
-  },
-  {
-   "term": "In-memory store",
-   "plain": "A store that keeps its whole dataset in RAM as ordinary data structures, and uses disk only for a log or a snapshot."
-  },
-  {
-   "term": "Multiplexing",
-   "plain": "Many callers sharing one connection: commands go out back to back, and replies are matched to callers in order."
-  },
-  {
-   "term": "Valkey",
-   "plain": "A BSD-licensed fork of Redis, run by the Linux Foundation."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate says: \"Redis is single-threaded, so it can't keep up with us. Let's turn on I/O threads so it runs our commands in parallel.\" Explain what is right and what is wrong in that, in your own words.",
-  "answer": "Redis does execute commands on one thread, one at a time, each to completion. That is why each command is atomic, and why one slow command makes everyone wait. But one thread is rarely the limit for small commands: a GET costs about half a microsecond. I/O threads don't run commands in parallel. They take over reading sockets, parsing commands and writing replies, which helps when the server spends its time on network bytes for many connections. If our problem is latency spikes, the likely cause is one slow O(N) command, and I/O threads won't touch it. I'd check `SLOWLOG GET` first and replace the slow command with an incremental one."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "The 2008 measurement is worth reading in full. With its data cached and logging on, Shore ran about 640 New Order transactions a second. The authors then removed one piece at a time: logging, locking, latching, then the buffer manager. The fully stripped engine ran about 12,700 a second on one thread, about 20 times faster, and a hand-written kernel doing only the useful work about 46,500. No single piece dominated, which is why tuning one of them in a disk-based engine never closes the gap. The H-Store research system, and VoltDB after it, came from the same group of people and the same argument: partition the data, run each partition's transactions one at a time on one thread, and keep everything in memory. *Designing Data-Intensive Applications*, 2nd edition, chapter 4, makes the same point about in-memory databases and cites this paper.\n\nWhy is one thread fast enough? Most commands touch one key and finish in well under a microsecond, the data is already in RAM, and with no second thread there are no locks to take and no cache lines bouncing between cores. For small commands the expensive part is usually the system calls: one `read` and one `write` per command per client. That is the cost pipelining attacks (send many commands, read many replies, pay the syscalls once; the Transactions track's lesson on serial execution uses it) and I/O threads spread over cores.\n\nThe real loop is a little richer than the lab's model. When a client has sent several commands at once, Redis reads a buffer's worth of bytes and runs every complete command in it before moving to the next client. That is why a pipelined batch from one client runs back to back, and why a client that sends a huge batch can delay the clients after it in the same pass.\n\nOne thing surprised me while writing this lesson. The first busy script I tried looped on `redis.call('TIME')` until 2,000 ms had passed. It ran for 5 seconds instead. Inside a script, `TIME` kept returning the moment the script started, and it only moved when the 5-second busy handling kicked in. `os.clock()` measures CPU time, which keeps moving, so the lab uses it. If you ever write a script that waits on server time, it won't work for the same reason, and you shouldn't want a script that waits anyway.\n\nIf you want the source, `src/ae.c` in the Redis repository is the event loop library (it wraps epoll on Linux and kqueue on macOS), and `src/networking.c` reads queries and writes replies."
- },
- "sources": [
-  {
-   "title": "Harizopoulos, Abadi, Madden and Stonebraker, OLTP Through the Looking Glass, and What We Found There (SIGMOD 2008)",
-   "url": "https://faculty.cc.gatech.edu/~jarulraj/courses/4420-s19/papers/02-inmemory/hstore-lookingglass.pdf"
-  },
-  {
-   "title": "Diagnosing latency issues (Redis docs)",
-   "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/"
-  },
-  {
-   "title": "Redis serialization protocol specification",
-   "url": "https://redis.io/docs/latest/develop/reference/protocol-spec/"
-  },
-  {
-   "title": "redis.conf for Redis 8.10",
-   "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf"
-  },
-  {
-   "title": "Dragonfly v2.1 release notes (the license change)",
-   "url": "https://github.com/dragonflydb/dragonfly/releases/tag/v2.1"
-  }
- ]
 }

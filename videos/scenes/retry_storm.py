@@ -1,64 +1,20 @@
 from sfz import *
 
-# "Goodput" at the start of a sentence came out as "output".
-SAY.insert(0, (r"\b[Gg]oodput\b", lambda m: m.group(0)[0] + "ood put"))
+SAY.insert(0, (r"\b111,557\b", "a hundred and eleven thousand, five hundred and fifty-seven"))
 
-# the pipeline: clients, a queue, the service
-PY = 1.85
-CX, QX, SX = -5.3, -0.85, 3.55
-CWD, QW, SWD, BH, QH = 2.2, 3.6, 2.5, 1.15, 0.75
-# the chart: 0 to 40 s across, 0 to 3,200 a second up
-X0, X1, Y0, YH, TMAX = -5.0, 4.4, -3.0, 2.9, 40.0
-
-# the lab's simulation (found-03, RetryStormDemo): capacity, attempts offered, goodput and queue, by time
-CAP = [(0, 1000), (10, 1000), (10, 400), (15, 400), (15, 1000), (40, 1000)]
-RUNS = {
-    "retry": dict(att=[(0, 800), (10.3, 800), (11, 3200), (40, 3200)],
-                  good=[(0, 800), (10, 800), (10, 400), (10.4, 400), (11, 0), (40, 0)],
-                  que=[(0, 0), (10, 0), (10.2, 80), (11, 4157), (15, 14757), (40, 69757)]),
-    "budget": dict(att=[(0, 800), (10.3, 800), (11, 880), (33.5, 880), (34, 800), (40, 800)],
-                   good=[(0, 800), (10, 800), (10, 400), (10.4, 400), (11, 0), (33.5, 0), (34, 800), (40, 800)],
-                   que=[(0, 0), (10, 0), (10.2, 80), (11, 937), (15, 2257), (30, 457), (33.8, 0), (40, 0)]),
-}
-
-
-def X(t):
-    return X0 + (X1 - X0) * t / TMAX
-
-
-def Y(v):
-    return Y0 + YH * v / 3200
-
-
-def at(pts, t):
-    """Value of a piecewise-linear series at t (the later value where it jumps)."""
-    v = pts[0][1] if t <= pts[0][0] else pts[-1][1]
-    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
-        if t0 <= t <= t1:
-            v = v1 if t1 == t0 else v0 + (v1 - v0) * (t - t0) / (t1 - t0)
-    return v
-
-
-def upto(pts, t):
-    out = [(0, pts[0][1])] + [(a, b) for a, b in pts if 0 < a <= t] + [(t, at(pts, t))]
-    return [[X(a), Y(b), 0] for a, b in out]
-
-
-def num(v):
-    return f"{int(round(v)):,}"
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def fillc(color):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), 0.14)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CL, CL_W, CL_H = np.array([-5.0, 0.3, 0]), 2.0, 1.3      # the customers, later the clients
+SV, SV_W, SV_H = np.array([4.0, 0.3, 0]), 2.4, 1.3       # the barista, later the server
+RAIL_Y, SLIP_Y = 0.62, 0.36                              # the rail of slips, later the queue
+RAIL_X0, RAIL_X1 = -2.5, 2.05
+SLIP_X = [1.75 - 0.36 * k for k in range(12)]             # k = 0 is the front, next to the barista
+LOOP_Y, ANS_Y = 2.0, -1.15                               # the retry loop above, the answers path below
+RISER_X = 1.4
+QLAB = np.array([-0.45, -0.15, 0])
+BIN = np.array([1.55, -0.55, 0])
+READ_Y, BAR_Y, CAP_Y = -1.68, -2.6, -3.2
+CLOCK = np.array([-5.45, 3.1, 0])
+BOARD_X, BOARD_Y = 2.1, 3.1                              # the scoreboard of fixes, top right
 
 
 class Base(VoiceScene):
@@ -114,225 +70,461 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
+
+
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
+def swap(old, new, d=UP):
+    """Replace one label with another: the old one leaves before the new one arrives, so they never overlap."""
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def poly(pts):
+    return VMobject().set_points_as_corners([np.array([x, y, 0]) for x, y in pts])
+
+
+def dot_on(path, color=YELLOW_M, rt=0.8, frac=1.0):
+    """A dot that runs along a path (part of the way if frac < 1, then fades: nobody there to take it)."""
+    d = Dot(radius=0.08, color=color).move_to(path.get_start())
+    seq = [FadeIn(d, run_time=0.05)]
+    if frac < 1:
+        seq += [MoveAlongPath(d, path, rate_func=lambda t: smooth(t) * frac, run_time=rt), FadeOut(d, scale=1.8, run_time=0.25)]
+    else:
+        seq += [MoveAlongPath(d, path, rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.15)]
+    return Succession(*seq)
+
+
+def labelled_box(c, w, h, color, top, sub, sub_color=GREY_B):
+    r = RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1).move_to(c)
+    a = T(top, 26).move_to(c + [0, 0.22, 0])
+    b = T(sub, 19, sub_color).move_to(c + [0, -0.25, 0])
+    return r, a, b
+
 
 class RetryStorm(Base):
-    """found-03, section 3: a service that finishes 1,000 a second gets 800. A dependency slows it to 400 a second
-    for five seconds; clients time out after 200 ms and retry up to 4 attempts, so 3,200 attempts a second arrive
-    and goodput stays at zero after capacity returns (a metastable failure). A 10% retry budget caps the load at
-    880 a second, so the backlog drains and the service is back at 34 s."""
+    """found-03, section 3. A program slows for five seconds and is still down a minute later. A coffee counter: slips
+    on a rail, a barista, customers who reorder after three minutes, a slow coffee machine, a café full of ghosts.
+    Mapped to server, queue, clients, timeout and retry; the lab's numbers (1,000 a second, 800 arriving, 200 ms,
+    4 attempts, 400 a second for five seconds). Goodput, metastable failure. Backoff and no retries tried; a retry
+    budget and dropping expired work fix it. Guardrail, moral and a check question."""
+
+    # --- small state helpers: each returns animations and updates what is on screen ---
+    def cap(self, s, color=GREY_B, size=24):
+        new = (T(s, size, color) if isinstance(s, str) else s)
+        fit(new, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def clock(self, s):
+        return self.put("clock", T(s, 26, WHITE).move_to(CLOCK))
+
+    def rate(self, s, color=WHITE):
+        return self.put("rate", T(s, 20, color).move_to([(CL[0] + CL_W / 2 + RAIL_X0) / 2, 0.68, 0]))
+
+    def queued(self, s, color=GREY_B):
+        return self.put("qname", T("the queue: " + s.split(": ")[1], 20, color).move_to(QLAB))
+
+    def reads(self, good, waste):
+        g = T(f"goodput: {good} a second", 22, GREEN_M if good != "0" else RED_M).move_to([-3.0, READ_Y, 0])
+        w = T(f"wasted: {waste} a second", 22, RED_M if waste != "0" else GREY_B).move_to([2.2, READ_Y, 0])
+        return self.put("good", g) + self.put("waste", w)
+
+    def rail(self, yellow, grey):
+        """The slips on the rail: `grey` slips at the front (nobody waits for them), then `yellow` ones behind."""
+        out = []
+        for k, s in enumerate(self.slips):
+            if k < grey:
+                out.append(s.animate.set_stroke(GREY_C, opacity=1).set_fill(fillc(GREY_C, 0.35), 1))
+            elif k < grey + yellow:
+                out.append(s.animate.set_stroke(YELLOW_M, opacity=1).set_fill(fillc(YELLOW_M, 0.3), 1))
+            else:
+                out.append(s.animate.set_stroke(opacity=0).set_fill(opacity=0))
+        return out
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
     def construct(self):
-        self.title_card("Retry storms", "a five-second slowdown that never ends")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Trying again, all at once", "how retries keep a program down")
 
-        self.mode = "retry"
-        tr = {"retry": ValueTracker(0), "budget": ValueTracker(10)}
+        # ---------------- scene 1: the symptom ----------------
+        X0, X1, Y0, Y1 = -4.6, 4.6, -1.3, 1.6
 
-        def now():
-            return tr[self.mode].get_value()
+        def px(t):
+            return X0 + (X1 - X0) * t / 60
 
-        def run():
-            return RUNS[self.mode]
+        def py(v):
+            return Y0 + (Y1 - Y0) * v / 1000
 
-        # ---- the pipeline ---------------------------------------------------------------------------------------
-        cl_r = RoundedRectangle(corner_radius=0.14, width=CWD, height=BH, stroke_color=WHITE, stroke_width=3)
-        cl_r.set_fill(BLACK, 1).move_to([CX, PY, 0])
-        clients = VGroup(cl_r, T("clients", 24).move_to([CX, PY + 0.24, 0]),
-                         T("800 new a second", 18, GREY_B).move_to([CX, PY - 0.2, 0]))
-        a_in = Arrow([CX + CWD / 2 + 0.05, PY, 0], [QX - QW / 2 - 0.05, PY, 0], buff=0, stroke_width=3, color=GREY_B,
-                     max_tip_length_to_length_ratio=0.15)
-        q_r = Rectangle(width=QW, height=QH, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1).move_to([QX, PY, 0])
-        a_out = Arrow([QX + QW / 2 + 0.05, PY, 0], [SX - SWD / 2 - 0.05, PY, 0], buff=0, stroke_width=3, color=GREY_B,
-                      max_tip_length_to_length_ratio=0.15)
-        sv_r = RoundedRectangle(corner_radius=0.14, width=SWD, height=BH, stroke_color=WHITE, stroke_width=3)
-        sv_r.set_fill(BLACK, 1).move_to([SX, PY, 0])
+        axes = VGroup(Line([X0, Y0, 0], [X1 + 0.2, Y0, 0], stroke_width=2, color=GREY_B),
+                      Line([X0, Y0, 0], [X0, Y1 + 0.2, 0], stroke_width=2, color=GREY_B))
+        ticks = VGroup(*[T(str(t), 18, GREY_B).move_to([px(t), Y0 - 0.3, 0]) for t in (0, 10, 15, 30, 60)])
+        axl = VGroup(T("seconds", 18, GREY_B).move_to([X1, Y0 - 0.62, 0]),
+                     left_at(T("useful answers a second", 20, GREY_B), X0 - 0.1, Y1 + 0.45))
+        band = Rectangle(width=px(15) - px(10), height=Y1 - Y0, stroke_width=0).set_fill(RED_M, 0.22).move_to([(px(10) + px(15)) / 2, (Y0 + Y1) / 2, 0])
+        band_l = left_at(T("slow for 5 s", 20, RED_M), px(15) + 0.15, Y1 - 0.2)
+        good_a = poly([(px(0), py(800)), (px(10), py(800)), (px(10.5), py(161)), (px(11), py(0))]).set_stroke(GREEN_M, 4)
+        good_b = poly([(px(11), py(0)), (px(60), py(0))]).set_stroke(RED_M, 5)
+        self.steps("Here's a strange outage. A program slows down for five seconds, then gets its speed back.", [
+            (lambda: [Create(axes), FadeIn(ticks), FadeIn(axl)], 1.0),
+            "A program",
+            (lambda: [Create(good_a)], 1.0),
+            "slows down",
+            (lambda: [FadeIn(band), FadeIn(band_l)], 0.6),
+        ])
+        self.steps("Yet a minute later, it's still giving useful answers to nobody. The cause is long gone, so what's keeping it down?", [
+            (lambda: [Create(good_b)], 2.0),
+            "The cause",
+            (lambda: self.cap("the cause: gone after 5 seconds.   useful answers: still zero a minute later", WHITE), 0.6),
+        ])
+        self.steps("The culprit is the most innocent habit in programming: trying again.", [
+            (lambda: self.cap("the culprit: trying again", YELLOW_M, 28), 0.6),
+        ], after=0.5)
 
-        def sv_color(m):
-            bad = at(CAP, now()) < 1000
-            m.set_stroke(RED_M if bad else WHITE).set_fill(fillc(RED_M) if bad else BLACK, 1)
+        # ---------------- scene 2: the coffee counter ----------------
+        cl_r, cl_a, cl_b = labelled_box(CL, CL_W, CL_H, BLUE_M, "customers", "at the till")
+        sv_r, sv_a, sv_b = labelled_box(SV, SV_W, SV_H, TEAL_M, "barista", "makes drinks")
+        rail = Line([RAIL_X0, RAIL_Y, 0], [RAIL_X1, RAIL_Y, 0], stroke_width=4, color=GREY_B)
+        self.slips = VGroup(*[Rectangle(width=0.27, height=0.46, stroke_width=2.5).set_stroke(YELLOW_M, opacity=0)
+                              .set_fill(BLACK, 0).move_to([x, SLIP_Y, 0]) for x in SLIP_X])
+        a_in = Arrow([CL[0] + CL_W / 2 + 0.08, CL[1], 0], [RAIL_X0 - 0.08, CL[1], 0], buff=0, stroke_width=3, color=GREY_B,
+                     max_tip_length_to_length_ratio=0.25)
+        a_out = Arrow([RAIL_X1 + 0.08, SV[1], 0], [SV[0] - SV_W / 2 - 0.08, SV[1], 0], buff=0, stroke_width=3, color=GREY_B,
+                      max_tip_length_to_length_ratio=0.3)
+        ans_pts = [(SV[0], SV[1] - SV_H / 2 - 0.08), (SV[0], ANS_Y), (CL[0], ANS_Y), (CL[0], CL[1] - CL_H / 2 - 0.08)]
+        ans = poly(ans_pts).set_stroke(GREY_C, 2)
+        ans_tip = Arrow([CL[0], ANS_Y + 0.3, 0], [CL[0], CL[1] - CL_H / 2 - 0.08, 0], buff=0, stroke_width=2, color=GREY_C,
+                        max_tip_length_to_length_ratio=0.5)
+        ans_path = poly(ans_pts)
+        in_path = Line(a_in.get_start(), a_in.get_end())
+        out_path = Line(a_out.get_start(), a_out.get_end())
 
-        sv_r.add_updater(sv_color)
-        sv_t = T("payment service", 22).move_to([SX, PY + 0.24, 0])
-        sv_sub = always_redraw(lambda: T(f"capacity {num(at(CAP, now()))}/s", 18,
-                                         RED_M if at(CAP, now()) < 1000 else GREY_B).move_to([SX, PY - 0.2, 0]))
-        a_lab = always_redraw(lambda: T(f"{num(at(run()['att'], now()))}/s", 18,
-                                        RED_M if at(run()['att'], now()) > 1000 else GREY_B).next_to(a_in, UP, buff=0.12))
+        def flow(n=3, useful=True, ans_col=GREEN_M):
+            """n orders arrive, n are served; each answer reaches the customer (useful) or fades (nobody waiting)."""
+            arrive = LaggedStart(*[dot_on(in_path, YELLOW_M, 0.5) for _ in range(n)], lag_ratio=0.35)
+            serve = LaggedStart(*[Succession(dot_on(out_path, YELLOW_M, 0.4),
+                                             dot_on(ans_path, ans_col if useful else RED_M, 1.1, 1.0 if useful else 0.45))
+                                  for _ in range(n)], lag_ratio=0.35)
+            return [arrive, serve]
 
-        def qfill():
-            q = at(run()["que"], now())
-            f = min(1.0, (q / 25000) ** 0.5)
-            w = max(0.001, f * (QW - 0.12))
-            return Rectangle(width=w, height=QH - 0.12, stroke_width=0).set_fill(RED_M, 0.45).move_to(
-                [QX - QW / 2 + 0.06 + w / 2, PY, 0])
-
-        q_fill = always_redraw(qfill)
-        q_lab = always_redraw(lambda: T(f"queue: {num(at(run()['que'], now()))}", 18, GREY_B).move_to([QX, PY - 0.62, 0]))
-        g_lab = always_redraw(lambda: T(f"goodput: {num(at(run()['good'], now()))}/s", 18,
-                                        GREEN_M if at(run()['good'], now()) > 0 else RED_M).move_to([SX, PY - 0.86, 0]))
-        clock = always_redraw(lambda: left_at(T(f"t = {int(now() + 1e-6)} s", 24, GREY_A), 5.15, 3.3))
-
-        # the retry loop: from the queue back to the clients
-        LY = 2.95
-        loop_pts = [[QX, PY + QH / 2 + 0.05, 0], [QX, LY, 0], [CX, LY, 0], [CX, PY + BH / 2 + 0.06, 0]]
-        loop_l = VGroup(Line(loop_pts[0], loop_pts[1]), Line(loop_pts[1], loop_pts[2]),
-                        Arrow(loop_pts[2], loop_pts[3], buff=0, max_tip_length_to_length_ratio=0.5,
-                              max_stroke_width_to_length_ratio=10)).set_stroke(GREY_C, 3).set_color(GREY_C)
-        loop_path = VMobject().set_points_as_corners(loop_pts)
-        loop_t = T("no answer in 200 ms: try again, up to 4 attempts", 18, GREY_B).move_to([(QX + CX) / 2, LY + 0.3, 0])
-
-        def loop_dots(n, color=RED_M, rt=1.0):
-            return LaggedStart(*[travel(loop_path, color, rt) for _ in range(n)], lag_ratio=0.35)
-
-        # ---- the chart ------------------------------------------------------------------------------------------
-        axes = VGroup(Line([X0, Y0, 0], [X1 + 0.15, Y0, 0]), Line([X0, Y0, 0], [X0, Y0 + YH + 0.1, 0])).set_stroke(GREY_B, 2)
-        xt = VGroup(*[VGroup(Line([X(t), Y0 - 0.07, 0], [X(t), Y0 + 0.07, 0], stroke_width=2, color=GREY_B),
-                             T(f"{t} s" if t else "0", 16, GREY_B).move_to([X(t), Y0 - 0.3, 0])) for t in (0, 10, 15, 20, 30, 40)])
-        yt = VGroup(*[T(s, 16, GREY_B).move_to([X0 - 0.42, Y(v), 0]) for s, v in (("1,000", 1000), ("3,200", 3200))])
-        shade = Rectangle(width=X(15) - X(10), height=YH, stroke_width=0).set_fill(RED_M, 0.13)
-        shade.move_to([(X(10) + X(15)) / 2, Y0 + YH / 2, 0])
-        shade_t = T("slowdown", 15, RED_M).move_to([X(13.35), -1.3, 0])
-
-        def entry(color, s):
-            return VGroup(Line(ORIGIN, 0.45 * RIGHT, stroke_width=4, color=color), T(s, 18, GREY_B)).arrange(RIGHT, buff=0.14)
-
-        legend = VGroup(entry(RED_M, "attempts sent"), entry(GREEN_M, "goodput (useful answers)"),
-                        entry(GREY_B, "capacity")).arrange(RIGHT, buff=0.55).move_to([-0.3, 0.35, 0])
-
-        def curve(pts, key, color, w, mode):
-            def make():
-                p = upto(pts if key is None else RUNS[mode][key], tr[mode].get_value())
-                return VMobject(stroke_color=color, stroke_width=w).set_points_as_corners(p)
-            return always_redraw(make)
-
-        cap_c = curve(CAP, None, GREY_B, 2.5, "retry")
-        good_c = curve(None, "good", GREEN_M, 6, "retry")
-        att_c = curve(None, "att", RED_M, 3.5, "retry")
-
-        # ---- the story ------------------------------------------------------------------------------------------
-        flow_in = lambda n, c=GREY_A: LaggedStart(*[travel(a_in, c, 0.5) for _ in range(n)], lag_ratio=0.4)
-        flow_out = lambda n, c=GREEN_M: LaggedStart(*[travel(a_out, c, 0.5) for _ in range(n)], lag_ratio=0.4)
-
-        self.steps("Take a payment service that can finish 1,000 requests a second. "
-                   "Its clients send 800, so it's 80 percent busy and answers in about a millisecond.", [
-            (lambda: [FadeIn(sv_r), FadeIn(sv_t), FadeIn(sv_sub)], 0.8),
-            "Its clients",
-            (lambda: [FadeIn(clients), GrowArrow(a_in), FadeIn(a_lab), FadeIn(q_r), FadeIn(q_fill), FadeIn(q_lab),
-                      GrowArrow(a_out)], 0.9),
-            "so it's 80",
-            (lambda: [flow_in(4), flow_out(4)], 1.4),
-            (lambda: [FadeIn(g_lab)], 0.5),
+        self.steps("Picture a coffee counter. Each order is a slip on a rail, and the barista makes drinks in the order the slips sit there.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(axes, ticks, axl, band, band_l, good_a, good_b))], 0.7),
+            "Picture a coffee",
+            (lambda: [FadeIn(VGroup(cl_r, cl_a, cl_b), shift=0.1 * RIGHT), FadeIn(VGroup(sv_r, sv_a, sv_b), shift=0.1 * LEFT)], 0.8),
+            "Each order",
+            (lambda: [Create(rail), GrowArrow(a_in), GrowArrow(a_out), *self.put("qname", T("the rail", 20, GREY_B).move_to(QLAB))], 0.8),
+            "a slip on a rail",
+            (lambda: self.rail(3, 0), 0.5),
+            "the barista makes",
+            (lambda: [Create(ans), GrowArrow(ans_tip), *self.put("ans", T("drinks", 20, GREY_B).move_to([-1.5, ANS_Y + 0.3, 0]))], 0.7),
+            (lambda: flow(2), 2.0),
+        ])
+        self.steps("On a normal morning she keeps up, and the rail stays almost empty.", [
+            (lambda: [*flow(3), *self.rail(1, 0)], 2.2),
+        ])
+        loop_pts = [(RISER_X, RAIL_Y + 0.06), (RISER_X, LOOP_Y), (CL[0], LOOP_Y), (CL[0], CL[1] + CL_H / 2 + 0.08)]
+        loop = poly(loop_pts).set_stroke(RED_M, 3)
+        loop_tip = Arrow([CL[0], LOOP_Y - 0.3, 0], [CL[0], CL[1] + CL_H / 2 + 0.08, 0], buff=0, stroke_width=3, color=RED_M,
+                         max_tip_length_to_length_ratio=0.5)
+        loop_path = poly(loop_pts)
+        self.steps("One more rule. A customer who has waited three minutes gives up, goes back to the till and orders again. "
+                   "The first slip stays on the rail.", [
+            "A customer who",
+            (lambda: [Create(loop), GrowArrow(loop_tip),
+                      *self.put("loop", T("waited 3 minutes: order again", 20, RED_M).move_to([-3.35, LOOP_Y + 0.3, 0]))], 1.0),
+            "orders again",
+            (lambda: [dot_on(loop_path, RED_M, 1.0)], 1.0),
+            "The first slip",
+            (lambda: [Indicate(self.slips[0], color=YELLOW_M, scale_factor=1.3)], 0.8),
         ])
 
-        self.steps("Each client waits 200 milliseconds for an answer. If none comes, it tries again at once, "
-                   "up to four attempts in all.", [
-            (lambda: [glow(cl_r, GREY_A)], 0.8),
-            "If none comes",
-            (lambda: [Create(loop_l), FadeIn(loop_t)], 1.2),
+        # ---------------- scene 3: the slow machine ----------------
+        sv_b2 = T("slow machine", 19, RED_M).move_to(sv_b)
+        sv_b3 = T("makes drinks", 19, GREY_B).move_to(sv_b)
+        sv_a2 = T("server", 26).move_to(sv_a)
+        cl_a2 = T("clients", 26).move_to(cl_a)
+        cl_b2 = T("send requests", 19, GREY_B).move_to(cl_b)
+        sv_cap2 = T("1,000 a second", 19, GREY_B).move_to(sv_b)
+        sv_slow2 = T("400 a second", 19, RED_M).move_to(sv_b)
+        sv_cap3 = T("1,000 a second", 19, GREY_B).move_to(sv_b)
+        self.steps("Now the coffee machine runs slowly for a few minutes. Slips pile up. People give up and order again, "
+                   "so the pile grows even faster.", [
+            "runs slowly",
+            (lambda: [sv_r.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), swap(sv_b, sv_b2)], 0.7),
+            "Slips pile up",
+            (lambda: [*flow(4), *self.rail(6, 0)], 1.8),
+            "People give up",
+            (lambda: [LaggedStart(*[dot_on(loop_path, RED_M, 0.9) for _ in range(3)], lag_ratio=0.3), *self.rail(7, 3)], 1.6),
+            (lambda: self.rail(8, 4), 0.6),
+        ])
+        self.steps("Soon the barista is making drinks for people who have left. Then the machine recovers, and it makes no difference. "
+                   "The reorders keep coming faster than she can work.", [
+            "making drinks",
+            (lambda: [*flow(3, useful=False), *self.rail(4, 8)], 2.0),
+            "Then the machine",
+            (lambda: [sv_r.animate.set_stroke(TEAL_M).set_fill(fillc(TEAL_M), 1), swap(sv_b2, sv_b3)], 0.7),
+            "The reorders",
+            (lambda: [LaggedStart(*[dot_on(loop_path, RED_M, 0.8) for _ in range(4)], lag_ratio=0.25), *flow(3, useful=False),
+                      *self.rail(4, 8)], 2.0),
+        ])
+        self.steps("She's busier than ever, serving a café full of ghosts. So the slowdown is over, but the reorders keep the rail full.", [
+            (lambda: [*flow(3, useful=False), *self.cap("a café full of ghosts")], 1.8),
+            "So the slowdown",
+            (lambda: [*self.cap("the slowdown is over; the reorders keep the rail full", WHITE),
+                      LaggedStart(*[Indicate(s, color=GREY_B, scale_factor=1.15) for s in self.slips], lag_ratio=0.06)], 1.2),
         ])
 
-        self.steps("For ten seconds, all 800 attempts a second get a useful answer. "
-                   "The rate of useful answers is called goodput.", [
-            (lambda: [Create(axes), FadeIn(xt), FadeIn(yt), FadeIn(legend), FadeIn(clock)], 0.9),
-            (lambda: [FadeIn(cap_c), FadeIn(good_c), FadeIn(att_c)], 0.1),
-            (lambda: [tr["retry"].animate(rate_func=linear).set_value(10), flow_in(5), flow_out(5)], 3.0),
-            "The rate",
-            (lambda: [glow(legend[1][0], GREEN_M, 1.2), Indicate(g_lab, color=GREEN_M)], 1.0),
+        # ---------------- scene 4: the program, with numbers ----------------
+        self.steps("Programs do the same. The barista is the server, the program doing the work. The rail is its queue. "
+                   "The customers are clients, programs that send it requests.", [
+            (lambda: [*self.uncap(), *self.rail(0, 0)], 0.5),
+            "The barista is",
+            (lambda: [swap(sv_a, sv_a2), glow(sv_r, TEAL_M)], 0.7),
+            "The rail is",
+            (lambda: self.put("qname", T("the queue", 20, GREY_B).move_to(QLAB)), 0.6),
+            "The customers",
+            (lambda: [swap(cl_a, cl_a2), swap(cl_b, cl_b2), glow(cl_r, BLUE_M)], 0.7),
+        ])
+        self.steps("Three minutes is the timeout, how long a client waits before giving up. And ordering again is a retry.", [
+            "Three minutes",
+            (lambda: self.put("loop", T("timed out after 200 ms: a retry", 20, RED_M).move_to([-3.35, LOOP_Y + 0.3, 0])), 0.7),
+            "a retry",
+            (lambda: [dot_on(loop_path, RED_M, 1.0), *self.put("ans", T("answers", 20, GREY_B).move_to([-1.5, ANS_Y + 0.3, 0]))], 1.0),
+        ])
+        sv_cap = T("1,000 a second", 19, GREY_B).move_to(sv_b)
+        self.steps("Now with numbers. The server can finish 1,000 requests a second, and gets 800. "
+                   "So it's 80% busy, and answers in about a millisecond.", [
+            "The server can",
+            (lambda: [swap(sv_b3, sv_cap), *self.clock("t = 5 s")], 0.7),
+            "and gets 800",
+            (lambda: [*self.rate("800/s"), *flow(3), *self.queued("queued: 0")], 1.6),
+            "So it's 80%",
+            (lambda: self.reads("800", "0"), 0.6),
+        ])
+        self.steps("Clients give up on an attempt after 200 milliseconds and try again at once, up to 4 attempts in all.", [
+            (lambda: [glow(loop, RED_M, 1.0)], 0.9),
+            "up to 4",
+            (lambda: self.cap("each request: up to 4 attempts", WHITE), 0.6),
         ])
 
-        self.steps("At ten seconds, a service it depends on slows down. "
-                   "For five seconds, it can finish only 400 a second.", [
-            (lambda: [FadeIn(shade), FadeIn(shade_t), tr["retry"].animate(rate_func=linear).set_value(10.05)], 0.8),
+        # ---------------- scene 5: predict, then watch ----------------
+        sv_slow = T("400 a second", 19, RED_M).move_to(sv_b)
+        self.steps("At ten seconds in, something the server depends on slows down. For five seconds, it can finish only 400 a second. "
+                   "Then it's back to 1,000. When does the service recover? Pause and guess.", [
+            (lambda: [*self.uncap(), *self.clock("t = 10 s")], 0.5),
             "For five seconds",
-            (lambda: [glow(sv_r, RED_M)], 0.9),
+            (lambda: [sv_r.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), swap(sv_cap, sv_slow)], 0.7),
+            "When does",
+            (lambda: self.cap("slow from 10 s to 15 s.  back to normal when?", WHITE), 0.6),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Let's watch. In a fifth of a second, 80 are queued: "
+                   "200 milliseconds of work at this speed. So anything joining now times out before it's served.", [
+            (lambda: [*self.uncap(), *flow(3), *self.rail(3, 0), *self.reads("400", "0")], 1.6),
+            "In a fifth",
+            (lambda: [*self.clock("t = 10.2 s"), *self.queued("queued: 80", WHITE), *self.rail(6, 0)], 0.6),
+            "200 milliseconds",
+            (lambda: self.cap("80 queued, at 400 a second: 200 ms of waiting", WHITE), 0.6),
+            "So anything",
+            (lambda: [Indicate(self.slips[5], color=RED_M, scale_factor=1.3)], 0.8),
+        ])
+        self.steps("Every attempt times out, so every request is sent four times. 800 new requests become 3,200 attempts a second.", [
+            (lambda: [*self.clock("t = 11 s"), LaggedStart(*[dot_on(loop_path, RED_M, 0.9) for _ in range(4)], lag_ratio=0.25),
+                      *self.rail(7, 5)], 1.6),
+            "800 new",
+            (lambda: [*self.rate("3,200/s", RED_M), *self.queued("queued: 4,157", WHITE), *self.cap("800 new requests × 4 attempts = 3,200 a second", WHITE)], 0.7),
+        ])
+        self.steps("The server can't tell who's still waiting. It works through the queue in order, and every answer goes to a client "
+                   "that already gave up.", [
+            (lambda: [*self.uncap(), *self.rail(4, 8)], 0.6),
+            "It works through",
+            (lambda: [*flow(3, useful=False), *self.reads("0", "400")], 2.0),
+        ])
+        self.steps("At fifteen seconds, the server is back to full speed. It makes no difference. "
+                   "3,200 attempts arrive each second, more than three times what it can do.", [
+            (lambda: [*self.clock("t = 16 s"), sv_r.animate.set_stroke(TEAL_M).set_fill(fillc(TEAL_M), 1), swap(sv_slow, sv_cap2)], 0.7),
+            "It makes no",
+            (lambda: [*flow(3, useful=False), *self.reads("0", "1,000"), *self.queued("queued: 16,957", WHITE)], 1.6),
+            "3,200 attempts",
+            (lambda: [Indicate(self.lab["rate"], color=RED_M, scale_factor=1.3), LaggedStart(*[dot_on(loop_path, RED_M, 0.8) for _ in range(4)], lag_ratio=0.25)], 1.4),
+        ])
+        self.steps("A minute in, 111,557 attempts are queued, and not one answer is useful. Well... that was a long five seconds.", [
+            (lambda: [*self.clock("t = 59 s"), *self.queued("queued: 111,557", RED_M), *flow(3, useful=False)], 1.6),
+            "Well",
+            (lambda: [Indicate(self.lab["good"], color=RED_M, scale_factor=1.15)], 0.8),
+        ], after=0.4)
+        self.stamp("storm")
+        self.steps("The rate of answers someone is still waiting for is called goodput. Here it's zero, and it stays zero.", [
+            "called goodput",
+            (lambda: [*self.cap("goodput: answers someone is still waiting for"), glow(ans, GREEN_M, 1.0)], 0.8),
+        ])
+        self.steps("A trigger pushed the system into a bad state, and its own behaviour keeps it there after the trigger is gone. "
+                   "That's called a metastable failure. Getting out takes a strong push, like cutting the load or restarting.", [
+            "its own behaviour",
+            (lambda: [glow(loop, RED_M, 1.0), LaggedStart(*[dot_on(loop_path, RED_M, 0.8) for _ in range(3)], lag_ratio=0.3)], 1.2),
+            "That's called",
+            (lambda: self.cap("metastable failure: the trigger is gone, and the system keeps itself down", YELLOW_M), 0.7),
+            "Getting out",
+            (lambda: self.cap("getting out: cut the load, or restart"), 0.6),
         ])
 
-        self.steps("Now 800 arrive each second and 400 leave, so a queue builds. "
-                   "Soon a new request waits longer than its client will, and the client sends it again.", [
-            (lambda: [tr["retry"].animate(rate_func=linear).set_value(10.2), flow_in(3), flow_out(1, GREY_A)], 1.6),
-            "Soon a new",
-            (lambda: [glow(q_r, RED_M, 1.03)], 0.8),
-            "and the client",
-            (lambda: [loop_l.animate.set_color(RED_M), loop_t.animate.set_color(RED_M),
-                      tr["retry"].animate(rate_func=linear).set_value(10.4), loop_dots(3)], 1.6),
+        # ---------------- scene 6: the obvious fixes ----------------
+        rows = []
+
+        def board(text, result, color):
+            y = BOARD_Y - 0.4 * len(rows)
+            r = VGroup(left_at(T(text, 20, GREY_B), BOARD_X, y), right_at(T(result, 20, color), BOARD_X + 4.3, y))
+            rows.append(r)
+            return [FadeIn(r, shift=0.1 * LEFT)]
+
+        def tag(text, color=WHITE):
+            r = RoundedRectangle(corner_radius=0.1, width=1.9, height=0.5, stroke_color=color, stroke_width=2.5).set_fill(BLACK, 1)
+            return self.put("tag", VGroup(r, T(text, 18, color)).move_to([0.1, LOOP_Y, 0]))
+
+        self.steps("So what fixes it? The obvious idea: wait longer before each retry, doubling the wait each time, "
+                   "with a random part so clients don't retry in step. That's exponential backoff with jitter.", [
+            (lambda: [*self.uncap(), *board("retry up to 4, at once", "never", RED_M)], 0.7),
+            "wait longer",
+            (lambda: tag("wait, then double"), 0.6),
+            "That's exponential",
+            (lambda: self.cap("exponential backoff with jitter: wait longer each time, plus a random part", WHITE), 0.6),
+        ])
+        self.steps("To be fair, it spreads the retries out. But every attempt still times out, so there are just as many. "
+                   "This run never recovers.", [
+            (lambda: [*self.rate("1,438/s", RED_M)], 0.5),
+            (lambda: [*self.rate("3,063/s", RED_M)], 0.5),
+            (lambda: [*self.rate("3,228/s", RED_M)], 0.5),
+            "This run",
+            (lambda: [*board("backoff with jitter", "never", RED_M), *self.cap("spread out in time, but just as many", WHITE)], 0.7),
+        ])
+        self.steps("No retries at all? It recovers at 24 seconds. But then every everyday hiccup, like a dropped connection, becomes an error.", [
+            (lambda: [*self.drop("tag"), loop.animate.set_stroke(opacity=0.15), loop_tip.animate.set_opacity(0.15),
+                      self.lab["loop"].animate.set_opacity(0.2), *self.rate("800/s")], 0.7),
+            "It recovers",
+            (lambda: board("no retries at all", "24 s", GOLD_M), 0.6),
+            "But then",
+            (lambda: self.cap("a dropped connection needs exactly one retry", WHITE), 0.6),
         ])
 
-        self.steps("Every attempt now times out, so each request is sent four times: 3,200 attempts a second.", [
-            (lambda: [tr["retry"].animate(rate_func=linear).set_value(11), loop_dots(6), flow_in(6, RED_M)], 2.4),
-            "3,200",
-            (lambda: [Indicate(a_lab, color=RED_M)], 0.8),
+        # ---------------- scene 7: a budget, and the bin ----------------
+        self.steps("A better rule is a retry budget: retries may add at most 10% to the work coming in. "
+                   "Now the server never gets more than 880 a second.", [
+            (lambda: [loop.animate.set_stroke(opacity=1), loop_tip.animate.set_opacity(1), self.lab["loop"].animate.set_opacity(1), *self.uncap()], 0.6),
+            "a retry budget",
+            (lambda: tag("budget: +10%", GREEN_M), 0.6),
+            "Now the server",
+            (lambda: [*self.rate("880/s", GOLD_M), *self.cap("800 new + 10% = at most 880 a second", WHITE)], 0.7),
+        ])
+        self.steps("It recovers at 34 seconds. Slowly, because it still serves a backlog of attempts nobody is waiting for.", [
+            (lambda: [*board("retry budget, 10%", "34 s", GOLD_M), *self.queued("queued: 2,257", WHITE), *self.clock("t = 15 s")], 0.7),
+            "Slowly",
+            (lambda: [*flow(3, useful=False), *self.reads("0", "1,000")], 1.8),
+            (lambda: [*self.queued("queued: 457", WHITE), *self.rail(2, 3), *self.clock("t = 30 s")], 0.5),
+        ])
+        def home(yellow, grey):
+            for k, sl in enumerate(self.slips):
+                sl.move_to([SLIP_X[k], SLIP_Y, 0])
+            return self.rail(yellow, grey)
+
+        bin_r = RoundedRectangle(corner_radius=0.08, width=0.9, height=0.5, stroke_color=GOLD_M, stroke_width=2.5).set_fill(fillc(GOLD_M), 1).move_to(BIN)
+        bin_t = T("bin", 18, GOLD_M).move_to(BIN)
+        self.steps("So drop those too. Picture a barista who throws away slips older than three minutes. In a program, each request carries "
+                   "its deadline, and the server drops attempts that are past it without working on them.", [
+            (lambda: [*self.drop("tag"), *self.uncap(), *self.rail(4, 8), *self.reads("0", "400"), *self.clock("t = 11 s"),
+                      sv_r.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.25), 1), swap(sv_cap2, sv_slow2), *self.rate("3,200/s", RED_M),
+                      *self.queued("queued: 4,157", WHITE)], 0.8),
+            "Picture a barista",
+            (lambda: [FadeIn(VGroup(bin_r, bin_t), shift=0.1 * DOWN)], 0.6),
+            "older than",
+            (lambda: [*[self.slips[k].animate.move_to(BIN).set_opacity(0) for k in range(8)]], 1.0),
+            "each request carries",
+            (lambda: [*self.cap("each attempt carries its deadline; past it, the server drops it unread", WHITE), *home(4, 0)], 0.7),
+        ])
+        self.steps("Clients still retry four times. During the slowdown, all 400 answers a second are now useful. "
+                   "And the moment the server is back to full speed, at fifteen seconds, so is the service.", [
+            (lambda: [*self.rate("2,000/s", RED_M), *self.queued("queued: 404", WHITE), *self.uncap()], 0.6),
+            "During the slowdown",
+            (lambda: [*flow(3), *self.reads("400", "0")], 1.8),
+            "And the moment",
+            (lambda: [*self.clock("t = 16 s"), sv_r.animate.set_stroke(TEAL_M).set_fill(fillc(TEAL_M), 1), swap(sv_slow2, sv_cap3),
+                      *self.rate("800/s"), *self.queued("queued: 0", WHITE), *self.rail(1, 0), *self.reads("880", "0")], 0.8),
+            "so is the service",
+            (lambda: [*board("retry up to 4, drop expired", "15 s", GREEN_M), *flow(2)], 1.6),
+        ])
+        self.stamp("fixed")
+
+        # ---------------- scene 8: a word of fairness ----------------
+        self.steps("So retries aren't the villain. The trouble is retries under overload.", [
+            (lambda: self.cap("the trouble: retries under overload", WHITE), 0.6),
+        ])
+        self.steps("And here the café picture breaks: a real customer reorders once and goes home. "
+                   "A program retries four times and never gets tired.", [
+            (lambda: self.cap("where the café picture breaks", GREY_B), 0.5),
+            "a real customer",
+            (lambda: self.cap("a customer: reorders once, goes home", BLUE_M), 0.5),
+            "A program retries",
+            (lambda: [*self.cap("a program: retries four times, never tires", RED_M), LaggedStart(*[dot_on(loop_path, RED_M, 0.7) for _ in range(4)], lag_ratio=0.25)], 1.4),
         ])
 
-        self.steps("The service answers in order, and each answer goes to a client that gave up long ago. "
-                   "Goodput falls to zero.", [
-            (lambda: [flow_out(4, RED_M)], 1.6),
-            "Goodput falls",
-            (lambda: [Indicate(g_lab, color=RED_M), glow(legend[1][0], RED_M, 1.2)], 1.0),
+        # ---------------- scene 9: the moral, and a check ----------------
+        self.steps("So why was it still down a minute later? Its own clients kept it down, asking again for answers nobody would wait for.", [
+            (lambda: self.cap("why still down a minute later?", WHITE), 0.5),
+            "Its own clients",
+            (lambda: [glow(loop, RED_M, 1.0), glow(cl_r, BLUE_M)], 1.0),
         ])
+        self.steps("Give retries a budget, and drop work nobody waits for.", [
+            (lambda: [*self.cap("give retries a budget, and drop work nobody waits for", YELLOW_M, 28), glow(bin_r, GOLD_M, 1.05)], 0.9),
+        ], after=0.6)
+        self.steps("One quick check. With a 10% budget and 800 new requests a second, what's the most the server is ever sent? Pause and think.", [
+            (lambda: [*self.cap("a 10% budget, 800 new a second: the most the server is ever sent?", WHITE), *self.rate("?/s", YELLOW_M)], 0.7),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("880 a second: the 800 new ones, plus 10% more.", [
+            (lambda: [*self.rate("880/s", GREEN_M), *self.cap("880 a second: 800 new, plus 10%", GREEN_M, 28)], 0.7),
+        ], after=0.3)
+        self.play(*self.cap("give retries a budget, and drop work nobody waits for", YELLOW_M, 28), run_time=0.7)
+        self.wait(2.0)
 
-        self.steps("At fifteen seconds the slow service recovers, and capacity is back to 1,000. It makes no difference.", [
-            (lambda: [tr["retry"].animate(rate_func=linear).set_value(15), loop_dots(5)], 2.0),
-            "It makes",
-            (lambda: [Indicate(g_lab, color=RED_M)], 0.8),
-        ])
 
-        self.steps("3,200 attempts a second is more than three times what it can finish. "
-                   "The queue keeps growing, and goodput stays at zero.", [
-            (lambda: [tr["retry"].animate(rate_func=linear).set_value(40), loop_dots(9), flow_in(9, RED_M)], 4.0),
-        ])
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
-        meta = chip("metastable failure: the retries keep it down", RED_M, 18).move_to([X(27), -1.15, 0])
-        self.steps("The trigger is gone, but the retries keep the service down. "
-                   "That's a metastable failure: its own behaviour holds it there.", [
-            (lambda: [glow(shade_t, RED_M, 1.1), loop_dots(4)], 1.4),
-            "That's a",
-            (lambda: [FadeIn(meta, shift=0.15 * UP)], 0.8),
-            "own behaviour",
-            (lambda: [loop_l.animate(rate_func=there_and_back).set_stroke(width=7)], 1.0),
-        ])
 
-        # the rerun with a budget: old lines dimmed, new ones drawn from t = 10
-        old = VGroup(cap_c, good_c, att_c)
-        for m in old:
-            m.clear_updaters()
-        nb = T("no budget", 16, GREY_C).move_to([X(36), Y(3200) - 0.25, 0])
-        cap_b = curve(CAP, None, GREY_B, 2.5, "budget")
-        good_b = curve(None, "good", GREEN_M, 6, "budget")
-        att_b = curve(None, "att", RED_M, 3.5, "budget")
-        loop_t2 = T("retries capped at 10% of requests", 18, GOLD_M).move_to(loop_t)
-
-        def to_budget():
-            self.mode = "budget"
-            return [old.animate.set_stroke(opacity=0.28), FadeIn(nb)]
-
-        self.steps("A retry budget breaks the loop. Retries may add at most 10 percent to the load, "
-                   "so the service never sees more than 880 a second.", [
-            (lambda: [FadeOut(meta), Transform(loop_t, loop_t2), loop_l.animate.set_color(GOLD_M)], 0.9),
-            "Retries may",
-            (lambda: to_budget(), 0.7),
-            (lambda: [FadeIn(cap_b), FadeIn(good_b), FadeIn(att_b)], 0.1),
-            "so the service",
-            (lambda: [tr["budget"].animate(rate_func=linear).set_value(11), loop_dots(2, GOLD_M), flow_in(3, GOLD_M)], 1.6),
-        ])
-
-        self.steps("Run the same slowdown again. Goodput still drops to zero, but once capacity is back, "
-                   "880 is less than 1,000, so the queue drains.", [
-            (lambda: [tr["budget"].animate(rate_func=linear).set_value(15), loop_dots(2, GOLD_M)], 2.2),
-            "so the queue",
-            (lambda: [tr["budget"].animate(rate_func=linear).set_value(28)], 2.2),
-        ])
-
-        back = T("back to normal at 34 s", 18, GREEN_M).move_to([X(32.5), -1.55, 0])
-        self.steps("Slowly, because the server still works through attempts nobody is waiting for. "
-                   "At 34 seconds it's back to normal.", [
-            (lambda: [tr["budget"].animate(rate_func=linear).set_value(33), flow_out(3, RED_M)], 2.4),
-            "At 34",
-            (lambda: [tr["budget"].animate(rate_func=linear).set_value(40), flow_out(4, GREEN_M)], 1.6),
-            (lambda: [FadeIn(back, shift=0.1 * UP)], 0.6),
-        ])
-
-        self.steps("Retries add load just when a service is slowest. A budget keeps a short slowdown short.", [
-            (lambda: [glow(sv_r, GREY_A), Indicate(a_lab, color=GOLD_M)], 1.0),
-            "A budget",
-            (lambda: [loop_l.animate(rate_func=there_and_back).set_stroke(width=7),
-                      good_b.clear_updaters().animate(rate_func=there_and_back).set_stroke(width=10)], 1.2),
-        ])
-        self.wait(0.6)
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])

@@ -1,441 +1,448 @@
 {
- "id": "cache-03",
- "title": "Core data types and their encodings",
- "minutes": 40,
- "goal": "By the end you can pick the right Redis type for a payment-service job, explain why per-key overhead decides how much an in-memory store holds, predict when a key switches from a compact encoding to a hash table or skip list, and build a leaderboard on a sorted set.",
- "warmup": {
-  "q": "A sorted set holds 128 merchants with short names, and `MEMORY USAGE` says it takes about 1 KB. You add one more short merchant. What happens to its memory?",
-  "options": [
-   "It grows by a few bytes, the size of one more entry",
-   "It grows about tenfold, to around 11 KB",
-   "Nothing changes until the set reaches 512 members",
-   "Redis refuses the add until you raise a memory setting"
-  ],
-  "answer": 1,
-  "why": "Up to 128 members, Redis packs a sorted set into one compact block called a listpack. The 129th member crosses the default `zset-max-listpack-entries` (128), and Redis rebuilds the key as a hash table plus a skip list, with pointers and an allocation per member. On the lab server `MEMORY USAGE` went from 1,076 to 10,888 bytes. 512 is the limit for hashes and for sets of integers, not sorted sets. This lesson builds up why: in a store that lives in memory, the bookkeeping around small objects decides how much fits."
- },
- "sections": [
-  {
-   "h": "Five core types cover most of a payment service",
-   "body": "Lesson 2 ended with a server that keeps typed values in memory. This lesson asks which types a payment service needs, and how an in-memory store lays them out, because in RAM the bookkeeping around small objects decides how much fits. Start with the jobs.\n\nA count of today's authorizations is a number you add to. Redis keeps it in a string, its basic value: any bytes up to 512 MB. When the bytes are an integer, `INCR` and `DECRBY` do the arithmetic on the server.\n\nA payment record has fields: status, amount, currency. With only strings, you would store it as one JSON string and rewrite all of it to change the status (read, change, write back: lesson 2's race), or as one key per field and pay a round trip for each. A hash is a small map of fields inside one key. `HSET payment:43 status settled` changes one field on the server, and `HGETALL` reads them all in one round trip.\n\nSettlement batches waiting for a worker need order: first in, first out. A list keeps insertion order and is cheap at both ends. `RPUSH` adds at the tail, `LPOP` takes from the head. (The Messaging track's lesson on Redis Streams shows why Streams make a better queue.)\n\nThe cards the fraud team flagged today need membership: is this card in the group or not? A set holds unique members. `SADD` adds, `SISMEMBER` checks, and adding a member twice changes nothing.\n\nMerchants ranked by approvals need order by a number that keeps changing. A sorted set holds unique members, each with a number called its score, and keeps them sorted by score. `ZINCRBY` bumps a score, `ZRANGE` reads the top ten.\n\nCost matters as much as shape, because every command runs on lesson 2's single thread. Redis writes costs in Big-O notation, where N is the number of elements in the key. O(1) means the work doesn't grow with the key. O(N) means it grows in step with it: twice the elements, twice the work. O(log N) grows very slowly: doubling N adds one step. M is the number of elements a command returns.\n\n| Type | Example key | Main commands | Cost |\n|---|---|---|---|\n| string | `card:7:status`, `auths:today` | `GET`, `SET`, `INCR` | O(1) |\n| hash | `payment:43` | `HGET`, `HSET`, `HINCRBY` | O(1) per field, `HGETALL` O(N) |\n| list | `settlement:queue` | `RPUSH`, `LPOP`, `LRANGE` | O(1) at either end |\n| set | `fraud:flagged` | `SADD`, `SISMEMBER`, `SINTER` | O(1) add and check, `SMEMBERS` O(N) |\n| sorted set | `merchants:approved` | `ZADD`, `ZINCRBY`, `ZRANGE` | O(log N), ranges O(log N + M) |\n\nKey names are plain strings. The habit is `type:id` with colons, such as `payment:43` or `merchant:m-17:approved`. Redis doesn't care, but a shared prefix lets `SCAN MATCH payment:*` find a family of keys, and your teammates can read it.",
-   "try": {
-    "title": "Use each type once",
-    "minutes": 4,
-    "steps": [
-     "Start the server if it isn't running (`docker compose -f env/redis.yml up -d` from the `labs` folder) and open `docker compose -f env/redis.yml exec redis redis-cli`.",
-     "Type the commands below. Before each one, say what it will print.",
-     "Predict the last one: what happens when you `GET` a hash?"
+  "id": "cache-03",
+  "title": "Core data types and their encodings",
+  "minutes": 40,
+  "goal": "By the end, you can pick the right Redis type for a job, explain why the fixed cost of every key decides how much fits in memory, predict when a key switches to a bigger layout, and rank shops with a sorted set.",
+  "opening": "Picture a café owner who keeps her regulars on one notebook page. With a hundred names, the page is perfect: one sheet, and a finger finds anyone in seconds. At a few thousand, she switches to a box of index cards and a ranked list on the wall. Lookups are quick again, but the paper has grown far faster than the names.\n\nRedis, a program that keeps data in memory and answers requests over the network, makes the same switch inside a key. A sorted set of 128 shops takes about 1 KB, and the 129th shop makes it about 11 KB. It's natural to expect a few bytes more per item. In memory, though, the bookkeeping around small items often weighs more than the items.\n\nInside an in-memory store showed one thread running every command, so each command's cost is everyone's. In this lesson, we'll pick a type for each job in the payments app, watch a key change shape, weigh what a key costs, and rank shops. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "A Redis sorted set (a type that keeps its items in order by a number) holds 128 shops with short names. Redis's `MEMORY USAGE` command says the key takes about 1 KB. You add one more shop with a short name. What happens to its memory?",
+    "options": [
+      "It grows by a few bytes, the size of one more entry",
+      "It grows about tenfold, to around 11 KB",
+      "Nothing changes until the set reaches 512 members",
+      "Redis refuses to add it until you raise a memory setting"
     ],
-    "code": {
-     "lang": "text",
-     "title": "at the redis-cli prompt",
-     "src": "SET card:7:status active\nHSET payment:43 status approved amount 1250 currency EUR\nRPUSH settlement:queue batch-1 batch-2 batch-3\nLPOP settlement:queue\nSADD fraud:flagged card:7 card:9 card:7\nSCARD fraud:flagged\nSISMEMBER fraud:flagged card:9\nZADD merchants:approved 42 m-17 40 m-03 12 m-88\nZRANGE merchants:approved 0 -1 REV WITHSCORES\nTYPE settlement:queue\nGET payment:43"
-    },
-    "expect": "`RPUSH` returns the new length, `(integer) 3`, and `LPOP` hands back `\"batch-1\"`, the oldest entry. `SADD` returns `(integer) 2`: the second `card:7` was already there, so `SCARD` says 2. `SISMEMBER` returns `(integer) 1` (true). `ZRANGE ... REV WITHSCORES` lists `m-17` 42, `m-03` 40, `m-88` 12, highest first. `TYPE settlement:queue` says `list`. `GET payment:43` fails with `(error) WRONGTYPE Operation against a key holding the wrong kind of value`: `GET` is a string command, and the key holds a hash."
-   },
-   "refs": [
-    {
-     "title": "Redis data types",
-     "url": "https://redis.io/docs/latest/develop/data-types/",
-     "kind": "docs"
-    },
-    {
-     "title": "Compare data types",
-     "url": "https://redis.io/docs/latest/develop/data-types/compare-data-types/",
-     "kind": "docs"
-    }
-   ]
+    "answer": 1,
+    "why": "Up to 128 members, Redis packs a sorted set into one compact block of memory called a listpack. The 129th member crosses the default limit, `zset-max-listpack-entries` (128), and Redis rebuilds the key as a hash table plus a skip list, with links and a separate piece of memory for every member. On the lab server, `MEMORY USAGE` went from 1,076 to 10,888 bytes. The first option is the trap, because it's how a list in your own program seems to grow. 512 is the limit for hashes and for sets of whole numbers, not for sorted sets. This lesson builds up why: in a store that lives in memory, the bookkeeping around small items decides how much fits."
   },
-  {
-   "h": "Small keys live in a listpack, big ones in a hash table or skip list",
-   "body": "Picture a hash with three fields stored the way `java.util.HashMap` stores entries: a table of slots, one entry object per field, and separately allocated strings for each field and value, all joined by 8-byte pointers. Every allocation also carries a header. For `status approved amount 1250 currency EUR`, 35 bytes of actual data, the bookkeeping outweighs the data. Multiply by ten million payment records and much of your RAM holds pointers.\n\nThe simplest fix is to drop the structure: write the entries one after another into a single block of memory, each with its length in front, and find a field by reading from the start. That is a **listpack**. On the lab server the three-field hash took 77 bytes as a listpack and 215 bytes as a hash table. The price is the search: finding a field means walking the block, which is O(N). For a hundred short entries in about a kilobyte of contiguous memory, the walk is cheap, because the CPU reads contiguous bytes fast.\n\nWhere does it break? At size. Walking 10,000 entries on every `HGET`, on the one thread every client shares, is too slow, and inserting into the middle of a big block means moving every byte after it. So Redis uses both layouts: a listpack while the key is small, the general structure once it grows. `TYPE` still says `hash`. What changes is the **encoding**, the layout behind the type, which `OBJECT ENCODING` reports.\n\nFor a big hash or set, the general structure is a hash table. A big sorted set needs two things at once: find a member's score fast, and keep members in score order. A sorted array would give fast lookups by position, but inserting would shift everything after the new member. A linked list inserts cheaply, but finding the place means walking it. Redis keeps two structures holding the same members: a hash table from member to score, and a skip list, a linked list in score order where some nodes carry extra links that jump far ahead, like express lanes. A search rides the top lane and drops down a lane when it would overshoot, so finding a position takes O(log N). Sets of plain integers have their own compact form, the intset, a sorted array searched by binary search. Big lists become a quicklist: a linked list of listpacks of up to 8 KB each.\n\nThese are the 8.10 defaults:\n\n| Setting | Default | Becomes |\n|---|---|---|\n| `hash-max-listpack-entries` and `-value` | 512 fields, 64 bytes | hashtable |\n| `set-max-intset-entries` | 512 integers | hashtable |\n| `set-max-listpack-entries` and `-value` | 128 members, 64 bytes | hashtable |\n| `zset-max-listpack-entries` and `-value` | 128 members, 64 bytes | skiplist |\n| `list-max-listpack-size` | -2, meaning 8 KB | quicklist |\n\nEither limit triggers the switch: too many entries, or one entry longer than the value limit. A single 65-byte member turns a two-member sorted set into a skip list. The switch goes one way only: remove members until the key is tiny again, and it keeps the big encoding. And it costs memory. On the lab server a sorted set of 128 short members took 1,076 bytes, and the 129th member made it 10,888.\n\nStrings have encodings too: `int` for a number that fits in 64 bits, `embstr` for a short string kept in one allocation with its header, and `raw` for longer ones.",
-   "stepper": {
-    "title": "A sorted set outgrows its listpack",
-    "intro": "Follow one key from three members to 129.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A three-member sorted set stored as one listpack block, entries sorted by score\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 42 m-17 40 m-03 12 m-88</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 68 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"327\" y=\"126\" text-anchor=\"middle\">m-17</text><text class=\"t-s\" x=\"327\" y=\"147\" text-anchor=\"middle\">42</text><text class=\"t-s t-m\" x=\"396\" y=\"136\" text-anchor=\"middle\">end</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">one allocation: entries back to back, sorted by score, each with its length</text></svg>",
-      "say": "Three merchants, one key. Redis stores the small sorted set as a **listpack**: one block of memory, the entries packed back to back in score order, each carrying its own length. No pointers, no per-entry allocations. `MEMORY USAGE` says 68 bytes."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"ZADD inserts m-51 with score 41 by walking the block from the start and shifting the tail\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 41 m-51</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 76 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box-a\" x=\"280\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"327\" y=\"126\" text-anchor=\"middle\">m-51</text><text class=\"t-s t-a\" x=\"327\" y=\"147\" text-anchor=\"middle\">41</text><rect class=\"box\" x=\"380\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"427\" y=\"126\" text-anchor=\"middle\">m-17</text><text class=\"t-s\" x=\"427\" y=\"147\" text-anchor=\"middle\">42</text><text class=\"t-s t-m\" x=\"496\" y=\"136\" text-anchor=\"middle\">end</text><line class=\"ln-a\" x1=\"40\" y1=\"84\" x2=\"276\" y2=\"84\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"40\" y=\"74\" text-anchor=\"start\">walk from the start</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">insert = walk to the spot, then move the bytes after it: O(N), with N at most 128</text></svg>",
-      "say": "`ZADD` walks the block from the start until it passes score 40, then moves the bytes after that point to make room for `m-51`. That is O(N) work, and for N up to 128 it is still fast: the bytes are contiguous, so the CPU streams through them."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"At 128 members the sorted set is still a single listpack block\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZCARD merchants:approved   (integer) 128</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 1,305 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"144\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"352.0\" y=\"136\" text-anchor=\"middle\">125 more entries</text><rect class=\"box\" x=\"430\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"477\" y=\"126\" text-anchor=\"middle\">m-x124</text><text class=\"t-s\" x=\"477\" y=\"147\" text-anchor=\"middle\">224</text><text class=\"t-s t-m\" x=\"546\" y=\"136\" text-anchor=\"middle\">end</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">ZSCORE and ZRANK also walk the block: fine while it stays small</text></svg>",
-      "say": "After 124 more merchants the key holds 128 members, the default `zset-max-listpack-entries`. It is still one block, 1,305 bytes. `ZSCORE` and `ZRANK` walk it too."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"The 129th member exceeds zset-max-listpack-entries and Redis converts the key\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 2 m-129</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s t-bad\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack → skiplist</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: converting</text><rect class=\"box-dim\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-129</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"144\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"352.0\" y=\"136\" text-anchor=\"middle\">126 more entries</text><rect class=\"box\" x=\"430\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"477\" y=\"126\" text-anchor=\"middle\">m-x124</text><text class=\"t-s\" x=\"477\" y=\"147\" text-anchor=\"middle\">224</text><text class=\"t-s t-m\" x=\"546\" y=\"136\" text-anchor=\"middle\">end</text><rect class=\"box-a\" x=\"150\" y=\"196\" width=\"380\" height=\"40\" rx=\"8\"/><text class=\"t-s t-a\" x=\"340\" y=\"221\" text-anchor=\"middle\">copy every member into a dict and a skip list</text><line class=\"ln-a\" x1=\"340\" y1=\"168\" x2=\"340\" y2=\"194\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"560\" y=\"221\" text-anchor=\"start\">129 &gt; 128</text></svg>",
-      "say": "The 129th member crosses the limit. Inside this one `ZADD`, Redis builds the big encoding: it copies all 129 members into a hash table and a skip list and frees the block. The client sees nothing except a slightly slower `ZADD`."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"The skiplist encoding: a dict from member to score plus a skip list with express lanes\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZREVRANK merchants:approved m-51</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: skiplist</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 10,813 bytes</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"640\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"81\" text-anchor=\"start\">dict</text><text class=\"t-s t-code\" x=\"80\" y=\"81\" text-anchor=\"start\">m-17→42  m-03→40  m-51→41  m-88→12  ...</text><text class=\"t-s t-m\" x=\"644\" y=\"81\" text-anchor=\"end\">(129 entries)</text><rect class=\"box\" x=\"40\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-m\" x=\"70\" y=\"258\" text-anchor=\"middle\">head</text><rect class=\"box\" x=\"150\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"180\" y=\"231\" text-anchor=\"middle\">12</text><text class=\"t-s t-code\" x=\"180\" y=\"258\" text-anchor=\"middle\">m-88</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"290\" y=\"231\" text-anchor=\"middle\">40</text><text class=\"t-s t-code\" x=\"290\" y=\"258\" text-anchor=\"middle\">m-03</text><rect class=\"box-a\" x=\"370\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-a\" x=\"400\" y=\"231\" text-anchor=\"middle\">41</text><text class=\"t-s t-code\" x=\"400\" y=\"258\" text-anchor=\"middle\">m-51</text><rect class=\"box\" x=\"480\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"231\" text-anchor=\"middle\">42</text><text class=\"t-s t-code\" x=\"510\" y=\"258\" text-anchor=\"middle\">m-17</text><rect class=\"box\" x=\"590\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"590\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"620\" y=\"258\" text-anchor=\"middle\">...</text><line class=\"ln\" x1=\"100\" y1=\"226\" x2=\"148\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"210\" y1=\"226\" x2=\"258\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"320\" y1=\"226\" x2=\"368\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"226\" x2=\"478\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"226\" x2=\"588\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"100\" y1=\"192\" x2=\"258\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"192\" x2=\"478\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"192\" x2=\"588\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"158\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">express lanes</text></svg>",
-      "say": "Now the key is two structures holding the same members. The **dict** (Redis's name for its hash table) maps member to score, so `ZSCORE` is O(1). The **skip list** keeps members in score order, and some nodes carry express links that jump ahead. A search starts in the top lane, moves right while the next score is smaller, and drops a lane when it would overshoot: O(log N). Each link also stores how many nodes it skips, so the rank comes out of the same walk. The price: 10,813 bytes, eight times more than at 128 members."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"After removing a member the key stays a skiplist; conversion only goes one way\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZREM merchants:approved m-129</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: skiplist (stays)</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 10,741 bytes</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"640\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"81\" text-anchor=\"start\">dict</text><text class=\"t-s t-code\" x=\"80\" y=\"81\" text-anchor=\"start\">m-17→42  m-03→40  m-51→41  m-88→12  ...</text><text class=\"t-s t-m\" x=\"644\" y=\"81\" text-anchor=\"end\">(128 entries)</text><rect class=\"box\" x=\"40\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-m\" x=\"70\" y=\"258\" text-anchor=\"middle\">head</text><rect class=\"box\" x=\"150\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"180\" y=\"231\" text-anchor=\"middle\">12</text><text class=\"t-s t-code\" x=\"180\" y=\"258\" text-anchor=\"middle\">m-88</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"290\" y=\"231\" text-anchor=\"middle\">40</text><text class=\"t-s t-code\" x=\"290\" y=\"258\" text-anchor=\"middle\">m-03</text><rect class=\"box\" x=\"370\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"400\" y=\"231\" text-anchor=\"middle\">41</text><text class=\"t-s t-code\" x=\"400\" y=\"258\" text-anchor=\"middle\">m-51</text><rect class=\"box\" x=\"480\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"231\" text-anchor=\"middle\">42</text><text class=\"t-s t-code\" x=\"510\" y=\"258\" text-anchor=\"middle\">m-17</text><rect class=\"box\" x=\"590\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"590\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"620\" y=\"258\" text-anchor=\"middle\">...</text><line class=\"ln\" x1=\"100\" y1=\"226\" x2=\"148\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"210\" y1=\"226\" x2=\"258\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"226\" x2=\"368\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"226\" x2=\"478\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"226\" x2=\"588\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"192\" x2=\"258\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"192\" x2=\"478\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"192\" x2=\"588\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"158\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/></svg>",
-      "say": "Remove the 129th member and the set is back to 128, but it stays a skip list at 10,741 bytes. Redis converts up, never down. To get the compact form back you would have to rebuild the key, for example by copying the members into a new key that starts small."
-     }
+  "sections": [
+    {
+      "h": "Five types for five jobs in the payments app",
+      "body": "Let's start with the jobs. The payments app keeps five kinds of data in Redis, and each kind fits one of its types. Inside an in-memory store named them; here's what each one is for.\n\nA count of today's payments is a number you add to. Redis keeps it in a string, its basic value: any bytes, up to 512 MB. When the bytes are a whole number, `INCR` and `DECRBY` do the arithmetic on the server.\n\nA payment record has fields: status, amount, currency. With only strings, you'd store it as one JSON string (text in a common format for structured data) and rewrite all of it to change the status. That's read, change, write back: the race from Inside an in-memory store. Or you'd keep one key per field and pay a round trip, a message to Redis and its answer back, for each. A hash is a small map of fields inside one key. `HSET payment:43 status settled` changes one field on the server, and `HGETALL` reads them all in one round trip.\n\nEvery night, the company pays each shop what it took, in batches that wait in line for a worker program. They need order: first in, first out. A list keeps items in the order they were added, and it's cheap at both ends. `RPUSH` adds at the tail, and `LPOP` takes from the head. The lab calls this queue `settlement:queue`, after the trade's word for paying the shops. (A lighter log: Redis pub/sub and Streams, in the Messaging and logs track, shows why Streams make a better queue.)\n\nThe cards the fraud team flagged today need membership: is this card in the group or not? A set holds unique members, so adding a member twice changes nothing. `SADD` adds, and `SISMEMBER` checks.\n\nShops ranked by approved payments need order by a number that keeps changing. A sorted set holds unique members, each with a number called its score, and keeps them sorted by score. `ZINCRBY` raises a score, and `ZRANGE` reads the top ten.\n\nCost matters as much as shape, because every command runs on that one thread. Redis writes costs in Big-O notation, where N is the number of items in the key. O(1) means the work doesn't grow with the key. O(N) means it grows in step with it: twice the items, twice the work. O(log N) grows very slowly, since doubling N adds only one step. M is the number of items a command returns.\n\n| Type | Example key | Main commands | Cost |\n|---|---|---|---|\n| string | `card:7:status`, `auths:today` | `GET`, `SET`, `INCR` | O(1) |\n| hash | `payment:43` | `HGET`, `HSET`, `HINCRBY` | O(1) per field, `HGETALL` O(N) |\n| list | `settlement:queue` | `RPUSH`, `LPOP`, `LRANGE` | O(1) at either end |\n| set | `fraud:flagged` | `SADD`, `SISMEMBER`, `SINTER` | O(1) add and check, `SMEMBERS` O(N) |\n| sorted set | `merchants:approved` | `ZADD`, `ZINCRBY`, `ZRANGE` | O(log N), ranges O(log N + M) |\n\nKey names are plain strings. The habit is `type:id` with colons, such as `payment:43` or `merchant:m-17:approved`. Redis doesn't care, but a shared start lets the command `SCAN MATCH payment:*` find a whole family of keys, and your teammates can read it.\n\nThat's the outside of each type. Next, we'll see how Redis lays them out in memory, and why a small key looks different inside.",
+      "try": {
+        "title": "Use each type once",
+        "minutes": 4,
+        "steps": [
+          "Start the server if it isn't running (`docker compose -f env/redis.yml up -d` from the `labs` folder; Docker runs it in a container). Then open Redis's prompt with `docker compose -f env/redis.yml exec redis redis-cli`.",
+          "Type the commands below, one at a time. Before each one, say what it will print.",
+          "Predict the last one: what happens when you `GET` a hash?"
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "SET card:7:status active\nHSET payment:43 status approved amount 1250 currency EUR\nRPUSH settlement:queue batch-1 batch-2 batch-3\nLPOP settlement:queue\nSADD fraud:flagged card:7 card:9 card:7\nSCARD fraud:flagged\nSISMEMBER fraud:flagged card:9\nZADD merchants:approved 42 m-17 40 m-03 12 m-88\nZRANGE merchants:approved 0 -1 REV WITHSCORES\nTYPE settlement:queue\nGET payment:43"
+        },
+        "expect": "`RPUSH` returns the new length, `(integer) 3`, and `LPOP` hands back `\"batch-1\"`, the oldest entry. `SADD` returns `(integer) 2`: the second `card:7` was already there, so `SCARD`, the count of members, says 2. `SISMEMBER` returns `(integer) 1`, meaning yes. `ZRANGE ... REV WITHSCORES` lists `m-17` 42, `m-03` 40, `m-88` 12, highest first. `TYPE settlement:queue` says `list`. `GET payment:43` fails with `(error) WRONGTYPE Operation against a key holding the wrong kind of value`: `GET` is a command for strings, and the key holds a hash."
+      },
+      "refs": [
+        {
+          "title": "Redis data types",
+          "url": "https://redis.io/docs/latest/develop/data-types/",
+          "kind": "docs"
+        },
+        {
+          "title": "Compare data types",
+          "url": "https://redis.io/docs/latest/develop/data-types/compare-data-types/",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Small keys are packed into one block, big ones become a hash table or a skip list",
+      "body": "Picture a hash with three fields, stored the way Java's `HashMap`, a hash table, stores its entries. There's a table of slots, one entry object per field, and a separate piece of memory for each field and each value. They're joined by pointers, 8-byte memory addresses that say where the next piece lives. Every piece of memory a program asks for also carries a small header. For `status approved amount 1250 currency EUR`, 35 bytes of real data, the bookkeeping weighs more than the data. Multiply by ten million payment records, and much of your RAM holds pointers.\n\nThe simplest fix is to drop the structure. Write the entries one after another into a single block of memory, each with its length in front, and find a field by reading from the start. That's a **listpack**, and it's the owner's notebook page from the opening. On the lab server, the three-field hash took 77 bytes as a listpack and 215 bytes as a hash table. The price is the search: finding a field means walking the block, which is O(N). For a hundred short entries in about a kilobyte, the walk is cheap, because the CPU reads bytes that sit side by side very fast.\n\nWhere does it break? At size. Walking 10,000 entries on every `HGET` (a read of one field), on the one thread every client shares, is too slow. And adding an entry in the middle of a big block means moving every byte after it. So Redis uses both layouts: a listpack while the key is small, and the general structure once it grows. `TYPE` still says `hash`. What changes is the **encoding**, the layout behind the type, which the command `OBJECT ENCODING` reports.\n\nFor a big hash or set, the general structure is a hash table. A big sorted set needs two things at once: find a member's score fast, and keep the members in score order. A sorted array would find positions fast, but adding a member would shift everything after it. A linked list, where each item points to the next, adds members cheaply, but finding the right place means walking it. So Redis keeps two structures holding the same members. A hash table maps each member to its score. A **skip list** keeps the members in score order: it's a linked list where some items carry extra links that jump far ahead, like express lanes. A search rides the top lane and drops down a lane whenever it would overshoot, so finding a position takes O(log N). That pair is the owner's box of cards and her ranked list on the wall.\n\nTwo more layouts complete the set. A set of plain whole numbers has its own compact form, the intset: a sorted array, searched by halving the range at each step. And a big list becomes a quicklist, a linked list of listpacks of up to 8 KB each.\n\nThese are the 8.10 defaults:\n\n| Setting | Default | Becomes |\n|---|---|---|\n| `hash-max-listpack-entries` and `-value` | 512 fields, 64 bytes | hashtable |\n| `set-max-intset-entries` | 512 integers | hashtable |\n| `set-max-listpack-entries` and `-value` | 128 members, 64 bytes | hashtable |\n| `zset-max-listpack-entries` and `-value` | 128 members, 64 bytes | skiplist |\n| `list-max-listpack-size` | -2, meaning 8 KB | quicklist |\n\nEither limit triggers the switch: too many entries, or one entry longer than the value limit. A single 65-byte member turns a two-member sorted set into a skip list. The switch goes one way only. Remove members until the key is tiny again, and it keeps the big encoding. That's where the notebook picture breaks: the owner can go back to one page when her list shrinks, and Redis never does. The switch costs memory, too. On the lab server, a sorted set of 128 short members took 1,076 bytes, and the 129th member made it 10,888.\n\nStrings have encodings too: `int` for a whole number that fits in 64 bits, `embstr` for a short string kept in one piece of memory with its header, and `raw` for longer ones.\n\nEncodings shrink what's inside a key. Every key also has a cost of its own, whatever it holds. Next, we'll weigh it.",
+      "stepper": {
+        "title": "A sorted set outgrows its listpack",
+        "intro": "Follow one key from three members to 129.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A three-member sorted set stored as one listpack block, entries sorted by score\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 42 m-17 40 m-03 12 m-88</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 68 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"327\" y=\"126\" text-anchor=\"middle\">m-17</text><text class=\"t-s\" x=\"327\" y=\"147\" text-anchor=\"middle\">42</text><text class=\"t-s t-m\" x=\"396\" y=\"136\" text-anchor=\"middle\">end</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">one allocation: entries back to back, sorted by score, each with its length</text></svg>",
+            "say": "Three shops, one key. Redis stores the small sorted set as a **listpack**: one block of memory, with the entries packed back to back in score order, each carrying its own length. There are no pointers, and no separate pieces of memory. `MEMORY USAGE` says 68 bytes."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"ZADD inserts m-51 with score 41 by walking the block from the start and shifting the tail\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 41 m-51</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 76 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box-a\" x=\"280\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code t-a\" x=\"327\" y=\"126\" text-anchor=\"middle\">m-51</text><text class=\"t-s t-a\" x=\"327\" y=\"147\" text-anchor=\"middle\">41</text><rect class=\"box\" x=\"380\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"427\" y=\"126\" text-anchor=\"middle\">m-17</text><text class=\"t-s\" x=\"427\" y=\"147\" text-anchor=\"middle\">42</text><text class=\"t-s t-m\" x=\"496\" y=\"136\" text-anchor=\"middle\">end</text><line class=\"ln-a\" x1=\"40\" y1=\"84\" x2=\"276\" y2=\"84\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"40\" y=\"74\" text-anchor=\"start\">walk from the start</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">insert = walk to the spot, then move the bytes after it: O(N), with N at most 128</text></svg>",
+            "say": "`ZADD` walks the block from the start until it passes score 40. Then it moves the bytes after that point to make room for `m-51`. That's O(N) work, and for N up to 128 it's still fast: the bytes sit side by side, so the CPU streams through them."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"At 128 members the sorted set is still a single listpack block\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZCARD merchants:approved   (integer) 128</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 1,305 bytes</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-03</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">40</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"144\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"352.0\" y=\"136\" text-anchor=\"middle\">125 more entries</text><rect class=\"box\" x=\"430\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"477\" y=\"126\" text-anchor=\"middle\">m-x124</text><text class=\"t-s\" x=\"477\" y=\"147\" text-anchor=\"middle\">224</text><text class=\"t-s t-m\" x=\"546\" y=\"136\" text-anchor=\"middle\">end</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">ZSCORE and ZRANK also walk the block: fine while it stays small</text></svg>",
+            "say": "After 124 more shops, the key holds 128 members, the default `zset-max-listpack-entries`. It's still one block, 1,305 bytes. `ZSCORE` and `ZRANK` walk it too."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"The 129th member exceeds zset-max-listpack-entries and Redis converts the key\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZADD merchants:approved 2 m-129</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s t-bad\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: listpack → skiplist</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: converting</text><rect class=\"box-dim\" x=\"20\" y=\"96\" width=\"640\" height=\"70\" rx=\"8\"/><text class=\"t-s t-m\" x=\"50\" y=\"136\" text-anchor=\"middle\">hdr</text><rect class=\"box\" x=\"80\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"127\" y=\"126\" text-anchor=\"middle\">m-129</text><text class=\"t-s\" x=\"127\" y=\"147\" text-anchor=\"middle\">2</text><rect class=\"box\" x=\"180\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"227\" y=\"126\" text-anchor=\"middle\">m-88</text><text class=\"t-s\" x=\"227\" y=\"147\" text-anchor=\"middle\">12</text><rect class=\"box\" x=\"280\" y=\"104\" width=\"144\" height=\"54\" rx=\"8\"/><text class=\"t-s t-m\" x=\"352.0\" y=\"136\" text-anchor=\"middle\">126 more entries</text><rect class=\"box\" x=\"430\" y=\"104\" width=\"94\" height=\"54\" rx=\"8\"/><text class=\"t-s t-code\" x=\"477\" y=\"126\" text-anchor=\"middle\">m-x124</text><text class=\"t-s\" x=\"477\" y=\"147\" text-anchor=\"middle\">224</text><text class=\"t-s t-m\" x=\"546\" y=\"136\" text-anchor=\"middle\">end</text><rect class=\"box-a\" x=\"150\" y=\"196\" width=\"380\" height=\"40\" rx=\"8\"/><text class=\"t-s t-a\" x=\"340\" y=\"221\" text-anchor=\"middle\">copy every member into a dict and a skip list</text><line class=\"ln-a\" x1=\"340\" y1=\"168\" x2=\"340\" y2=\"194\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"560\" y=\"221\" text-anchor=\"start\">129 &gt; 128</text></svg>",
+            "say": "The 129th member crosses the limit. Inside this one `ZADD`, Redis builds the big encoding: it copies all 129 members into a hash table and a skip list, and frees the block. The client sees nothing except a slightly slower `ZADD`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"The skiplist encoding: a dict from member to score plus a skip list with express lanes\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZREVRANK merchants:approved m-51</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: skiplist</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 10,813 bytes</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"640\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"81\" text-anchor=\"start\">dict</text><text class=\"t-s t-code\" x=\"80\" y=\"81\" text-anchor=\"start\">m-17→42  m-03→40  m-51→41  m-88→12  ...</text><text class=\"t-s t-m\" x=\"644\" y=\"81\" text-anchor=\"end\">(129 entries)</text><rect class=\"box\" x=\"40\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-m\" x=\"70\" y=\"258\" text-anchor=\"middle\">head</text><rect class=\"box\" x=\"150\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"180\" y=\"231\" text-anchor=\"middle\">12</text><text class=\"t-s t-code\" x=\"180\" y=\"258\" text-anchor=\"middle\">m-88</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"290\" y=\"231\" text-anchor=\"middle\">40</text><text class=\"t-s t-code\" x=\"290\" y=\"258\" text-anchor=\"middle\">m-03</text><rect class=\"box-a\" x=\"370\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-a\" x=\"400\" y=\"231\" text-anchor=\"middle\">41</text><text class=\"t-s t-code\" x=\"400\" y=\"258\" text-anchor=\"middle\">m-51</text><rect class=\"box\" x=\"480\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"231\" text-anchor=\"middle\">42</text><text class=\"t-s t-code\" x=\"510\" y=\"258\" text-anchor=\"middle\">m-17</text><rect class=\"box\" x=\"590\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"590\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"620\" y=\"258\" text-anchor=\"middle\">...</text><line class=\"ln\" x1=\"100\" y1=\"226\" x2=\"148\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"210\" y1=\"226\" x2=\"258\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"320\" y1=\"226\" x2=\"368\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"226\" x2=\"478\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"226\" x2=\"588\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"100\" y1=\"192\" x2=\"258\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"192\" x2=\"478\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"192\" x2=\"588\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"158\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">express lanes</text></svg>",
+            "say": "Now the key is two structures holding the same members. The **dict** (Redis's name for its hash table) maps each member to its score, so `ZSCORE` is O(1). The **skip list** keeps the members in score order, and some items carry express links that jump ahead. A search starts in the top lane, moves right while the next score is smaller, and drops a lane when it would overshoot: O(log N). Each link also stores how many items it skips, so the rank comes out of the same walk. The price is 10,813 bytes, eight times more than at 128 members."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"After removing a member the key stays a skiplist; conversion only goes one way\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-code\" x=\"20\" y=\"30\" text-anchor=\"start\">&gt; ZREM merchants:approved m-129</text><line class=\"ln-d\" x1=\"20\" y1=\"46\" x2=\"660\" y2=\"46\"/><text class=\"t-s\" x=\"20\" y=\"284\" text-anchor=\"start\">OBJECT ENCODING: skiplist (stays)</text><text class=\"t-s\" x=\"660\" y=\"284\" text-anchor=\"end\">MEMORY USAGE: 10,741 bytes</text><rect class=\"box\" x=\"20\" y=\"56\" width=\"640\" height=\"40\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"81\" text-anchor=\"start\">dict</text><text class=\"t-s t-code\" x=\"80\" y=\"81\" text-anchor=\"start\">m-17→42  m-03→40  m-51→41  m-88→12  ...</text><text class=\"t-s t-m\" x=\"644\" y=\"81\" text-anchor=\"end\">(128 entries)</text><rect class=\"box\" x=\"40\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"40\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-m\" x=\"70\" y=\"258\" text-anchor=\"middle\">head</text><rect class=\"box\" x=\"150\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"180\" y=\"231\" text-anchor=\"middle\">12</text><text class=\"t-s t-code\" x=\"180\" y=\"258\" text-anchor=\"middle\">m-88</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"260\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"290\" y=\"231\" text-anchor=\"middle\">40</text><text class=\"t-s t-code\" x=\"290\" y=\"258\" text-anchor=\"middle\">m-03</text><rect class=\"box\" x=\"370\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"400\" y=\"231\" text-anchor=\"middle\">41</text><text class=\"t-s t-code\" x=\"400\" y=\"258\" text-anchor=\"middle\">m-51</text><rect class=\"box\" x=\"480\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"480\" y=\"146\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s\" x=\"510\" y=\"231\" text-anchor=\"middle\">42</text><text class=\"t-s t-code\" x=\"510\" y=\"258\" text-anchor=\"middle\">m-17</text><rect class=\"box\" x=\"590\" y=\"214\" width=\"60\" height=\"24\" rx=\"8\"/><rect class=\"box\" x=\"590\" y=\"180\" width=\"60\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"620\" y=\"258\" text-anchor=\"middle\">...</text><line class=\"ln\" x1=\"100\" y1=\"226\" x2=\"148\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"210\" y1=\"226\" x2=\"258\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"226\" x2=\"368\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"430\" y1=\"226\" x2=\"478\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"226\" x2=\"588\" y2=\"226\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"192\" x2=\"258\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"320\" y1=\"192\" x2=\"478\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"540\" y1=\"192\" x2=\"588\" y2=\"192\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"100\" y1=\"158\" x2=\"478\" y2=\"158\" marker-end=\"url(#arr)\"/></svg>",
+            "say": "Remove the 129th member and the set is back to 128, but it stays a skip list, at 10,741 bytes. Redis converts up, never down. To get the compact form back, you'd rebuild the key, for example by copying the members into a new key that starts small."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch a sorted set change shape",
+        "minutes": 5,
+        "steps": [
+          "At the `redis-cli` prompt, run the commands below one at a time. The first four ask how keys from the previous Try it are stored. The `EVAL` runs a tiny Lua script that adds 128 members in one go.",
+          "Before `ZADD board 129 m-129`, predict the encoding and the memory after it.",
+          "Before the last `OBJECT ENCODING small`, predict what one 65-character member does to a two-member set. (Paste 65 x's, or any 65-character string.)"
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "SET auths:today 41\nOBJECT ENCODING auths:today\nOBJECT ENCODING card:7:status\nOBJECT ENCODING payment:43\nEVAL \"for i = 1, 128 do redis.call('ZADD', KEYS[1], i, 'm-' .. i) end\" 1 board\nOBJECT ENCODING board\nMEMORY USAGE board\nZADD board 129 m-129\nOBJECT ENCODING board\nMEMORY USAGE board\nZREM board m-129\nOBJECT ENCODING board\nZADD small 1 m-1\nOBJECT ENCODING small\nZADD small 2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nOBJECT ENCODING small\nCONFIG GET zset-max-listpack-*"
+        },
+        "expect": "`auths:today` is `\"int\"` (the value is a number, so Redis stores it as one), `card:7:status` is `\"embstr\"`, and the three-field `payment:43` is `\"listpack\"`. With 128 members, `board` is `\"listpack\"` at `(integer) 1076` bytes. After the 129th, it's `\"skiplist\"` at `(integer) 10888`, about ten times more. After `ZREM`, it's back to 128 members and still `\"skiplist\"`. `small` starts as `\"listpack\"` and becomes `\"skiplist\"` with only two members, because one member is longer than 64 bytes. `CONFIG GET` shows the two limits: `zset-max-listpack-entries` `128` and `zset-max-listpack-value` `64`. Byte counts can differ by a few percent between Redis builds."
+      },
+      "refs": [
+        {
+          "title": "redis.conf for Redis 8.10 (ADVANCED CONFIG)",
+          "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Every key pays a fixed cost in Redis's table of keys",
+      "body": "Write 100,000 tiny keys into Redis 8.10, each a 10-byte name with the 4-byte value `done`, and its memory grows by about 55 bytes per key. Only about 14 of those bytes are your data. The rest is a cost every key pays, whatever it holds, because all the keys on a server live in one big hash table, the keyspace, from each key's name to its value. Caches mostly hold small items. In Twitter's study of 153 cache clusters, from Why caches work, the typical cluster's average key was under 38 bytes and its average value about 230 bytes. Memcached, an older cache program, spends 56 bytes of bookkeeping on every item. At those sizes, the fixed cost per key decides how many keys fit in RAM.\n\nHere Redis and Valkey, a free copy of Redis that has gone its own way since 2024, differ. Redis 7.2, the version Valkey started from, keeps the keyspace in a chained hash table. That's an array of buckets (slots), each pointing to a separate entry, which points to the key and to the value. A lookup follows about four pointers, and each one can be a trip to RAM, the 100 ns rung from Why caches work. Valkey 8.1 replaced it with buckets of 64 bytes, the size of the piece the CPU loads from RAM at a time. A bucket holds up to seven entries, plus one byte of each entry's hash, a number worked out from the key's name. That one byte rules out almost every wrong entry without following its pointer, and the key is stored inside the value's own object. A lookup touches about two places in memory instead of four.\n\nRedis 8 cut its own cost per key by a different route. On the lab machine, the same 100,000 keys cost 75 bytes each on Redis 7.2.4, 55 on Redis 8.10.3 and 46 on Valkey 9.1.3. A TTL, the time to live after which Redis deletes the key, added 20 to 35 bytes more.\n\nThe table also has to grow as keys arrive. Doubling a table of 10 million buckets in one go would hold the only thread for a long time. So both servers rehash, moving the entries into a bigger table, a little at a time. They keep the old and the new table side by side. Every command that touches the table moves a few buckets across, a short step on the server's background timer moves more, and lookups check both tables until the old one is empty. Redis also avoids resizing while it saves a snapshot of its data in the background, because moving memory then makes the operating system copy pages (lesson 9).\n\nValkey's developers kept that incremental rehashing in their new table. They also kept `SCAN`'s cursor, a bookmark for reading the keys in pages, and the random sampling of keys that eviction, throwing keys out when memory is full, depends on (lesson 5). Those needs are why they wrote their own table instead of taking a ready-made one.\n\nSo far we've weighed keys. Next, we'll put one type to work: a ranking of shops that stays sorted as payments arrive.",
+      "try": {
+        "title": "Weigh a key on Redis 8.10 and on Valkey 9.1",
+        "minutes": 4,
+        "steps": [
+          "Run the script below in a terminal. It starts a throwaway Redis 8.10.3 and a throwaway Valkey 9.1.3 (the first run downloads the Valkey image, the package Docker starts it from). It writes 100,000 tiny keys into each, without and then with a TTL, prints the memory per key from `used_memory`, and removes both containers.",
+          "Before it prints, predict which server stores a key in fewer bytes, and how much a TTL adds.",
+          "Notice that one script talks to both servers: the Valkey image also ships `redis-cli`, as another name for `valkey-cli`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "terminal",
+          "src": "# one throwaway server of each, then 100,000 tiny keys in each, with and without a TTL\ndocker run --rm -d --name sfz-redis-mem -m 256m redis:8.10.3 > /dev/null\ndocker run --rm -d --name sfz-valkey-mem -m 256m valkey/valkey:9.1.3 > /dev/null\nsleep 2\nused() { docker exec \"$1\" redis-cli INFO memory | grep '^used_memory:' | tr -dc '0-9'; }\nfor c in sfz-redis-mem sfz-valkey-mem; do\n  for args in \"\" \", 'EX', 3600\"; do\n    docker exec \"$c\" redis-cli FLUSHALL > /dev/null\n    before=$(used \"$c\")\n    docker exec \"$c\" redis-cli EVAL \"for i = 1, 100000 do redis.call('SET', 'idem:' .. i, 'done'$args) end return 1\" 0 > /dev/null\n    echo \"$c${args:+ with TTL}: $(( ($(used \"$c\") - before) / 100000 )) bytes per key\"\n  done\ndone\ndocker rm -f sfz-redis-mem sfz-valkey-mem > /dev/null\n"
+        },
+        "expect": "On the lab machine: `sfz-redis-mem: 55 bytes per key`, `sfz-redis-mem with TTL: 79 bytes per key` (84 in a second run, depending on how far Redis's table of deadlines had grown), `sfz-valkey-mem: 46 bytes per key` and `sfz-valkey-mem with TTL: 66 bytes per key`. Each key name is about 10 bytes and each value the 4-byte string `done`, so most of what you pay for is bookkeeping. The same script against `redis:7.2.4`, the version Valkey forked from, printed 75 and 108. Both servers have cut the cost per key since they split, and Valkey a little further."
+      },
+      "refs": [
+        {
+          "title": "Valkey blog: A new hash table (Valkey 8.1)",
+          "url": "https://valkey.io/blog/new-hash-table/",
+          "kind": "read"
+        },
+        {
+          "title": "Yang et al., A large scale analysis of hundreds of in-memory cache clusters at Twitter (OSDI 2020)",
+          "url": "https://www.usenix.org/system/files/osdi20-yang.pdf",
+          "kind": "read"
+        }
+      ],
+      "aside": {
+        "title": "Why fuss over 20 bytes a key?",
+        "body": "Because a store in memory has to fit all of its data in RAM, and RAM costs far more per byte than disk. Twenty bytes times 40 million keys is 800 MB, a good share of a server's memory, and it holds nothing you asked to store. When the memory runs out, Redis either refuses new writes or throws keys away, and lesson 5 covers both. So in a store that lives in memory, the bookkeeping per key is a large part of the bill."
+      }
+    },
+    {
+      "h": "Ranking shops with a sorted set: scores, ties and ranks that start at 0",
+      "body": "Rank 20,000 shops by approved payments, and refresh the ranking on a screen every second. In SQL, the language most databases understand, you'd ask for `ORDER BY approvals DESC LIMIT 10` each time. The database would sort, or walk an index (a lookup table kept in order), on every refresh. A sorted set does the ordering when you write instead. Every `ZINCRBY` moves the member to its new place, so reading the top ten is reading the first ten entries.\n\n`ZINCRBY merchants:approved 1 m-17` adds one approval to shop `m-17`, and creates the member if it's new. `ZRANGE merchants:approved 0 9 REV WITHSCORES` returns the top ten with their scores, highest first (`REV` reverses the usual low-to-high order). `ZREVRANK merchants:approved m-17` returns the shop's place, counted from the top.\n\nThree details cause most ranking bugs.\n\nRanks start at 0. `ZREVRANK` returns 0 for the leader, so add one before a person sees it.\n\nTies are ordered by member, byte by byte. In ascending order, `m-anna` comes before `m-bert` when both have 5. `REV` flips the whole order, ties included, so `m-bert` comes first. If the product wants \"whoever got there first wins the tie\", the member name can't give you that. You have to fold the time into the score (see Go deeper).\n\nScores are doubles, 64-bit numbers with a decimal point. Whole numbers are exact up to 2^53 (2 to the power 53), about 9 × 10^15, which is plenty for counts and for amounts in cents. Fractions aren't always exact, so store cents, never euros with decimals.\n\nSince Redis 6.2, `ZRANGE` takes `REV`, `BYSCORE`, `BYLEX` and `LIMIT`, and the docs mark the older `ZREVRANGE` and `ZRANGEBYSCORE` as deprecated: still there, but on the way out. Since 7.2, `ZRANK` and `ZREVRANK` accept `WITHSCORE` and return the rank and the score in one round trip. Under the hood, with the encodings from earlier, `ZSCORE` asks the hash table, which is O(1). `ZADD`, `ZREVRANK` and `ZRANGE` walk the skip list: O(log N), plus M for the members a range returns. In Jedis, a `Tuple` holds one member and its score, and a `KeyValue` holds a rank and a score:\n\n```java\nList<Tuple> top = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 9).rev());\nKeyValue<Long, Double> me = redis.zrevrankWithScore(\"merchants:approved\", \"m-17\");   // null if absent\n```\n\n```kotlin\nval top: List<Tuple> = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 9).rev())\nval me: KeyValue<Long, Double>? = redis.zrevrankWithScore(\"merchants:approved\", \"m-17\")   // null if absent\n```\n\nA ranking like this stays cheap while each key is small. Next, we'll see what happens when a key keeps growing.",
+      "try": {
+        "title": "Rank four shops, two of them tied",
+        "minutes": 4,
+        "steps": [
+          "Add four shops with the first command. `m-anna` and `m-bert` both have 5.",
+          "Predict the order of the two `ZRANGE` calls before you run them, ties included.",
+          "Run the rest. What rank does `m-anna` have, and does it count from 0 or 1?"
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "ZADD merchants:today 5 m-anna 5 m-bert 7 m-cora 3 m-dave\nZRANGE merchants:today 0 -1 WITHSCORES\nZRANGE merchants:today 0 -1 REV WITHSCORES\nZREVRANK merchants:today m-anna WITHSCORE\nZINCRBY merchants:today 1 m-anna\nZRANGE merchants:today 0 2 REV WITHSCORES\nZREVRANK merchants:today m-zed"
+        },
+        "expect": "Ascending, the order is `m-dave` 3, `m-anna` 5, `m-bert` 5, `m-cora` 7: the tie goes to the smaller member name. With `REV` it's `m-cora`, `m-bert`, `m-anna`, `m-dave`, so the tie flips too. `ZREVRANK ... WITHSCORE` returns `1) (integer) 2` and `2) \"5\"`, so `m-anna` is third, counted from 0. After `ZINCRBY`, it has `\"6\"`, and the top three are `m-cora` 7, `m-anna` 6, `m-bert` 5. A member that doesn't exist gets `(nil)`, Redis's word for no value."
+      },
+      "refs": [
+        {
+          "title": "Redis sorted sets",
+          "url": "https://redis.io/docs/latest/develop/data-types/sorted-sets/",
+          "kind": "docs"
+        },
+        {
+          "title": "t_zset.c in Redis 8.10 (the two structures)",
+          "url": "https://github.com/redis/redis/blob/8.10/src/t_zset.c",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "One big key can make every client wait",
+      "body": "Put the one thread from Inside an in-memory store next to this lesson's Big-O table, and you get the most common way a Redis server stops answering. An O(N) command on a key with a big N holds the only thread for as long as it runs. Nobody writes a slow `SMEMBERS` on purpose. A set of flagged cards starts with 50 members, grows for two years, and one day holds a million. The code that reads it in one call never changed.\n\nOn the lab server, a set of a million card ids took about 30 MB. Reading it whole with `SMEMBERS` held the one thread for about 54 ms, and freeing it with `DEL` took about 40 ms. For those milliseconds, every other client of that Redis waited. Run the same read from a few copies of the program at once, and the waits add up. A key that large is called a **big key**, and the cure is to stop it growing, or to touch it only in small pieces.\n\nFour habits keep you out of trouble:\n\n- Read big collections in pages, with a cursor: `SSCAN`, `HSCAN`, `ZSCAN`, and `SCAN` for the whole keyspace. Each call returns a small batch plus a cursor to continue from. So each call does a limited amount of work, and other clients get their turn in between. For sorted sets, `ZRANGE` with small ranges does the same.\n- Delete big keys with `UNLINK`. It removes the key at once, and a background thread, `bio_lazy_free`, frees the memory while commands keep running.\n- Split by something natural: one set per day, one hash per shop, one sorted set per region. Ten keys of 100,000 members are kinder to everyone than one key of a million.\n- Find big keys before they find you, with `MEMORY USAGE key` and `redis-cli --bigkeys`, which walks the keyspace with `SCAN`.\n\nThe encoding limits give you a second reason to keep keys small: below them, the same data takes a fraction of the memory. **A key you can't read in one go is too big. Split it before it grows.**\n\nSmall keys still hold exact data, though, and some questions don't need exact answers. The next lesson trades exactness for memory on purpose.",
+      "try": {
+        "title": "Build a big key and time it",
+        "minutes": 5,
+        "steps": [
+          "At the `redis-cli` prompt, run the first three commands. The `EVAL` builds a set of a million card ids. It takes most of a second, and blocks the server the whole time.",
+          "In a second terminal, read the whole set once and throw the output away: `docker compose -f env/redis.yml exec redis redis-cli SMEMBERS flagged:cards > /dev/null`.",
+          "Back at the prompt, run the rest: build a copy, delete one set with `DEL` and the other with `UNLINK`, then read the slow log, Redis's list of slow commands. Predict which commands it lists.",
+          "Clean up afterwards with `FLUSHALL`, which deletes every key, if you like. This is your own lab server."
+        ],
+        "code": {
+          "lang": "text",
+          "title": "at the redis-cli prompt",
+          "src": "SLOWLOG RESET\nEVAL \"for i = 1, 1000000 do redis.call('SADD', KEYS[1], 'card:' .. i) end return redis.call('SCARD', KEYS[1])\" 1 flagged:cards\nMEMORY USAGE flagged:cards\nEVAL \"for i = 1, 1000000 do redis.call('SADD', KEYS[1], 'card:' .. i) end return 1\" 1 flagged:copy\nDEL flagged:cards\nUNLINK flagged:copy\nSLOWLOG GET 5"
+        },
+        "expect": "The slow log lists commands that ran longer than 10 ms. Each entry starts with an id, a Unix timestamp (seconds since 1970), the duration in microseconds and the command. On the lab server: both `EVAL`s about 640,000 µs, `SMEMBERS` about 54,000 µs, and `DEL` about 40,000 µs. `UNLINK` is missing, because it returned in well under 10 ms and left the freeing to the background thread. Your numbers depend on your CPU. `MEMORY USAGE` printed about 37 MB: it samples a few members and multiplies up, so treat it as a rough size."
+      },
+      "refs": [
+        {
+          "title": "Diagnosing latency issues (big keys and slow commands)",
+          "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
+          "kind": "docs"
+        },
+        {
+          "title": "SCAN and its cursor guarantees",
+          "url": "https://redis.io/docs/latest/commands/scan/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "compare": {
+    "title": "The ranking's top N in Java and Kotlin",
+    "java": {
+      "title": "Leaderboard.java",
+      "src": "public record Standing(String merchant, long approvals, long rank) {}\n\npublic List<Standing> top(int n) {\n    List<Tuple> rows = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, n - 1).rev());\n    List<Standing> out = new ArrayList<>(rows.size());\n    for (int i = 0; i < rows.size(); i++) {\n        Tuple t = rows.get(i);\n        out.add(new Standing(t.getElement(), (long) t.getScore(), i + 1));   // ranks start at 1 for people\n    }\n    return out;\n}"
+    },
+    "kotlin": {
+      "title": "Leaderboard.kt",
+      "src": "data class Standing(val merchant: String, val approvals: Long, val rank: Long)\n\nfun top(n: Int): List<Standing> =\n    redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, n - 1).rev())\n        .mapIndexed { i, t -> Standing(t.element, t.score.toLong(), i + 1L) }   // ranks start at 1 for people"
+    },
+    "note": "The Redis call is the same in both: one `ZRANGE ... REV WITHSCORES`. Kotlin reads Jedis's getters as properties (`t.element`, `t.score`), and a data class replaces the Java record, a small class that only holds values. Watch for missing values where the two languages meet. `zrevrank` returns a Java `Long` that is null when the shop has no entry, and Kotlin can't tell from Java code whether a value may be null (it calls such a value a platform type). Declare it `Long?`, so the compiler makes you handle the null. Pass it unchecked to code that wants a `Long`, and you get a `NullPointerException` the first time a shop has no entry."
+  },
+  "worked": {
+    "title": "Keep a sorted set per shop small on purpose",
+    "steps": [
+      {
+        "say": "The fraud team wants a screen that shows, for each shop, the card BINs with the most declined payments this hour. A BIN is the first six digits of a card number, and it names the bank that gave out the card. A sorted set per shop and hour fits: the member is the BIN, and the score counts the declines. About 20,000 shops are active in an hour, and a busy one sees declines from 300 different BINs.",
+        "code": "String key = \"declines:\" + merchant + \":h\" + hour;    // declines:m-17:h14\nredis.zincrby(key, 1, bin);",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "val key = \"declines:$merchant:h$hour\"                  // declines:m-17:h14\nredis.zincrby(key, 1.0, bin)"
+      },
+      {
+        "say": "Size it before you ship it. 300 members is past `zset-max-listpack-entries`, so a busy shop's key is a skip list. On the lab server, a 300-BIN set took 25,223 bytes, and a 100-BIN set took 730 bytes as a listpack (short members made of digits pack tightly). Across 20,000 shops, that's about 500 MB against about 15 MB.",
+        "code": "",
+        "lang": ""
+      },
+      {
+        "say": "The screen shows the top 20. So keep the 100 highest and drop the rest after every increment. The key never passes 101 members, and stays a listpack. A BIN that falls off and comes back starts again from 1, which is fine for a \"most declines\" view. Trimming a key that's already a skip list wouldn't help: it stays a skip list.",
+        "code": "redis.zincrby(key, 1, bin);\nredis.zremrangeByRank(key, 0, -101);      // keep the 100 highest; the key never passes 101 members",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "redis.zincrby(key, 1.0, bin)\nredis.zremrangeByRank(key, 0, -101)       // keep the 100 highest; the key never passes 101 members"
+      },
+      {
+        "say": "Read the top 20 with one `ZRANGE`, and give the key a lifetime so that old hours clean themselves up (Expiry, eviction and memory, lesson 5). These are two separate commands per decline, so another client can run between them. Here that only means the trim runs a moment late. Serial execution, in the Transactions track, shows how to make increment-and-trim one atomic step with a script.",
+        "code": "List<Tuple> top20 = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, 19).rev());\nredis.expire(key, 7_200);                 // two hours, then Redis deletes the key",
+        "lang": "java",
+        "alt_lang": "kotlin",
+        "alt_code": "val top20 = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, 19).rev())\nredis.expire(key, 7_200)                  // two hours, then Redis deletes the key"
+      }
     ]
-   },
-   "try": {
-    "title": "Watch a sorted set change shape",
-    "minutes": 5,
-    "steps": [
-     "At the redis-cli prompt, run the commands below one at a time. The first four ask how keys from the previous Try it are stored. The `EVAL` adds 128 members in one go.",
-     "Before `ZADD board 129 m-129`, predict the encoding and the memory after it.",
-     "Before the last `OBJECT ENCODING small`, predict what one 65-character member does to a two-member set. (Paste 65 x's or any 65-character string.)"
-    ],
-    "code": {
-     "lang": "text",
-     "title": "at the redis-cli prompt",
-     "src": "SET auths:today 41\nOBJECT ENCODING auths:today\nOBJECT ENCODING card:7:status\nOBJECT ENCODING payment:43\nEVAL \"for i = 1, 128 do redis.call('ZADD', KEYS[1], i, 'm-' .. i) end\" 1 board\nOBJECT ENCODING board\nMEMORY USAGE board\nZADD board 129 m-129\nOBJECT ENCODING board\nMEMORY USAGE board\nZREM board m-129\nOBJECT ENCODING board\nZADD small 1 m-1\nOBJECT ENCODING small\nZADD small 2 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nOBJECT ENCODING small\nCONFIG GET zset-max-listpack-*"
-    },
-    "expect": "`auths:today` is `\"int\"` (the value is a number, so Redis stores it as one), `card:7:status` is `\"embstr\"`, and the three-field `payment:43` is `\"listpack\"`. With 128 members, `board` is `\"listpack\"` at `(integer) 1076` bytes. After the 129th it is `\"skiplist\"` at `(integer) 10888`, about ten times more. After `ZREM` it is back to 128 members and still `\"skiplist\"`. `small` starts as `\"listpack\"` and becomes `\"skiplist\"` with only two members, because one member is longer than 64 bytes. `CONFIG GET` shows the two limits: `zset-max-listpack-entries` `128` and `zset-max-listpack-value` `64`. Byte counts can differ by a few percent between Redis builds."
-   },
-   "refs": [
-    {
-     "title": "redis.conf for Redis 8.10 (ADVANCED CONFIG)",
-     "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf",
-     "kind": "docs"
-    }
-   ]
   },
-  {
-   "h": "Every key also costs a slot in the keyspace's hash table",
-   "body": "Encodings shrink what is inside a key. Every key also has a fixed cost, because the whole keyspace is one big hash table from key name to value. In-memory caches mostly hold small objects. In Twitter's study of 153 cache clusters, the median cluster's average key was under 38 bytes and its average value about 230 bytes, and Memcached spends 56 bytes of bookkeeping on every item. At those sizes the fixed cost per key decides how many keys fit in RAM.\n\nHere Redis and Valkey have parted ways. Redis 7.2, the version Valkey forked from, keeps the keyspace in a chained hash table: an array of buckets, each pointing to a separately allocated entry, which points to the key and to the value. A lookup follows about four pointers, and each one can be a trip to RAM, lesson 1's 100 ns rung. Valkey 8.1 replaced it with buckets of 64 bytes, one CPU cache line each. A bucket holds up to seven entries plus one byte of each entry's hash, which rules out almost every wrong candidate without following its pointer, and the key is stored inside the value's own object. A lookup touches about two memory locations instead of four. Redis 8 cut its own per-key cost by a different route. On the lab machine, 100,000 tiny keys cost 75 bytes each on Redis 7.2.4, 55 on Redis 8.10.3 and 46 on Valkey 9.1.3, and a TTL added 20 to 35 bytes more.\n\nThe table also has to grow. Doubling a table of 10 million buckets in one go would hold the only thread for a long time, so both servers rehash incrementally. They keep the old and the new table side by side. Every command that touches the table moves a few buckets across, a short timed step on the server's background timer moves more, and lookups check both tables until the old one is empty. Redis also avoids resizing while a forked child is writing a snapshot, because moving memory then makes the kernel copy pages (lesson 9). Valkey's developers kept incremental rehashing, `SCAN`'s cursor and the random sampling of keys that eviction depends on (lesson 5), and those needs are why they wrote their own table instead of taking an off-the-shelf one.",
-   "try": {
-    "title": "Weigh a key on Redis 8.10 and on Valkey 9.1",
+  "lab": {
+    "title": "Catch the encoding switch, then build a ranking of shops",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/redis/src/main/java/sfz/cache/l03/EncodingProbe.java",
+      "labs/redis/src/main/kotlin/sfz/cache/l03/Leaderboard.kt"
+    ],
+    "run": "./gradlew :redis:test --tests 'sfz.cache.l03.*'",
+    "steps": [
+      "Run the tests from the `labs` folder with the command above. All 14 fail. They run against a shared Redis 8.10 container, which Testcontainers, a library for tests, starts for you. Each test gets its own key prefix, a start for its key names, so the tests don't collide.",
+      "In `EncodingProbe.java`, write `describe` with `objectEncoding` and `memoryUsage`, Jedis's names for `OBJECT ENCODING` and `MEMORY USAGE`.",
+      "Write `growUntilConverted`. Add element 1 and describe the key, then loop from 2 to `maxSize`: add, describe, and return a `Transition` as soon as the encoding changes. Run `./gradlew :redis:test --tests 'sfz.cache.l03.EncodingProbeTest'`. Its tests pin the 8.10 defaults: 129 for sorted sets and sets of strings, 513 for hashes and sets of whole numbers, and one long member converting at once.",
+      "In `Leaderboard.kt`, write `record` with `zincrby`, and `top` with one `zrangeWithScores` call using `ZRangeParams.zrangeParams(0, n - 1).rev()`. Turn positions counted from 0 into ranks that start at 1.",
+      "Write `standingOf` with `zrevrankWithScore`, and `around` with `zrevrank` and one range around that rank. Run all the tests."
+    ],
+    "hints": [
+      "`OBJECT ENCODING` comes back as a lowercase `String`. Compare encodings with `equals`, not `==`.",
+      "`zrevrankWithScore` returns a `KeyValue<Long, Double>`: `key` is the rank counted from 0, and `value` is the score. It's null when the shop has no entry.",
+      "In `around`, the range starts at `max(0, rank - radius)`. You don't need to limit the end: `ZRANGE` stops at the last member.",
+      "Scores are doubles. `toLong()` is safe here, because the totals are whole numbers far below 2^53."
+    ],
+    "done_when": "All 14 tests in `sfz.cache.l03` pass."
+  },
+  "drill": {
+    "title": "Top five and a rank, from memory",
     "minutes": 4,
-    "steps": [
-     "Run the script below in a terminal. It starts a throwaway Redis 8.10.3 and a throwaway Valkey 9.1.3 (the first run downloads the Valkey image), writes 100,000 tiny keys into each, without and then with a TTL, prints the memory per key from `used_memory`, and removes both containers.",
-     "Before it prints, predict which server stores a key in fewer bytes, and how much a TTL adds.",
-     "Notice that one script talks to both servers: the Valkey image also ships `redis-cli` as an alias for `valkey-cli`."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "terminal",
-     "src": "# one throwaway server of each, then 100,000 tiny keys in each, with and without a TTL\ndocker run --rm -d --name sfz-redis-mem -m 256m redis:8.10.3 > /dev/null\ndocker run --rm -d --name sfz-valkey-mem -m 256m valkey/valkey:9.1.3 > /dev/null\nsleep 2\nused() { docker exec \"$1\" redis-cli INFO memory | grep '^used_memory:' | tr -dc '0-9'; }\nfor c in sfz-redis-mem sfz-valkey-mem; do\n  for args in \"\" \", 'EX', 3600\"; do\n    docker exec \"$c\" redis-cli FLUSHALL > /dev/null\n    before=$(used \"$c\")\n    docker exec \"$c\" redis-cli EVAL \"for i = 1, 100000 do redis.call('SET', 'idem:' .. i, 'done'$args) end return 1\" 0 > /dev/null\n    echo \"$c${args:+ with TTL}: $(( ($(used \"$c\") - before) / 100000 )) bytes per key\"\n  done\ndone\ndocker rm -f sfz-redis-mem sfz-valkey-mem > /dev/null\n"
-    },
-    "expect": "On the lab machine: `sfz-redis-mem: 55 bytes per key`, `sfz-redis-mem with TTL: 79 bytes per key` (84 in a second run, depending on where the deadline table was in its growth), `sfz-valkey-mem: 46 bytes per key` and `sfz-valkey-mem with TTL: 66 bytes per key`. Each key name is about 10 bytes and each value the 4-byte string `done`, so most of what you pay for is bookkeeping. The same script against `redis:7.2.4`, the version Valkey forked from, printed 75 and 108: both servers have cut the per-key cost since they split, and Valkey a little further."
-   },
-   "refs": [
-    {
-     "title": "Valkey blog: A new hash table (Valkey 8.1)",
-     "url": "https://valkey.io/blog/new-hash-table/",
-     "kind": "read"
-    },
-    {
-     "title": "Yang et al., A large scale analysis of hundreds of in-memory cache clusters at Twitter (OSDI 2020)",
-     "url": "https://www.usenix.org/system/files/osdi20-yang.pdf",
-     "kind": "read"
+    "prompt": "Without looking, write the Jedis calls for two questions about `merchants:approved`. First, print the top 5 shops with their totals, highest first, numbered from 1. Second, get the rank of `m-17` counted from 1, or null if it has no entry. Then compare. Did you remember that ranks start at 0?",
+    "answer": {
+      "lang": "java",
+      "src": "List<Tuple> top5 = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 4).rev());\nfor (int i = 0; i < top5.size(); i++) {\n    System.out.printf(\"%d. %s %d%n\", i + 1, top5.get(i).getElement(), (long) top5.get(i).getScore());\n}\nLong rank = redis.zrevrank(\"merchants:approved\", \"m-17\");      // 0-based, null if absent\nLong shown = rank == null ? null : rank + 1;",
+      "alt": {
+        "lang": "kotlin",
+        "src": "val top5 = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 4).rev())\ntop5.forEachIndexed { i, t -> println(\"${i + 1}. ${t.element} ${t.score.toLong()}\") }\nval rank: Long? = redis.zrevrank(\"merchants:approved\", \"m-17\")   // 0-based, null if absent\nval shown = rank?.plus(1)"
+      }
     }
-   ]
   },
-  {
-   "h": "A sorted set orders by score, then by member",
-   "body": "Rank 20,000 merchants by approved payments, refreshed every second on a dashboard. In SQL you would run `ORDER BY approvals DESC LIMIT 10` each time, and the database would sort or walk an index on every refresh. A sorted set does the ordering on write instead: every `ZINCRBY` moves the member to its new place, so reading the top ten is reading the first ten entries.\n\n`ZINCRBY merchants:approved 1 m-17` adds one approval to merchant `m-17`, creating the member if it is new. `ZRANGE merchants:approved 0 9 REV WITHSCORES` returns the top ten with their scores, highest first (`REV` reverses the default low-to-high order). `ZREVRANK merchants:approved m-17` returns its place counted from the top.\n\nThree details cause most leaderboard bugs.\n\nRanks start at 0. `ZREVRANK` returns 0 for the leader, so add one before a person sees it.\n\nTies are ordered by member, byte by byte. In ascending order, `m-anna` comes before `m-bert` when both have 5. `REV` flips the whole order, ties included, so `m-bert` comes first. If the product wants \"whoever got there first wins the tie\", the member name can't give you that; you have to fold time into the score (see Go deeper).\n\nScores are doubles, 64-bit floating-point numbers. Whole numbers are exact up to 2^53, about 9 × 10^15, which is plenty for counts and for amounts in cents. Fractions are not exact, so store cents, never euros with decimals.\n\nSince Redis 6.2, `ZRANGE` takes `REV`, `BYSCORE`, `BYLEX` and `LIMIT`, and the docs mark `ZREVRANGE` and `ZRANGEBYSCORE` as deprecated. Since 7.2, `ZRANK` and `ZREVRANK` accept `WITHSCORE` and return rank and score in one round trip. Under the hood, from the encodings above: `ZSCORE` asks the hash table, O(1); `ZADD`, `ZREVRANK` and `ZRANGE` walk the skip list, O(log N), plus M for the members a range returns. In Jedis:\n\n```java\nList<Tuple> top = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 9).rev());\nKeyValue<Long, Double> me = redis.zrevrankWithScore(\"merchants:approved\", \"m-17\");   // null if absent\n```\n\n```kotlin\nval top: List<Tuple> = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 9).rev())\nval me: KeyValue<Long, Double>? = redis.zrevrankWithScore(\"merchants:approved\", \"m-17\")   // null if absent\n```",
-   "try": {
-    "title": "Rank four merchants, two of them tied",
-    "minutes": 4,
-    "steps": [
-     "Add four merchants. `m-anna` and `m-bert` both have 5.",
-     "Predict the order of the two `ZRANGE` calls before you run them, ties included.",
-     "Run the rest. What rank does `m-anna` have, and does it count from 0 or 1?"
-    ],
-    "code": {
-     "lang": "text",
-     "title": "at the redis-cli prompt",
-     "src": "ZADD merchants:today 5 m-anna 5 m-bert 7 m-cora 3 m-dave\nZRANGE merchants:today 0 -1 WITHSCORES\nZRANGE merchants:today 0 -1 REV WITHSCORES\nZREVRANK merchants:today m-anna WITHSCORE\nZINCRBY merchants:today 1 m-anna\nZRANGE merchants:today 0 2 REV WITHSCORES\nZREVRANK merchants:today m-zed"
-    },
-    "expect": "Ascending, the order is `m-dave` 3, `m-anna` 5, `m-bert` 5, `m-cora` 7: the tie goes to the smaller member name. With `REV` it is `m-cora`, `m-bert`, `m-anna`, `m-dave`: the tie flips too. `ZREVRANK ... WITHSCORE` returns `1) (integer) 2` and `2) \"5\"`, so `m-anna` is third, counted from 0. After `ZINCRBY` it has `\"6\"` and the top three are `m-cora` 7, `m-anna` 6, `m-bert` 5. A member that doesn't exist gets `(nil)`."
-   },
-   "refs": [
+  "recap": [
+    "Five types cover most jobs: strings, hashes, lists, sets and sorted sets. Choose by the operation you need, then check its cost in Big-O.",
+    "Small hashes, sets and sorted sets are listpacks, and small sets of whole numbers are intsets. Past 128 or 512 entries, or one value over 64 bytes, Redis converts them to hash tables or skip lists, and never converts back.",
+    "The conversion costs memory: on the lab server, a 128-member sorted set took about 1 KB, and the 129-member one about 11 KB.",
+    "All the keys live in one big hash table, so every key carries fixed bookkeeping. A tiny key cost about 75 bytes on Redis 7.2.4, 55 on Redis 8.10 and 46 on Valkey 9.1, whose 8.1 release moved to buckets the size of one CPU load.",
+    "Sorted sets order by score, then by member bytes, and `REV` flips both. Ranks start at 0. Scores are doubles, exact for whole numbers up to 2^53.",
+    "The limit: a big key makes O(N) commands block everyone. Read it in pages with the `SCAN` family, delete it with `UNLINK`, and split keys by day, shop or region."
+  ],
+  "closing": "We started with a café owner whose notebook page turned into a box of cards. Redis makes that switch inside a key, at 128 or 512 items, and the same data can then take ten times the memory. A key that keeps growing can also hold up every client.\n\nWith the lab server running, try `docker compose -f env/redis.yml exec redis redis-cli --bigkeys` from the `labs` folder. Then look at each key name in this lesson and ask: can it grow without limit?\n\nNext, we'll meet structures that answer one narrow question, such as how many different cards paid today, in a small, fixed amount of memory. Some of them give up exactness to do it.",
+  "quiz": [
     {
-     "title": "Redis sorted sets",
-     "url": "https://redis.io/docs/latest/develop/data-types/sorted-sets/",
-     "kind": "docs"
+      "q": "A Redis 7.2 server remembers who is logged in to a website: 40 million keys, each name about 16 bytes and each value about 8. About how much memory do the keys take?",
+      "options": [
+        "About 3 GB: roughly 75 bytes per key, most of it bookkeeping such as table entries, pointers and headers",
+        "About 1 GB: the 24 bytes of data per key",
+        "About 40 GB: Redis stores each key in its own 1 KB page",
+        "It depends only on which keys Redis throws away when it's full"
+      ],
+      "answer": 0,
+      "why": "On the lab machine, 100,000 tiny keys cost about 75 bytes each on Redis 7.2.4, and the key and value were only about 14 of them. The rest is the keyspace table's bucket and entry, the pointers between them, and the headers on every piece of memory. So 40 million keys need about 3 GB, not 1. Redis 8.10 and Valkey 9.1 cut that to about 55 and 46 bytes. Redis has no pages: that's the layout of a database built for disks."
     },
     {
-     "title": "t_zset.c in Redis 8.10 (the two structures)",
-     "url": "https://github.com/redis/redis/blob/8.10/src/t_zset.c",
-     "kind": "read"
+      "q": "A sorted set grew to 200 card BINs (the first digits of a card number) and was then trimmed to 50 with `ZREMRANGEBYRANK`. What does `OBJECT ENCODING` say now?",
+      "options": [
+        "`listpack`, because it's under 128 members again",
+        "`skiplist`",
+        "`intset`, because the BINs are numbers",
+        "It depends on the scores"
+      ],
+      "answer": 1,
+      "why": "The conversion goes one way. Once a sorted set becomes a skip list, removing members never turns it back into a listpack. To keep a key compact, keep it under the limit from the start, as the worked example does. The first option is the trap, because it assumes Redis checks the limit in both directions. Intset is only for sets, never for sorted sets."
+    },
+    {
+      "q": "Shops `m-a`, `m-b` and `m-c` all have score 10 in `board`. What does `ZRANGE board 0 -1 REV` return?",
+      "options": [
+        "`m-a`, `m-b`, `m-c`",
+        "The order in which they were added",
+        "`m-c`, `m-b`, `m-a`",
+        "A different order each time"
+      ],
+      "answer": 2,
+      "why": "Equal scores are ordered by member, comparing bytes, so ascending is `m-a`, `m-b`, `m-c`. `REV` reverses the whole order, ties included. The order they were added in is never used, and the order is the same on every call."
+    },
+    {
+      "q": "A nightly report runs `SMEMBERS fraud:flagged` on a set that has grown to 2 million members. What's the risk?",
+      "options": [
+        "None: `SMEMBERS` only reads, and reads never hold anyone up",
+        "Redis cuts the reply off at 1 million members",
+        "The set converts back to a listpack",
+        "Every other client of that Redis waits while the reply is built, for tens of milliseconds or more"
+      ],
+      "answer": 3,
+      "why": "`SMEMBERS` is O(N) and runs on the one thread that runs every command, so it holds everyone up for as long as it takes. On the lab server, one million members took about 54 ms. Read with `SSCAN` in pages instead, or split the set by day. The first option is the trap: a read is still a command, and commands take turns."
+    },
+    {
+      "q": "From Inside an in-memory store: a thousand copies of the payments program run `ZINCRBY merchants:approved 1 m-17` at the same moment. Why is no approval lost?",
+      "options": [
+        "Redis locks the key during each `ZINCRBY`",
+        "Each `ZINCRBY` runs to the end on the one thread that runs commands, before the next command starts",
+        "Jedis queues the calls from all the copies",
+        "Sorted sets update scores with special CPU instructions that can't be interrupted"
+      ],
+      "answer": 1,
+      "why": "The event loop never runs two commands at once, so each `ZINCRBY` reads the score, adds and writes it with nobody in between. There's no lock to take. Jedis can't line up calls from different copies either, because each copy has its own client.",
+      "from": "cache-02"
     }
-   ]
-  },
-  {
-   "h": "Big keys turn O(N) commands into outages",
-   "body": "Put lesson 2's model next to this lesson's Big-O table and you get the most common Redis outage. An O(N) command on a key with a big N holds the only thread for as long as it runs. Nobody writes a slow `SMEMBERS` on purpose. A set of flagged cards starts with 50 members, grows for two years, and one day holds a million. The code that reads it in one call never changed.\n\nOn the lab server a set of a million card ids took about 30 MB. Reading it whole with `SMEMBERS` held the event loop for about 54 ms, and freeing it with `DEL` took about 40 ms. For those milliseconds every other client of that Redis waited. Run the same read from a few pods at once and the waits add up.\n\nFour habits keep you out of trouble:\n\n- Read big collections in pages with a cursor: `SSCAN`, `HSCAN`, `ZSCAN`, and `SCAN` for the whole keyspace. Each call returns a small batch plus a cursor to continue from, so each does a bounded amount of work and other clients get their turn in between. For sorted sets, `ZRANGE` with small ranges does the same.\n- Delete big keys with `UNLINK`. It removes the key from the keyspace at once and frees the memory on the `bio_lazy_free` background thread.\n- Split by something natural: one set per day, one hash per merchant, one sorted set per region. Ten keys of 100,000 members are kinder to everyone than one key of a million.\n- Find big keys before they find you, with `MEMORY USAGE key` and `redis-cli --bigkeys`, which walks the keyspace with `SCAN`.\n\nThe encoding limits give you a second reason to keep keys small: below them, the same data takes a fraction of the memory.",
-   "try": {
-    "title": "Build a big key and time it",
-    "minutes": 5,
-    "steps": [
-     "At the redis-cli prompt, run the first three commands. The `EVAL` builds a set of a million card ids. It takes most of a second, and blocks the server the whole time.",
-     "In a second terminal, read the whole set once and throw the output away: `docker compose -f env/redis.yml exec redis redis-cli SMEMBERS flagged:cards > /dev/null`.",
-     "Back at the prompt, run the rest: build a copy, delete one set with `DEL` and the other with `UNLINK`, then read the slow log. Predict which commands it lists.",
-     "Clean up afterwards with `FLUSHALL` if you like. This is your own lab server."
-    ],
-    "code": {
-     "lang": "text",
-     "title": "at the redis-cli prompt",
-     "src": "SLOWLOG RESET\nEVAL \"for i = 1, 1000000 do redis.call('SADD', KEYS[1], 'card:' .. i) end return redis.call('SCARD', KEYS[1])\" 1 flagged:cards\nMEMORY USAGE flagged:cards\nEVAL \"for i = 1, 1000000 do redis.call('SADD', KEYS[1], 'card:' .. i) end return 1\" 1 flagged:copy\nDEL flagged:cards\nUNLINK flagged:copy\nSLOWLOG GET 5"
-    },
-    "expect": "The slow log lists commands that ran longer than 10 ms. Each entry starts with an id, a Unix timestamp, the duration in microseconds and the command. On the lab server: both `EVAL`s about 640,000 µs, `SMEMBERS` about 54,000 µs, `DEL` about 40,000 µs. `UNLINK` is missing, because it returned in well under 10 ms and left the freeing to the background thread. Your numbers depend on your CPU. `MEMORY USAGE` printed about 37 MB: it samples a few members and extrapolates, so treat it as a rough size."
-   },
-   "refs": [
+  ],
+  "flashcards": [
     {
-     "title": "Diagnosing latency issues (big keys and slow commands)",
-     "url": "https://redis.io/docs/latest/operate/oss_and_stack/management/optimization/latency/",
-     "kind": "docs"
+      "front": "Which command shows how Redis lays out a key in memory?",
+      "back": "`OBJECT ENCODING key`. Answers include `listpack`, `intset`, `skiplist`, `hashtable`, `quicklist`, `int`, `embstr` and `raw`."
     },
     {
-     "title": "SCAN and its cursor guarantees",
-     "url": "https://redis.io/docs/latest/commands/scan/",
-     "kind": "docs"
+      "front": "When does a sorted set stop being a listpack (8.10 defaults)?",
+      "back": "At its 129th member (`zset-max-listpack-entries 128`), or as soon as one member is longer than 64 bytes. It becomes a skip list and never converts back."
+    },
+    {
+      "front": "What are the default compact limits for hashes and for sets of whole numbers?",
+      "back": "Hashes stay a listpack up to 512 fields, with values up to 64 bytes. Sets of whole numbers stay an intset up to 512 members."
+    },
+    {
+      "front": "How does Redis order members with equal scores?",
+      "back": "By member, comparing bytes: ascending with `ZRANGE`, descending with `ZRANGE ... REV`."
+    },
+    {
+      "front": "Which two structures hold a big sorted set?",
+      "back": "A hash table from member to score (`ZSCORE` in O(1)) and a skip list in score order (`ZADD`, `ZRANK`, `ZRANGE` in O(log N))."
+    },
+    {
+      "front": "Why use `UNLINK` rather than `DEL` for a big key?",
+      "back": "`UNLINK` removes the key at once and frees the memory on a background thread. `DEL` frees it on the main thread, and every client waits."
+    },
+    {
+      "front": "How many bytes does a tiny key cost on Redis 8.10 and on Valkey 9.1?",
+      "back": "About 55 and 46 on the lab machine (100,000 keys with 4-byte values), against 75 on Redis 7.2.4. Most of it is bookkeeping."
     }
-   ]
-  }
- ],
- "analogy": "Encodings are a shop owner's stock book. With twenty products, one page is enough: the owner runs a finger down it, and it costs one sheet of paper. At two thousand products the page is hopeless, so the owner switches to a box of index cards sorted by name plus a ranked list on the wall. That takes far more paper, but any lookup is quick. Redis makes the same switch for you, at a size you can configure. The analogy breaks in two places: Redis switches at an exact count, and it never switches back, even after the shop shrinks.",
- "in_your_world": "The five types map onto jobs your payment services already have. Idempotency keys and per-card counters are strings. A cached card-issuer response or a payment record is a hash. Settlement batches waiting for a worker could sit in a list. The cards the fraud team flagged today are a set, and `SISMEMBER` checks one in O(1) on every authorization. Merchant rankings and \"BINs (card number prefixes) with the most declines this hour\" are sorted sets. The encoding limits matter when you size an instance: a million payment hashes of 12 fields each stay listpacks and take a fraction of the memory that a million 600-field hashes would. And look out for keys that grow without bound, like one set of every card ever flagged. That is the key that turns into a 50 ms `SMEMBERS` two years from now.",
- "mistake": "The most common mistake is keeping everything in one big key because it is convenient: all flagged cards in one set, all sessions in one hash, every event in one list. It works in test, where the key holds a hundred members, and fails in production, where it holds millions and an innocent `HGETALL`, `SMEMBERS` or `DEL` blocks the server for tens of milliseconds. It happens because Redis types feel like in-memory collections, and reading a whole `HashMap` in the JVM is cheap. In Redis that read holds the only command thread. Bound every key: split by day, merchant or region, read with the `SCAN` family, and delete big keys with `UNLINK`.",
- "compare": {
-  "title": "The leaderboard's top N in Java and Kotlin",
-  "java": {
-   "title": "Leaderboard.java",
-   "src": "public record Standing(String merchant, long approvals, long rank) {}\n\npublic List<Standing> top(int n) {\n    List<Tuple> rows = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, n - 1).rev());\n    List<Standing> out = new ArrayList<>(rows.size());\n    for (int i = 0; i < rows.size(); i++) {\n        Tuple t = rows.get(i);\n        out.add(new Standing(t.getElement(), (long) t.getScore(), i + 1));   // ranks start at 1 for people\n    }\n    return out;\n}"
+  ],
+  "terms": [
+    {
+      "term": "Encoding",
+      "plain": "How Redis lays a value out in memory, separate from its type. `OBJECT ENCODING` shows it."
+    },
+    {
+      "term": "Listpack",
+      "plain": "One block of memory holding entries back to back, each with its length in front. Compact, searched from the start, and used for small hashes, sets, sorted sets and lists."
+    },
+    {
+      "term": "Intset",
+      "plain": "A sorted array of whole numbers, used for small sets that hold only whole numbers."
+    },
+    {
+      "term": "Skip list",
+      "plain": "A sorted linked list where some items have extra links that jump ahead, so a search, an insert or a rank takes O(log N)."
+    },
+    {
+      "term": "Big-O notation",
+      "plain": "A way to say how a command's work grows with the size of the key: O(1) stays the same, O(N) grows in step, O(log N) grows very slowly."
+    },
+    {
+      "term": "Keyspace",
+      "plain": "The one big hash table that holds every key on a Redis server, from each name to its value."
+    },
+    {
+      "term": "Big key",
+      "plain": "A key so large that O(N) commands on it take milliseconds and make every other client wait."
+    },
+    {
+      "term": "Incremental rehashing",
+      "plain": "Growing a hash table a few buckets at a time, with the old and new tables side by side, so no single command pays for the whole move."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate asks why `MEMORY USAGE` of their sorted set jumped from about 1 KB to about 11 KB when it went from 128 to 129 members, and whether deleting members will bring it back down. Explain.",
+    "answer": "Up to 128 members, the default `zset-max-listpack-entries`, Redis stores a sorted set as a listpack. That's one block of memory with the entries packed back to back, no pointers, searched from the start, which is cheap for a small set. The 129th member makes Redis convert the key to the general form: a hash table from member to score, plus a skip list in score order. Every member now has its own pieces of memory, pointers and a slot in the hash table, so the same data takes about ten times the memory. In exchange, finding a score takes O(1) and finding a rank O(log N), instead of a walk through the block. Deleting members won't bring it back, because Redis only converts upward. If we want the compact form, we have to keep the key under 128 members from the start, for example by trimming after each insert, or rebuild it into a new key."
   },
-  "kotlin": {
-   "title": "Leaderboard.kt",
-   "src": "data class Standing(val merchant: String, val approvals: Long, val rank: Long)\n\nfun top(n: Int): List<Standing> =\n    redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, n - 1).rev())\n        .mapIndexed { i, t -> Standing(t.element, t.score.toLong(), i + 1L) }   // ranks start at 1 for people"
+  "deeper": {
+    "minutes": 10,
+    "body": "Two pieces of old advice are out of date. Old posts put the `embstr` cut-off at 44 bytes. In Redis 8.10, a 44-byte value under a 1-character key came out `raw`, and so did a 35-byte value under a 41-character key, because the cut-off now depends on the key's length as well. Old posts also say ziplist. Redis 7.0 replaced ziplist with listpack, and the old `*-ziplist-*` setting names still work as other names for the new ones.\n\nTo break ties by time, fold the time into the score. Say the product wants the shop that reached a total first to rank higher. Use `score = approvals × 100,000 + (99,999 − second of the day)`. A day has 86,400 seconds, so the time part fits in five digits, and a higher total always wins. Between equal totals, the earlier second gives the bigger score. Doubles stay exact up to 2^53, so totals up to about 90 billion are safe. The catch: every new approval must rewrite the time part too, which is read, compute and write. Two clients can interleave that, so do it in a Lua script (Serial execution, in the Transactions track), or accept small errors.\n\nThe value limits count bytes, not characters. In UTF-8, the usual way to store text as bytes, an accented letter such as é takes two bytes. So a 40-character shop name full of them can cross the 64-byte `zset-max-listpack-value`.\n\nThe limits decide how much a whole server holds, too. A million payment hashes of 12 fields each stay listpacks, and take a fraction of the memory that a million 600-field hashes would.\n\nRaising the limits is allowed. `CONFIG SET zset-max-listpack-entries 256` keeps bigger sets compact, at the cost of O(N) inserts and lookups on longer blocks. The defaults are a sensible trade, so measure before you change them. Existing keys aren't converted when you change the setting; it applies the next time a key would grow.\n\nRedis keeps squeezing the big encodings too. The 8.6 release notes list a large memory cut for hashes in a hash table and sorted sets in a skip list. Redis 8.10 added a new layout for many hashes that share the same field names, loaded with `HIMPORT`. Plain `HSET` keys, like the ones in this lesson's lab, still show `listpack` and `hashtable`.\n\nValkey's write-up of its new table explains why it didn't adopt a ready-made design such as a Swiss table, a fast hash table design from Google. The keyspace has to support incremental rehashing, a `SCAN` cursor that survives a resize, and picking random keys for eviction and for expiry, and ready-made tables offer none of that. The developers report that speed changed very little either way. The win was memory: roughly 20 bytes per key, and 30 per key with a TTL, against the old layout, plus 10 to 20 bytes per item inside big hashes, sets and sorted sets."
   },
-  "note": "The Redis call is the same in both: one `ZRANGE ... REV WITHSCORES`. Kotlin reads Jedis's getters as properties (`t.element`, `t.score`), and a data class replaces the record. Watch nullability at the boundary. `zrevrank` returns a Java `Long` that is null when the member doesn't exist, and Kotlin sees it as a platform type. Declare it `Long?` so the compiler makes you handle the null. Pass it unchecked to something that wants a `Long`, and you get a `NullPointerException` the first time a merchant has no entry."
- },
- "worked": {
-  "title": "Keep a per-merchant sorted set small on purpose",
-  "steps": [
-   {
-    "say": "The fraud team wants, for each merchant, the card BINs (the first six digits of a card number) with the most declines this hour. A sorted set per merchant and hour fits: the member is the BIN, the score counts declines. About 20,000 merchants are active in an hour, and a busy one sees declines from 300 different BINs.",
-    "code": "String key = \"declines:\" + merchant + \":h\" + hour;    // declines:m-17:h14\nredis.zincrby(key, 1, bin);",
-    "lang": "java",
-    "alt_lang": "kotlin",
-    "alt_code": "val key = \"declines:$merchant:h$hour\"                  // declines:m-17:h14\nredis.zincrby(key, 1.0, bin)"
-   },
-   {
-    "say": "Size it before you ship it. 300 members is past `zset-max-listpack-entries`, so a busy merchant's key is a skip list. On the lab server a 300-BIN set took 25,223 bytes, and a 100-BIN set took 730 bytes as a listpack (short numeric members pack tightly). Across 20,000 merchants that is about 500 MB against about 15 MB.",
-    "code": "",
-    "lang": ""
-   },
-   {
-    "say": "The dashboard shows the top 20. So keep the 100 highest and drop the rest after every increment. The key never passes 101 members and stays a listpack. A BIN that falls off and comes back starts again from 1, which is fine for a \"most declines\" view. Trimming a key that is already a skip list would not help: it stays a skip list.",
-    "code": "redis.zincrby(key, 1, bin);\nredis.zremrangeByRank(key, 0, -101);      // keep the 100 highest; the key never passes 101 members",
-    "lang": "java",
-    "alt_lang": "kotlin",
-    "alt_code": "redis.zincrby(key, 1.0, bin)\nredis.zremrangeByRank(key, 0, -101)       // keep the 100 highest; the key never passes 101 members"
-   },
-   {
-    "say": "Read the top 20 with one `ZRANGE`, and give the key a lifetime so old hours clean themselves up (lesson 5 covers expiry). These are two separate commands per decline, so another client can run between them. Here that only means the trim runs a moment late. The Transactions track's lesson on serial execution shows how to make increment-and-trim one atomic step with a script.",
-    "code": "List<Tuple> top20 = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, 19).rev());\nredis.expire(key, 7_200);                 // two hours, then Redis deletes the key",
-    "lang": "java",
-    "alt_lang": "kotlin",
-    "alt_code": "val top20 = redis.zrangeWithScores(key, ZRangeParams.zrangeParams(0, 19).rev())\nredis.expire(key, 7_200)                  // two hours, then Redis deletes the key"
-   }
+  "sources": [
+    {
+      "title": "Redis data types (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/data-types/"
+    },
+    {
+      "title": "Redis sorted sets (Redis docs)",
+      "url": "https://redis.io/docs/latest/develop/data-types/sorted-sets/"
+    },
+    {
+      "title": "redis.conf for Redis 8.10",
+      "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf"
+    },
+    {
+      "title": "Redis 7.0 release notes (listpack replaces ziplist)",
+      "url": "https://raw.githubusercontent.com/redis/redis/7.0/00-RELEASENOTES"
+    },
+    {
+      "title": "Valkey blog: A new hash table",
+      "url": "https://valkey.io/blog/new-hash-table/"
+    }
   ]
- },
- "lab": {
-  "title": "Catch the encoding switch, then build a merchant leaderboard",
-  "minutes": 15,
-  "needs": [
-   "Docker"
-  ],
-  "files": [
-   "labs/redis/src/main/java/sfz/cache/l03/EncodingProbe.java",
-   "labs/redis/src/main/kotlin/sfz/cache/l03/Leaderboard.kt"
-  ],
-  "run": "./gradlew :redis:test --tests 'sfz.cache.l03.*'",
-  "steps": [
-   "Run the tests from the `labs` folder. All 14 fail. They run against the shared Redis 8.10 container, and each test gets its own key prefix.",
-   "In `EncodingProbe.java`, write `describe` with `objectEncoding` and `memoryUsage`.",
-   "Write `growUntilConverted`: add element 1 and describe the key, then loop from 2 to `maxSize`: add, describe, and return a `Transition` as soon as the encoding changes. Run `EncodingProbeTest`. Its tests pin the 8.10 defaults: 129 for sorted sets and sets of strings, 513 for hashes and sets of integers, and one long member converting at once.",
-   "In `Leaderboard.kt`, write `record` with `zincrby` and `top` with one `zrangeWithScores` call using `ZRangeParams.zrangeParams(0, n - 1).rev()`. Turn 0-based positions into ranks that start at 1.",
-   "Write `standingOf` with `zrevrankWithScore`, and `around` with `zrevrank` and one range around that rank. Run all the tests."
-  ],
-  "hints": [
-   "`OBJECT ENCODING` comes back as a lowercase `String`. Compare encodings with `equals`, not `==`.",
-   "`zrevrankWithScore` returns a `KeyValue<Long, Double>`: `key` is the 0-based rank and `value` the score. It is null when the merchant has no entry.",
-   "In `around`, the range starts at `max(0, rank - radius)`. You don't need to clamp the end: `ZRANGE` stops at the last member.",
-   "Scores are doubles. `toLong()` is safe here, because the totals are whole numbers far below 2^53."
-  ],
-  "done_when": "All 14 tests in `sfz.cache.l03` pass."
- },
- "drill": {
-  "title": "Top five and a rank, from memory",
-  "minutes": 4,
-  "prompt": "Without looking, write the Jedis calls for two questions about `merchants:approved`: print the top 5 merchants with their totals, highest first, numbered from 1; and get the 1-based rank of `m-17`, or null if it has no entry. Then compare. Did you remember that ranks start at 0?",
-  "answer": {
-   "lang": "java",
-   "src": "List<Tuple> top5 = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 4).rev());\nfor (int i = 0; i < top5.size(); i++) {\n    System.out.printf(\"%d. %s %d%n\", i + 1, top5.get(i).getElement(), (long) top5.get(i).getScore());\n}\nLong rank = redis.zrevrank(\"merchants:approved\", \"m-17\");      // 0-based, null if absent\nLong shown = rank == null ? null : rank + 1;",
-   "alt": {
-    "lang": "kotlin",
-    "src": "val top5 = redis.zrangeWithScores(\"merchants:approved\", ZRangeParams.zrangeParams(0, 4).rev())\ntop5.forEachIndexed { i, t -> println(\"${i + 1}. ${t.element} ${t.score.toLong()}\") }\nval rank: Long? = redis.zrevrank(\"merchants:approved\", \"m-17\")   // 0-based, null if absent\nval shown = rank?.plus(1)"
-   }
-  }
- },
- "recap": [
-  "Five types cover most jobs: strings, hashes, lists, sets and sorted sets. Choose by the operation you need, then check its cost.",
-  "Small hashes, sets and sorted sets are listpacks, and small sets of integers are intsets. Past 128 or 512 entries, or one value over 64 bytes, Redis converts them to hash tables or skip lists, and never converts back.",
-  "The keyspace is one big hash table, so every key carries fixed bookkeeping: about 75 bytes per tiny key on Redis 7.2.4, 55 on Redis 8.10 and 46 on Valkey 9.1, whose 8.1 release moved to cache-line-sized buckets.",
-  "The conversion costs memory: on the lab server a 128-member sorted set took about 1 KB, and the 129-member one about 11 KB.",
-  "Sorted sets order by score, then by member bytes, and `REV` flips both. Ranks start at 0. Scores are doubles, exact for whole numbers up to 2^53.",
-  "Big keys make O(N) commands block everyone. Page with the `SCAN` family, delete with `UNLINK`, and split keys by day, merchant or region."
- ],
- "quiz": [
-  {
-   "q": "A session cache on Redis 7.2 holds 40 million keys. Each key name is about 16 bytes and each value about 8. About how much memory do the keys take?",
-   "options": [
-    "About 3 GB: roughly 75 bytes per key, most of it bookkeeping such as table entries, pointers and allocation headers",
-    "About 1 GB: the 24 bytes of data per key",
-    "About 40 GB: Redis stores each key in its own 1 KB page",
-    "It depends only on the eviction policy"
-   ],
-   "answer": 0,
-   "why": "On the lab machine, 100,000 tiny keys cost about 75 bytes each on Redis 7.2.4, and the key and value were only about 14 of them. The rest is the keyspace table's bucket and entry, pointers and allocator headers, so 40 million keys need about 3 GB, not 1. Redis 8.10 and Valkey 9.1 cut that to about 55 and 46 bytes. Redis has no pages: that is a disk engine's layout."
-  },
-  {
-   "q": "A sorted set grew to 200 BINs and was then trimmed to 50 with `ZREMRANGEBYRANK`. What does `OBJECT ENCODING` say now?",
-   "options": [
-    "`listpack`, because it is under 128 members again",
-    "`skiplist`",
-    "`intset`, because the BINs are numbers",
-    "It depends on the scores"
-   ],
-   "answer": 1,
-   "why": "Conversion goes one way. Once a sorted set becomes a skip list, removing members never turns it back into a listpack. To keep a key compact, keep it under the limit from the start, as the worked example does. Intset is only for sets, never sorted sets."
-  },
-  {
-   "q": "Merchants `m-a`, `m-b` and `m-c` all have score 10 in `board`. What does `ZRANGE board 0 -1 REV` return?",
-   "options": [
-    "`m-a`, `m-b`, `m-c`",
-    "The order in which they were added",
-    "`m-c`, `m-b`, `m-a`",
-    "A different order each time"
-   ],
-   "answer": 2,
-   "why": "Equal scores are ordered by member, comparing bytes, so ascending is `m-a`, `m-b`, `m-c`. `REV` reverses the whole order, ties included. Insertion order is never used, and the order is deterministic."
-  },
-  {
-   "q": "A nightly report runs `SMEMBERS fraud:flagged` on a set that has grown to 2 million members. What is the risk?",
-   "options": [
-    "None: `SMEMBERS` is a read, and reads never block anyone",
-    "Redis cuts the reply off at 1 million members",
-    "The set converts back to a listpack",
-    "Every other client of that Redis waits while the reply is built, for tens of milliseconds or more"
-   ],
-   "answer": 3,
-   "why": "`SMEMBERS` is O(N) and runs on the one command thread, so it blocks everyone for as long as it takes. On the lab server one million members took about 54 ms. Read with `SSCAN` in pages instead, or split the set by day."
-  },
-  {
-   "q": "From lesson 2: a thousand pods run `ZINCRBY merchants:approved 1 m-17` at the same moment. Why is no approval lost?",
-   "options": [
-    "Redis locks the key during each `ZINCRBY`",
-    "Each `ZINCRBY` runs to completion on the one command thread before the next command starts",
-    "Jedis queues the calls from all pods",
-    "Sorted sets update scores with atomic CPU instructions"
-   ],
-   "answer": 1,
-   "why": "The event loop never runs two commands at once, so each `ZINCRBY` reads the score, adds and writes it with nobody in between. There is no lock to take. Jedis can't coordinate pods: each pod has its own client.",
-   "from": "cache-02"
-  }
- ],
- "flashcards": [
-  {
-   "front": "Which command shows how Redis stores a key internally?",
-   "back": "`OBJECT ENCODING key`. Answers include `listpack`, `intset`, `skiplist`, `hashtable`, `quicklist`, `int`, `embstr` and `raw`."
-  },
-  {
-   "front": "When does a sorted set stop being a listpack (8.10 defaults)?",
-   "back": "At its 129th member (`zset-max-listpack-entries 128`), or as soon as one member is longer than 64 bytes. It becomes a skiplist and never converts back."
-  },
-  {
-   "front": "Default compact limits for hashes and for sets of integers?",
-   "back": "Hashes: 512 fields with values up to 64 bytes stay a listpack. Sets of integers: up to 512 members stay an intset."
-  },
-  {
-   "front": "How does Redis order members with equal scores?",
-   "back": "By member, comparing bytes. Ascending with `ZRANGE`, descending with `ZRANGE ... REV`."
-  },
-  {
-   "front": "What two structures hold a big sorted set?",
-   "back": "A hash table from member to score (`ZSCORE` in O(1)) and a skip list in score order (`ZADD`, `ZRANK`, `ZRANGE` in O(log N))."
-  },
-  {
-   "front": "Why `UNLINK` rather than `DEL` for a big key?",
-   "back": "`UNLINK` removes the key at once and frees the memory on a background thread. `DEL` frees it on the main thread, and every client waits."
-  },
-  {
-   "front": "How many bytes does a tiny key cost on Redis 8.10 and on Valkey 9.1?",
-   "back": "About 55 and 46 on the lab machine (100,000 keys with 4-byte values), against 75 on Redis 7.2.4. Most of it is bookkeeping."
-  }
- ],
- "terms": [
-  {
-   "term": "Encoding",
-   "plain": "How Redis lays a value out in memory, separate from its type. `OBJECT ENCODING` shows it."
-  },
-  {
-   "term": "Listpack",
-   "plain": "One block of memory holding length-prefixed entries back to back. Compact, searched from the start, used for small hashes, sets, sorted sets and lists."
-  },
-  {
-   "term": "Intset",
-   "plain": "A sorted array of integers, used for small sets that hold only integers."
-  },
-  {
-   "term": "Skip list",
-   "plain": "A sorted linked list where some nodes have extra links that jump ahead, so search, insert and rank take O(log N)."
-  },
-  {
-   "term": "Quicklist",
-   "plain": "A linked list of listpacks: the encoding Redis uses for big lists."
-  },
-  {
-   "term": "Big key",
-   "plain": "A key so large that O(N) commands on it take milliseconds and stall the server."
-  },
-  {
-   "term": "Incremental rehashing",
-   "plain": "Growing a hash table a few buckets at a time, with the old and new tables side by side, so no single command pays for the whole resize."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate asks why `MEMORY USAGE` of their sorted set jumped from about 1 KB to about 11 KB when it went from 128 to 129 members, and whether deleting members will bring it back down. Explain.",
-  "answer": "Up to 128 members (the default `zset-max-listpack-entries`), Redis stores a sorted set as a listpack: one block of memory with the entries packed back to back, no pointers, searched from the start. That is cheap for a small set. The 129th member makes Redis convert the key to the general form: a hash table from member to score plus a skip list in score order. Every member now has its own nodes, pointers and hash table slot, so the same data takes about ten times the memory. In exchange, lookups and ranks become O(1) and O(log N) instead of a scan. Deleting members won't bring it back: Redis only converts upward. If we want the compact form, we have to keep the key under 128 members from the start, for example by trimming after each insert, or rebuild it into a new key."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "Two pieces of folklore are out of date. Old posts put the `embstr` cut-off at 44 bytes. In Redis 8.10 a 44-byte value under a 1-character key came out `raw`, and so did a 35-byte value under a 41-character key, because the cut-off now depends on the key's length as well. Old posts also say ziplist: Redis 7.0 replaced ziplist with listpack, and the old `*-ziplist-*` setting names still work as aliases.\n\nTo break ties by time, fold time into the score. Say the product wants the merchant that reached a total first to rank higher. Use `score = approvals × 100,000 + (99,999 − second of the day)`. A day has 86,400 seconds, so the time part fits in five digits, and a higher total always wins. Between equal totals, the earlier second gives the bigger score. Doubles stay exact up to 2^53, so totals up to about 90 billion are safe. The catch: every new approval must rewrite the time part too, which is read, compute and write. Two clients can interleave that, so do it in a Lua script (the Transactions track's lesson on serial execution) or accept small errors.\n\nThe value limits count bytes, not characters. In UTF-8 an accented letter such as é takes two bytes, so a 40-character merchant name full of them can cross the 64-byte `zset-max-listpack-value`.\n\nRaising the limits is allowed. `CONFIG SET zset-max-listpack-entries 256` keeps bigger sets compact, at the cost of O(N) inserts and lookups on longer blocks. The defaults are a sensible trade, and you should measure before you change them. Existing keys are not converted when you change the setting; it applies the next time a key would grow.\n\nRedis keeps squeezing the big encodings too. The 8.6 release notes list a substantial memory reduction for hashtable-encoded hashes and skiplist-encoded sorted sets. Redis 8.10 added a new hash encoding for many hashes that share the same field names, loaded with `HIMPORT`. Plain `HSET` keys, like the ones in this lesson's lab, still show `listpack` and `hashtable`.\n\nValkey's write-up of its new table explains why it didn't adopt a ready-made design such as a Swiss table. The keyspace has to support incremental rehashing, a `SCAN` cursor that survives a resize, and picking random keys for eviction and for the expiry cycle, and off-the-shelf tables offer none of that. The developers report that speed changed very little either way: the win was memory, roughly 20 bytes per key and 30 per key with a TTL against the old layout, plus 10 to 20 bytes per element inside big hashes, sets and sorted sets."
- },
- "sources": [
-  {
-   "title": "Redis data types (Redis docs)",
-   "url": "https://redis.io/docs/latest/develop/data-types/"
-  },
-  {
-   "title": "Redis sorted sets (Redis docs)",
-   "url": "https://redis.io/docs/latest/develop/data-types/sorted-sets/"
-  },
-  {
-   "title": "redis.conf for Redis 8.10",
-   "url": "https://raw.githubusercontent.com/redis/redis/8.10/redis.conf"
-  },
-  {
-   "title": "Redis 7.0 release notes (listpack replaces ziplist)",
-   "url": "https://raw.githubusercontent.com/redis/redis/7.0/00-RELEASENOTES"
-  },
-  {
-   "title": "Valkey blog: A new hash table",
-   "url": "https://valkey.io/blog/new-hash-table/"
-  }
- ]
 }

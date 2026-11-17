@@ -1,52 +1,29 @@
 from sfz import *
 
-SAY.insert(0, (r"\brouter2\b", "router two"))
-SAY.insert(0, (r"\bICMP\b", "I C M P"))
-SAY.insert(0, (r"\b([Tt])raceroute\b", r"\1race route"))
-SAY.insert(0, (r"\b10\.10\.4\b", "ten dot ten dot four"))
-SAY.insert(0, (r"\b10\.10\.4\.0/24\b", "ten dot ten dot four dot zero slash twenty-four"))
+# Applied in this order, before the course-wide rules.
+SAY[0:0] = [
+    (r"\brouter2\b", "router two"),
+    (r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b", r"\1 dot \2 dot \3 dot \4"),
+    (r"/(\d+)\b", r" slash \1"),
+    (r"\bBGP\b", "B G P"),
+]
 
-HY, HW, HH = 2.75, 2.4, 1.1                 # the path, left to right
-HX = {"client": -5.4, "router": -1.85, "router2": 1.75, "ledger": 5.3}
-NET_Y = 1.05                                # the internet, below router
-TX, TW, TY, TH = -2.75, 7.3, -0.95, 2.6     # routing table panel
-PX, PW = 3.9, 5.0                           # packet / traceroute panel
-ROW_Y = [TY + 0.05, TY - 0.45, TY - 0.95]
-LINE_Y = [TY + 0.3, TY - 0.15, TY - 0.6, TY - 1.02]
-ST_Y = -3.0
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+TOP, LOW = 2.3, 0.65                   # the two rows of machines
+BUS = 1.35                             # the lan, a shared wire under the top row
+BW, BH = 2.3, 0.9
+X_CL, X_RT, X_R2, X_LG = -5.45, -1.4, 2.0, 5.35
+X_GW, X_PR, X_SV = -5.45, -3.2, 0.1
+RT_BUS, RT_WAN = -1.9, -0.6            # where router's lan and wan wires leave its box
+TB_X, TB_Y0, TB_DY = -5.6, -0.68, 0.42
+CAP_Y, BAR_Y = -2.95, -3.4
 
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def run(a, b, color=YELLOW_M, run_time=0.7):
-    """A dot from point a to point b, invisible until its turn."""
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.12))
-
-
-def edge(a, b):
-    """The points where the link between hosts a and b leaves each box."""
-    s = 1 if HX[b] > HX[a] else -1
-    return np.array([HX[a] + s * HW / 2, HY, 0]), np.array([HX[b] - s * HW / 2, HY, 0])
-
-
-def hop(a, b, color=YELLOW_M, rt=0.6):
-    pa, pb = edge(a, b)
-    return run(pa, pb, color, rt)
+P_CL_RT = [[X_CL, TOP - BH / 2, 0], [X_CL, BUS, 0], [RT_BUS, BUS, 0], [RT_BUS, TOP - BH / 2, 0]]
+P_CL_PR = [[X_CL, TOP - BH / 2, 0], [X_CL, BUS, 0], [X_PR, BUS, 0], [X_PR, LOW + BH / 2, 0]]
+P_CL_GW = [[X_CL, TOP - BH / 2, 0], [X_GW, LOW + BH / 2, 0]]
+P_RT_R2 = [[X_RT + BW / 2, TOP, 0], [X_R2 - BW / 2, TOP, 0]]
+P_R2_LG = [[X_R2 + BW / 2, TOP, 0], [X_LG - BW / 2, TOP, 0]]
+P_RT_SV = [[RT_WAN, TOP - BH / 2, 0], [RT_WAN, LOW + BH / 2, 0]]
 
 
 class Base(VoiceScene):
@@ -76,7 +53,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.3):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -97,210 +74,362 @@ class Base(VoiceScene):
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
+        if t > dur + 0.1:
+            print(f"WARNING: steps run {t - dur:.1f}s past the line: {text[:50]}")
         if dur - t > 0.02:
             self.wait(dur - t)
         if after:
             self.wait(after)
 
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 12.6).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
 
-def host(name, ip, color):
-    x = HX[name]
-    r = RoundedRectangle(corner_radius=0.14, width=HW, height=HH, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1)
-    r.move_to([x, HY, 0])
-    return VGroup(r, T(name, 28).move_to([x, HY + 0.2, 0]), M(ip, 21, GREY_B).move_to([x, HY - 0.22, 0]))
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
 
-
-def row(dest, nxt, k, color=WHITE):
-    return VGroup(left_at(M(dest, 22, color), TX - TW / 2 + 0.3, ROW_Y[k]), left_at(M(nxt, 22, color), TX - 0.35, ROW_Y[k]))
-
-
-def pline(s, k, color=WHITE, size=22):
-    return left_at(M(s, size, color), PX - PW / 2 + 0.3, LINE_Y[k])
-
-
-def ptitle(s):
-    return T(s, 24, GREY_B).move_to([PX, TY + TH / 2 - 0.35, 0])
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def status(s, color=GREY_B):
-    return T(s, 28, color).move_to([0, ST_Y, 0])
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def swap(old, new, d=UP):
+    """Replace one label with another: the old one leaves before the new one arrives, so they never overlap."""
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def go(pts, color=YELLOW_M, rt=0.9):
+    """A dot (the packet) running along a wire."""
+    d = Dot(radius=0.09, color=color).move_to(pts[0]).set_z_index(3)
+    path = VMobject().set_points_as_corners(pts)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, path, rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.12))
+
+
+def wire(pts):
+    return VMobject(stroke_color=GREY_B, stroke_width=2.5).set_points_as_corners(pts).set_z_index(-5)
+
+
+# ---- the pieces ----
+def node(name, sub, x, y, w=BW, color=WHITE, mono=True, size=22):
+    r = RoundedRectangle(corner_radius=0.14, width=w, height=BH, stroke_color=color, stroke_width=3).set_fill(BLACK, 1)
+    r.move_to([x, y, 0])
+    s = M(sub, 16, GREY_B) if mono else T(sub, 17, GREY_B)
+    return VGroup(r, T(name, size).move_to([x, y + 0.17, 0]), s.move_to([x, y - 0.2, 0]))
+
+
+def trow(i, prefix, dest, color=WHITE):
+    y = TB_Y0 - i * TB_DY
+    return VGroup(left_at(M(prefix, 19, color), TB_X, y), T("→", 20, GREY_B).move_to([TB_X + 2.75, y, 0]),
+                  left_at(T(dest, 19, color), TB_X + 3.1, y))
+
+
+def hl(row, color=YELLOW_M):
+    return SurroundingRectangle(row, buff=0.08, corner_radius=0.06, color=color, stroke_width=2.5)
 
 
 class Routing(Base):
-    """net-04, sections 0 to 2: client sends to ledger (10.10.4.40) through router and router2. A table with only a default
-    route sends it to the internet; a /24 line for 10.10.4.0 wins by longest prefix match. Two routers that disagree loop a
-    packet; the TTL (5 here) runs out at router, which sends ICMP time exceeded. Traceroute's probes with TTL 1, 2, 3 map
-    the hops 10.10.1.2, 10.10.3.3 and 10.10.4.40, the last by port unreachable."""
+    """net-04, section 0. A packet from client to ledger (10.10.4.40) crosses router and router2; each forwards it
+    alone, like parcel sorting offices. One default line can't serve a router with three ways out, so it keeps one line
+    per block (10.10.4.0/24: first 24 bits fixed). Client's lines /0, /16 and /24 all fit peer's 10.10.1.20; reading
+    the list top-down would send it to Docker's gateway, but the longest prefix wins and the order never matters."""
+
+    def set_rows(self, rows):
+        olds = [r for r in self.rows]
+        self.rows = rows
+        return [*[FadeOut(r) for r in olds], LaggedStart(*[FadeIn(r, shift=0.1 * RIGHT) for r in rows], lag_ratio=0.25)]
+
+    def set_title(self, s):
+        new = left_at(T(s, 20, GREY_B), TB_X, -0.25)
+        old, self.tt = self.tt, new
+        return [swap(old, new)]
 
     def construct(self):
-        self.title_card("Routing, TTL and traceroute", "one table lookup per hop, and a counter that stops loops")
+        self.capm = self.tt = None
+        self.rows = []
+        self.title_card("The most specific route wins", "how a router picks the next step for every packet")
 
-        hs = {"client": host("client", "10.10.1.10", BLUE_M), "router": host("router", "10.10.1.2", GOLD_M),
-              "router2": host("router2", "10.10.3.3", GOLD_M), "ledger": host("ledger", "10.10.4.40", GREEN_M)}
-        links = VGroup(*[Line(*edge(a, b), stroke_width=3, color=GREY_C)
-                         for a, b in (("client", "router"), ("router", "router2"), ("router2", "ledger"))])
-        lnames = VGroup(*[T(s, 20, GREY_B).move_to([(HX[a] + HX[b]) / 2, HY + 0.25, 0])
-                          for s, (a, b) in zip(("lan", "tunnel", "dc"), (("client", "router"), ("router", "router2"),
-                                                                         ("router2", "ledger")))])
-        net = RoundedRectangle(corner_radius=0.14, width=HW, height=0.7, stroke_color=GREY_B, stroke_width=2.5)
-        net.set_fill(BLACK, 1).move_to([HX["router"], NET_Y, 0])
-        netl = T("internet", 24, GREY_B).move_to(net)
-        wan = Line([HX["router"], HY - HH / 2, 0], [HX["router"], NET_Y + 0.35, 0], stroke_width=3, color=GREY_C)
-        wanl = T("wan", 20, GREY_B).move_to([HX["router"] + 0.38, (HY - HH / 2 + NET_Y + 0.35) / 2, 0])
-
-        tpanel = RoundedRectangle(corner_radius=0.14, width=TW, height=TH, stroke_color=GOLD_M, stroke_width=2.5)
-        tpanel.set_fill(BLACK, 1).move_to([TX, TY, 0])
-        ttitle = T("router's routing table", 24, GREY_B).move_to([TX, TY + TH / 2 - 0.35, 0])
-        thead = VGroup(left_at(T("destination block", 20, GREY_C), TX - TW / 2 + 0.3, TY + 0.5),
-                       left_at(T("next hop", 20, GREY_C), TX - 0.35, TY + 0.5))
-        ppanel = RoundedRectangle(corner_radius=0.14, width=PW, height=TH, stroke_color=BLUE_M, stroke_width=2.5)
-        ppanel.set_fill(BLACK, 1).move_to([PX, TY, 0])
-        pt = ptitle("the packet")
-        pto = pline("to   10.10.4.40", 0)
-        pttl = pline("TTL  64", 1, GREY_B)
-        self.steps("A packet from client to ledger crosses two routers, and nobody on the way knows the whole path. "
-                   "Each router looks at the destination, picks the next hop from its routing table, and forgets the packet.", [
-            (lambda: [*[FadeIn(h) for h in hs.values()], Create(links), FadeIn(lnames)], 1.0),
-            (lambda: [FadeIn(ppanel), FadeIn(pt), FadeIn(pto), FadeIn(pttl)], 0.7),
-            "Each router",
-            (lambda: [glow(hs["router"][0], GOLD_M), pto.animate.set_color(YELLOW_M)], 0.8),
-            "from its routing table",
-            (lambda: [FadeIn(tpanel), FadeIn(ttitle), FadeIn(thead), pto.animate.set_color(WHITE)], 0.8),
+        # ---------------- scene 1: who knows the way? ----------------
+        cl = node("client", "10.10.1.10", X_CL, TOP)
+        rt = node("router", "10.10.1.2", X_RT, TOP, color=GREY_B)
+        r2 = node("router2", "10.10.3.3", X_R2, TOP, color=GREY_B)
+        lg = node("ledger", "10.10.4.40", X_LG, TOP)
+        pr = node("peer", "10.10.1.20", X_PR, LOW, w=1.6)
+        sv = node("server", "10.10.2.20", X_SV, LOW, w=2.0)
+        gw = node("Docker's gateway", "10.10.1.1", X_GW, LOW, w=2.25, size=19)
+        bus = Line([X_GW - 0.55, BUS, 0], [RT_BUS, BUS, 0], stroke_width=2.5, color=GREY_B).set_z_index(-5)
+        stubs = VGroup(wire([[X_CL, TOP - BH / 2, 0], [X_CL, BUS, 0]]), wire([[RT_BUS, BUS, 0], [RT_BUS, TOP - BH / 2, 0]]))
+        lan_t = T("lan", 17, GREY_C).move_to([-2.55, BUS + 0.18, 0])
+        tun = VGroup(wire(P_RT_R2), T("tunnel", 17, GREY_C).move_to([(X_RT + X_R2) / 2, TOP + 0.24, 0]))
+        dc = VGroup(wire(P_R2_LG), T("dc", 17, GREY_C).move_to([(X_R2 + X_LG) / 2, TOP + 0.24, 0]))
+        wan = VGroup(wire(P_RT_SV), T("wan", 17, GREY_C).move_to([RT_WAN + 0.32, (TOP + LOW) / 2, 0]))
+        lowers = VGroup(wire([[X_PR, BUS, 0], [X_PR, LOW + BH / 2, 0]]), wire([[X_GW, BUS, 0], [X_GW, LOW + BH / 2, 0]]))
+        pkt = VGroup(RoundedRectangle(corner_radius=0.08, width=3.3, height=0.42, stroke_color=YELLOW_M, stroke_width=2.5)
+                     .set_fill("#1c1a10", 1), M("packet: to 10.10.4.40", 16, YELLOW_M)).move_to([X_CL + 0.7, 3.17, 0])
+        pkt[1].move_to(pkt[0])
+        self.steps("Client wants to send a packet to ledger, at 10.10.4.40, the computer that keeps the café's payment records.", [
+            (lambda: [FadeIn(cl), FadeIn(lg)], 0.8),
+            "a packet",
+            (lambda: [FadeIn(pkt, shift=0.1 * DOWN)], 0.5),
+        ])
+        self.steps("A packet is a small piece of data with a label in front: where it came from, and where it's going.", [
+            (lambda: self.cap("a packet: a small piece of data, with a label saying where it's from and where it's going"), 0.5),
+            "where it's going",
+            (lambda: [Indicate(pkt[1], color=YELLOW_M, scale_factor=1.08)], 0.7),
+        ])
+        self.steps("On the way, it crosses two routers: machines joined to more than one network, whose job is to pass packets on.", [
+            (lambda: [*self.uncap(), FadeIn(rt), FadeIn(r2)], 0.7),
+            (lambda: [Create(bus), Create(stubs), FadeIn(lan_t), Create(tun), Create(dc)], 0.9),
+            "machines joined",
+            (lambda: [FadeIn(sv), Create(wan), FadeIn(pr), FadeIn(gw), Create(lowers)], 0.9),
+            "pass packets on",
+            (lambda: self.cap("a router: a machine on more than one network that passes packets on"), 0.5),
+        ])
+        self.steps("Nobody on the way knows the whole path. So how does each router know which way to send it?", [
+            (lambda: self.uncap(), 0.3),
+            "which way",
+            (lambda: [glow(rt[0], YELLOW_M), glow(r2[0], YELLOW_M)], 0.8),
+            (lambda: self.cap("how does each router know which way to send it?", WHITE), 0.5),
         ])
 
-        rdef = row("0.0.0.0/0", "internet gateway", 2)
-        xnet = tick(False, 0.2).move_to([HX["router"] + 1.55, NET_Y, 0])
-        self.steps("The simplest table has one line, the default route: everything goes to my gateway. "
-                   "For router, that sends ledger's packet out to the internet.", [
-            (lambda: [FadeIn(rdef, shift=0.1 * DOWN)], 0.7),
-            "For router",
-            (lambda: [FadeIn(net), FadeIn(netl), Create(wan), FadeIn(wanl)], 0.7),
-            (lambda: [hop("client", "router", BLUE_M, 0.6)], 0.6),
-            (lambda: [run(wan.get_start(), wan.get_end(), RED_M, 0.6), rdef.animate.set_color(RED_M)], 0.6),
-            (lambda: [Create(xnet)], 0.4),
+        # ---------------- scene 2: sorting offices ----------------
+        self.steps("Think of a chain of parcel sorting offices. A sorter reads the address, drops the parcel in the van "
+                   "for the right direction, and never thinks about it again.", [
+            (lambda: self.cap("a chain of parcel sorting offices"), 0.5),
+            "drops the parcel",
+            (lambda: [go(P_CL_RT, YELLOW_M, 1.1)], 1.1),
+            (lambda: [glow(rt[0], YELLOW_M)], 0.5),
+            "never thinks",
+            (lambda: [go(P_RT_R2, YELLOW_M, 0.7)], 0.7),
+        ])
+        self.steps("Routers work the same way. Each one reads the destination, hands the packet to the next machine, and forgets it.", [
+            "Each one reads",
+            (lambda: [glow(r2[0], YELLOW_M)], 0.5),
+            "hands the packet",
+            (lambda: [go(P_R2_LG, YELLOW_M, 0.7)], 0.7),
+            "forgets it",
+            (lambda: [glow(lg[0], WHITE)], 0.5),
+        ])
+        self.steps("That hand-off is called forwarding, and the next machine is the next hop.", [
+            (lambda: self.cap("forwarding: hand the packet to the next machine, the next hop", WHITE), 0.6),
+        ])
+        self.steps("A sorter never asks a parcel where it's been. Nobody has the time. "
+                   "So each router decides with one thing in hand: the destination.", [
+            "So each router",
+            (lambda: [*self.cap("each router decides with one thing in hand: the destination"), Indicate(pkt[1], color=YELLOW_M, scale_factor=1.08)], 0.8),
         ])
 
-        r1 = row("10.10.1.0/24", "lan, direct", 0)
-        r4 = row("10.10.4.0/24", "router2, 10.10.3.3", 1, GOLD_M)
-        self.steps("So a router keeps one line per block of addresses. 10.10.4.0/24 means every address "
-                   "whose first 24 bits are 10.10.4, and that block is behind router2.", [
-            (lambda: [FadeOut(xnet), rdef.animate.set_color(WHITE), FadeIn(r1, shift=0.1 * DOWN)], 0.7),
-            "10.10.4.0/24",
-            (lambda: [FadeIn(r4, shift=0.1 * DOWN)], 0.7),
-            "whose first 24 bits",
-            (lambda: [r4[0].animate(rate_func=there_and_back).scale(1.12)], 0.9),
-            "and that block",
-            (lambda: [glow(hs["router2"][0], GOLD_M)], 0.8),
+        # ---------------- scene 3: the simplest table, and where it breaks ----------------
+        self.steps("It decides from a list called its routing table. Start with the simplest list that could work: one line. "
+                   "Everything goes to my gateway, the router that leads out.", [
+            (lambda: [*self.uncap(), *self.set_title("router's table")], 0.5),
+            "one line",
+            (lambda: self.set_rows([trow(0, "everything", "my gateway")]), 0.7),
+        ])
+        self.steps("That's the default route. For a machine with one way out, it's all you need.", [
+            (lambda: self.cap("the default route: everything else goes this way"), 0.5),
+        ])
+        self.steps("But router has three ways out. A packet for the server must leave on wan. One for ledger must go into the tunnel. "
+                   "One line can't say both.", [
+            (lambda: [*self.uncap(), glow(rt[0], WHITE)], 0.6),
+            "for the server",
+            (lambda: [go(P_RT_SV, WHITE, 0.6), glow(sv[0], WHITE)], 0.7),
+            "into the tunnel",
+            (lambda: [go(P_RT_R2, YELLOW_M, 0.6)], 0.7),
+            "One line can't",
+            (lambda: [*self.cap("one line, three ways out: it can't work", RED_M), self.rows[0].animate.set_color(RED_M)], 0.6),
         ])
 
-        win = chip("longest prefix: /24 beats /0", GOLD_M, 24).move_to([0, ST_Y, 0])
-        self.steps("Now ledger's address matches two lines. The longest prefix wins: the line with the most matching bits, "
-                   "because it knows the destination best.", [
-            (lambda: [pto.animate.set_color(YELLOW_M), r4.animate.set_color(YELLOW_M), rdef.animate.set_color(YELLOW_M),
-                      r1.animate.set_color(GREY_D)], 0.8),
-            "The longest prefix",
-            (lambda: [r4.animate.set_color(GOLD_M).scale(1.05), rdef.animate.set_color(GREY_D)], 0.8),
-            (lambda: [FadeIn(win, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 4: blocks, and router's real table ----------------
+        bx = [2.35, 3.4, 4.45, 5.75]
+        nums = VGroup()
+        for i, (s, x) in enumerate(zip(["10", "10", "4", "0 to 255"], bx)):
+            w = 1.45 if i == 3 else 0.95
+            col = GREY_B if i == 3 else GREEN_M
+            r = RoundedRectangle(corner_radius=0.08, width=w, height=0.55, stroke_color=col, stroke_width=2.5).move_to([x, -0.85, 0])
+            t = (T(s, 17, GREY_B) if i == 3 else M(s, 20, GREEN_M)).move_to(r)
+            nums.add(VGroup(r, t, T("8 bits", 14, GREY_C).move_to([x, -1.32, 0])))
+        bhead = M("10.10.4.0/24", 22).move_to([4.05, -0.25, 0])
+        bfix = T("/24: the first 24 bits are fixed", 18, GREEN_M).move_to([4.05, -1.78, 0])
+        brange = M("10.10.4.0 to 10.10.4.255", 17).move_to([4.05, -2.2, 0])
+        self.steps("So a router keeps one line per block of addresses. A block is written like this: 10.10.4.0/24.", [
+            (lambda: self.uncap(), 0.3),
+            "A block is",
+            (lambda: [FadeIn(bhead, shift=0.1 * DOWN)], 0.6),
+        ])
+        self.steps("An address is 32 bits, 8 for each of its four numbers. The /24 says the first 24 bits, "
+                   "here the first three numbers, are fixed.", [
+            "An address",
+            (lambda: [LaggedStart(*[FadeIn(n, shift=0.1 * UP) for n in nums], lag_ratio=0.2)], 1.0),
+            "The /24",
+            (lambda: [FadeIn(bfix)], 0.5),
+            "the first three",
+            (lambda: [LaggedStart(*[glow(n[0], GREEN_M, 1.08) for n in nums[:3]], lag_ratio=0.25)], 0.9),
+        ])
+        self.steps("So the block holds every address from 10.10.4.0 to 10.10.4.255. That count of fixed bits is the prefix length.", [
+            "every address",
+            (lambda: [FadeIn(brange), glow(nums[3][0], WHITE, 1.06)], 0.6),
+            "prefix length",
+            (lambda: self.cap("prefix length: how many bits are fixed (here 24)", WHITE), 0.5),
+        ])
+        rrows = [trow(0, "10.10.1.0/24", "lan, its own card"), trow(1, "10.10.2.0/24", "wan, its own card"),
+                 trow(2, "10.10.3.0/24", "tunnel, its own card"), trow(3, "10.10.4.0/24", "via router2 (10.10.3.3)"),
+                 trow(4, "0.0.0.0/0", "Docker's gateway (10.10.1.1)")]
+        self.steps("Router's table gets a line for each of its own cards, which the kernel adds by itself, a line typed in by hand "
+                   "for ledger's block, and the default, now written 0.0.0.0/0: no fixed bits at all, so every address fits.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(nums, bfix, brange)), bhead.animate.set_opacity(0)], 0.5),
+            (lambda: self.set_rows(rrows[:3]), 0.9),
+            "a line typed",
+            (lambda: [FadeIn(rrows[3], shift=0.1 * RIGHT)], 0.5),
+            "and the default",
+            (lambda: [FadeIn(rrows[4], shift=0.1 * RIGHT)], 0.5),
+            "no fixed bits",
+            (lambda: [Indicate(rrows[4][0], color=YELLOW_M, scale_factor=1.08)], 0.7),
+        ])
+        self.rows = rrows
+        box4 = hl(rrows[3])
+        self.steps("Watch ledger's packet arrive. 10.10.4.40 fits 10.10.4.0/24, so router sends it into the tunnel, to router2.", [
+            (lambda: [go(P_CL_RT, YELLOW_M, 1.0)], 1.0),
+            "fits 10.10",
+            (lambda: [Create(box4)], 0.5),
+            "into the tunnel",
+            (lambda: [go(P_RT_R2, YELLOW_M, 0.7)], 0.7),
+        ])
+        box0 = hl(rrows[4], GREY_B)
+        self.steps("Notice it also fits the default. Hold that thought.", [
+            "also fits",
+            (lambda: [Create(box0)], 0.5),
+        ], after=0.4)
+
+        # ---------------- scene 5: three lines fit; which wins? ----------------
+        crows = [trow(0, "0.0.0.0/0", "Docker's gateway (10.10.1.1)"), trow(1, "10.10.0.0/16", "router (10.10.1.2)"),
+                 trow(2, "10.10.1.0/24", "straight across lan")]
+        self.steps("Now look at client's table. The lesson gives it a broad line: every address in 10.10.0.0/16 goes to router. "
+                   "Client already had its own network, 10.10.1.0/24, straight across lan, and the default.", [
+            (lambda: [FadeOut(box4), FadeOut(box0), *self.set_title("client's table, in the order it prints")], 0.5),
+            (lambda: [*[FadeOut(r) for r in self.rows]], 0.4),
+            "a broad line",
+            (lambda: [FadeIn(crows[1], shift=0.1 * RIGHT), glow(cl[0], WHITE)], 0.6),
+            "its own network",
+            (lambda: [FadeIn(crows[2], shift=0.1 * RIGHT)], 0.5),
+            "and the default",
+            (lambda: [FadeIn(crows[0], shift=0.1 * RIGHT)], 0.5),
+        ])
+        self.rows = crows
+        ppk = VGroup(RoundedRectangle(corner_radius=0.08, width=3.3, height=0.42, stroke_color=YELLOW_M, stroke_width=2.5)
+                     .set_fill("#1c1a10", 1), M("packet: to 10.10.1.20", 16, YELLOW_M)).move_to(pkt)
+        ppk[1].move_to(ppk[0])
+        fits = [T("fits", 17, YELLOW_M).move_to([1.3, TB_Y0 - i * TB_DY, 0]) for i in range(3)]
+        self.steps("A packet for peer, at 10.10.1.20, fits all three. Which line wins? Pause and guess.", [
+            (lambda: [swap(pkt, ppk), glow(pr[0], YELLOW_M)], 0.7),
+            "fits all three",
+            (lambda: [LaggedStart(*[FadeIn(f) for f in fits], lag_ratio=0.3)], 0.8),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        first = hl(crows[0], RED_M)
+        self.steps("Most lists, we read from the top and stop at the first line that fits. Here, that's the default. "
+                   "So peer's packet would go to Docker's gateway, the way out to the internet, to reach a computer on client's own wire.", [
+            (lambda: self.uncap(), 0.3),
+            "stop at the first",
+            (lambda: [Create(first)], 0.5),
+            "So peer's packet",
+            (lambda: [go(P_CL_GW, RED_M, 0.8), glow(gw[0], RED_M)], 0.9),
+            "to reach a computer",
+            (lambda: [glow(pr[0], WHITE)], 0.7),
+        ])
+        self.steps("Well... that's like posting a note to your neighbour through the national hub.", [
+            (lambda: self.cap("posting a note to your neighbour through the national hub", RED_M), 0.5),
+        ], after=0.4)
+        bits = [T(s, 17, GREY_B).move_to([1.3, TB_Y0 - i * TB_DY, 0]) for i, s in enumerate(["0 bits", "16 bits", "24 bits"])]
+        win = hl(crows[2], GREEN_M)
+        self.steps("The real rule is longest prefix match. Of all the lines that fit, the one with the most fixed bits wins, "
+                   "because it describes the destination most precisely.", [
+            (lambda: [*self.cap("longest prefix match: of the lines that fit, the most fixed bits wins", WHITE), FadeOut(first)], 0.6),
+            "the most fixed bits",
+            (lambda: [*[swap(f, b) for f, b in zip(fits, bits)]], 0.7),
+            "most precisely",
+            (lambda: [Create(win), bits[2].animate.set_color(GREEN_M)], 0.6),
+        ])
+        self.steps("24 beats 16, which beats 0. So peer's packet goes straight across lan, and ledger's goes to router. "
+                   "And the order of the lines never matters.", [
+            "24 beats",
+            (lambda: [Indicate(bits[2], color=GREEN_M), Indicate(bits[1], color=WHITE), Indicate(bits[0], color=WHITE)], 0.8),
+            "goes straight across",
+            (lambda: [go(P_CL_PR, GREEN_M, 0.9)], 0.9),
+            "ledger's goes",
+            (lambda: [go(P_CL_RT, YELLOW_M, 0.9)], 0.9),
+            "the order",
+            (lambda: [*self.cap("the order of the lines never matters"), *[glow(win, GREEN_M, 1.02)]], 0.7),
+        ])
+        self.steps("A sorting office works the same way. The pigeonhole for one street beats the one for the whole city, "
+                   "which beats everything else: send it to the national hub.", [
+            (lambda: self.cap("one street  >  the whole city  >  everything else"), 0.5),
+            "one street",
+            (lambda: [Indicate(crows[2], color=GREEN_M, scale_factor=1.04)], 0.6),
+            "the whole city",
+            (lambda: [Indicate(crows[1], color=WHITE, scale_factor=1.04)], 0.6),
+            "everything else",
+            (lambda: [Indicate(crows[0], color=WHITE, scale_factor=1.04)], 0.6),
         ])
 
-        self.steps("So router hands the packet to router2, which does the same, and it reaches ledger.", [
-            (lambda: [r4.animate.scale(1 / 1.05), hop("router", "router2", GOLD_M, 0.8)], 0.8),
-            (lambda: [hop("router2", "ledger", GREEN_M, 0.8)], 0.8),
-            (lambda: [glow(hs["ledger"][0], GREEN_M), pto.animate.set_color(GREEN_M)], 0.8),
+        # ---------------- scene 6: where lines come from, and the limit ----------------
+        self.steps("On the internet, nobody types these lines in. Routers tell each other which blocks they can reach, "
+                   "using a routing protocol called BGP. A full table holds around a million blocks.", [
+            (lambda: [*self.cap("on the internet: routers announce their blocks to each other (BGP)"), FadeOut(win)], 0.6),
+            "A full table",
+            (lambda: self.cap("a full table: around a million blocks"), 0.5),
         ])
-
-        lr = pline("router:  10.10.9.0/24 → router2", 2, GOLD_M, 17)
-        lr2 = pline("router2: 10.10.9.0/24 → router", 3, GOLD_M, 17)
-        self.steps("Each router decides alone. If two routers disagree about a block, "
-                   "they pass a packet back and forth forever.", [
-            (lambda: [FadeOut(win), r1.animate.set_color(WHITE), r4.animate.set_color(WHITE), rdef.animate.set_color(WHITE),
-                      Transform(pto, pline("to   10.10.9.9", 0)), FadeOut(net), FadeOut(netl), FadeOut(wan), FadeOut(wanl)], 0.8),
-            "If two routers",
-            (lambda: [FadeIn(lr, shift=0.1 * DOWN)], 0.5),
-            (lambda: [FadeIn(lr2, shift=0.1 * DOWN)], 0.5),
+        self.steps("One property matters for what comes next. Each router decides alone, with no memory of where the packet has been.", [
+            (lambda: self.cap("each router decides alone, with no memory of the packet", WHITE), 0.5),
+            "decides alone",
+            (lambda: [glow(rt[0], YELLOW_M), glow(r2[0], YELLOW_M)], 0.8),
+        ])
+        self.steps("That lets the internet route around a broken link. It also means two routers whose tables disagree "
+                   "could pass a packet back and forth forever. The next section makes two of them do it.", [
             "back and forth",
-            (lambda: [hop("router", "router2", RED_M, 0.45)], 0.45),
-            (lambda: [hop("router2", "router", RED_M, 0.45)], 0.45),
-            (lambda: [hop("router", "router2", RED_M, 0.45)], 0.45),
-            (lambda: [hop("router2", "router", RED_M, 0.45)], 0.45),
+            (lambda: [go(P_RT_R2, RED_M, 0.5)], 0.5),
+            (lambda: [go(list(reversed(P_RT_R2)), RED_M, 0.5)], 0.5),
+            (lambda: [go(P_RT_R2, RED_M, 0.5)], 0.5),
+            "The next section",
+            (lambda: self.cap("a packet bouncing forever: the next section", RED_M), 0.5),
         ])
 
-        self.steps("So the IP header carries a counter, the TTL. Every router lowers it by one before it forwards. "
-                   "Client sends this packet with TTL 5.", [
-            (lambda: [pttl.animate.set_color(YELLOW_M)], 0.6),
-            "Every router",
-            (lambda: [Transform(pttl, pline("TTL  64 → 63", 1, YELLOW_M))], 0.8),
-            "Client sends",
-            (lambda: [Transform(pttl, pline("TTL  5", 1, YELLOW_M))], 0.6),
-            (lambda: [hop("client", "router", BLUE_M, 0.6)], 0.6),
-        ])
-
-        drop = tick(False, 0.2).move_to([HX["router"], HY - HH / 2 - 0.3, 0])
-        icmp = VGroup(pline("ICMP time exceeded", 2, TEAL_M), pline("from 10.10.1.2", 3, TEAL_M))
-
-        def bounce(a, b, ttl):
-            return [hop(a, b, RED_M, 0.5), Transform(pttl, pline(f"TTL  {ttl}", 1, YELLOW_M))]
-
-        self.steps("4, 3, 2, 1. A router may not forward a packet that would arrive with 0, so it drops it, "
-                   "and sends an ICMP time exceeded message back to the sender.", [
-            (lambda: bounce("router", "router2", 4), 0.5),
-            (lambda: bounce("router2", "router", 3), 0.5),
-            (lambda: bounce("router", "router2", 2), 0.5),
-            (lambda: bounce("router2", "router", 1), 0.5),
-            "A router may not",
-            (lambda: [Create(drop), pttl.animate.set_color(RED_M)], 0.5),
-            "and sends",
-            (lambda: [FadeOut(lr2), FadeOut(lr), hop("router", "client", TEAL_M, 0.8)], 0.8),
-            (lambda: [FadeIn(icmp, shift=0.1 * UP)], 0.5),
-        ])
-
-        tr = [pline(" 1  10.10.1.2   router", 1), pline(" 2  10.10.3.3   router2", 2), pline(" 3  10.10.4.40  ledger", 3)]
-        probe = pline("probe: TTL 1", 0, YELLOW_M)
-        self.steps("Traceroute uses exactly this. Its first probe has TTL 1. "
-                   "Router drops it and reports back, so hop 1 is router.", [
-            (lambda: [FadeOut(drop), FadeOut(icmp), FadeOut(pttl), FadeOut(pto),
-                      Transform(pt, ptitle("traceroute to 10.10.4.40"))], 0.7),
-            "Its first probe",
-            (lambda: [FadeIn(probe)], 0.5),
-            (lambda: [hop("client", "router", YELLOW_M, 0.6)], 0.6),
-            "Router drops it",
-            (lambda: [hop("router", "client", TEAL_M, 0.6)], 0.6),
-            "so hop 1",
-            (lambda: [FadeIn(tr[0], shift=0.1 * UP), glow(hs["router"][0], TEAL_M)], 0.7),
-        ])
-
-        self.steps("The next probe has TTL 2 and dies one router further. Hop 2 is router2.", [
-            (lambda: [Transform(probe, pline("probe: TTL 2", 0, YELLOW_M))], 0.4),
-            (lambda: [hop("client", "router", YELLOW_M, 0.5)], 0.5),
-            (lambda: [hop("router", "router2", YELLOW_M, 0.5)], 0.5),
-            (lambda: [hop("router2", "router", TEAL_M, 0.5)], 0.5),
-            (lambda: [hop("router", "client", TEAL_M, 0.5)], 0.5),
-            "Hop 2",
-            (lambda: [FadeIn(tr[1], shift=0.1 * UP), glow(hs["router2"][0], TEAL_M)], 0.7),
-        ])
-
-        self.steps("TTL 3 reaches ledger itself. Nothing listens on the probe's port, so ledger answers port unreachable, "
-                   "and traceroute knows it has arrived.", [
-            (lambda: [Transform(probe, pline("probe: TTL 3", 0, YELLOW_M))], 0.4),
-            (lambda: [hop("client", "router", YELLOW_M, 0.45)], 0.45),
-            (lambda: [hop("router", "router2", YELLOW_M, 0.45)], 0.45),
-            (lambda: [hop("router2", "ledger", YELLOW_M, 0.45)], 0.45),
-            "Nothing listens",
-            (lambda: [glow(hs["ledger"][0], GREEN_M)], 0.7),
-            "so ledger answers",
-            (lambda: [hop("ledger", "router2", GREEN_M, 0.4)], 0.4),
-            (lambda: [hop("router2", "router", GREEN_M, 0.4)], 0.4),
-            (lambda: [hop("router", "client", GREEN_M, 0.4)], 0.4),
-            "and traceroute",
-            (lambda: [FadeIn(tr[2], shift=0.1 * UP), FadeOut(probe)], 0.6),
-        ])
-
-        rule = chip("most specific line wins, and every hop costs one TTL", GREEN_M, 24).move_to([0, ST_Y, 0])
-        self.steps("Every router picks the most specific line and lowers the TTL. "
-                   "Traceroute reads the path from the packets that die.", [
-            (lambda: [glow(tpanel, GOLD_M, 1.02), r4.animate(rate_func=there_and_back).set_color(GOLD_M)], 0.9),
-            (lambda: [FadeIn(rule, shift=0.15 * UP)], 0.6),
-            "Traceroute reads",
-            (lambda: [*[t.animate(rate_func=there_and_back).set_color(TEAL_M) for t in tr]], 1.0),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 7: the moral, and a check ----------------
+        self.steps("So how does a router know the way? It doesn't. It knows the next step: the most specific line that fits.", [
+            (lambda: self.cap("how does a router know the way?", WHITE), 0.5),
+            "It knows the next",
+            (lambda: [*self.cap("it knows only the next step: the most specific line that fits", YELLOW_M, 28), go(P_CL_RT, YELLOW_M, 0.8)], 0.8),
+        ], after=0.5)
+        qpk = VGroup(RoundedRectangle(corner_radius=0.08, width=3.3, height=0.42, stroke_color=YELLOW_M, stroke_width=2.5)
+                     .set_fill("#1c1a10", 1), M("packet: to 1.1.1.1", 16, YELLOW_M)).move_to(pkt)
+        qpk[1].move_to(qpk[0])
+        self.steps("One quick check. Client sends a packet to 1.1.1.1, out on the internet. Which of client's three lines wins? "
+                   "Pause and think.", [
+            (lambda: [*self.uncap(), swap(ppk, qpk), *[FadeOut(b) for b in bits]], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        ans = hl(crows[0], GREEN_M)
+        self.steps("The default. 1.1.1.1 doesn't start with 10.10, so the only line that fits is 0.0.0.0/0. Off to Docker's gateway.", [
+            (lambda: [*self.uncap(), Create(ans)], 0.6),
+            "Off to",
+            (lambda: [go(P_CL_GW, GREEN_M, 0.8), glow(gw[0], GREEN_M)], 0.9),
+        ], after=0.3)
+        self.play(*self.cap("most specific line wins; the order never matters", YELLOW_M, 28), run_time=0.6)
+        self.wait(2.0)

@@ -1,35 +1,34 @@
 from sfz import *
 
-SAY.insert(0, (r"\b192\.168\.1\.23\b", "one ninety-two dot one sixty-eight dot one dot twenty-three"))
-SAY.insert(0, (r"\b192\.168\b", "one ninety-two dot one sixty-eight"))
-SAY.insert(0, (r"\b41000\b", "forty-one thousand"))
-SAY.insert(0, (r"\b3417\b", "thirty-four seventeen"))
+# Applied in this order, before the course-wide rules.
+SAY[0:0] = [
+    (r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b", r"\1 dot \2 dot \3 dot \4"),
+    (r"\b192 dot 168\b", "one ninety-two dot one sixty-eight"),
+    (r"\b192\.168\b", "one ninety-two dot one sixty-eight"),
+    (r"\b172\.16\b", "one seventy-two dot sixteen"),
+    (r"\b172\.31\b", "one seventy-two dot thirty-one"),
+    (r"\b41000\b", "forty-one thousand"),
+    (r"\b3417\b", "thirty-four seventeen"),
+    (r"\b8080\b", "eighty eighty"),
+]
 
-LX, LY, PHY = -5.2, 2.85, 1.75         # laptop and phone
-RX, RY = -0.7, 2.3                     # home router
-SX, SY = 4.8, 2.3                      # server
-LANE = 0.6                             # where packet headers travel
-COLX = [-4.2, 0.0, 4.2]                # table columns: inside, outside, remote
-HEAD_Y, ROW_Y, STATUS_Y = -0.78, [-1.45, -2.05], -2.85
-PW = 4.2                               # packet header width
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CL, PR = np.array([-5.35, 1.55, 0]), np.array([-5.35, 0.2, 0])   # inside: client and peer
+RT = np.array([-1.0, 0.875, 0])                                   # the router, one foot on each side
+SV = np.array([5.2, 0.875, 0])                                    # outside: the server
+CW, CH = 2.3, 0.9
+RW, RH = 2.7, 1.5
+SW_, SH = 2.5, 1.25
+CARD_A = np.array([-3.0, 3.05, 0])    # a packet as it looks inside
+CARD_B = np.array([2.15, 2.05, 0])    # the same packet outside
+CARD_W, CARD_H = 3.1, 0.85
+TB_Y = [-1.65, -2.05, -2.45]          # rows of the router's table
+COL_X = [-3.6, 0.2, 3.9]              # inside, outside, far end
+CAP_Y, BAR_Y = -3.0, -3.42
 
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=0.7, back=False):
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.12))
+W_CL = [CL + [CW / 2, 0, 0], RT + [-RW / 2, 0.33, 0]]
+W_PR = [PR + [CW / 2, 0, 0], RT + [-RW / 2, -0.33, 0]]
+W_OUT = [RT + [RW / 2, 0, 0], SV + [-SW_ / 2, 0, 0]]
 
 
 class Base(VoiceScene):
@@ -59,7 +58,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.3):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -80,234 +79,375 @@ class Base(VoiceScene):
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
+        if t > dur + 0.1:
+            print(f"WARNING: steps run {t - dur:.1f}s past the line: {text[:50]}")
         if dur - t > 0.02:
             self.wait(dur - t)
         if after:
             self.wait(after)
 
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 12.6).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
 
-def host(name, addr, color, x, y, w=2.6, h=0.9):
-    r = RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1)
-    r.move_to([x, y, 0])
-    return VGroup(r, T(name, 24).move_to([x, y + 0.18, 0]), M(addr, 18, GREY_B).move_to([x, y - 0.2, 0]))
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
 
-
-def lane_x(x):
-    return min(max(x, -6.55 + PW / 2), 6.55 - PW / 2)
-
-
-def line(prefix, addr, color=WHITE):
-    return M(f"{prefix} {addr}", 19, color)
-
-
-def pkt(src, dst, x, color=WHITE, scol=WHITE, dcol=WHITE):
-    """A packet header: where it's from and where it's going."""
-    a, b = line("from", src, scol), line("to  ", dst, dcol)
-    r = RoundedRectangle(corner_radius=0.1, width=PW, height=0.95, stroke_color=color, stroke_width=2.5).set_fill(fillc(color), 1)
-    r.move_to([lane_x(x), LANE, 0])
-    a.move_to([r.get_left()[0] + 0.22 + a.width / 2, LANE + 0.2, 0])
-    b.move_to([r.get_left()[0] + 0.22 + b.width / 2, LANE - 0.2, 0])
-    return VGroup(r, a, b)
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def reline(p, k, prefix, addr, color):
-    """The k-th line of packet p rewritten (1: from, 2: to)."""
-    n = line(prefix, addr, color)
-    return n.move_to([p[0].get_left()[0] + 0.22 + n.width / 2, p[k].get_center()[1], 0])
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def cell(s, col, row, color=WHITE, mono=True):
-    return (M(s, 20, color) if mono else T(s, 22, color)).move_to([COLX[col], ROW_Y[row], 0])
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def status(s, color=GREY_B):
-    return T(s, 24, color).move_to([0, STATUS_Y, 0])
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def swap(old, new, d=UP):
+    """Replace one label with another: the old one leaves before the new one arrives, so they never overlap."""
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def run(pts, color=YELLOW_M, rt=0.9, frac=1.0):
+    """A dot (a packet) running along a wire; frac < 1 stops part of the way and leaves the dot there."""
+    a, b = np.array(pts[0]), np.array(pts[1])
+    d = Dot(radius=0.09, color=color).move_to(a).set_z_index(3)
+    seq = [FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, a + frac * (b - a)), rate_func=smooth, run_time=rt)]
+    if frac >= 1:
+        seq.append(FadeOut(d, run_time=0.12))
+    return d, Succession(*seq)
+
+
+def go(pts, color=YELLOW_M, rt=0.9):
+    return run(pts, color, rt)[1]
+
+
+def back(pts):
+    return list(reversed(pts))
+
+
+# ---- the pieces ----
+def node(lines, c, w, h, color=WHITE):
+    r = RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(BLACK, 1).move_to(c)
+    g = VGroup(*lines).arrange(DOWN, buff=0.12).move_to(c)
+    return VGroup(r, *g)
+
+
+def card(lines, c, color=WHITE):
+    r = RoundedRectangle(corner_radius=0.1, width=CARD_W, height=CARD_H, stroke_color=color, stroke_width=2.5)
+    r.set_fill(fillc(color, 0.12), 1).move_to(c)
+    return VGroup(r, VGroup(*lines).arrange(DOWN, buff=0.12, aligned_edge=LEFT).move_to(c))
+
+
+def pk(frm, to, hl=None, hc=YELLOW_M):
+    """Two lines of a packet header; hl ('from' or 'to') is drawn in colour hc."""
+    return [M(f"from {frm}", 15, hc if hl == "from" else WHITE), M(f"to {to}", 15, hc if hl == "to" else WHITE)]
+
+
+def cell(s, k, row, color=WHITE, mono=True):
+    t = M(s, 17, color) if mono else T(s, 19, color)
+    return t.move_to([COL_X[k], TB_Y[row], 0])
 
 
 class Nat(Base):
-    """net-03, sections 2 and 3: a laptop at 192.168.1.23 connects to 198.51.100.20:443. A private source can't be answered,
-    so the home router rewrites the source to its public 203.0.113.7 and keeps an entry; the reply is mapped back. A phone
-    also using port 41000 forces a port rewrite (3417, as in the lab). An unsolicited packet matches no entry; an idle
-    entry expires and the laptop's next packet is dropped."""
+    """net-03, section 2. Three devices at home share one internet address. Private blocks can't be answered from outside,
+    so the router rewrites the source to its own outside address and writes the connection in a table (the mailroom's
+    ledger). Two connections from port 41000 would collide, so it rewrites the port too (3417). Costs: nothing gets in
+    without a line, and quiet lines are crossed out without telling anyone."""
+
+    def set_card(self, which, lines, color=WHITE):
+        new = card(lines, CARD_A if which == "A" else CARD_B, color)
+        old = self.cards[which]
+        self.cards[which] = new
+        return [swap(old, new)]
+
+    def clear_cards(self):
+        out = [FadeOut(c) for c in self.cards.values() if c is not None]
+        self.cards = {"A": None, "B": None}
+        return out
 
     def construct(self):
-        self.title_card("NAT: many private addresses behind one public one", "a translation table, and what it can't do")
+        self.capm = None
+        self.cards = {"A": None, "B": None}
+        self.title_card("One address, many computers", "how a home router shares one address, and what it must remember")
 
-        laptop = host("laptop", "192.168.1.23", BLUE_M, LX, LY)
-        phone = host("phone", "192.168.1.24", TEAL_M, LX, PHY)
-        rbox = RoundedRectangle(corner_radius=0.14, width=2.8, height=2.0, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1)
-        rbox.move_to([RX, RY, 0])
-        rtitle = T("home router", 24).move_to([RX, RY + 0.55, 0])
-        rin = T("inside: 192.168.1.1", 18, GREY_B).move_to([RX, RY + 0.05, 0])
-        rpub = T("public: 203.0.113.7", 18, GREY_B).move_to([RX, RY - 0.45, 0])
-        router = VGroup(rbox, rtitle, rin, rpub)
-        server = host("server", "198.51.100.20", GREEN_M, SX, SY, w=3.0, h=1.0)
-        wl = Line([LX + 1.3, LY, 0], [RX - 1.4, LY, 0], stroke_width=3, color=GREY_D)
-        wp = Line([LX + 1.3, PHY, 0], [RX - 1.4, PHY, 0], stroke_width=3, color=GREY_D)
-        ws = Line([RX + 1.4, SY, 0], [SX - 1.5, SY, 0], stroke_width=3, color=GREY_D)
-        p = pkt("192.168.1.23:41000", "198.51.100.20:443", LX)
-        self.steps("A laptop at home has the address 192.168.1.23. It opens a connection to a server on the internet. "
-                   "Where does the reply go?", [
-            (lambda: [FadeIn(laptop)], 0.6),
-            "It opens",
-            (lambda: [FadeIn(router), Create(wl), Create(ws), FadeIn(server)], 0.9),
-            (lambda: [FadeIn(p, shift=0.15 * DOWN)], 0.5),
-            "Where does",
-            (lambda: [glow(laptop[0], BLUE_M, 1.05)], 0.8),
+        # ---------------- scene 1: the hook ----------------
+        phone = node([T("your phone", 24), M("192.168.1.23", 20)], [-4.3, 0.6, 0], 3.0, 1.2)
+        site = node([T("a website", 24), T("you're calling from:", 18, GREY_B), M("one other address", 18, YELLOW_M)], [4.3, 0.6, 0], 3.4, 1.5)
+        others = VGroup(node([T("laptop", 20)], [-4.3, -1.05, 0], 1.7, 0.6), node([T("TV", 20)], [-2.35, -1.05, 0], 1.0, 0.6))
+        hw = Line([-2.8, 0.6, 0], [2.6, 0.6, 0], stroke_width=2.5, color=GREY_B).set_z_index(-5)
+        self.steps("Look at your phone's Wi-Fi settings at home. It shows an IP address, such as 192.168.1.23.", [
+            (lambda: [FadeIn(phone, shift=0.2 * UP)], 0.8),
+            "such as",
+            (lambda: [Indicate(phone[2], color=YELLOW_M, scale_factor=1.1)], 0.8),
+        ])
+        self.steps("Now ask a website which address you're calling from. You get a different one: the same one your laptop and TV get.", [
+            "Now ask",
+            (lambda: [Create(hw), FadeIn(site, shift=0.2 * UP)], 0.9),
+            "You get a different",
+            (lambda: [Indicate(site[3], color=YELLOW_M, scale_factor=1.1)], 0.8),
+            "your laptop",
+            (lambda: [FadeIn(others, shift=0.1 * UP)], 0.6),
+        ])
+        self.steps("Three devices share one address on the internet. Yet the film goes to the TV, and the messages to your phone. "
+                   "How does the box on the wall keep them apart?", [
+            "Yet the film",
+            (lambda: [glow(others[1][0], WHITE, 1.08)], 0.7),
+            "and the messages",
+            (lambda: [glow(phone[0], WHITE, 1.05)], 0.7),
+            "How does",
+            (lambda: self.cap("three devices, one address: how do the replies find the right one?", WHITE), 0.5),
+        ])
+        self.steps("And here's the odd part. Millions of homes use 192.168.1.23 right now.", [
+            "Millions of homes",
+            (lambda: self.cap("millions of homes use 192.168.1.23 right now", YELLOW_M), 0.5),
         ])
 
-        reply = pkt("198.51.100.20:443", "192.168.1.23:41000", SX, GREEN_M, dcol=RED_M)
-        xr = tick(False, 0.22).move_to([RX + 2.45, LANE + 0.75, 0])
-        st1 = status("192.168.x.x is private: no router on the internet carries packets to it", RED_M)
-        self.steps("Nowhere. Addresses that start with 192.168 are private. "
-                   "Millions of homes reuse them, so no router on the internet carries packets to one.", [
-            (lambda: [flow(wl, BLUE_M, 0.5), p.animate.move_to([lane_x(RX), LANE, 0])], 0.6),
-            (lambda: [flow(ws, BLUE_M, 0.6), p.animate.move_to([lane_x(SX), LANE, 0])], 0.7),
-            (lambda: [FadeOut(p), FadeIn(reply)], 0.4),
-            "Millions",
-            (lambda: [reply.animate.move_to([lane_x(RX + 2.9), LANE, 0])], 1.0),
-            (lambda: [Create(xr)], 0.4),
-            "so no router",
-            (lambda: [FadeIn(st1, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 2: why private addresses ----------------
+        self.steps("Start with a counting problem. An IP address has 32 bits, so there are about 4.3 billion of them. "
+                   "Today there are more mobile phone contracts in the world than that.", [
+            (lambda: [FadeOut(VGroup(phone, site, others, hw)), *self.cap("32 bits: about 4.3 billion addresses")], 0.8),
+            "Today there are",
+            (lambda: self.cap("more mobile phone contracts than IPv4 addresses"), 0.5),
+        ])
+        blocks = VGroup(*[M(s, 26, GREEN_M) for s in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]]).arrange(RIGHT, buff=0.9)
+        blocks.move_to([0, 0.9, 0])
+        bnote = T("private: use them inside, as often as you like", 22, GREY_B).move_to([0, 0.2, 0])
+        self.steps("So three blocks were set aside for private use: addresses starting with 10, with 172.16 to 172.31, "
+                   "and with 192.168.", [
+            (lambda: self.uncap(), 0.3),
+            "three blocks",
+            (lambda: [LaggedStart(*[FadeIn(b, shift=0.1 * UP) for b in blocks], lag_ratio=0.4)], 1.4),
+        ])
+        self.steps("Anyone may use them inside their own network, as many times over as they like, and no router on the internet "
+                   "carries packets to them.", [
+            (lambda: [FadeIn(bnote)], 0.5),
+            "no router on",
+            (lambda: self.cap("no router on the internet carries packets to them", RED_M), 0.5),
         ])
 
-        p2 = pkt("192.168.1.23:41000", "198.51.100.20:443", LX)
-        self.steps("So the home router owns one public address. As the packet leaves, "
-                   "the router rewrites its source to that address.", [
-            (lambda: [FadeOut(reply), FadeOut(xr), FadeOut(st1)], 0.5),
-            (lambda: [rpub.animate.set_color(GOLD_M), glow(rbox, GOLD_M, 1.04)], 0.8),
-            "As the packet",
-            (lambda: [FadeIn(p2, shift=0.15 * DOWN)], 0.4),
-            (lambda: [flow(wl, BLUE_M, 0.5), p2.animate.move_to([lane_x(RX), LANE, 0])], 0.6),
-            "rewrites its source",
-            (lambda: [Transform(p2[1], reline(p2, 1, "from", "203.0.113.7:41000", GOLD_M))], 0.7),
-            (lambda: [flow(ws, GOLD_M, 0.6), p2.animate.move_to([lane_x(SX), LANE, 0])], 0.7),
+        # ---------------- the lab network ----------------
+        cl = node([T("client", 22), M("10.10.1.10", 16)], CL, CW, CH)
+        pr = node([T("peer", 22), M("10.10.1.20", 16)], PR, CW, CH)
+        rt = node([T("router", 24), M("inside 10.10.1.2", 15, GREY_B), M("outside 10.10.2.2", 15, YELLOW_M)], RT, RW, RH, GREY_B)
+        sv = node([T("server", 22), M("10.10.2.20", 16), M("port 8080", 15, GREY_B)], SV, SW_, SH)
+        wires = VGroup(*[Line(*w, stroke_width=2.5, color=GREY_B).set_z_index(-5) for w in (W_CL, W_PR, W_OUT)])
+        inside_l = T("inside", 20, GREY_B).move_to(CL + [0, 0.72, 0])
+        outside_l = T("outside", 20, GREY_B).move_to(SV + [0, 0.95, 0])
+        self.steps("Let's watch it on the lab network. Inside, client and peer have private addresses. Outside sits a server. "
+                   "In between, a router, with one address on each side.", [
+            (lambda: [*self.uncap(), FadeOut(blocks), FadeOut(bnote)], 0.5),
+            "Inside, client",
+            (lambda: [FadeIn(cl), FadeIn(pr), FadeIn(inside_l)], 0.7),
+            "Outside sits",
+            (lambda: [FadeIn(sv), FadeIn(outside_l)], 0.6),
+            "In between",
+            (lambda: [FadeIn(rt), Create(wires)], 0.8),
+            "one address on each",
+            (lambda: [Indicate(rt[2], color=WHITE, scale_factor=1.1), Indicate(rt[3], color=YELLOW_M, scale_factor=1.1)], 0.8),
         ])
 
-        ttl = T("the router's translation table", 22, GREY_B)
-        ttl.move_to([-6.3 + ttl.width / 2, -0.22, 0])
-        heads = VGroup(*[T(s, 22, GREY_B).move_to([COLX[i], HEAD_Y, 0]) for i, s in enumerate(("inside", "outside", "remote"))])
-        rule = Line([-6.3, HEAD_Y - 0.3, 0], [6.3, HEAD_Y - 0.3, 0], stroke_width=1.5, color=GREY_D)
-        row1 = VGroup(cell("192.168.1.23:41000", 0, 0, BLUE_M), cell("203.0.113.7:41000", 1, 0, GOLD_M),
-                      cell("198.51.100.20:443", 2, 0))
-        self.steps("Then it writes down what it did: the inside address and port, "
-                   "the outside address and port, and the remote end.", [
-            (lambda: [FadeOut(p2), FadeIn(ttl), FadeIn(heads), Create(rule)], 0.8),
-            "the inside",
-            (lambda: [FadeIn(row1[0], shift=0.1 * DOWN)], 0.5),
-            "the outside",
-            (lambda: [FadeIn(row1[1], shift=0.1 * DOWN)], 0.5),
-            "and the remote",
-            (lambda: [FadeIn(row1[2], shift=0.1 * DOWN)], 0.5),
+        # ---------------- scene 3: the reply with nowhere to go ----------------
+        self.steps("Client opens a connection to the server, from port 41000 to port 8080. A port is the number that picks one program on a computer.", [
+            (lambda: [*self.set_card("A", pk("10.10.1.10:41000", "10.10.2.20:8080"))], 0.6),
+            "A port is",
+            (lambda: self.cap("a port: the number that picks one program on a computer"), 0.5),
+        ])
+        stuck, stuck_go = run(back(W_OUT), WHITE, 0.8, frac=0.5)
+        nox = tick(False, 0.15).move_to((np.array(W_OUT[0]) + np.array(W_OUT[1])) / 2)
+        nor = T("no way back to 10.10.1.10", 18, RED_M).move_to(nox.get_center() + 0.4 * DOWN)
+        self.steps("The question gets there. But the answer is addressed to 10.10.1.10, and the server has no way back to it.", [
+            (lambda: [*self.uncap(), go(W_CL)], 0.7),
+            (lambda: [go(W_OUT), *self.set_card("B", pk("10.10.1.10:41000", "10.10.2.20:8080"))], 0.9),
+            "But the answer",
+            (lambda: [*self.set_card("B", pk("10.10.2.20:8080", "10.10.1.10:41000", "to", RED_M))], 0.6),
+            (lambda: [stuck_go], 0.8),
+            (lambda: [FadeOut(stuck, scale=1.8), Create(nox), FadeIn(nor)], 0.5),
+        ])
+        self.steps("Out on the internet, no router could even tell which of a million homes you mean. "
+                   "What we need is someone at the door who takes each reply to the right desk.", [
+            "What we need",
+            (lambda: self.cap("the wish: someone at the door who takes each reply to the right desk", WHITE), 0.5),
         ])
 
-        rp = pkt("198.51.100.20:443", "203.0.113.7:41000", SX, GREEN_M, dcol=GOLD_M)
-        self.steps("The server replies to the router's address. "
-                   "The router finds the entry and rewrites the destination back to the laptop.", [
-            (lambda: [FadeIn(rp, shift=0.15 * DOWN)], 0.4),
-            (lambda: [flow(ws, GREEN_M, 0.6, back=True), rp.animate.move_to([lane_x(RX), LANE, 0])], 0.8),
-            "The router finds",
-            (lambda: [Indicate(row1, color=YELLOW_M, scale_factor=1.06)], 0.8),
+        # ---------------- scene 4: the mailroom ----------------
+        self.steps("Think of an office building with one street address. Every letter leaves through the mailroom, "
+                   "which writes the building's address as the return address.", [
+            (lambda: [*self.uncap(), *self.clear_cards(), FadeOut(nox), FadeOut(nor)], 0.5),
+            "one street address",
+            (lambda: [Indicate(rt[3], color=YELLOW_M, scale_factor=1.12)], 0.8),
+            "the mailroom",
+            (lambda: [glow(rt[0], GREY_B, 1.04)], 0.7),
+        ])
+        self.steps("Replies come back to the mailroom, and a clerk walks each one to the desk that sent the original.", [
+            (lambda: [go(back(W_OUT), WHITE, 0.8)], 0.8),
+            "walks each one",
+            (lambda: [go(back(W_CL), WHITE, 0.7)], 0.7),
+        ])
+        mail_t = T("the mailroom", 18, GREY_B).move_to(RT + [0, RH / 2 + 0.3, 0])
+        desks_t = T("inside: the desks", 20, GREY_B).move_to(inside_l)
+        self.steps("Map it. The mailroom is the router. The desks are the computers inside. "
+                   "And the building's street address is the router's outside address, 10.10.2.2.", [
+            "The mailroom is",
+            (lambda: [FadeIn(mail_t, shift=0.1 * DOWN)], 0.5),
+            "The desks are",
+            (lambda: [swap(inside_l, desks_t)], 0.6),
+            "the building's street",
+            (lambda: [Indicate(rt[3], color=YELLOW_M, scale_factor=1.12), *self.cap("the building's address = the router's outside address, 10.10.2.2")], 0.8),
+        ])
+
+        # ---------------- scene 5: rewrite and write it down ----------------
+        heads = VGroup(*[T(s, 18, GREY_B).move_to([x, -1.2, 0]) for s, x in zip(["inside", "outside", "far end"], COL_X)])
+        rule = Line([-5.6, -1.4, 0], [5.6, -1.4, 0], stroke_width=1.5, color=GREY_C)
+        tb_t = left_at(T("the router's table", 20, GREY_B), -5.6, -0.8)
+        row1 = VGroup(cell("10.10.1.10:41000", 0, 0), cell("10.10.2.2:41000", 1, 0, YELLOW_M), cell("10.10.2.20:8080", 2, 0))
+        self.steps("So the router rewrites the source of every packet going out, to its own outside address.", [
+            (lambda: [*self.uncap(), *self.set_card("A", pk("10.10.1.10:41000", "10.10.2.20:8080"))], 0.6),
+            (lambda: [go(W_CL)], 0.7),
+            "rewrites the source",
+            (lambda: [*self.set_card("B", pk("10.10.2.2:41000", "10.10.2.20:8080", "from"))], 0.7),
+        ])
+        self.steps("And before the packet leaves, it writes down what it did: the inside address and port, the outside ones, "
+                   "and the far end.", [
+            "writes down",
+            (lambda: [FadeIn(tb_t), FadeIn(heads), Create(rule)], 0.6),
+            "the inside address",
+            (lambda: [FadeIn(row1[0], shift=0.1 * DOWN)], 0.3),
+            "the outside ones",
+            (lambda: [FadeIn(row1[1], shift=0.1 * DOWN)], 0.3),
+            "the far end",
+            (lambda: [FadeIn(row1[2], shift=0.1 * DOWN), go(W_OUT)], 0.6),
+        ])
+        self.steps("The server sees a packet from 10.10.2.2, an address on its own network, so it can answer.", [
+            "it can answer",
+            (lambda: [*self.set_card("B", pk("10.10.2.20:8080", "10.10.2.2:41000", "to")), go(back(W_OUT), WHITE, 0.8)], 0.8),
+        ])
+        self.steps("The router finds the line, rewrites the destination back to 10.10.1.10, and sends it inside.", [
+            "finds the line",
+            (lambda: [Indicate(row1, color=YELLOW_M, scale_factor=1.04)], 0.8),
             "rewrites the destination",
-            (lambda: [Transform(rp[2], reline(rp, 2, "to  ", "192.168.1.23:41000", BLUE_M))], 0.7),
-            (lambda: [flow(wl, GREEN_M, 0.5, back=True), rp.animate.move_to([lane_x(LX), LANE, 0])], 0.7),
-            (lambda: [glow(laptop[0], GREEN_M, 1.05)], 0.6),
+            (lambda: [*self.set_card("A", pk("10.10.2.20:8080", "10.10.1.10:41000", "to", GREEN_M))], 0.6),
+            "sends it inside",
+            (lambda: [go(back(W_CL), GREEN_M, 0.7)], 0.7),
         ])
+        self.steps("This is NAT: network address translation.", [
+            (lambda: self.cap("NAT, network address translation: rewrite on the way out, rewrite back on the way in", WHITE), 0.6),
+        ], after=0.5)
 
-        pp = pkt("192.168.1.24:41000", "198.51.100.20:443", LX)
-        row2 = VGroup(cell("192.168.1.24:41000", 0, 1, TEAL_M), cell("203.0.113.7:41000", 1, 1, RED_M),
-                      cell("198.51.100.20:443", 2, 1))
-        clash = status("two connections, one identical header: whose reply is it?", RED_M)
-        self.steps("Now the phone also connects from port 41000 to the same server. "
-                   "Rewrite only the address, and its packets look exactly like the laptop's.", [
-            (lambda: [FadeOut(rp), FadeIn(phone), Create(wp)], 0.7),
-            (lambda: [FadeIn(pp, shift=0.15 * DOWN)], 0.4),
-            (lambda: [flow(wp, TEAL_M, 0.5), pp.animate.move_to([lane_x(RX), LANE, 0])], 0.6),
-            "Rewrite only",
-            (lambda: [Transform(pp[1], reline(pp, 1, "from", "203.0.113.7:41000", RED_M))], 0.6),
-            (lambda: [FadeIn(row2, shift=0.1 * DOWN)], 0.5),
-            "look exactly",
-            (lambda: [Indicate(row1[1], color=RED_M), Indicate(row2[1], color=RED_M), FadeIn(clash, shift=0.1 * UP)], 0.9),
+        # ---------------- scene 6: two connections, one port ----------------
+        row2 = VGroup(cell("10.10.1.20:41000", 0, 1), cell("10.10.2.2:41000", 1, 1, RED_M), cell("10.10.2.20:8080", 2, 1))
+        self.steps("Now peer connects too: same server, and by chance, the same port, 41000. If the router rewrites only the address, "
+                   "what will peer's packet look like outside? Pause and guess.", [
+            (lambda: [*self.uncap(), *self.set_card("A", pk("10.10.1.20:41000", "10.10.2.20:8080")), FadeOut(self.cards["B"])], 0.6),
+            (lambda: [go(W_PR)], 0.7),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.cards["B"] = None
+        self.countdown(3.0)
+        self.steps("Exactly like client's: 10.10.2.2, port 41000, to the same server. "
+                   "So when an answer comes back to port 41000, whose is it? The router can't tell.", [
+            (lambda: [*self.uncap(), *self.set_card("B", pk("10.10.2.2:41000", "10.10.2.20:8080", "from", RED_M)),
+                      FadeIn(row2, shift=0.1 * DOWN)], 0.7),
+            (lambda: [Indicate(row1[1], color=RED_M, scale_factor=1.12), Indicate(row2[1], color=RED_M, scale_factor=1.12)], 0.9),
+            "whose is it",
+            (lambda: [*self.set_card("B", pk("10.10.2.20:8080", "10.10.2.2:41000", "to", RED_M)), go(back(W_OUT), WHITE, 0.8)], 0.8),
+            "The router can't",
+            (lambda: [*self.cap("two lines, same outside port: the reply could be either", RED_M), glow(rt[0], RED_M, 1.04)], 0.7),
         ])
-
-        new_out = cell("203.0.113.7:3417", 1, 1, GOLD_M)
-        self.steps("So the router rewrites the port too. "
-                   "The phone's connection leaves from port 3417 and gets its own entry.", [
-            (lambda: [FadeOut(clash)], 0.4),
+        r2fix = cell("10.10.2.2:3417", 1, 1, YELLOW_M)
+        self.steps("So the router rewrites the port too. It gives peer's connection a different outside port. In the lesson's run, it picked 3417.", [
+            (lambda: [*self.uncap(), *self.set_card("A", pk("10.10.1.20:41000", "10.10.2.20:8080"))], 0.5),
             "rewrites the port",
-            (lambda: [Transform(pp[1], reline(pp, 1, "from", "203.0.113.7:3417", GOLD_M))], 0.7),
-            "and gets its own",
-            (lambda: [Transform(row2[1], new_out)], 0.6),
-            (lambda: [flow(ws, GOLD_M, 0.6), pp.animate.move_to([lane_x(SX), LANE, 0])], 0.7),
+            (lambda: [*self.set_card("B", pk("10.10.2.2:3417", "10.10.2.20:8080", "from"))], 0.6),
+            "it picked 3417",
+            (lambda: [swap(row2[1], r2fix)], 0.6),
         ])
-
-        st2 = status("one public address, many devices: the port tells them apart", GREEN_M)
-        self.steps("Each reply is matched by its port: 41000 goes to the laptop, 3417 to the phone. "
-                   "That's how thousands of devices share one address.", [
-            (lambda: [FadeOut(pp)], 0.3),
-            (lambda: [flow(ws, BLUE_M, 0.6, back=True)], 0.6),
-            (lambda: [Indicate(row1, color=BLUE_M, scale_factor=1.06), flow(wl, BLUE_M, 0.6, back=True)], 0.8),
-            "3417",
-            (lambda: [flow(ws, TEAL_M, 0.6, back=True)], 0.6),
-            (lambda: [Indicate(row2, color=TEAL_M, scale_factor=1.06), flow(wp, TEAL_M, 0.6, back=True)], 0.8),
-            "That's how",
-            (lambda: [FadeIn(st2, shift=0.1 * UP)], 0.6),
+        row2[1] = r2fix
+        self.steps("Now every line is different, and every answer can be matched. "
+                   "In the mailroom, the ledger says: replies for 41000 go to client, replies for 3417 go to peer.", [
+            (lambda: [row1[1].animate.set_color(WHITE), row2[1].animate.set_color(WHITE)], 0.5),
+            "replies for 41000",
+            (lambda: [Indicate(row1, color=YELLOW_M, scale_factor=1.04), go(back(W_CL), WHITE, 0.7)], 0.8),
+            "replies for 3417",
+            (lambda: [Indicate(row2, color=YELLOW_M, scale_factor=1.04), go(back(W_PR), WHITE, 0.7)], 0.8),
         ])
-
-        un = pkt("198.51.100.66:51000", "203.0.113.7:5000", SX, RED_M, dcol=RED_M)
-        xu = tick(False, 0.24).move_to([lane_x(RX) + PW / 2 + 0.35, LANE, 0])
-        st3 = status("no entry for port 5000: the router can't know which device, so it drops it", RED_M)
-        self.steps("Now a packet arrives from outside that nobody inside asked for. No entry matches, "
-                   "so the router doesn't know which device it's for, and drops it.", [
-            (lambda: [FadeOut(st2), FadeIn(un, shift=0.15 * DOWN)], 0.5),
-            (lambda: [flow(ws, RED_M, 0.6, back=True), un.animate.move_to([lane_x(RX), LANE, 0])], 0.8),
-            "No entry matches",
-            (lambda: [Indicate(row1[1], color=RED_M), Indicate(row2[1], color=RED_M)], 0.8),
-            "so the router",
-            (lambda: [Create(xu), FadeIn(st3, shift=0.1 * UP)], 0.7),
-            "and drops it",
-            (lambda: [FadeOut(un, scale=0.7), FadeOut(xu)], 0.6),
+        self.steps("Nearly every NAT you'll meet works this way. Linux calls its version masquerade.", [
+            (lambda: self.cap("one line per connection, addresses and ports  (Linux: MASQUERADE)", WHITE), 0.5),
         ])
+        self.steps("And the server? As far as it knows, it's chatting with one very busy computer.", [
+            "As far as",
+            (lambda: [glow(sv[0], WHITE), Indicate(rt[3], color=YELLOW_M, scale_factor=1.12)], 0.8),
+        ], after=0.5)
 
-        st4 = status("to let traffic in: a port forward, or a load balancer with a public address", GOLD_M)
-        self.steps("Letting traffic in takes a port forward set up by hand, or a load balancer with its own public address.", [
-            (lambda: [Transform(st3, st4)], 0.8),
-            (lambda: [glow(rbox, GOLD_M, 1.04)], 0.9),
+        # ---------------- scene 7: two costs ----------------
+        self.steps("This trick has two costs. First, nothing outside can start a conversation. "
+                   "A packet that arrives unasked matches no line, so it goes nowhere.", [
+            (lambda: [*self.uncap(), *self.clear_cards()], 0.4),
+            "nothing outside",
+            (lambda: [*self.set_card("B", [T("new, from outside", 18, RED_M), M("to 10.10.2.2:41000", 15)], RED_M),
+                      *self.cap("cost 1: nothing outside can start a conversation in")], 0.6),
+            "arrives unasked",
+            (lambda: [go(back(W_OUT), RED_M, 0.8)], 0.8),
+            (lambda: [glow(rt[0], RED_M, 1.04)], 0.6),
         ])
-
-        idle = status("the laptop's connection: idle for 0 s")
-        idle2 = status("the laptop's connection: idle for 5 minutes", RED_M)
-        strike = Line([COLX[0] - 1.6, ROW_Y[0], 0], [COLX[2] + 1.6, ROW_Y[0], 0], stroke_width=3, color=RED_M)
-        self.steps("Entries also expire. When a connection sits idle too long, "
-                   "the router deletes its entry, and tells neither end.", [
-            (lambda: [FadeOut(st3)], 0.4),
-            "When a connection",
-            (lambda: [FadeIn(idle)], 0.4),
-            (lambda: [Transform(idle, idle2)], 1.0),
-            "the router deletes",
-            (lambda: [Create(strike)], 0.5),
-            (lambda: [FadeOut(VGroup(row1, strike, idle))], 0.6),
-            "and tells neither",
-            (lambda: [glow(laptop[0], GREY_B, 1.04), glow(server[0], GREY_B, 1.04)], 0.8),
+        strike = Line([-5.0, TB_Y[0], 0], [5.0, TB_Y[0], 0], stroke_width=3, color=RED_M)
+        self.steps("Second, the table can't grow forever, so a line that stays quiet for too long is crossed out. Neither end is told.", [
+            (lambda: [*self.clear_cards(), *self.cap("cost 2: quiet lines are crossed out, and nobody is told")], 0.5),
+            "crossed out",
+            (lambda: [Create(strike), row1.animate.set_opacity(0.3)], 0.7),
         ])
-
-        lp = pkt("192.168.1.23:41000", "198.51.100.20:443", LX)
-        xl = tick(False, 0.24).move_to([lane_x(RX) + PW / 2 + 0.35, LANE, 0])
-        st5 = status("no entry: dropped or reset, on a connection both ends think is open", RED_M)
-        self.steps("The laptop's next packet on it matches nothing, and is dropped or reset. "
-                   "That's the reset on a pooled connection that worked minutes ago.", [
-            (lambda: [FadeIn(lp, shift=0.15 * DOWN)], 0.4),
-            (lambda: [flow(wl, BLUE_M, 0.5), lp.animate.move_to([lane_x(RX), LANE, 0])], 0.7),
+        dead, dead_go = run(W_OUT, WHITE, 0.6, frac=0.25)
+        nox2 = tick(False, 0.15).move_to(np.array(W_OUT[0]) * 0.75 + np.array(W_OUT[1]) * 0.25)
+        self.steps("Client still thinks its connection is open. Its next packet matches nothing, and is dropped.", [
+            (lambda: [*self.set_card("A", pk("10.10.1.10:41000", "10.10.2.20:8080"))], 0.5),
+            (lambda: [go(W_CL)], 0.7),
             "matches nothing",
-            (lambda: [Create(xl), lp[0].animate.set_stroke(RED_M)], 0.5),
-            "That's the reset",
-            (lambda: [FadeIn(st5, shift=0.1 * UP)], 0.7),
+            (lambda: [dead_go], 0.6),
+            (lambda: [FadeOut(dead, scale=1.8), Create(nox2),
+                      self.cards["A"][0].animate.set_stroke(RED_M)], 0.5),
+        ])
+        self.steps("The next section shows how long routers wait, and what to do about it.", [
+            (lambda: self.cap("how long a router waits: the next section"), 0.5),
         ])
 
-        self.steps("NAT works because the router remembers every conversation. "
-                   "A packet it has no memory of has nowhere to go.", [
-            (lambda: [FadeOut(lp), FadeOut(xl), Indicate(row2, color=GOLD_M, scale_factor=1.06)], 1.0),
-            "A packet",
-            (lambda: [glow(rbox, WHITE, 1.04)], 1.0),
+        # ---------------- scene 8: the moral, and a check ----------------
+        r1 = VGroup(cell("10.10.1.10:41000", 0, 0), cell("10.10.2.2:41000", 1, 0), cell("10.10.2.20:8080", 2, 0))
+        self.steps("So how does the film find the TV? The router wrote it down: one line per conversation, "
+                   "rewritten on the way out and on the way back.", [
+            (lambda: [*self.uncap(), *self.clear_cards(), FadeOut(nox2)], 0.3),
+            (lambda: [FadeOut(strike), FadeOut(row1), FadeIn(r1)], 0.6),
+            "one line per",
+            (lambda: [*self.cap("one line per conversation, rewritten on the way out and on the way back", WHITE),
+                      Indicate(VGroup(r1, row2), color=YELLOW_M, scale_factor=1.03)], 0.9),
         ])
-        self.wait(0.6)
+        q3 = VGroup(cell("a third computer, port 41000", 0, 2, WHITE, mono=False), cell("?", 1, 2, YELLOW_M), cell("10.10.2.20:8080", 2, 2))
+        self.steps("One quick check. A third computer inside connects to the same server, also from port 41000. "
+                   "What does the router do? Pause and think.", [
+            "A third computer",
+            (lambda: [FadeIn(q3, shift=0.1 * DOWN)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        q3fix = cell("10.10.2.2: another free port", 1, 2, GREEN_M, mono=False)
+        self.steps("It picks another free outside port, and writes a third line.", [
+            (lambda: [*self.uncap(), swap(q3[1], q3fix)], 0.6),
+            "writes a third",
+            (lambda: [Indicate(VGroup(q3[0], q3fix, q3[2]), color=GREEN_M, scale_factor=1.04)], 0.8),
+        ], after=0.3)
+        self.play(*self.cap("one address outside, one line per conversation inside the router", YELLOW_M, 26), run_time=0.6)
+        self.wait(2.0)
