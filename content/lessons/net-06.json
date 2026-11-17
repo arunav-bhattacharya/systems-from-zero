@@ -1,420 +1,424 @@
 {
- "id": "net-06",
- "title": "UDP and the sockets API",
- "minutes": 40,
- "goal": "By the end you can read a UDP header, write a UDP client and server in Kotlin with timeouts, say exactly when a sender does and doesn't hear about a lost datagram, and build sequence numbers, ACKs and retransmission on top of UDP.",
- "warmup": {
-  "q": "A Quarkus service sends a fraud score to a scoring collector as one UDP datagram, and `channel.send()` returns 120, the size of the datagram. What do you know now?",
-  "options": [
-   "The collector received the 120 bytes",
-   "The collector's kernel received them, but the collector program may not have read them yet",
-   "Your own kernel accepted 120 bytes to send, and nothing more",
-   "The datagram left your network card and is on the wire"
+  "id": "net-06",
+  "title": "UDP and the sockets API",
+  "minutes": 40,
+  "goal": "By the end, you can read a UDP header, send and receive datagrams through the sockets API in Kotlin, say exactly when a sender does and doesn't hear that a message was lost, and build numbering, replies and sending again on top of UDP so that every message arrives once.",
+  "opening": "Picture the café's busiest morning. Each time the card reader takes a payment, the till program sends a tiny message to another computer that draws the day's charts: one more coffee, 3.50. It sends each one and moves on, without waiting for a reply. At closing time, the till has counted every payment, and the chart shows a few hundred fewer. No error appeared anywhere.\n\nThe easy conclusion is a bug in the chart program, because every send reported success. It's a fair guess: on one laptop, in tests, these messages never go missing. But a successful send promised much less than it seemed to.\n\nIPv6 for application engineers ended with programs connecting to an address. In this lesson, we'll look at the simplest thing a program can send there: UDP, one message with no promise attached. We'll read a message on the wire, send and receive one through the sockets API, lose some in three places without a word, and then build the promise ourselves. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "The till program sends each payment to the chart program on another computer as one UDP message: a single message sent with no reply expected. `channel.send()` returns 120, the size of the message. What do you know now?",
+    "options": [
+      "The chart program received the 120 bytes",
+      "The other computer received them, but the chart program may not have read them yet",
+      "Your own computer's operating system took the 120 bytes to send, and nothing more",
+      "The message left your network card and is on its way"
+    ],
+    "answer": 2,
+    "why": "The return value counts the bytes your own operating system copied into its memory to send. UDP has no acknowledgment, no reply that says \"got it\", so nothing ever comes back to confirm delivery. The message may be dropped before it leaves your machine, on the way, or in the other computer's full queue. The second option is tempting because TCP, the other common way to send data, does get such replies. UDP gets nothing at all."
+  },
+  "sections": [
+    {
+      "h": "UDP puts a port number on a packet, and nothing else",
+      "body": "Let's send one message and look at it on the wire. In the Try it below, a machine called client sends the 16 bytes `AUTH 4242 100.00` to port 9000 on a machine called peer. Both are pretend machines in the lab network on your laptop: Docker containers that each behave like a separate computer. A port is a number that picks one program on a machine, the way a flat number picks one door in a building. The message travels as a packet: a small piece of data with a label in front, the IP header, that holds the two machines' addresses.\n\nWhat's the least a program needs from the network? IP, the Internet Protocol whose rules that label follows, already gets a packet to the right machine, most of the time. Then the receiving machine's kernel, the core of its operating system, has to know which program gets it. What happens when you curl a URL split the job of a transport protocol, the layer that carries data between programs, in two. One part is to pick the right program. The other is to cope with a network that loses, duplicates and reorders packets.\n\nSo the smallest useful transport puts a port number on each packet and leaves everything else alone. That protocol exists. It's **UDP**, the User Datagram Protocol, and its specification, RFC 768 from 1980, is three pages long. (An RFC is a numbered document that defines an internet standard.)\n\nA UDP message is called a datagram. In front of our 16 bytes sits an 8-byte UDP header, four numbers of 16 bits each. They are the source port, 52362, the destination port, 9000, the length, 24 (8 bytes of header plus 16 of data), and a checksum. The checksum is a number worked out from the header, the data and the two IP addresses, so the receiver can spot and drop a damaged datagram. In the IP header, the protocol field says 17, the number for UDP.\n\nNow count what's missing. There's no handshake, the opening exchange TCP uses to agree on a conversation, so the first packet already carries data. There's no acknowledgment, so the sender never learns whether anything arrived. Nothing is sent again, nothing is put back in order, and duplicates are passed up as they come. The receiver can't ask the sender to slow down, and nothing slows the sender when the network is full. One send becomes one datagram in one IP packet, as long as it fits.\n\nIt's a postcard. You write it, drop it in the box and walk away. You get no receipt, two cards can arrive in the wrong order, and some never arrive at all.\n\nA datagram can be up to 65,507 bytes over IPv4. But anything bigger than the path MTU, the largest packet every link on the way can carry (from Routing, ICMP and traceroute), travels as IP fragments, pieces cut to fit. Losing one fragment loses the whole datagram.\n\nWhy would anyone want so little? Because some programs are better off without the rest. A DNS lookup, which turns a name into an address, is one question and one answer. A TCP handshake first would triple the round trips, the trips there and back that each cost time. A voice call has no use for a word that arrives a second late, so waiting for it to be sent again is worse than a short gap. A metrics agent, a program that sends thousands of counts a second for charts like the café's, would rather lose a few than slow down the program it measures. And protocols that want their own rules start from UDP, so the kernel stays out of their way. QUIC, which carries HTTP/3, the newest version of the web's protocol, does that, and so does WireGuard, a program that builds private links between networks.\n\nUDP sends nothing back on its own. The one exception comes from the receiving kernel, not from UDP. If no program listens on the destination port, the kernel answers with ICMP Port Unreachable, a short error report. (ICMP is IP's own set of error messages, from Routing, ICMP and traceroute.) Whether your program ever hears about it is the subject of the third section. First, let's see how a program sends and receives at all.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 236\" role=\"img\" aria-label=\"The 8-byte UDP header of a captured datagram: source port, destination port, length and checksum, followed by 16 bytes of data, inside a 20-byte IPv4 header\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"24\" text-anchor=\"middle\">one datagram from the Try it: 14 Ethernet + 20 IPv4 + 8 UDP + 16 data = 58 bytes</text><rect class=\"box-dim\" x=\"20\" y=\"40\" width=\"640\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"62\" text-anchor=\"middle\">IPv4 header, 20 bytes: protocol 17 (UDP), 10.10.1.10 &gt; 10.10.1.20</text><rect class=\"box-a\" x=\"20\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"97\" y=\"110\" text-anchor=\"middle\">source port</text><text class=\"t-s t-code\" x=\"97\" y=\"132\" text-anchor=\"middle\">cc8a = 52362</text><rect class=\"box-a\" x=\"182\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"259\" y=\"110\" text-anchor=\"middle\">destination port</text><text class=\"t-s t-code\" x=\"259\" y=\"132\" text-anchor=\"middle\">2328 = 9000</text><rect class=\"box-a\" x=\"344\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"421\" y=\"110\" text-anchor=\"middle\">length</text><text class=\"t-s t-code\" x=\"421\" y=\"132\" text-anchor=\"middle\">0018 = 24</text><rect class=\"box-a\" x=\"506\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"583\" y=\"110\" text-anchor=\"middle\">checksum</text><text class=\"t-s t-code\" x=\"583\" y=\"132\" text-anchor=\"middle\">165b</text><text class=\"t-s t-a\" x=\"340\" y=\"168\" text-anchor=\"middle\">UDP header: four 16-bit fields, 8 bytes, and that is all</text><rect class=\"box-b\" x=\"20\" y=\"180\" width=\"640\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"203\" text-anchor=\"middle\">data, 16 bytes: AUTH 4242 100.00</text></svg>",
+        "caption": "A real datagram from the first Try it. The whole UDP header is four 16-bit fields. Everything TCP adds on top of them is missing on purpose."
+      },
+      "try": {
+        "title": "Send one datagram and find its header",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start the lab network if it isn't running (`docker compose -f env/net.yml up -d`). Then start a UDP echo server on peer with socat, a tool that connects two streams of data: every datagram that arrives on port 9000 goes back to its sender. `ss -uanp` lists UDP sockets, the endpoints programs send and receive through (the next section builds one). You should see socat on `0.0.0.0:9000`, which means port 9000 on every address.",
+          "Open a shell on client (`docker compose -f env/net.yml exec client bash`) and run the lines below. They send one datagram to the echo server and one to port 9001, where nothing listens, while tcpdump, a tool that prints every packet a network card sees, records both. `nc -u` sends each line of its input as a UDP datagram.",
+          "In the hex of the first datagram (base 16, where each pair of digits is one byte), find the UDP header. It starts at byte 34 (`0x22`), right after the `0114` that ends the IP header. Read its four fields. Then predict, before you look at the end of the output: what does nc's exit code, the number a program returns to say how it went, tell you about the datagram to port 9001?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "first in labs/, then on client",
+          "src": "docker compose -f env/net.yml exec -d peer socat UDP-RECVFROM:9000,fork SYSTEM:cat\ndocker compose -f env/net.yml exec peer ss -uanp\n\n# on client\ntcpdump -i eth0 -nn --immediate-mode -w /tmp/udp.pcap 'udp or icmp' 2>/dev/null &\nsleep 1\necho -n 'AUTH 4242 100.00' | nc -u -w1 10.10.1.20 9000; echo\necho -n 'AUTH 4242 100.00' | nc -u -w1 10.10.1.20 9001; echo \"nc exit code: $?\"\nsleep 1; kill %1; wait\ntcpdump -r /tmp/udp.pcap -nn -XX\n"
+        },
+        "expect": "From one run (the hex of the later packets trimmed):\n\n```text\nState  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess\nUNCONN 0      0         127.0.0.11:35553      0.0.0.0:*\nUNCONN 0      0            0.0.0.0:9000       0.0.0.0:*    users:((\"socat\",pid=55,fd=5))\n\nAUTH 4242 100.00\nnc exit code: 0\nreading from file /tmp/udp.pcap, link-type EN10MB (Ethernet), snapshot length 262144\n19:09:00.343049 IP 10.10.1.10.52362 > 10.10.1.20.9000: UDP, length 16\n\t0x0000:  6edc a299 ec4b 1a77 a5ab e1c1 0800 4500  n....K.w......E.\n\t0x0010:  002c ccb6 4000 4011 57d9 0a0a 010a 0a0a  .,..@.@.W.......\n\t0x0020:  0114 cc8a 2328 0018 165b 4155 5448 2034  ....#(...[AUTH.4\n\t0x0030:  3234 3220 3130 302e 3030                 242.100.00\n19:09:00.343118 IP 10.10.1.10.52362 > 10.10.1.20.9000: UDP, length 16\n19:09:00.344853 IP 10.10.1.20.9000 > 10.10.1.10.52362: UDP, length 16\n19:09:01.349560 IP 10.10.1.10.39785 > 10.10.1.20.9001: UDP, length 16\n19:09:01.349696 IP 10.10.1.20 > 10.10.1.10: ICMP 10.10.1.20 udp port 9001 unreachable, length 52\n```\n\nThe UDP header is `cc8a 2328 0018 165b`: port 52362, chosen by the kernel, then port 9000, length 24 and the checksum. Byte 23, the IP protocol, is `11` in hex, which is 17. There was no handshake: the first packet already carries `AUTH`. The `127.0.0.11` socket on peer is Docker's built-in DNS server. Toward port 9001, peer's kernel answered Port Unreachable, and nc still exited with 0, which means success: it never heard about it. The first datagram shows up twice in this run, with the same timestamp to a tenth of a millisecond. The bridge, the virtual switch Docker uses to join the containers, had forgotten which of its ports peer is on, so it sent the packet out of all of them, and hairpin mode sent a copy back to client (The link layer: Ethernet, MAC addresses and ARP). Your run may show it once."
+      },
+      "refs": [
+        {
+          "title": "RFC 768: User Datagram Protocol",
+          "url": "https://www.rfc-editor.org/rfc/rfc768.html",
+          "kind": "docs"
+        },
+        {
+          "title": "udp(7) man page",
+          "url": "https://man7.org/linux/man-pages/man7/udp.7.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A socket is a mailbox the kernel keeps for one port",
+      "body": "How does a program send that datagram? It can't put bytes on the wire itself. The network card, the part of a machine that joins it to a network, belongs to the kernel. So the program asks the kernel through a small set of system calls, the functions a program calls to ask the kernel for something. Together they're the **sockets API** (an API is the set of functions a system offers to programs). Its design goes back to BSD Unix, an early operating system, in 1983, and every language wraps the same calls: C, Kotlin on the JVM, Python and Go.\n\nLet's build it from what the kernel needs to know. First, the program asks for a socket with `socket()`. The kernel creates one, an endpoint for network traffic, and hands back a number the program uses to refer to it. To receive anything, the socket needs an address, so the program calls `bind()` with an IP address and a port, such as `127.0.0.1:9000`. (127.0.0.1 is the loopback address, which always means this machine.)\n\nA socket that sends without binding gets a free port at its first send, chosen by the kernel: an ephemeral port. Linux, the operating system on the lab machines, picks from 32768 to 60999, and that's where the 52362 in the capture came from. Then `sendto(bytes, address)` hands the kernel one datagram for one destination. `recvfrom()` waits for one datagram, and returns its bytes together with the address it came from. UDP has no `listen()` or `accept()`, the calls TCP uses to take a new connection. One socket can talk to any number of other machines, and each datagram says who sent it.\n\nThink of a bound socket as a mailbox the kernel keeps for one port. Datagrams that arrive for port 9000 go into the socket's receive queue, which has a fixed size (`SO_RCVBUF`; Linux's default is 212,992 bytes). Each receive takes out the oldest datagram, whole. **Message boundaries survive**: three sends become three receives, even if all three are already waiting. In postcard terms, the mailbox keeps the cards separate. TCP is the opposite. Its byte stream, from What happens when you curl a URL, pours the words of three letters into one long scroll, so three writes can come out as one read.\n\nThe price is that a datagram can't be split across receives. Read one into a buffer that's too small, and the rest is cut off and thrown away. So receive into a buffer of 65,535 bytes, unless your protocol promises smaller datagrams.\n\nJava and Kotlin programs run on the JVM, the Java Virtual Machine. In Kotlin, the server side of an echo service is four lines with `DatagramChannel`, from NIO, the JVM's newer library for input and output:\n\n```kotlin\nval channel = DatagramChannel.open().bind(InetSocketAddress(\"127.0.0.1\", 9000))\nval buffer = ByteBuffer.allocate(65_535)\nval from = channel.receive(buffer)   // blocks until one datagram arrives; returns who sent it\nchannel.send(buffer.flip(), from)    // one datagram back, to that address\n```\n\nThe older `java.net.DatagramSocket` does the same with `DatagramPacket` objects, and has a simple receive timeout, `soTimeout`. A UDP socket can also call `connect()`. Nothing is sent, because there's no connection to make: the kernel only records one peer, the one other machine this socket talks to. After that, `send()` needs no address, datagrams from anyone else are filtered out, and the kernel can report ICMP errors from that peer back to the socket. You'll see why that matters in a moment, once we start losing datagrams.",
+      "try": {
+        "title": "Count receives: UDP against TCP",
+        "minutes": 3,
+        "steps": [
+          "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`. The lab box is a Linux shell with the course's tools in it. It has JDK 25, which runs a single Java file without a build tool.",
+          "Read `labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java` first. Then predict: how many receives does the UDP part need for three sends, and how many bytes does TCP's single read return?",
+          "Run it. On your Mac, `./gradlew :net:demo -Pmain=sfz.net.l06.demo.Boundaries` from the `labs` folder prints the same (Gradle, behind `./gradlew`, is the tool that builds and runs the course's code)."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java"
+        },
+        "expect": "```text\nUDP receive 1: 6 bytes \"AUTH 1\"\nUDP receive 2: 7 bytes \"AUTH 22\"\nUDP receive 3: 8 bytes \"AUTH 333\"\nTCP read 1:    21 bytes \"AUTH 1AUTH 22AUTH 333\"\nUDP into a 9-byte buffer: \"AUTH 4242\" (sent 20 bytes; the other 11 are gone)\n```\n\nAll three datagrams were waiting in the queue before the first receive, and each receive still returned exactly one. TCP returned the three writes as one run of 21 bytes, with nothing to say where `AUTH 1` ends. The last line is the price of boundaries: a datagram that doesn't fit the buffer is cut, and the rest can't be read later."
+      },
+      "refs": [
+        {
+          "title": "Beej's Guide to Network Programming",
+          "url": "https://beej.us/guide/bgnet/html/",
+          "kind": "read"
+        },
+        {
+          "title": "JDK 25: DatagramChannel",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/DatagramChannel.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Three places a message can vanish, and nobody tells you",
+      "body": "When `send()` returns on a UDP socket, the kernel has copied your bytes into its own memory. It doesn't know whether they'll leave the machine, and nothing will ever tell it whether they arrived. That's the café's chart from the opening. A datagram can die in three places, and in each one nobody is told.\n\nOn the way. A router, one of the machines that pass packets between networks, has a queue that overflows in a burst. Or a packet sent over Wi-Fi is damaged on the way and fails its checksum. The router or the card drops it. Inside one data centre this is rare. Across the internet some loss is normal, and it comes in bursts when a link is busy.\n\nAt the receiver's kernel. If the program doesn't read fast enough, the socket's receive queue fills up, and the kernel drops every new datagram for that socket until there's room again. The queue also counts the kernel's own bookkeeping, not only your bytes. In the Try it below, a socket asks for a 16 KB queue. Linux doubles a requested `SO_RCVBUF` to leave room for that bookkeeping, so it gets 32 KB. That holds only 37 datagrams of 200 bytes, about 900 bytes of queue for each one. The other 1,963 of 2,000 vanish, and the only trace is a counter, `UdpRcvbufErrors`.\n\nA short pause in the receiving program during a burst does exactly this. Java programs stop for a moment now and then to clean up memory they no longer use, a pause called garbage collection, and 300 ms is plenty. That's how the café's chart lost its payments. The till's sends all worked, and the chart program fell behind for a moment.\n\nAt an empty port. If nothing listens, the receiving kernel answers ICMP Port Unreachable. The sender's kernel gets it, with the start of your datagram quoted inside. But an ordinary UDP socket is never told. It may be talking to a hundred machines, and the kernel doesn't report errors to unconnected sockets. Only a **connected** UDP socket hears it: its next receive fails with \"connection refused\", which the JVM turns into `PortUnreachableException`. Even that is a courtesy, not a promise, because the ICMP message can be lost or filtered like any other packet.\n\nUDP also doesn't promise order, or that each datagram comes once. Datagrams that take different paths can arrive in a different order, and a fault on some link can deliver a copy twice. On one local network both are rare. That's how bugs that depend on them stay hidden until a program meets the real internet.\n\nSo a UDP program has to decide, for every message, what happens if it disappears. For a chart counter or one frame of a video, the answer is \"nothing much\". For a payment, it matters a great deal, and the program has to find out for itself. Next, we'll build the way it does.",
+      "try": {
+        "title": "Lose datagrams without a word",
+        "minutes": 4,
+        "steps": [
+          "In the lab box, read `labs/net/src/demo/java/sfz/net/l06/demo/Silence.java`. Part 1 sends to a closed port from an unconnected socket. Part 2 does the same from a connected `DatagramChannel`. Part 3 sends 2,000 datagrams of 200 bytes to a socket with a 16 KB queue that reads only after the burst.",
+          "Predict part 3 before you run it: how many of the 2,000 arrive? Then run it, and ask the kernel's counters what it saw. `nstat -az` prints counters since the box started, so in a fresh box they belong to this run alone."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l06/demo/Silence.java\nnstat -az UdpRcvbufErrors UdpInDatagrams UdpNoPorts\n",
+          "file": "labs/net/src/demo/java/sfz/net/l06/demo/Silence.java"
+        },
+        "expect": "From one run:\n\n```text\n1. send() to closed port 37353 returned normally\n   receive(): Receive timed out after 1001 ms\n2. connected write() sent 9 bytes\n   read(): PortUnreachableException, the ICMP error reached us\n3. sent 2000 datagrams, received 37, lost 1963 without a word\n#kernel\nUdpInDatagrams                  41                 0.0\nUdpNoPorts                      2                  0.0\nUdpRcvbufErrors                 1963               0.0\n```\n\nThe same ICMP Port Unreachable came back in parts 1 and 2 (`UdpNoPorts` counts the two datagrams that found no socket), but only the connected channel was told. In part 3, every `send()` succeeded, 37 datagrams fit in the 32 KB queue, and `UdpRcvbufErrors` counted exactly the 1,963 the kernel threw away. On a Mac (run it with Gradle, as in the last Try it), 66 arrived in one run, because macOS sizes the queue differently, and `netstat -s -p udp` counts the rest as `dropped due to full socket buffers`. The exact numbers vary with the machine."
+      },
+      "refs": [
+        {
+          "title": "JDK 25: DatagramSocket",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/DatagramSocket.html",
+          "kind": "docs"
+        },
+        {
+          "title": "socket(7): SO_RCVBUF",
+          "url": "https://man7.org/linux/man-pages/man7/socket.7.html",
+          "kind": "docs"
+        }
+      ],
+      "aside": {
+        "title": "Why doesn't the kernel tell my program when a datagram is dropped?",
+        "body": "Mostly because it can't know. A datagram lost on the way, or in another machine's queue, dies far from your kernel, and the machine that dropped it owes you nothing. A report for every drop would also add traffic at the worst moment, when a network or a receiver is already overloaded, which is why routers limit their ICMP errors. The one report that does exist, Port Unreachable, reaches only connected sockets. So silence is the normal case, and a program that needs to know has to ask."
+      }
+    },
+    {
+      "h": "Making UDP reliable: number, wait, send again, drop duplicates",
+      "body": "Suppose your program must know that a message arrived, as it must for a payment. Let's rebuild what TCP does, one problem at a time, with postcards.\n\nThe receiver says so: it answers every message with an **ACK**, short for acknowledgment, a small reply that says \"got it\". The sender waits for it, but only for a while, because a lost message and a lost ACK look the same from the sender's side: silence. When the wait runs out, it sends the message again. That wait is the retransmission timeout, and sending again is a retransmission.\n\nThat fixes a lost message, and it creates a new problem. If the ACK was the thing that got lost, the receiver now gets the message twice. So every message carries a **sequence number**: 0, 1, 2 and so on. The receiver remembers which numbers it has already handed to the program. It delivers each number once, and still ACKs every copy, because a repeat means the sender is still waiting.\n\nShops do the same with receipt numbers. If the card reader sends the same payment twice with the same number, the payments app records it once. Programmers call such a number an idempotency key: a retry carries the same key, and the work happens once.\n\nStep through it below. Then let's see what we've built.\n\nIt's called stop and wait: one message in flight at a time. It's correct, and it's slow. Each message costs at least one round trip, the time for a message to go out and its ACK to come back. Across 70 ms, about the round trip between the two coasts of the United States, it manages about 14 messages a second, however fast the link is. The fix is to allow many numbered messages in flight at once, and to ACK which ones arrived. That's called a window, and TCP's sliding window, which the next two lessons open up, works this way.\n\nThe timeout is the hard part. Too short, and you send again messages that were only slow, which adds duplicates and load to a network that may already be struggling. Too long, and every loss costs a long pause. TCP measures the round trip time of its own connection and sets the timeout from it (RFC 6298 starts at 1 second). It doubles the timeout after every timeout in a row, so a sender backs off from a crowded network instead of hammering it.\n\nReal protocols on UDP do all of this themselves. A DNS client puts a 16-bit ID in its question, to match the answer to it, and asks again after a timeout. dig, the tool for DNS lookups, waits 5 seconds and tries 3 times by default. Asking the same question twice does no harm, so DNS needs no check for duplicates. QUIC (RFC 9000 and RFC 9002) rebuilds everything. It has packet numbers that are never reused, ACKs that list ranges of received packets, and loss detection. It has congestion control, which slows a sender down when the network is full. And it adds encryption, and many streams in one connection, on top.\n\nSo \"UDP is faster than TCP\" is true only for the parts you choose to leave out. **Once you need every message, you pay for reliability either way. Pay for it on purpose.** RFC 8085, the IETF's guidelines for programs that use UDP, asks you to add congestion control too. (The IETF is the group that writes the RFCs.)\n\nThe lab builds the stop-and-wait protocol from the stepper on real UDP sockets, with a relay in the tests that drops datagrams on purpose. After that, TCP will feel familiar.",
+      "stepper": {
+        "title": "A datagram lost with no one noticing, then a retry",
+        "intro": "Stop and wait, the simplest reliable protocol on top of UDP: one message in flight, a timer, and a sequence number.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"360\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 1</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">send() returned: OK</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">timer: 200 ms</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
+            "say": "The sender wraps the message in a frame, a small header of its own plus the message, with sequence number 7, and sends it. `send()` returns at once: the kernel took the bytes, and that's all it promises. The sender starts a 200 ms timer."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-bad\" x=\"240\" y=\"88\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"108\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><text class=\"t-s t-bad\" x=\"340\" y=\"128\" text-anchor=\"middle\">lost: nobody is told</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 1</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
+            "say": "A queue on the way is full, and the datagram is dropped. **No one notices.** The receiver never knew it existed, and the sender has no signal at all except the silence."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"360\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-bad\" x=\"36\" y=\"200\" text-anchor=\"start\">timer fired: no ACK in 200 ms</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"222\" text-anchor=\"start\">sent DATA 7 again, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">timer: 200 ms</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
+            "say": "200 ms pass without an ACK. The sender can't tell a lost message from a lost answer or a dead receiver. So it does the one thing that helps in all three cases: it sends the same frame again, with the same sequence number."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box-a\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"320\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"115\" text-anchor=\"middle\">ACK 7</text><line class=\"ln-a\" x1=\"320\" y1=\"110\" x2=\"192\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"200\" text-anchor=\"start\">seq 7 is new: delivered</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: AUTH 4242</text><text class=\"t-s t-code\" x=\"366\" y=\"244\" text-anchor=\"start\">now expecting seq 8</text><text class=\"t-s t-code t-a\" x=\"366\" y=\"266\" text-anchor=\"start\">sent ACK 7</text></svg>",
+            "say": "This copy arrives. Seq 7 is the number the receiver expected, so it hands `AUTH 4242` to the program, moves on to expecting 8, and answers with ACK 7."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-bad\" x=\"240\" y=\"88\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"108\" text-anchor=\"middle\">ACK 7</text><text class=\"t-s t-bad\" x=\"340\" y=\"128\" text-anchor=\"middle\">lost: nobody is told</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">delivered: AUTH 4242</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">now expecting seq 8</text></svg>",
+            "say": "The ACK is lost on the way back. Now the two sides disagree: the receiver has the message, and the sender believes it doesn't."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box-a\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"320\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"520\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-bad\" x=\"36\" y=\"200\" text-anchor=\"start\">timer fired again</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"222\" text-anchor=\"start\">sent DATA 7 again, attempt 3</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-bad\" x=\"366\" y=\"200\" text-anchor=\"start\">seq 7 is older than 8: duplicate</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"222\" text-anchor=\"start\">not delivered again</text><text class=\"t-s t-code t-a\" x=\"366\" y=\"244\" text-anchor=\"start\">sent ACK 7 again</text></svg>",
+            "say": "The sender times out again and sends attempt 3. The receiver sees seq 7 a second time. Delivering it again would record the payment twice, so it doesn't. It still sends ACK 7 again, because the sender is clearly still waiting for one."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">ACK 7</text><line class=\"ln-a\" x1=\"160\" y1=\"110\" x2=\"192\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-ok\" x=\"36\" y=\"200\" text-anchor=\"start\">ACK 7 arrived: done</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">3 attempts, 2 retransmissions</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">next message gets seq 8</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"200\" text-anchor=\"start\">delivered: AUTH 4242, once</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">now expecting seq 8</text><text class=\"t-s t-code\" x=\"366\" y=\"244\" text-anchor=\"start\">duplicates seen: 1</text></svg>",
+            "say": "ACK 7 arrives. The sender is done after three attempts and two lost datagrams, and the program got the message exactly once. Number, acknowledge, time out, send again and drop duplicates: that's the whole reliability layer this lesson's lab builds."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch DNS ask again over a lossy link",
+        "minutes": 4,
+        "steps": [
+          "Start a fresh lab box. `tc` is Linux's traffic control tool, and `tc qdisc ... netem loss 50%` makes the kernel drop half of the packets leaving `eth0`, the box's network card, at random. It affects only this box.",
+          "Run six DNS lookups through the lossy link. `+tries=4 +timeout=1` lets dig ask up to four times, waiting one second each time. Predict: how many of the six lookups will fail?",
+          "Exit the box when you're done: the loss rule disappears with it."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "tc qdisc add dev eth0 root netem loss 50%\nfor i in 1 2 3 4 5 6; do\n  dig +tries=4 +timeout=1 @1.1.1.1 example.com A +noall +answer +stats | grep -E 'communications error|Query time|^example'\n  echo ---\ndone\ntc -s qdisc show dev eth0 | head -2\n"
+        },
+        "expect": "From one run (the last two lookups, which went through first time, trimmed):\n\n```text\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t172.66.147.243\nexample.com.\t\t30\tIN\tA\t104.20.23.154\n;; Query time: 8 msec\n---\nexample.com.\t\t30\tIN\tA\t104.20.23.154\nexample.com.\t\t30\tIN\tA\t172.66.147.243\n;; Query time: 11 msec\n---\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t172.66.147.243\nexample.com.\t\t30\tIN\tA\t104.20.23.154\n;; Query time: 11 msec\n---\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t104.20.23.154\nexample.com.\t\t30\tIN\tA\t172.66.147.243\n;; Query time: 9 msec\n---\nqdisc netem 8003: root refcnt 13 limit 1000 loss 50%\n Sent 648 bytes 8 pkt (dropped 7, overlimits 0 requeues 0)\n```\n\nEvery lookup got its answer in the end, because dig asks again after its timeout. Each `timed out` line is one lost question and one second of waiting. The third lookup took about 3 seconds, yet dig reports `Query time: 11 msec`, the time of the try that worked. A chart of lookup times built from that number would hide the loss completely. The loss is random, so your run will differ, and with bad luck all four tries of a lookup fail. Neither UDP nor the network told dig anything. It relied on its own timer."
+      },
+      "refs": [
+        {
+          "title": "RFC 8085: UDP Usage Guidelines",
+          "url": "https://www.rfc-editor.org/rfc/rfc8085.html",
+          "kind": "docs"
+        },
+        {
+          "title": "RFC 9002: QUIC Loss Detection and Congestion Control",
+          "url": "https://www.rfc-editor.org/rfc/rfc9002.html",
+          "kind": "docs"
+        }
+      ]
+    }
   ],
-  "answer": 2,
-  "why": "The return value counts bytes your kernel copied into its own buffer. UDP has no acknowledgment, so nothing ever comes back to confirm delivery: the datagram may be dropped before it leaves your machine, on the way, or in the collector's full receive queue. The second option is tempting because TCP's ACKs tell the sender's kernel that much. UDP says nothing at all."
- },
- "sections": [
-  {
-   "h": "UDP adds ports and a length to IP, and nothing else",
-   "body": "Lesson 1 of this track split the transport layer's job in two: pick the right program on the machine (the port), and cope with a network that loses, duplicates and reorders packets (TCP's numbering and resending). What is the least a transport protocol could do? Only the first part. Put a port number on each packet so the receiving kernel knows which program gets it, and leave everything else alone. That protocol exists. It is **UDP**, the User Datagram Protocol, and its specification, RFC 768 from 1980, is three pages long.\n\nHere is a whole UDP datagram from the Try it below: client sends the 16 bytes `AUTH 4242 100.00` to port 9000 on peer. The UDP header in front of them is 8 bytes, four numbers of 16 bits each: source port 52362, destination port 9000, length 24 (8 of header plus 16 of data), and a checksum computed over the header, the data and the two IP addresses, so the receiver can drop a damaged datagram. IP's protocol field says 17, the number lesson 1 listed for UDP.\n\nCount what is missing. There is no handshake, so the first packet already carries data. There is no acknowledgment, so the sender never learns whether anything arrived. Nothing is resent, nothing is put back in order, and duplicates are passed up as they come. The receiver can't ask the sender to slow down, and nothing slows the sender when the network is full. One `send()` becomes one datagram in one IP packet, as long as it fits. A datagram can be up to 65,507 bytes over IPv4, but anything bigger than the path MTU from lesson 4 travels as IP fragments, and losing one fragment loses the whole datagram.\n\nWhy would anyone want so little? Because some programs are better off without the rest. A DNS lookup is one question and one answer: a TCP handshake first would triple the round trips. A voice call has no use for a word that arrives a second late, so waiting for a resend is worse than a short gap. A metrics agent sending thousands of counters a second would rather lose a few than slow the service it measures. And protocols that want their own rules start from UDP so the kernel stays out of the way: QUIC, which carries HTTP/3, and the WireGuard VPN both do.\n\nUDP sends nothing back on its own. The one exception comes from the receiving kernel, not from UDP: if no program listens on the destination port, the kernel answers ICMP Port Unreachable, the message traceroute waits for in lesson 4. Whether your program ever hears about that is the subject of the third section.",
-   "figure": {
-    "svg": "<svg viewBox=\"0 0 680 236\" role=\"img\" aria-label=\"The 8-byte UDP header of a captured datagram: source port, destination port, length and checksum, followed by 16 bytes of data, inside a 20-byte IPv4 header\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"340\" y=\"24\" text-anchor=\"middle\">one datagram from the Try it: 14 Ethernet + 20 IPv4 + 8 UDP + 16 data = 58 bytes</text><rect class=\"box-dim\" x=\"20\" y=\"40\" width=\"640\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"62\" text-anchor=\"middle\">IPv4 header, 20 bytes: protocol 17 (UDP), 10.10.1.10 &gt; 10.10.1.20</text><rect class=\"box-a\" x=\"20\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"97\" y=\"110\" text-anchor=\"middle\">source port</text><text class=\"t-s t-code\" x=\"97\" y=\"132\" text-anchor=\"middle\">cc8a = 52362</text><rect class=\"box-a\" x=\"182\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"259\" y=\"110\" text-anchor=\"middle\">destination port</text><text class=\"t-s t-code\" x=\"259\" y=\"132\" text-anchor=\"middle\">2328 = 9000</text><rect class=\"box-a\" x=\"344\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"421\" y=\"110\" text-anchor=\"middle\">length</text><text class=\"t-s t-code\" x=\"421\" y=\"132\" text-anchor=\"middle\">0018 = 24</text><rect class=\"box-a\" x=\"506\" y=\"86\" width=\"154\" height=\"62\" rx=\"8\"/><text class=\"t-s\" x=\"583\" y=\"110\" text-anchor=\"middle\">checksum</text><text class=\"t-s t-code\" x=\"583\" y=\"132\" text-anchor=\"middle\">165b</text><text class=\"t-s t-a\" x=\"340\" y=\"168\" text-anchor=\"middle\">UDP header: four 16-bit fields, 8 bytes, and that is all</text><rect class=\"box-b\" x=\"20\" y=\"180\" width=\"640\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"203\" text-anchor=\"middle\">data, 16 bytes: AUTH 4242 100.00</text></svg>",
-    "caption": "A real datagram from the first Try it. The whole UDP header is four 16-bit fields; everything TCP adds on top of them is missing on purpose."
-   },
-   "try": {
-    "title": "Send one datagram and find its header",
-    "minutes": 4,
-    "steps": [
-     "From the `labs` folder, start the lab network if it isn't running (`docker compose -f env/net.yml up -d`), then start a UDP echo server on peer with socat: every datagram that arrives on port 9000 goes back to its sender. `ss -uanp` lists UDP sockets: you should see socat on `0.0.0.0:9000`.",
-     "Open a shell on client (`docker compose -f env/net.yml exec client bash`) and run the lines below. They send one datagram to the echo server and one to port 9001, where nothing listens, while tcpdump records both. `nc -u` sends each line of input as a UDP datagram.",
-     "In the hex of the first datagram, find the UDP header. It starts at byte 34 (`0x22`), right after the `0114` that ends the IP header. Read its four fields. Predict before you look at the end of the output: what does nc's exit code say about the datagram to port 9001?"
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "first in labs/, then on client",
-     "src": "docker compose -f env/net.yml exec -d peer socat UDP-RECVFROM:9000,fork SYSTEM:cat\ndocker compose -f env/net.yml exec peer ss -uanp\n\n# on client\ntcpdump -i eth0 -nn --immediate-mode -w /tmp/udp.pcap 'udp or icmp' 2>/dev/null &\nsleep 1\necho -n 'AUTH 4242 100.00' | nc -u -w1 10.10.1.20 9000; echo\necho -n 'AUTH 4242 100.00' | nc -u -w1 10.10.1.20 9001; echo \"nc exit code: $?\"\nsleep 1; kill %1; wait\ntcpdump -r /tmp/udp.pcap -nn -XX\n"
+  "compare": {
+    "title": "The same three messages, read back over UDP and over TCP",
+    "a": {
+      "label": "UDP",
+      "lang": "text",
+      "title": "three sends, then three receives",
+      "src": "send(\"AUTH 1\")      receive -> 6 bytes \"AUTH 1\"\nsend(\"AUTH 22\")     receive -> 7 bytes \"AUTH 22\"\nsend(\"AUTH 333\")    receive -> 8 bytes \"AUTH 333\"\n\nany of the three may be missing, duplicated or out of order\n"
     },
-    "expect": "From one run (the hex of the later packets trimmed):\n\n```text\nState  Recv-Q Send-Q Local Address:Port  Peer Address:PortProcess\nUNCONN 0      0         127.0.0.11:35553      0.0.0.0:*\nUNCONN 0      0            0.0.0.0:9000       0.0.0.0:*    users:((\"socat\",pid=55,fd=5))\n\nAUTH 4242 100.00\nnc exit code: 0\nreading from file /tmp/udp.pcap, link-type EN10MB (Ethernet), snapshot length 262144\n19:09:00.343049 IP 10.10.1.10.52362 > 10.10.1.20.9000: UDP, length 16\n\t0x0000:  6edc a299 ec4b 1a77 a5ab e1c1 0800 4500  n....K.w......E.\n\t0x0010:  002c ccb6 4000 4011 57d9 0a0a 010a 0a0a  .,..@.@.W.......\n\t0x0020:  0114 cc8a 2328 0018 165b 4155 5448 2034  ....#(...[AUTH.4\n\t0x0030:  3234 3220 3130 302e 3030                 242.100.00\n19:09:00.343118 IP 10.10.1.10.52362 > 10.10.1.20.9000: UDP, length 16\n19:09:00.344853 IP 10.10.1.20.9000 > 10.10.1.10.52362: UDP, length 16\n19:09:01.349560 IP 10.10.1.10.39785 > 10.10.1.20.9001: UDP, length 16\n19:09:01.349696 IP 10.10.1.20 > 10.10.1.10: ICMP 10.10.1.20 udp port 9001 unreachable, length 52\n```\n\nThe UDP header is `cc8a 2328 0018 165b`: port 52362 (chosen by the kernel), port 9000, length 24, checksum. Byte 23, the IP protocol, is `11`, which is 17. There was no handshake: the first packet already carries `AUTH`. The `127.0.0.11` socket on peer is Docker's built-in DNS server. Toward port 9001, peer's kernel answered Port Unreachable, and nc still exited with 0: it never heard about it. The first datagram shows up twice in this run with the same timestamp to a tenth of a millisecond: the bridge had forgotten which port peer is on, so it flooded the frame, and hairpin mode sent a copy back to client, as in lesson 2. Your run may show it once."
-   },
-   "refs": [
-    {
-     "title": "RFC 768: User Datagram Protocol",
-     "url": "https://www.rfc-editor.org/rfc/rfc768.html",
-     "kind": "docs"
+    "b": {
+      "label": "TCP",
+      "lang": "text",
+      "title": "three writes, then one read",
+      "src": "write(\"AUTH 1\")\nwrite(\"AUTH 22\")     read -> 21 bytes \"AUTH 1AUTH 22AUTH 333\"\nwrite(\"AUTH 333\")\n\nall bytes arrive once and in order, with no boundaries\n"
     },
-    {
-     "title": "udp(7) man page",
-     "url": "https://man7.org/linux/man-pages/man7/udp.7.html",
-     "kind": "docs"
-    }
-   ]
+    "note": "Both columns come from `Boundaries.java` in the second Try it. UDP keeps every message whole and separate, and promises nothing about delivery. TCP promises every byte, once and in order, and keeps no message boundaries at all. That's why every protocol on TCP adds its own way to mark where a message ends, such as HTTP's `Content-Length` header from What happens when you curl a URL. Neither gives you both. A protocol on UDP that needs reliability adds sequence numbers and ACKs, and a protocol on TCP that needs messages adds lengths or markers between them."
   },
-  {
-   "h": "A socket is the kernel's mailbox for one port",
-   "body": "A program can't put bytes on the wire itself. The network card belongs to the kernel, so the program asks the kernel through a small set of system calls, the **sockets API**. Its design goes back to BSD Unix in 1983, and every language wraps the same calls: C, Kotlin on the JVM, Python, Go.\n\nBuild it from what the kernel needs to know. First the program asks for a socket, `socket()`: the kernel creates one, an endpoint for network traffic, and hands back a number the program refers to it by. To receive anything, the socket needs an address, so the program calls `bind()` with an IP address and a port, such as `127.0.0.1:9000`. A socket that sends without binding gets a free port chosen by the kernel at its first send, an ephemeral port (Linux picks from 32768 to 60999). That is where the 52362 in the capture came from. Then `sendto(bytes, address)` hands the kernel one datagram for one destination, and `recvfrom()` waits for one datagram and returns its bytes together with the address it came from. UDP has no `listen()` or `accept()`: one socket can talk to any number of peers, and each datagram says who sent it.\n\nThink of the bound socket as a mailbox the kernel keeps for one port. Datagrams that arrive for port 9000 go into the socket's receive queue, which has a fixed size (`SO_RCVBUF`; Linux's default is 212,992 bytes). Each receive call takes out the oldest datagram, whole. **Message boundaries survive**: three sends become three receives, even if all three are already waiting. That is the opposite of TCP's byte stream from lesson 1, where three writes can come out as one read. The price is that a datagram can't be split across receives. Read one into a buffer that is too small and the rest is cut off and thrown away. So receive into a buffer of 65,535 bytes unless your protocol promises smaller datagrams.\n\nIn Kotlin the server side of an echo service is four lines with NIO's `DatagramChannel`:\n\n```kotlin\nval channel = DatagramChannel.open().bind(InetSocketAddress(\"127.0.0.1\", 9000))\nval buffer = ByteBuffer.allocate(65_535)\nval from = channel.receive(buffer)   // blocks until one datagram arrives; returns who sent it\nchannel.send(buffer.flip(), from)    // one datagram back, to that address\n```\n\nThe older `java.net.DatagramSocket` does the same with `DatagramPacket` objects and has a simple receive timeout, `soTimeout`. A UDP socket can also call `connect()`. Nothing is sent, because there is no connection to make: the kernel only records one peer. After that, `send()` needs no address, datagrams from anyone else are filtered out, and the kernel can report ICMP errors from that peer back to the socket. You will see why that matters in a moment.",
-   "try": {
-    "title": "Count receives: UDP against TCP",
-    "minutes": 3,
+  "worked": {
+    "title": "Read a UDP datagram by hand",
     "steps": [
-     "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`. It has JDK 25, which runs a single Java file without Gradle.",
-     "Read `labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java` first, then predict: how many receives does the UDP part need for three sends, and how many bytes does TCP's single read return?",
-     "Run it. On your Mac, `./gradlew :net:demo -Pmain=sfz.net.l06.demo.Boundaries` from the `labs` folder prints the same."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java /labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java\n",
-     "file": "labs/net/src/demo/java/sfz/net/l06/demo/Boundaries.java"
-    },
-    "expect": "```text\nUDP receive 1: 6 bytes \"AUTH 1\"\nUDP receive 2: 7 bytes \"AUTH 22\"\nUDP receive 3: 8 bytes \"AUTH 333\"\nTCP read 1:    21 bytes \"AUTH 1AUTH 22AUTH 333\"\nUDP into a 9-byte buffer: \"AUTH 4242\" (sent 20 bytes; the other 11 are gone)\n```\n\nAll three datagrams were waiting in the queue before the first receive, and each receive still returned exactly one. TCP returned the three writes as one run of 21 bytes, with nothing to say where `AUTH 1` ends. The last line is the price of boundaries: a datagram that doesn't fit the buffer is cut, and the rest can't be read later."
-   },
-   "refs": [
-    {
-     "title": "Beej's Guide to Network Programming",
-     "url": "https://beej.us/guide/bgnet/html/",
-     "kind": "read"
-    },
-    {
-     "title": "JDK 25: DatagramChannel",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/DatagramChannel.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Nothing tells you a datagram was lost",
-   "body": "When `send()` returns on a UDP socket, the kernel has copied your bytes into its own buffer. It doesn't know whether they will leave the machine, and nothing will ever tell it whether they arrived. A datagram can die in three places, and in each one nobody is told.\n\nOn the way. A router's queue overflows in a burst, or a Wi-Fi frame is damaged and fails its checksum. The router or the card drops it. In a data centre this is rare. Across the internet some loss is normal, and it comes in bursts when a link is busy.\n\nAt the receiver's kernel. If the program doesn't read fast enough, the socket's receive queue fills up, and the kernel drops every new datagram for that socket until there is room again. The queue also counts the kernel's own bookkeeping, not only your bytes. In the Try it below, a socket that asks for a 16 KB queue (Linux doubles a requested `SO_RCVBUF` to leave room for that bookkeeping, so it gets 32 KB) holds just 37 datagrams of 200 bytes: about 900 bytes of queue for each one. The other 1,963 of 2,000 vanish, and the only trace is a counter, `UdpRcvbufErrors`. A 300 ms garbage collection pause in the receiving JVM during a burst does exactly this.\n\nAt an empty port. If nothing listens, the receiving kernel answers ICMP Port Unreachable. The sender's kernel gets it, quoting the start of your datagram, but an ordinary UDP socket is never told: it may be talking to a hundred peers, and the kernel doesn't report errors for unconnected sockets. Only a **connected** UDP socket hears it. Its next receive fails with \"connection refused\", which the JVM turns into `PortUnreachableException`. Even that is a courtesy, not a guarantee, because the ICMP message can be lost or filtered like any other packet.\n\nUDP also doesn't promise order or uniqueness. Datagrams that take different paths can arrive in a different order, and a fault on some link can deliver a copy twice. On one LAN both are rare, which is how bugs that depend on them reach production.\n\nSo a UDP program has to decide, for every message, what happens if it disappears. For a metrics counter or a frame of video, the answer is \"nothing much\". For an authorization request it is not, and the program has to find out by itself. The last section builds that.",
-   "try": {
-    "title": "Lose datagrams without a word",
-    "minutes": 4,
-    "steps": [
-     "In the lab box, read `labs/net/src/demo/java/sfz/net/l06/demo/Silence.java`. Part 1 sends to a closed port from an unconnected socket, part 2 does it from a connected `DatagramChannel`, and part 3 sends 2,000 datagrams of 200 bytes to a socket with a 16 KB queue that reads only after the burst.",
-     "Predict part 3 before you run it: how many of the 2,000 arrive? Then run it, and ask the kernel's counters what it saw. `nstat -az` prints counters since the box started, so in a fresh box they belong to this run alone."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java /labs/net/src/demo/java/sfz/net/l06/demo/Silence.java\nnstat -az UdpRcvbufErrors UdpInDatagrams UdpNoPorts\n",
-     "file": "labs/net/src/demo/java/sfz/net/l06/demo/Silence.java"
-    },
-    "expect": "From one run:\n\n```text\n1. send() to closed port 37353 returned normally\n   receive(): Receive timed out after 1001 ms\n2. connected write() sent 9 bytes\n   read(): PortUnreachableException, the ICMP error reached us\n3. sent 2000 datagrams, received 37, lost 1963 without a word\n#kernel\nUdpInDatagrams                  41                 0.0\nUdpNoPorts                      2                  0.0\nUdpRcvbufErrors                 1963               0.0\n```\n\nThe same ICMP Port Unreachable came back in parts 1 and 2 (`UdpNoPorts` counts the two datagrams that found no socket), but only the connected channel was told. In part 3 every `send()` succeeded, 37 datagrams fit in the 32 KB queue, and `UdpRcvbufErrors` counted exactly the 1,963 the kernel threw away. On a Mac (run it with Gradle, as in the last Try it) 66 arrived in one run, because macOS sizes the queue differently, and `netstat -s -p udp` counts the rest as `dropped due to full socket buffers`. The exact numbers vary with the machine."
-   },
-   "refs": [
-    {
-     "title": "JDK 25: DatagramSocket",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/DatagramSocket.html",
-     "kind": "docs"
-    },
-    {
-     "title": "socket(7): SO_RCVBUF",
-     "url": "https://man7.org/linux/man-pages/man7/socket.7.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Reliability on top of UDP: number, wait, resend, drop duplicates",
-   "body": "Suppose your protocol must know that a message arrived. Rebuild what TCP does, one problem at a time.\n\nThe receiver says so: it answers every message with an **ACK**. The sender waits for it, but only for a while, because a lost message and a lost ACK look the same from its side: silence. When the wait runs out (the retransmission timeout), it sends the message again. That fixes a lost message, and creates a new problem. If the ACK was the thing that got lost, the receiver now gets the message twice. So every message carries a **sequence number**: 0, 1, 2, and so on. The receiver remembers which numbers it has already handed to the application, delivers each number once, and still ACKs every copy, because a repeat means the sender is still waiting. That is the same idea as an idempotency key on a payment API: a retry carries the same key, and the server does the work once.\n\nWhat you have now is stop and wait: one message in flight at a time. It is correct, and it is slow. Each message costs at least one round trip, so across 70 ms between US coasts it manages about 14 messages a second, whatever the bandwidth. The fix is to allow many numbered messages in flight at once and to ACK which ones arrived, a window. That is TCP's sliding window, which lessons 7 and 8 open up.\n\nThe timeout is the hard part. Too short, and you resend messages that were merely slow, which adds duplicates and load to a network that may already be struggling. Too long, and every loss costs a long pause. TCP measures the round trip time of its own connection and sets the timeout from it (RFC 6298 starts at 1 second), and doubles it after every timeout in a row, so a sender backs off from a congested network instead of hammering it.\n\nReal protocols on UDP do all of this themselves. A DNS client puts a 16-bit ID in its query to match the answer, and asks again after a timeout: dig waits 5 seconds and tries 3 times by default. Repeating a question is harmless, so DNS needs no duplicate check. QUIC (RFC 9000 and RFC 9002) rebuilds everything: packet numbers that are never reused, ACKs that list ranges of received packets, loss detection, congestion control, plus encryption and many streams in one connection. So \"UDP is faster than TCP\" is true only for the parts you choose to leave out. Once you need reliability, you pay for it either way, and RFC 8085, the IETF's guidelines for applications on UDP, asks you to add congestion control too.\n\nThe lab builds the stop-and-wait protocol from the stepper on real UDP sockets, and a relay in the tests drops datagrams on purpose.",
-   "stepper": {
-    "title": "A datagram lost with no one noticing, then a retry",
-    "intro": "Stop and wait, the simplest reliable protocol on top of UDP: one message in flight, a timer, and a sequence number.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"360\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 1</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">send() returned: OK</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">timer: 200 ms</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
-      "say": "The sender wraps the message in a frame with sequence number 7 and sends it. `send()` returns at once: the kernel took the bytes, and that is all it promises. The sender starts a 200 ms timer."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-bad\" x=\"240\" y=\"88\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"108\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><text class=\"t-s t-bad\" x=\"340\" y=\"128\" text-anchor=\"middle\">lost: nobody is told</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 1</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
-      "say": "A queue on the way is full, and the datagram is dropped. **No one notices.** The receiver never knew it existed, and the sender has no signal at all except the silence."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"360\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-bad\" x=\"36\" y=\"200\" text-anchor=\"start\">timer fired: no ACK in 200 ms</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"222\" text-anchor=\"start\">sent DATA 7 again, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">timer: 200 ms</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">expecting seq 7</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: nothing yet</text></svg>",
-      "say": "200 ms pass without an ACK. The sender can't tell a lost request from a lost answer or a dead receiver, so it does the one thing that helps in all three cases: it sends the same frame again, with the same sequence number."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box-a\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"320\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"115\" text-anchor=\"middle\">ACK 7</text><line class=\"ln-a\" x1=\"320\" y1=\"110\" x2=\"192\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"200\" text-anchor=\"start\">seq 7 is new: delivered</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"222\" text-anchor=\"start\">delivered: AUTH 4242</text><text class=\"t-s t-code\" x=\"366\" y=\"244\" text-anchor=\"start\">now expecting seq 8</text><text class=\"t-s t-code t-a\" x=\"366\" y=\"266\" text-anchor=\"start\">sent ACK 7</text></svg>",
-      "say": "This copy arrives. Seq 7 is the one the receiver expected, so it hands `AUTH 4242` to the application, moves on to expecting 8, and answers with ACK 7."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-bad\" x=\"240\" y=\"88\" width=\"200\" height=\"50\" rx=\"8\"/><text class=\"t-s t-code\" x=\"340\" y=\"108\" text-anchor=\"middle\">ACK 7</text><text class=\"t-s t-bad\" x=\"340\" y=\"128\" text-anchor=\"middle\">lost: nobody is told</text><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code\" x=\"36\" y=\"200\" text-anchor=\"start\">sent DATA 7, attempt 2</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">waiting, timer running</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code\" x=\"366\" y=\"200\" text-anchor=\"start\">delivered: AUTH 4242</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">now expecting seq 8</text></svg>",
-      "say": "The ACK is lost on the way back. Now the two sides disagree: the receiver has the message, and the sender believes it doesn't."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box-a\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"320\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"420\" y=\"115\" text-anchor=\"middle\">DATA 7 AUTH 4242</text><line class=\"ln-a\" x1=\"520\" y1=\"110\" x2=\"488\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-bad\" x=\"36\" y=\"200\" text-anchor=\"start\">timer fired again</text><text class=\"t-s t-code t-a\" x=\"36\" y=\"222\" text-anchor=\"start\">sent DATA 7 again, attempt 3</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-bad\" x=\"366\" y=\"200\" text-anchor=\"start\">seq 7 is older than 8: duplicate</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"222\" text-anchor=\"start\">not delivered again</text><text class=\"t-s t-code t-a\" x=\"366\" y=\"244\" text-anchor=\"start\">sent ACK 7 again</text></svg>",
-      "say": "The sender times out again and sends attempt 3. The receiver sees seq 7 a second time. Delivering it again would authorize the payment twice, so it doesn't. It still sends ACK 7 again, because the sender is clearly still waiting for one."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A sender on the left and a receiver on the right, the datagram or ACK on the network between them, and what each side knows\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"20\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"105\" y=\"43\" text-anchor=\"middle\">sender</text><text class=\"t-s t-code\" x=\"105\" y=\"63\" text-anchor=\"middle\">127.0.0.1:41000</text><rect class=\"box\" x=\"490\" y=\"20\" width=\"170\" height=\"56\" rx=\"8\"/><text class=\"t\" x=\"575\" y=\"43\" text-anchor=\"middle\">receiver</text><text class=\"t-s t-code\" x=\"575\" y=\"63\" text-anchor=\"middle\">127.0.0.1:9000</text><line class=\"ln-d\" x1=\"190\" y1=\"48\" x2=\"490\" y2=\"48\"/><text class=\"t-s t-m\" x=\"340\" y=\"40\" text-anchor=\"middle\">the network</text><rect class=\"box-a\" x=\"160\" y=\"92\" width=\"200\" height=\"36\" rx=\"8\"/><text class=\"t-s t-code\" x=\"260\" y=\"115\" text-anchor=\"middle\">ACK 7</text><line class=\"ln-a\" x1=\"160\" y1=\"110\" x2=\"192\" y2=\"66\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"20\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"36\" y=\"174\" text-anchor=\"start\">what the sender knows</text><text class=\"t-s t-code t-ok\" x=\"36\" y=\"200\" text-anchor=\"start\">ACK 7 arrived: done</text><text class=\"t-s t-code\" x=\"36\" y=\"222\" text-anchor=\"start\">3 attempts, 2 retransmissions</text><text class=\"t-s t-code\" x=\"36\" y=\"244\" text-anchor=\"start\">next message gets seq 8</text><rect class=\"box\" x=\"350\" y=\"152\" width=\"310\" height=\"132\" rx=\"8\"/><text class=\"t-s t-m\" x=\"366\" y=\"174\" text-anchor=\"start\">what the receiver knows</text><text class=\"t-s t-code t-ok\" x=\"366\" y=\"200\" text-anchor=\"start\">delivered: AUTH 4242, once</text><text class=\"t-s t-code\" x=\"366\" y=\"222\" text-anchor=\"start\">now expecting seq 8</text><text class=\"t-s t-code\" x=\"366\" y=\"244\" text-anchor=\"start\">duplicates seen: 1</text></svg>",
-      "say": "ACK 7 arrives. The sender is done after three attempts and two lost datagrams, and the application got the message exactly once. Number, acknowledge, time out, resend, and drop duplicates: that is the whole reliability layer this lesson's lab builds."
-     }
+      {
+        "say": "The first datagram from the first Try it is 58 bytes, printed in hex. Ethernet's header, the label for the local link, takes the first 14 bytes, and the IPv4 header starts at byte 14 with `45`. Byte 23, the protocol, is `11` in hex: 17, UDP. The total length, `002c`, is 44: 20 bytes of IP header and 24 of UDP datagram.",
+        "code": "0x0000:  6edc a299 ec4b 1a77 a5ab e1c1 0800 4500\n0x0010:  002c ccb6 4000 4011 57d9 0a0a 010a 0a0a\n0x0020:  0114 ...\n\n00 2c       total length 44\n40 00       Don't Fragment set\n40          TTL 64\n11          protocol 17: UDP\n0a0a 010a   source 10.10.1.10 (client)\n0a0a 0114   destination 10.10.1.20 (peer)",
+        "lang": "text"
+      },
+      {
+        "say": "UDP starts at 14 + 20 = 34. Its header is four 16-bit numbers and nothing else.",
+        "code": "0x0020:  0114 cc8a 2328 0018 165b ...\n\ncc 8a   source port 52362, picked by the kernel because nc never called bind()\n23 28   destination port 9000, socat's socket\n00 18   length 24 = 8 bytes of header + 16 bytes of data\n16 5b   checksum over the header, the data and both IP addresses",
+        "lang": "text"
+      },
+      {
+        "say": "The data starts at 34 + 8 = 42 and runs to the end of the packet. It's exactly what `echo -n` gave nc, with no length in front and no marker at the end. The receiving kernel doesn't need one, because the UDP length field already says where the message ends.",
+        "code": "0x0020:                      4155 5448 2034   AUTH 4\n0x0030:  3234 3220 3130 302e 3030             242 100.00\n\n16 bytes: AUTH 4242 100.00",
+        "lang": "text"
+      },
+      {
+        "say": "Compare the reply from peer. The ports have swapped places, and the data is the same. Nothing in either header numbers the datagram or acknowledges the other one. If a protocol needs that, it has to put it inside the 16 bytes of data, which is what the lab's `Frame` does with 5 bytes of its own header.",
+        "code": "reply: 10.10.1.20.9000 > 10.10.1.10.52362: UDP, length 16\n\n23 28   source port 9000\ncc 8a   destination port 52362\n00 18   length 24\n\nthe lab's frame inside the data: 01 byte kind | 4 bytes seq | message",
+        "lang": "text"
+      }
     ]
-   },
-   "try": {
-    "title": "Watch DNS resend over a lossy link",
-    "minutes": 4,
-    "steps": [
-     "Start a fresh lab box. `tc qdisc ... netem loss 50%` makes the kernel drop half of the packets leaving `eth0`, at random. It affects only this box.",
-     "Run six DNS lookups through the lossy link. `+tries=4 +timeout=1` lets dig ask up to four times, waiting one second each time. Predict: how many of the six lookups will fail?",
-     "Exit the box when you're done: the loss rule disappears with it."
+  },
+  "lab": {
+    "title": "A UDP echo server, and a reliability layer that survives loss",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/net/src/main/kotlin/sfz/net/l06/UdpEcho.kt",
+      "labs/net/src/main/kotlin/sfz/net/l06/Reliable.kt",
+      "labs/net/src/main/kotlin/sfz/net/l06/Frame.kt"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "tc qdisc add dev eth0 root netem loss 50%\nfor i in 1 2 3 4 5 6; do\n  dig +tries=4 +timeout=1 @1.1.1.1 example.com A +noall +answer +stats | grep -E 'communications error|Query time|^example'\n  echo ---\ndone\ntc -s qdisc show dev eth0 | head -2\n"
-    },
-    "expect": "From one run (the last two lookups, which went through first time, trimmed):\n\n```text\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t172.66.147.243\nexample.com.\t\t30\tIN\tA\t104.20.23.154\n;; Query time: 8 msec\n---\nexample.com.\t\t30\tIN\tA\t104.20.23.154\nexample.com.\t\t30\tIN\tA\t172.66.147.243\n;; Query time: 11 msec\n---\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t172.66.147.243\nexample.com.\t\t30\tIN\tA\t104.20.23.154\n;; Query time: 11 msec\n---\n;; communications error to 1.1.1.1#53: timed out\nexample.com.\t\t30\tIN\tA\t104.20.23.154\nexample.com.\t\t30\tIN\tA\t172.66.147.243\n;; Query time: 9 msec\n---\nqdisc netem 8003: root refcnt 13 limit 1000 loss 50%\n Sent 648 bytes 8 pkt (dropped 7, overlimits 0 requeues 0)\n```\n\nEvery lookup got its answer in the end, because dig resends after its timeout, and every `timed out` line is one lost query and one second of waiting. The third lookup took about 3 seconds, yet dig reports `Query time: 11 msec`, the time of the try that worked. A latency graph built from that number would hide the loss completely. The loss is random, so your run will differ, and with bad luck all four tries of a lookup fail. Neither UDP nor the network told dig anything; it relied on its own timer."
-   },
-   "refs": [
-    {
-     "title": "RFC 8085: UDP Usage Guidelines",
-     "url": "https://www.rfc-editor.org/rfc/rfc8085.html",
-     "kind": "docs"
-    },
-    {
-     "title": "RFC 9002: QUIC Loss Detection and Congestion Control",
-     "url": "https://www.rfc-editor.org/rfc/rfc9002.html",
-     "kind": "docs"
+    "run": "./gradlew :net:test --tests 'sfz.net.l06.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder with the command above. Tests are small programs that check your code and say what's wrong. All 13 fail for now. They use real UDP sockets on 127.0.0.1, this machine, and no Docker. `Frame.kt` is finished: 1 byte that says DATA or ACK, 4 bytes of sequence number, then the message.",
+      "In `UdpEcho.kt`, write `UdpEchoServer.serve`: receive, flip the buffer from writing to reading, send it back, and repeat until the channel closes. Then write `udpRequest`: one datagram out and one back, or null after the timeout. Run `UdpEchoTest` until its 6 tests pass.",
+      "In `Reliable.kt`, write `ReliableReceiver.handle`: deliver the expected sequence number once, count older ones as duplicates, and ACK both.",
+      "Write `ReliableSender.send`: send DATA, wait for the matching ACK, send again on a timeout, and give up after `maxAttempts`.",
+      "Read `src/test/kotlin/sfz/net/l06/LossyLink.kt`, a relay between sender and receiver that drops chosen datagrams. The tests lose the first DATA, then the first ACK, then every third datagram one way and every fourth the other. Run the tests until all 13 pass."
+    ],
+    "hints": [
+      "`channel.receive(buffer)` throws `AsynchronousCloseException` when `close()` runs on another thread. That's a kind of `ClosedChannelException`, so one `catch` ends the loop.",
+      "In `udpRequest`, `DatagramSocket().use { ... }` closes the socket for you. Return `packet.data.copyOf(packet.length)`, because the buffer is bigger than the datagram.",
+      "In `send`, keep the sequence number in a local variable, and only move `nextSeq` on after the right ACK. An old ACK means \"keep waiting\", not \"send again\".",
+      "To wait out the rest of one timeout after an old ACK, work out a deadline with `System.nanoTime()`, and set `socket.soTimeout` to what's left before each `receive`.",
+      "In `handle`, send the ACK for every DATA with `seq <= expected`, after you update `expected`. A DATA from the future (`seq > expected`) can't happen in stop and wait, so ignore it."
+    ],
+    "done_when": "All 13 tests in `UdpEchoTest` and `ReliableTest` pass."
+  },
+  "drill": {
+    "title": "Write the stop-and-wait sender from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write the body of `send(message)` for a stop-and-wait sender over a `DatagramSocket`. Wrap the message in a frame with the next sequence number, send it, and wait for the matching ACK with a timeout. Send again on a timeout, and give up after a fixed number of attempts. Then say in one sentence what the receiver must do with a DATA frame whose sequence number it has already delivered.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun send(message: ByteArray): Int {\n    val seq = nextSeq\n    val data = Frame(Frame.Kind.DATA, seq, message).encode()\n    for (attempt in 1..maxAttempts) {\n        if (attempt > 1) retransmissions++                       // silence last time: send it again\n        socket.send(DatagramPacket(data, data.size, peer))      // may vanish silently\n        socket.soTimeout = timeout.toMillis().toInt()\n        try {\n            while (true) {                                       // skip stale ACKs\n                val p = DatagramPacket(ByteArray(65_535), 65_535)\n                socket.receive(p)\n                val f = Frame.decode(p.data, p.length) ?: continue\n                if (f.kind == Frame.Kind.ACK && f.seq == seq) {\n                    nextSeq = seq + 1\n                    return attempt\n                }\n            }\n        } catch (e: SocketTimeoutException) {\n            // no ACK in time: go round again\n        }\n    }\n    throw DeliveryFailedException(\"no ACK for seq $seq\")\n}\n\n// Receiver: don't deliver an old seq again, but ACK it again,\n// because the repeat means the sender never got the first ACK.\n// (This simple version gives each receive the full timeout; the lab's solution keeps a deadline.)\n"
     }
-   ]
-  }
- ],
- "compare": {
-  "title": "The same three messages, read back over UDP and over TCP",
-  "a": {
-   "label": "UDP",
-   "lang": "text",
-   "title": "three sends, then three receives",
-   "src": "send(\"AUTH 1\")      receive -> 6 bytes \"AUTH 1\"\nsend(\"AUTH 22\")     receive -> 7 bytes \"AUTH 22\"\nsend(\"AUTH 333\")    receive -> 8 bytes \"AUTH 333\"\n\nany of the three may be missing, duplicated or out of order\n"
   },
-  "b": {
-   "label": "TCP",
-   "lang": "text",
-   "title": "three writes, then one read",
-   "src": "write(\"AUTH 1\")\nwrite(\"AUTH 22\")     read -> 21 bytes \"AUTH 1AUTH 22AUTH 333\"\nwrite(\"AUTH 333\")\n\nall bytes arrive once and in order, with no boundaries\n"
+  "recap": [
+    "UDP adds an 8-byte header to IP: source port, destination port, length and checksum. There's no handshake, no ACK, no sending again, no ordering, and nothing that slows the sender down.",
+    "A socket is the kernel's mailbox for one port. Each send is one datagram, and each receive returns exactly one, whole; a buffer that's too small cuts it.",
+    "A successful `send()` means only that your own kernel took the bytes. Datagrams die on the way, in a full receive queue (counted in `UdpRcvbufErrors`), or at a closed port.",
+    "Only a connected UDP socket hears about ICMP Port Unreachable, as `PortUnreachableException` in the JVM. An unconnected one hears nothing.",
+    "Reliability on UDP means sequence numbers, ACKs, a retransmission timeout and dropping duplicates. DNS does a little of it, and QUIC rebuilds all of TCP's work.",
+    "The limit: stop and wait keeps one message in flight, so it manages one message per round trip, about 14 a second across 70 ms. Going faster takes a window of many messages and a way to slow down when the network is full, which is what TCP adds."
+  ],
+  "closing": "We started with a café chart that showed fewer payments than the till, while every send said it worked. A UDP send only means your own machine took the bytes. The chart program's full queue dropped the rest, and a counter was the only witness.\n\nOn a Mac, run `netstat -s -p udp` and find the line `dropped due to full socket buffers`. Each one counts a datagram your Mac threw away without telling the program it was for.\n\nNext, we'll see how TCP does the same work for a stream of bytes, and why both sides must agree on where the numbering starts before the first byte moves.",
+  "quiz": [
+    {
+      "q": "The till program sends one 1,000-byte UDP datagram per payment to a program that writes a log. During a burst, the log program pauses for 300 ms while Java cleans up unused memory (a garbage collection). What happens to the datagrams that arrive during the pause?",
+      "options": [
+        "They wait in the network until the log program reads again",
+        "The receiving kernel queues what fits in the socket's receive buffer and drops the rest; the sender isn't told",
+        "The receiving kernel tells the sender to slow down, and the sender's `send()` blocks",
+        "They're delivered later, out of order, but all of them arrive"
+      ],
+      "answer": 1,
+      "why": "The network doesn't hold packets for a slow program, and UDP has no flow control, no way for the receiver to push back on the sender. The receiving kernel keeps what fits in the socket's queue and drops the rest, counting it in `UdpRcvbufErrors`. The sender's `send()` calls all succeeded. Making the sender wait is what TCP's flow control would do, and UDP has none."
+    },
+    {
+      "q": "A program sends three datagrams of 100, 200 and 300 bytes to a server that reads with a 1,000-byte buffer. What can the server's receive calls return?",
+      "options": [
+        "Receives of exactly 100, 200 and 300 bytes, one datagram each, for those that arrive",
+        "One receive of 600 bytes, if all three arrived before it read",
+        "Any split of the 600 bytes, depending on the MTU",
+        "Three receives of 1,000 bytes, padded with zeros"
+      ],
+      "answer": 0,
+      "why": "UDP keeps message boundaries: each receive returns one whole datagram. Some may be lost, and they may come in another order, but they're never merged or split. Merging bytes into one read is TCP's byte stream, the habit this question tests."
+    },
+    {
+      "q": "A `DatagramChannel` is connected to `10.10.1.20:9001`, where nothing listens. It writes a datagram, then calls `read()`. What happens, if nothing on the way filters ICMP?",
+      "options": [
+        "`read()` blocks forever, since UDP never gets answers",
+        "`write()` throws `ConnectException`",
+        "`read()` throws `PortUnreachableException`, because the kernel passes the ICMP Port Unreachable to the connected socket",
+        "`read()` returns 0 bytes"
+      ],
+      "answer": 2,
+      "why": "The other machine's kernel answers with ICMP Port Unreachable. Because the socket is connected, your kernel knows which socket the error is about, and reports it on the next call, which the JVM turns into `PortUnreachableException`. An unconnected socket would hear nothing, and `read()` would wait for its timeout. `write()` succeeds either way, because nothing is known yet when it runs."
+    },
+    {
+      "q": "In a stop-and-wait protocol over UDP, the receiver gets DATA with sequence number 7, which it has already delivered. What should it do?",
+      "options": [
+        "Drop it without a word: it's a duplicate",
+        "Deliver it again, since the sender clearly wants it delivered",
+        "Send a reply that says \"stop sending\", so the sender gives up",
+        "Send ACK 7 again without delivering it"
+      ],
+      "answer": 3,
+      "why": "A repeat means the sender never got the first ACK 7, so it will keep sending until one arrives. Dropping it without a word makes the sender retry until it gives up, and delivering it again would record a payment twice. ACK again, deliver once."
+    },
+    {
+      "q": "From Routing, ICMP and traceroute: the ICMP Port Unreachable a UDP sender gets back quotes the start of the datagram it's about. Which quoted fields let the sender's kernel find the socket the error belongs to?",
+      "options": [
+        "Only the ICMP checksum",
+        "The quoted IP addresses and the first 8 bytes after the IP header, which hold the UDP source and destination ports",
+        "The whole data of the datagram, which the kernel compares with recent sends",
+        "The TTL, which is unique per socket"
+      ],
+      "answer": 1,
+      "why": "Every ICMP error quotes the dead packet's IP header plus at least 8 more bytes. For UDP, those 8 bytes are the whole UDP header, so the kernel has the addresses and both ports, which is enough to find the socket. Traceroute uses the same quote to match answers to its probes by port.",
+      "from": "net-04"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What are the four fields of the UDP header?",
+      "back": "Source port, destination port, length (header plus data) and checksum. 16 bits each, 8 bytes in all."
+    },
+    {
+      "front": "What does a successful UDP `send()` tell you?",
+      "back": "That your own kernel took the bytes. Nothing about whether they left the machine or arrived."
+    },
+    {
+      "front": "What happens when you receive a UDP datagram into a buffer that's too small?",
+      "back": "You get the first bytes, and the rest is thrown away. Receive into 65,535 bytes unless your protocol promises smaller datagrams."
+    },
+    {
+      "front": "Where does Linux count UDP datagrams it dropped because a socket's queue was full?",
+      "back": "In `UdpRcvbufErrors`, shown by `nstat -az` (or by `netstat -su`, as receive buffer errors)."
+    },
+    {
+      "front": "Why `connect()` a UDP socket?",
+      "back": "It fixes one peer: `send` needs no address, other senders are filtered out, and ICMP errors such as Port Unreachable reach the socket (`PortUnreachableException` in the JVM)."
+    },
+    {
+      "front": "What are the four parts of a minimal reliability layer on UDP?",
+      "back": "Sequence numbers, ACKs, a retransmission timeout, and a receiver that delivers each number once but ACKs every copy."
+    },
+    {
+      "front": "Why is stop and wait slow?",
+      "back": "It sends one message per round trip: at 70 ms, about 14 messages a second, however fast the link. A window, with many messages in flight, fixes it."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Datagram",
+      "plain": "One self-contained UDP message, sent and received whole."
+    },
+    {
+      "term": "Socket",
+      "plain": "The kernel's endpoint for one port or conversation, which a program reads and writes through system calls."
+    },
+    {
+      "term": "Ephemeral port",
+      "plain": "A free port the kernel picks for a socket that never called `bind()`."
+    },
+    {
+      "term": "Receive buffer",
+      "plain": "A socket's queue of arrived datagrams (`SO_RCVBUF`). When it's full, new ones are dropped."
+    },
+    {
+      "term": "Connected UDP socket",
+      "plain": "A UDP socket fixed to one peer, which also receives that peer's ICMP errors."
+    },
+    {
+      "term": "Sequence number",
+      "plain": "A number on each message, so the receiver can spot duplicates and put messages in order."
+    },
+    {
+      "term": "Retransmission timeout",
+      "plain": "How long a sender waits for an ACK before it sends the message again."
+    },
+    {
+      "term": "Stop and wait",
+      "plain": "A protocol that keeps one message in flight, and sends the next only after the ACK for the last."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend building a small payments app wants to send each payment from one program to another over UDP, \"because it's faster, and my laptop never drops anything\". Explain what UDP does and doesn't do, where payments could disappear, and what they'd have to build to make it safe.",
+    "answer": "UDP only puts ports, a length and a checksum on a datagram. There's no handshake, no acknowledgment and no sending again, so a successful send only means our own operating system took the bytes. A payment can vanish in a router's queue during a burst. It can vanish in the receiving program's queue when that program pauses or falls behind, which the kernel only counts in UdpRcvbufErrors. Or it can vanish at a closed port while the receiver restarts, where only a connected socket would even hear about it. A copy can also arrive twice. Your laptop never drops anything because nothing ever leaves it. To make it safe, we'd number every payment, have the receiver acknowledge each one, and send again after a timeout that grows. The receiver would record each number once while acknowledging every copy, the idea behind a receipt number. Then we'd want many payments in flight for speed, and a way to slow down so retries don't swamp the network. At that point we've rebuilt TCP, so for payments I'd use TCP, and keep UDP for data we can afford to lose, like chart counters."
   },
-  "note": "Both columns come from `Boundaries.java` in the second Try it. UDP keeps every message whole and separate, and promises nothing about delivery. TCP promises every byte in order, and keeps no message boundaries at all, which is why every protocol on TCP adds its own framing, such as HTTP's `Content-Length` from lesson 1. Neither gives you both, so a protocol on UDP that needs reliability adds sequence numbers and ACKs, and a protocol on TCP that needs messages adds lengths or delimiters."
- },
- "analogy": "UDP is a postcard dropped into a postbox. It needs no envelope and no queue at the counter, and that is why it is quick. You get no receipt, the card can arrive after the one you sent later, and if the recipient's letterbox is already full the postman drops it in the street. Making it reliable means doing the post office's work yourself: number every card, ask the recipient to send a card back for each number, send a copy if no reply comes within a few days, and have the recipient throw away any number it has already read. The analogy breaks on duplicates: a real postal service never delivers the same card twice, while a network occasionally does, so your recipient has to check the numbers even when nothing seems lost.",
- "in_your_world": "Two pieces of your payment stack run on UDP without saying so. The first is DNS. A JVM resolving `api.card-issuer.example` sends a UDP query through the C library's resolver, which waits 5 seconds before it asks again (`timeout:5` and `attempts:2` are glibc's defaults in `resolv.conf`). One lost query adds 5 seconds to the first authorization after the JVM's own 30-second DNS cache expires, and nothing in your logs says why. The second is metrics. If your Quarkus services ship Micrometer metrics over StatsD, each counter update is a datagram to an agent on the node. During a traffic spike, the moment you most want accurate numbers, the agent falls behind, its receive queue overflows, and the dashboard undercounts declined authorizations. Watch `UdpRcvbufErrors` (`nstat -az`) on the node, give the agent a larger `SO_RCVBUF`, and keep anything that must not be lost, such as ledger postings and audit events, on TCP or Kafka.",
- "mistake": "The common mistake is choosing UDP because \"it is faster\", and then treating a successful `send()` as delivery. The fast path works perfectly in tests on one machine, where loopback never drops anything. In production, a busy receiver's queue overflows, a router drops a burst, and messages vanish with no exception anywhere. Teams then add a retry, but without sequence numbers, so a lost ACK becomes a duplicate payment or a double-counted event. If you need every message, use TCP or a broker. If you must use UDP, number every message, acknowledge it, retry with a growing timeout, drop duplicates at the receiver, and alert on the kernel's drop counters.",
- "worked": {
-  "title": "Read a UDP datagram by hand",
-  "steps": [
-   {
-    "say": "The first datagram from the first Try it is 58 bytes. Ethernet takes the first 14, and the IPv4 header starts at byte 14 with `45`. Byte 23, the protocol, is `11` in hex: 17, UDP. Total length `002c` is 44: 20 bytes of IP header and 24 of UDP datagram.",
-    "code": "0x0000:  6edc a299 ec4b 1a77 a5ab e1c1 0800 4500\n0x0010:  002c ccb6 4000 4011 57d9 0a0a 010a 0a0a\n0x0020:  0114 ...\n\n00 2c       total length 44\n40 00       Don't Fragment set\n40          TTL 64\n11          protocol 17: UDP\n0a0a 010a   source 10.10.1.10 (client)\n0a0a 0114   destination 10.10.1.20 (peer)",
-    "lang": "text"
-   },
-   {
-    "say": "UDP starts at 14 + 20 = 34. Its header is four 16-bit numbers and nothing else.",
-    "code": "0x0020:  0114 cc8a 2328 0018 165b ...\n\ncc 8a   source port 52362, picked by the kernel because nc never called bind()\n23 28   destination port 9000, socat's socket\n00 18   length 24 = 8 bytes of header + 16 bytes of data\n16 5b   checksum over the header, the data and both IP addresses",
-    "lang": "text"
-   },
-   {
-    "say": "The data starts at 34 + 8 = 42 and runs to the end of the frame: exactly what `echo -n` gave nc, with no length prefix and no terminator. The receiving kernel doesn't need one, because the UDP length field already says where the message ends.",
-    "code": "0x0020:                      4155 5448 2034   AUTH 4\n0x0030:  3234 3220 3130 302e 3030             242 100.00\n\n16 bytes: AUTH 4242 100.00",
-    "lang": "text"
-   },
-   {
-    "say": "Compare the reply from peer. The ports have swapped places and the data is the same. Nothing in either header numbers the datagram or acknowledges the other one: if the protocol needs that, it has to be inside the 16 bytes of data, which is what the lab's `Frame` does with 5 bytes of its own header.",
-    "code": "reply: 10.10.1.20.9000 > 10.10.1.10.52362: UDP, length 16\n\n23 28   source port 9000\ncc 8a   destination port 52362\n00 18   length 24\n\nthe lab's frame inside the data: 01 byte kind | 4 bytes seq | message",
-    "lang": "text"
-   }
+  "deeper": {
+    "minutes": 8,
+    "body": "**One thread per UDP socket isn't enough.** A UDP server has one socket for all its clients, so one thread reading it becomes the bottleneck. (A thread is one path of work running inside a program.) On Linux, `SO_REUSEPORT` lets several sockets bind the same port, and the kernel spreads datagrams across them by mixing the addresses and ports into a number. Each thread then gets its own socket and queue. DNS servers and QUIC servers use it.\n\n**How big should a datagram be?** Stay under the path MTU from Routing, ICMP and traceroute, and the datagram travels as one packet. Go over, and IP cuts it into fragments, and losing any fragment loses all of it. DNS learned this the hard way. Since DNS Flag Day 2020, resolvers (the servers that look names up for you) advertise EDNS buffers of 1,232 bytes (EDNS lets a DNS message say how big an answer it can take), small enough to fit an IPv6 packet of 1,280 bytes without fragments, and anything bigger moves to TCP. Operating systems also cap datagram sizes: macOS refuses to send UDP datagrams over 9,216 bytes by default (`net.inet.udp.maxdgram`), which is why this lesson's lab tests stop at 8,000 bytes.\n\n**Why QUIC lives outside the kernel.** TCP is in the kernel, so improving it means waiting years for every operating system to update. QUIC runs on UDP inside the program or its library, so a browser or a server can ship a new way of handling congestion with its next release. The cost is processor time, because the kernel's UDP path was built for small datagrams. So Linux added UDP segmentation offload (GSO) and receive offload (GRO), which pass many datagrams through the kernel as one.\n\n**Java details.** `DatagramChannel` can be non-blocking, returning at once instead of waiting, and registered with a `Selector`, so one thread can serve many sockets. Since JDK 15, the old `DatagramSocket` is built on top of `DatagramChannel` (JEP 373; a JEP is a numbered proposal for a change to Java), so both behave the same underneath. Virtual threads, the JVM's cheap threads, work with blocking UDP calls too."
+  },
+  "sources": [
+    {
+      "title": "RFC 768: User Datagram Protocol",
+      "url": "https://www.rfc-editor.org/rfc/rfc768.html"
+    },
+    {
+      "title": "RFC 8085: UDP Usage Guidelines",
+      "url": "https://www.rfc-editor.org/rfc/rfc8085.html"
+    },
+    {
+      "title": "RFC 9000: QUIC, a UDP-Based Multiplexed and Secure Transport",
+      "url": "https://www.rfc-editor.org/rfc/rfc9000.html"
+    },
+    {
+      "title": "udp(7) man page",
+      "url": "https://man7.org/linux/man-pages/man7/udp.7.html"
+    },
+    {
+      "title": "Beej's Guide to Network Programming",
+      "url": "https://beej.us/guide/bgnet/html/"
+    }
   ]
- },
- "lab": {
-  "title": "A UDP echo server, and a reliability layer that survives loss",
-  "minutes": 15,
-  "needs": [],
-  "files": [
-   "labs/net/src/main/kotlin/sfz/net/l06/UdpEcho.kt",
-   "labs/net/src/main/kotlin/sfz/net/l06/Reliable.kt",
-   "labs/net/src/main/kotlin/sfz/net/l06/Frame.kt"
-  ],
-  "run": "./gradlew :net:test --tests 'sfz.net.l06.*'",
-  "steps": [
-   "Run the tests once from the `labs` folder. All 13 fail. They use real UDP sockets on 127.0.0.1 and no Docker. `Frame.kt` is finished: 1 byte for DATA or ACK, 4 bytes of sequence number, then the message.",
-   "In `UdpEcho.kt`, write `UdpEchoServer.serve` (receive, flip, send back, until the channel closes) and `udpRequest` (one datagram out, one back, or null after the timeout). Run `UdpEchoTest` until its 6 tests pass.",
-   "In `Reliable.kt`, write `ReliableReceiver.handle`: deliver the expected sequence number once, count older ones as duplicates, and ACK both.",
-   "Write `ReliableSender.send`: send DATA, wait for the matching ACK, resend on timeout, give up after `maxAttempts`.",
-   "Read `src/test/kotlin/sfz/net/l06/LossyLink.kt`: a relay between sender and receiver that drops chosen datagrams. The tests lose the first DATA, the first ACK, and then every third datagram one way and every fourth the other. Run the tests until all 13 pass."
-  ],
-  "hints": [
-   "`channel.receive(buffer)` throws `AsynchronousCloseException` when `close()` runs on another thread. It is a `ClosedChannelException`, so one `catch` ends the loop.",
-   "In `udpRequest`, `DatagramSocket().use { ... }` closes the socket for you. Return `packet.data.copyOf(packet.length)`: the buffer is bigger than the datagram.",
-   "In `send`, keep the sequence number in a local variable and only advance `nextSeq` after the right ACK. A stale ACK means \"keep waiting\", not \"try again\".",
-   "To wait the rest of one timeout after a stale ACK, compute a deadline with `System.nanoTime()` and set `socket.soTimeout` to what is left before each `receive`.",
-   "In `handle`, send the ACK for every DATA with `seq <= expected` after you update `expected`. A DATA from the future (`seq > expected`) can't happen in stop and wait; ignore it."
-  ],
-  "done_when": "All 13 tests in `UdpEchoTest` and `ReliableTest` pass."
- },
- "drill": {
-  "title": "Write the stop-and-wait sender from memory",
-  "minutes": 5,
-  "prompt": "Without looking, write the body of `send(message)` for a stop-and-wait sender over a `DatagramSocket`: frame the message with the next sequence number, send it, wait for the matching ACK with a timeout, resend on timeout, give up after a fixed number of attempts. Then say in one sentence what the receiver must do with a DATA frame whose sequence number it has already delivered.",
-  "answer": {
-   "lang": "kotlin",
-   "src": "fun send(message: ByteArray): Int {\n    val seq = nextSeq\n    val data = Frame(Frame.Kind.DATA, seq, message).encode()\n    for (attempt in 1..maxAttempts) {\n        if (attempt > 1) retransmissions++                       // silence last time: send it again\n        socket.send(DatagramPacket(data, data.size, peer))      // may vanish silently\n        socket.soTimeout = timeout.toMillis().toInt()\n        try {\n            while (true) {                                       // skip stale ACKs\n                val p = DatagramPacket(ByteArray(65_535), 65_535)\n                socket.receive(p)\n                val f = Frame.decode(p.data, p.length) ?: continue\n                if (f.kind == Frame.Kind.ACK && f.seq == seq) {\n                    nextSeq = seq + 1\n                    return attempt\n                }\n            }\n        } catch (e: SocketTimeoutException) {\n            // no ACK in time: go round again\n        }\n    }\n    throw DeliveryFailedException(\"no ACK for seq $seq\")\n}\n\n// Receiver: don't deliver an old seq again, but ACK it again,\n// because the repeat means the sender never got the first ACK.\n// (This simple version gives each receive the full timeout; the lab's solution keeps a deadline.)\n"
-  }
- },
- "recap": [
-  "UDP adds an 8-byte header to IP: source port, destination port, length and checksum. No handshake, no ACK, no resend, no ordering, no flow or congestion control.",
-  "A socket is the kernel's mailbox for one port. Each send is one datagram and each receive returns exactly one, whole; a buffer that's too small cuts it.",
-  "`send()` succeeding means only that your kernel took the bytes. Datagrams die on the way, in a full receive queue (counted in `UdpRcvbufErrors`), or at a closed port.",
-  "Only a connected UDP socket hears about ICMP Port Unreachable, as `PortUnreachableException` in the JVM. An unconnected one hears nothing.",
-  "Reliability on UDP means sequence numbers, ACKs, a retransmission timeout and dropping duplicates. DNS does a little of it; QUIC rebuilds all of TCP's work."
- ],
- "quiz": [
-  {
-   "q": "A service sends one 1,000-byte UDP datagram per payment event to a log collector. During a burst the collector's JVM pauses for garbage collection for 300 ms. What happens to the datagrams that arrive during the pause?",
-   "options": [
-    "They wait in the network until the collector reads again",
-    "The collector's kernel queues what fits in the socket's receive buffer and drops the rest; the sender is not told",
-    "The collector's kernel tells the sender to slow down, and the sender's `send()` blocks",
-    "They are delivered later, out of order, but all of them arrive"
-   ],
-   "answer": 1,
-   "why": "The network doesn't hold packets for a slow program, and UDP has no flow control to push back on the sender. The receiving kernel keeps what fits in the socket's queue and drops the rest, counting it in `UdpRcvbufErrors`. The sender's `send()` calls all succeeded. Blocking the sender is what TCP's flow control would do, and UDP has none."
-  },
-  {
-   "q": "A client sends three datagrams of 100, 200 and 300 bytes to a server that reads with a 1,000-byte buffer. What can the server's receive calls return?",
-   "options": [
-    "Receives of exactly 100, 200 and 300 bytes, one datagram each, for those that arrive",
-    "One receive of 600 bytes, if all three arrived before it read",
-    "Any split of the 600 bytes, depending on the MTU",
-    "Three receives of 1,000 bytes, padded with zeros"
-   ],
-   "answer": 0,
-   "why": "UDP keeps message boundaries: each receive returns one whole datagram. Some may be lost and they may come in another order, but they are never merged or split. Merging bytes into one read is TCP's byte stream, the habit this question tests."
-  },
-  {
-   "q": "A `DatagramChannel` is connected to `10.10.1.20:9001`, where nothing listens. It writes a datagram, then calls `read()`. What happens, assuming nothing filters ICMP?",
-   "options": [
-    "`read()` blocks forever, since UDP never gets answers",
-    "`write()` throws `ConnectException`",
-    "`read()` throws `PortUnreachableException`, because the kernel passes the ICMP Port Unreachable to the connected socket",
-    "`read()` returns 0 bytes"
-   ],
-   "answer": 2,
-   "why": "The peer's kernel answers with ICMP Port Unreachable. Because the socket is connected, your kernel knows which socket it is about and reports it on the next operation, which the JVM turns into `PortUnreachableException`. An unconnected socket would hear nothing and `read()` would wait for its timeout. `write()` succeeds either way, because nothing is known yet when it runs."
-  },
-  {
-   "q": "In a stop-and-wait protocol over UDP, the receiver gets DATA with sequence number 7, which it has already delivered. What should it do?",
-   "options": [
-    "Drop it silently: it is a duplicate",
-    "Deliver it again, since the sender clearly wants it delivered",
-    "Send a negative acknowledgment so the sender stops",
-    "Send ACK 7 again without delivering it"
-   ],
-   "answer": 3,
-   "why": "A repeat means the sender never got the first ACK 7, so it will keep resending until one arrives. Dropping it silently makes the sender retry until it gives up, and delivering it again would authorize a payment twice. ACK again, deliver once."
-  },
-  {
-   "q": "From lesson 4: the ICMP Port Unreachable a UDP sender gets back quotes the start of the datagram it is about. Which quoted fields let the sender's kernel find the socket the error belongs to?",
-   "options": [
-    "Only the ICMP checksum",
-    "The quoted IP addresses and the first 8 bytes after the IP header, which hold the UDP source and destination ports",
-    "The whole data of the datagram, which the kernel compares with recent sends",
-    "The TTL, which is unique per socket"
-   ],
-   "answer": 1,
-   "why": "Every ICMP error quotes the dead packet's IP header plus at least 8 more bytes. For UDP, those 8 bytes are the whole UDP header, so the kernel has the addresses and both ports, enough to find the socket. Traceroute uses the same quote to match answers to its probes by port.",
-   "from": "net-04"
-  }
- ],
- "flashcards": [
-  {
-   "front": "The four fields of the UDP header?",
-   "back": "Source port, destination port, length (header plus data), checksum. 16 bits each, 8 bytes in all."
-  },
-  {
-   "front": "What does a successful UDP `send()` tell you?",
-   "back": "That your own kernel accepted the bytes. Nothing about whether they left the machine or arrived."
-  },
-  {
-   "front": "What happens when you receive a UDP datagram into a buffer that is too small?",
-   "back": "You get the first bytes and the rest is thrown away. Receive into 65,535 bytes unless your protocol promises smaller datagrams."
-  },
-  {
-   "front": "Where does Linux count UDP datagrams it dropped because a socket's queue was full?",
-   "back": "`UdpRcvbufErrors`, shown by `nstat -az` (or `netstat -su` as receive buffer errors)."
-  },
-  {
-   "front": "Why connect() a UDP socket?",
-   "back": "It fixes one peer: send needs no address, other senders are filtered out, and ICMP errors such as Port Unreachable are reported to the socket (`PortUnreachableException` in the JVM)."
-  },
-  {
-   "front": "The four parts of a minimal reliability layer on UDP?",
-   "back": "Sequence numbers, ACKs, a retransmission timeout, and a receiver that delivers each number once but ACKs every copy."
-  },
-  {
-   "front": "Why is stop and wait slow?",
-   "back": "One message per round trip: at 70 ms RTT, about 14 messages a second, whatever the bandwidth. Windows (many in flight) fix it."
-  }
- ],
- "terms": [
-  {
-   "term": "Datagram",
-   "plain": "One self-contained UDP message, sent and received whole."
-  },
-  {
-   "term": "Socket",
-   "plain": "The kernel's endpoint for one conversation or port, which a program reads and writes through system calls."
-  },
-  {
-   "term": "Ephemeral port",
-   "plain": "A free port the kernel picks for a socket that never called `bind()`."
-  },
-  {
-   "term": "Receive buffer",
-   "plain": "The socket's queue of arrived datagrams (`SO_RCVBUF`); when it is full, new ones are dropped."
-  },
-  {
-   "term": "Connected UDP socket",
-   "plain": "A UDP socket fixed to one peer, which also receives that peer's ICMP errors."
-  },
-  {
-   "term": "Sequence number",
-   "plain": "A number on each message so the receiver can spot duplicates and order."
-  },
-  {
-   "term": "Retransmission timeout",
-   "plain": "How long a sender waits for an ACK before it sends the message again."
-  },
-  {
-   "term": "Stop and wait",
-   "plain": "A protocol that keeps one message in flight and sends the next only after its ACK."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate proposes sending ledger postings from one service to another over UDP, \"because it's faster and the network never drops anything here\". Explain what UDP does and doesn't do, where postings could disappear, and what you would have to build to make it safe.",
-  "answer": "UDP only puts ports, a length and a checksum on a datagram. There's no handshake, no acknowledgment and no resend, so a successful send only means our own kernel took the bytes. A posting can vanish in a router queue during a burst, in the receiver's socket queue when the receiving service pauses or falls behind, which the kernel only counts in UdpRcvbufErrors, or at a closed port during a deploy, where only a connected socket would even hear about it. A copy can also arrive twice. To make it safe we would number every posting, have the receiver acknowledge each one, resend after a timeout that backs off, and have the receiver apply each number once while acknowledging every copy, which is the idempotency-key idea. Then we'd want many postings in flight for speed, and congestion control so retries don't swamp the network. At that point we've rebuilt TCP, so for postings I'd use TCP or Kafka and keep UDP for data we can afford to lose, like metrics."
- },
- "deeper": {
-  "minutes": 8,
-  "body": "**One thread per UDP socket isn't enough.** A UDP server has one socket for all its clients, so one thread reading it becomes the bottleneck. On Linux, `SO_REUSEPORT` lets several sockets bind the same port, and the kernel spreads datagrams across them by hashing the addresses and ports, so each thread gets its own socket and queue. DNS servers and QUIC servers use it.\n\n**How big should a datagram be?** Stay under the path MTU from lesson 4 and the datagram travels as one packet; go over and IP fragments it, and losing any fragment loses all of it. DNS learned this the hard way: since DNS Flag Day 2020, resolvers advertise EDNS buffers of 1,232 bytes, small enough to fit an IPv6 packet of 1,280 bytes without fragments, and anything bigger moves to TCP. Platforms also cap datagram sizes: macOS refuses to send UDP datagrams over 9,216 bytes by default (`net.inet.udp.maxdgram`), which is why this lesson's lab tests stop at 8,000 bytes.\n\n**Why QUIC lives in user space.** TCP is in the kernel, so improving it means waiting years for every operating system to update. QUIC runs on UDP inside the application or its library, so a browser or a server can ship a new congestion controller with its next release. The cost is CPU: the kernel's UDP path was built for small datagrams, so Linux added UDP segmentation offload (GSO) and receive offload (GRO), which pass many datagrams through the stack as one.\n\n**Java details.** `DatagramChannel` can be non-blocking and registered with a `Selector`, so one thread can serve many sockets. Since JDK 15 the old `DatagramSocket` is implemented on top of `DatagramChannel` (JEP 373), so both behave the same underneath. Virtual threads work with blocking UDP calls too."
- },
- "sources": [
-  {
-   "title": "RFC 768: User Datagram Protocol",
-   "url": "https://www.rfc-editor.org/rfc/rfc768.html"
-  },
-  {
-   "title": "RFC 8085: UDP Usage Guidelines",
-   "url": "https://www.rfc-editor.org/rfc/rfc8085.html"
-  },
-  {
-   "title": "RFC 9000: QUIC, a UDP-Based Multiplexed and Secure Transport",
-   "url": "https://www.rfc-editor.org/rfc/rfc9000.html"
-  },
-  {
-   "title": "udp(7) man page",
-   "url": "https://man7.org/linux/man-pages/man7/udp.7.html"
-  },
-  {
-   "title": "Beej's Guide to Network Programming",
-   "url": "https://beej.us/guide/bgnet/html/"
-  }
- ]
 }

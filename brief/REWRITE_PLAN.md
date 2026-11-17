@@ -44,3 +44,8 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
 - 2026-11-16: briefs written, site support added. Pilot lesson found-01 rewritten and shipped (opening 177 words,
   closing 117, sections 2,698). Weekly usage reached 73%, so the pilot video (derived-data) and every other
   batch are parked for the reset. Next: remake derived-data at 1440p as the video pilot, then batch found.
+- 2026-11-16 (later): the user chose to continue past the cap. Wave 1 shipped: found-02, 03, 05, 06 and all of
+  net-01 to net-12 (17 of the 18 lessons in the two tracks). Usage went 73% to about 90%, so writers were stopped
+  after their current lesson. Still to do in these tracks: found-04 (an unreviewed draft script is in
+  `brief/drafts/found-04-unreviewed.py`), the track pages `content/tracks/found.json` and `net.json`, and every
+  video. The pilot video (derived-data) was in progress.

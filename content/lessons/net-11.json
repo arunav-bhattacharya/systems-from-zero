@@ -1,418 +1,421 @@
 {
- "id": "net-11",
- "title": "HTTP/1.1, HTTP/2 and HTTP/3 over QUIC",
- "minutes": 40,
- "goal": "By the end you can explain why HTTP/1.1 needs several connections to send requests in parallel, decode HTTP/2 frames from a capture, show why one lost TCP segment stalls every HTTP/2 stream, and say what QUIC changes for HTTP/3 and what it takes to use it from the JVM today.",
- "warmup": {
-  "q": "A service sends 10 authorization requests at once to an issuer that takes 300 ms to answer each one. They all go over a single HTTP/1.1 connection with keep-alive. About when does the last answer arrive?",
-  "options": [
-   "After about 300 ms: keep-alive lets the requests overlap",
-   "After about 3 seconds",
-   "After about 30 ms: the connection is already open",
-   "It depends only on the bandwidth"
+  "id": "net-11",
+  "title": "HTTP/1.1, HTTP/2 and HTTP/3 over QUIC",
+  "minutes": 40,
+  "goal": "By the end, you can explain why HTTP/1.1 needs several connections to answer requests side by side, read HTTP/2 frames from a capture, show why one lost packet makes every HTTP/2 request wait, and say what QUIC changes for HTTP/3 and what it takes to use it from Java today.",
+  "opening": "It's the morning rush at a café with one till. The person at the front is paying by card, and the card reader is slow today. Everyone behind them waits, even someone who only wants to pay for a glass of water. A second till would help, but it needs a second cashier and a second card reader.\n\nWhen a program waits like this, the tempting fix is a faster network. That's the trap. The wait isn't in the cable. It's in the rule that one till serves one customer at a time, and a faster cable doesn't change the rule.\n\nThe last lesson, TLS 1.3, certificates and mTLS, locked the connection between the payments app and the bank, and counted what each new connection costs. In this lesson, we'll look inside that connection at HTTP. We'll see why HTTP/1.1 makes requests queue, how HTTP/2 lets many share one connection, why one lost packet still holds them all up, and how HTTP/3 fixes that. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "The payments app sends 10 requests at once to a bank that takes 300 ms (thousandths of a second) to answer each one. They all go over a single HTTP/1.1 connection, which stays open between requests. About when does the last answer arrive?",
+    "options": [
+      "After about 300 ms: the open connection lets the requests overlap",
+      "After about 3 seconds",
+      "After about 30 ms: the connection is already open",
+      "It depends only on how fast the network is"
+    ],
+    "answer": 1,
+    "why": "An HTTP/1.1 connection carries one exchange at a time, like the café's one till. Answers carry no label saying which request they belong to, so a client sends the next request only after the previous answer is complete. Keeping the connection open saves the handshake, not the wait. Ten requests take ten times 300 ms. To finish them in 300 ms you need ten connections, or HTTP/2's numbered streams on one connection, as the first two sections show."
+  },
+  "sections": [
+    {
+      "h": "HTTP/1.1: plain text, and one request at a time on each connection",
+      "body": "Let's start with what an HTTP request looks like. HTTP is the set of rules that browsers and servers use to ask and answer, and HTTP/1.1 is the oldest version still in wide use. A request is a few lines of plain text. This is what curl, a command-line program that fetches web addresses, sent to the lab's server in the Try it below, and what came back:\n\n```http\nGET /auth/1 HTTP/1.1\nHost: 127.0.0.1:8080\nUser-Agent: curl/8.5.0\nAccept: */*\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\nContent-Length: 24\n\nhello from connection 1\n```\n\nFirst comes the request line: the method (`GET` asks for something), then the path. Then header lines, each a name and a value. Then an empty line, and then the body, if there is one. The answer has the same shape, with a status line on top: `200 OK` means it worked. What all of it means (methods, status codes, headers such as `Content-Type`) is written down once, in RFC 9110, one of the public documents that define the internet's protocols. All three versions in this lesson carry exactly that meaning. Only the way it's written on the wire changes: RFC 9112 for HTTP/1.1, RFC 9113 for HTTP/2, RFC 9114 for HTTP/3. A Java program's `HttpClient.send` code is the same for all three.\n\nThe answer travels over a TCP connection. TCP, the protocol underneath, delivers a stream of bytes in order, with no marks between messages (lesson 7 of this track, TCP connections). So the client has to find the end of the answer by itself. `Content-Length: 24` tells it: the answer ends 24 bytes after the empty line. A server that doesn't know the length in advance sends the body in chunks, with each chunk's size in front. Knowing where an answer ends is what lets one connection carry a second request. HTTP/1.0 closed the connection after every answer, so every request paid for a new handshake, the opening messages that set up a connection. HTTP/1.1 keeps connections open by default, and curl's `Re-using existing connection` line shows it.\n\nReuse has a limit. An answer carries no label saying which request it answers. So answers must come back in the order the requests went out, and in practice a client sends the next request only when the previous answer is complete. While the bank spends 300 ms on one payment, nothing else moves on that connection. That's the café's single till, and it has a name: **head-of-line blocking**, the first in the queue holding up everyone behind. HTTP/1.1 also allowed pipelining, sending several requests without waiting. The answers still came back in order, though, so one slow answer still blocked the rest, and clients gave up on it.\n\nSo the only way to get requests answered side by side over HTTP/1.1 is more connections: more tills. Browsers open up to six per site. A program keeps a connection pool, a set of open connections it reuses, and a pool of 20 connections means at most 20 requests in flight. Each extra till costs something. Every connection pays its own TCP and TLS handshakes (TLS is the locking from the last lesson). That's two round trips, two trips there and back, as the last lesson counted, plus memory on both ends. It also gets its own congestion window, TCP's estimate of how fast it may send, which starts small (lesson 8 of this track). Next, we'll see how HTTP/2 serves many customers at one till.",
+      "try": {
+        "title": "One connection, one request at a time",
+        "minutes": 4,
+        "steps": [
+          "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`. It's a Linux shell inside a container (a program that behaves like a separate small computer), with this track's tools installed. `H2Server.java` is a small server that speaks HTTP/1.1 and HTTP/2 on one port (port 8080, the number that picks out this program on the computer) and answers every request after 300 ms, like a slow bank. It writes a log line for every new connection, and `conns` counts those lines.",
+          "First, two requests on one curl command line, with `-v` (verbose: print what was sent and received). Then ten requests one after another, and ten requests in parallel over HTTP/1.1. Predict both times and both connection counts."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java > /tmp/h2.log &\nuntil grep -q listening /tmp/h2.log 2>/dev/null; do sleep 0.2; done\ncurl -sv http://127.0.0.1:8080/auth/1 http://127.0.0.1:8080/auth/2 2>&1 | grep -E '^[<>] |^\\* (Re-using|Connected)|hello'\nurls() { for i in $(seq 1 10); do echo \"-o /dev/null http://127.0.0.1:8080/auth/$i\"; done; }\nconns() { grep -c ' from ' /tmp/h2.log; }\nTIMEFORMAT='took %R s'\nb=$(conns); time curl -s $(urls); echo \"new connections: $(( $(conns) - b ))\"\nb=$(conns); time curl -s --parallel --parallel-max 10 --http1.1 $(urls); echo \"new connections: $(( $(conns) - b ))\"\n",
+          "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
+        },
+        "expect": "From one run:\n\n```text\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n> GET /auth/1 HTTP/1.1\n> Host: 127.0.0.1:8080\n> User-Agent: curl/8.5.0\n> Accept: */*\n>\n< HTTP/1.1 200 OK\n< Content-Type: text/plain\n< Content-Length: 24\n<\nhello from connection 1\n* Re-using existing connection with host 127.0.0.1\n> GET /auth/2 HTTP/1.1\n...\nhello from connection 1\ntook 3.066 s\nnew connections: 1\ntook 0.323 s\nnew connections: 10\n```\n\nThe second request went over the same connection, after the first answer was complete. Ten requests in a row on one connection took ten times 300 ms. In parallel they took one 300 ms, but only because curl opened ten connections. That's ten handshakes, ten sockets (a program's end of a connection) on each side, and ten TIME-WAIT entries afterwards, the short wait a closed connection leaves behind (lesson 7). Your times will differ by a few milliseconds."
+      },
+      "refs": [
+        {
+          "title": "RFC 9112: HTTP/1.1",
+          "url": "https://www.rfc-editor.org/rfc/rfc9112.html",
+          "kind": "docs"
+        },
+        {
+          "title": "MDN: Evolution of HTTP",
+          "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Evolution_of_HTTP",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "HTTP/2: numbered streams let many requests share one connection",
+      "body": "Many cafés already know the fix. You order at the counter, get a ticket with a number, and step aside. When your coffee is ready, they call your number, in whatever order the coffees finish. One counter serves many people at once.\n\nHTTP/2 builds the same idea in two steps. First, give every request a number, and stamp the same number on its answer. Now answers may come back in any order. That alone isn't enough, though. A 2 MB file sent as one numbered answer would still hold the connection for as long as it takes, and a 300-byte payment answer behind it would wait. So the second step is to cut every message into small pieces that can take turns.\n\nThat's HTTP/2's design. A request and its answer form a **stream**, the ticket, and each stream has a number. The client numbers its streams 1, 3, 5 and so on. Every message is cut into **frames**, and every frame starts with the same 9-byte header:\n\n```text\nlength (3 bytes)   type (1)   flags (1)   stream id (4 bytes, top bit reserved)\n```\n\nEach frame says which stream it belongs to, so frames of different streams can take turns on one connection, and the receiver puts each stream back together. A slow answer no longer blocks the others, because the server sends each answer's frames as soon as that answer is ready. `H2Server.java` does exactly that. When a request's last frame arrives, it starts a virtual thread for that stream (a cheap Java thread, a line of work that runs on its own). Each thread writes its answer when its 300 ms are up. A frame's length field allows 16 MB, but by default a frame carries at most 16,384 bytes. So a large body becomes many DATA frames, and small answers can slip in between them.\n\nA handful of frame types do the work. HEADERS (type 1) carries a request's or an answer's headers, and DATA (type 0) carries the body. The END_STREAM flag (0x1) marks a stream's last frame. SETTINGS (type 4) carries each side's limits, such as how many streams may be open at once. WINDOW_UPDATE (type 8) is flow control, the receiver's way of saying how much more it can take. It's the same idea as TCP's receive window from lesson 8, but for each stream as well as for the whole connection. Every window starts at 65,535 bytes, and a sender may never have more unacknowledged data out than the window allows. TCP's own window can't do this job, because it covers all the streams at once: one slow reader would stop the whole connection. In the Try it, curl raised its windows to 10 MB per stream and about 1 GB for the connection, so flow control never gets in the way. PING, RST_STREAM (cancel one stream) and GOAWAY (close the connection politely) cover the rest.\n\nHeaders are compressed with **HPACK**. The request line becomes four pseudo-headers: `:method`, `:scheme`, `:authority` and `:path`. A fixed table numbers 61 common headers, so `:method: GET` becomes the single byte `0x82`, and `:status: 200` becomes `0x88`. A second table remembers the headers already sent on this connection, so a later request's `user-agent` and `accept` cost one byte each. In the Try it, the first request's headers took 36 bytes, and the next two took 12 bytes each.\n\nHow do both sides agree to speak HTTP/2? Over TLS, the client offers `h2` in the ALPN field of its ClientHello, its first handshake message, and the server chooses. In the last lesson, the JDK's client (Java's built-in web client, part of the Java Development Kit) offered `h2` and got `http/1.1`, because the JDK's HTTPS server speaks only HTTP/1.1. Without TLS, as in the lab box, curl can skip the choice and open with HTTP/2's 24-byte greeting at once (`--http2-prior-knowledge`).\n\nOne connection now carries many requests. Next, we'll see what happens to all of them when a single packet goes missing.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"One HTTP/2 connection between a client and a server: three HEADERS frames for streams 1, 3 and 5 go to the server, and six frames come back, HEADERS and DATA for streams 1, 5 and 3, interleaved; below, the 9-byte frame header: length, type, flags and stream id\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"40\" width=\"84\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"56.0\" y=\"120\" text-anchor=\"middle\">client</text><rect class=\"box\" x=\"582\" y=\"40\" width=\"84\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"624.0\" y=\"120\" text-anchor=\"middle\">server</text><rect class=\"ln-d\" x=\"108\" y=\"40\" width=\"464\" height=\"150\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340\" y=\"30\" text-anchor=\"middle\">one TCP connection</text><rect class=\"box-a\" x=\"128\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"164\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"164\" y=\"90\" text-anchor=\"middle\">1</text><rect class=\"box-a\" x=\"210\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"246\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"246\" y=\"90\" text-anchor=\"middle\">3</text><rect class=\"box-a\" x=\"292\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"328\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"328\" y=\"90\" text-anchor=\"middle\">5</text><line class=\"ln\" x1=\"380\" y1=\"76\" x2=\"560\" y2=\"76\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"470\" y=\"68\" text-anchor=\"middle\">3 requests</text><rect class=\"box\" x=\"118\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"153\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"153\" y=\"160\" text-anchor=\"middle\">1</text><rect class=\"box-b\" x=\"194\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"229\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"229\" y=\"160\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"270\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"305\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"305\" y=\"160\" text-anchor=\"middle\">5</text><rect class=\"box-b\" x=\"346\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"381\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"381\" y=\"160\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"422\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"457\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"457\" y=\"160\" text-anchor=\"middle\">3</text><rect class=\"box-b\" x=\"498\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"533\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"533\" y=\"160\" text-anchor=\"middle\">3</text><line class=\"ln\" x1=\"566\" y1=\"182\" x2=\"120\" y2=\"182\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"210\" text-anchor=\"middle\">answers in the order they finished: 1, 5, 3</text><rect class=\"box\" x=\"70\" y=\"230\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"145.0\" y=\"252\" text-anchor=\"middle\">length</text><text class=\"t-s t-code\" x=\"145.0\" y=\"272\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"230\" y=\"230\" width=\"90\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"275.0\" y=\"252\" text-anchor=\"middle\">type</text><text class=\"t-s t-code\" x=\"275.0\" y=\"272\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"330\" y=\"230\" width=\"90\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"375.0\" y=\"252\" text-anchor=\"middle\">flags</text><text class=\"t-s t-code\" x=\"375.0\" y=\"272\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"430\" y=\"230\" width=\"190\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"525.0\" y=\"252\" text-anchor=\"middle\">R + stream id</text><text class=\"t-s t-code\" x=\"525.0\" y=\"272\" text-anchor=\"middle\">4 bytes</text></svg>",
+        "caption": "Three requests and three answers on one connection, as in the lab's capture. The numbers are stream numbers, and every frame starts with the 9-byte header shown below."
+      },
+      "try": {
+        "title": "Ten requests, one connection",
+        "minutes": 4,
+        "steps": [
+          "Use the lab box from the last Try it (the first line starts `H2Server.java` again only if nothing is listening on port 8080). Send the same ten requests in parallel, this time over HTTP/2. Predict the time and the number of connections.",
+          "Then capture three parallel HTTP/2 requests with tcpdump, a program that records packets, and let tshark, a program that reads such recordings, decode the frames. `-d tcp.port==8080,http2` tells it that port 8080 carries HTTP/2, which it can't guess without TLS."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "ss -ltn | grep -q ':8080 ' || { java /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java > /tmp/h2.log & }\nuntil ss -ltn | grep -q ':8080 '; do sleep 0.2; done\nurls() { for i in $(seq 1 10); do echo \"-o /dev/null http://127.0.0.1:8080/auth/$i\"; done; }\nconns() { grep -c ' from ' /tmp/h2.log; }\nTIMEFORMAT='took %R s'\nb=$(conns); time curl -s --parallel --parallel-max 10 --http2-prior-knowledge $(urls); echo \"new connections: $(( $(conns) - b ))\"\ntcpdump -i lo -nn --immediate-mode -w /tmp/h2.pcap 'tcp port 8080' 2>/dev/null &\nsleep 1\ncurl -s --parallel --http2-prior-knowledge http://127.0.0.1:8080/auth/1 http://127.0.0.1:8080/auth/2 http://127.0.0.1:8080/auth/3\nsleep 1; kill %%\ntshark -r /tmp/h2.pcap -d tcp.port==8080,http2 -Y http2 -T fields -e frame.number -e tcp.srcport -e frame.len -e _ws.col.Info 2>/dev/null\n",
+          "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
+        },
+        "expect": "From one run (bash prints the time when curl finishes, before the capture):\n\n```text\ntook 0.543 s\nnew connections: 1\nhello from stream 5\nhello from stream 3\nhello from stream 1\n4\t40592\t130\tMagic, SETTINGS[0], WINDOW_UPDATE[0]\n6\t40592\t111\tHEADERS[1]: GET /auth/1\n8\t40592\t87\tHEADERS[3]: GET /auth/2\n10\t40592\t87\tHEADERS[5]: GET /auth/3\n12\t8080\t81\tSETTINGS[0]\n14\t40592\t75\tSETTINGS[0]\n15\t8080\t75\tSETTINGS[0]\n17\t8080\t94\tHEADERS[5]: 200 OK\n19\t8080\t95\tDATA[5] (text/plain)\n21\t8080\t94\tHEADERS[3]: 200 OK\n23\t8080\t95\tDATA[3] (text/plain)\n25\t8080\t94\tHEADERS[1]: 200 OK\n27\t8080\t95\tDATA[1] (text/plain)\n```\n\nTen requests, one connection, and about 300 ms of waiting, plus Java warming up on its first HTTP/2 connection. In the capture, the client's first segment (TCP's word for one packet of data) holds the greeting (tshark calls it \"Magic\"), its SETTINGS and a WINDOW_UPDATE that raises the connection's window. The three HEADERS frames went out before any answer came back. The first is 111 bytes on the wire and the next two 87, because HPACK's second table already knew their headers. Each side then confirms the other's SETTINGS with an empty SETTINGS frame. The answers came back in the order they finished (5, 3, 1 in this run; yours may differ), all on the same connection. The lab decodes these exact bytes."
+      },
+      "refs": [
+        {
+          "title": "RFC 9113: HTTP/2",
+          "url": "https://www.rfc-editor.org/rfc/rfc9113.html",
+          "kind": "docs"
+        },
+        {
+          "title": "High Performance Browser Networking: HTTP/2",
+          "url": "https://hpbn.co/http2/",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "One lost packet makes every HTTP/2 request wait",
+      "body": "HTTP/2 removed head-of-line blocking from HTTP, and kept it one layer down, in TCP. Picture the café again. The coffees are ready in any order, but every tray leaves through one narrow hatch, in single file. If one tray is dropped, every tray behind it waits until that one is made again, even the trays that are ready. In this picture the hatch is the TCP connection, the trays are segments (TCP's word for its packets of data), and the orders are streams.\n\nTCP behaves exactly like that hatch. Lesson 8 of this track showed what happens when a segment goes missing. The receiver keeps the segments that arrive after the hole. It tells the sender with duplicate ACKs, acknowledgements that keep asking for the same missing byte, and SACK blocks, the ranges of bytes it does have. And it hands nothing past the hole to the program until the resent segment fills it. TCP promises one ordered stream of bytes, and keeps that promise even when the bytes behind the hole are complete.\n\nNow put three HTTP/2 streams on that connection. The server sends stream 1's DATA, then stream 3's, then stream 5's. Stream 1's segment is lost. Streams 3 and 5 arrive whole, and the receiver's kernel (the core of the operating system, where TCP runs) holds them anyway: to TCP they're only later bytes of the same stream. All three requests wait at least one round trip for the resend. RFC 9113 says so itself: \"TCP head-of-line blocking is not addressed by this protocol.\"\n\nWith HTTP/1.1 and three connections, the same loss hits one connection and one request, and the other two finish on time. How often does it matter? A busy HTTP/2 connection carries hundreds of segments a second. At 1% loss, common on a phone's mobile link, that's several holes a second. Each one stalls every request in flight for at least a round trip: 100 ms on a path with 50 ms each way. So on a lossy network, HTTP/2's single connection can do worse than HTTP/1.1's six. There's a second cost. One connection has one congestion window, and each loss shrinks it (lesson 8) for every stream at once. Six HTTP/1.1 connections would have shrunk only one window of six.\n\nInside a data center, a building full of servers where companies run their programs, loss is far rarer, and round trips take a fraction of a millisecond. There a stall costs little, and HTTP/2's one connection with many streams is a good default between programs. **HTTP/2 removed the wait in HTTP, not the wait in TCP. Measure under loss.**\n\nThe Try it measures this. It drops one segment on purpose and times three requests, over HTTP/2 and over HTTP/1.1. The fix can't live in HTTP. The transport itself, the layer that delivers the bytes, has to know which bytes belong to which stream. That's QUIC, and the last two frames of the stepper show the difference.",
+      "stepper": {
+        "title": "Three streams, one lost segment",
+        "intro": "The Try it below in pictures: three answers of 1,000 bytes, 50 ms each way, and one segment lost.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 300 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><rect class=\"box\" x=\"326\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"406\" y=\"67\" text-anchor=\"middle\">seg 2: DATA stream 3</text><rect class=\"box\" x=\"502\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"582\" y=\"67\" text-anchor=\"middle\">seg 3: DATA stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-m\" x=\"406\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-m\" x=\"582\" y=\"222\" text-anchor=\"middle\">waiting</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "The server finishes three answers at 300 ms and writes them on one connection, one segment each: stream 1's DATA, then stream 3's, then stream 5's. To TCP, these are bytes 1 to 3,000 of one stream of bytes."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 300 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-bad\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><rect class=\"box\" x=\"326\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"406\" y=\"67\" text-anchor=\"middle\">seg 2: DATA stream 3</text><rect class=\"box\" x=\"502\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"582\" y=\"67\" text-anchor=\"middle\">seg 3: DATA stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-m\" x=\"406\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-m\" x=\"582\" y=\"222\" text-anchor=\"middle\">waiting</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "Segment 1 is lost on the way. In the Try it, a firewall rule (iptables) drops it. On a real network it would be a full queue in a router, or a weak radio link."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 350 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><rect class=\"box-dim\" x=\"160\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"238\" y=\"133\" text-anchor=\"middle\">seg 2: stream 3</text><rect class=\"box-dim\" x=\"330\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"408\" y=\"133\" text-anchor=\"middle\">seg 3: stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-bad\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-bad\" x=\"230\" y=\"222\" text-anchor=\"middle\">its bytes are lost</text><rect class=\"box-bad\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-bad\" x=\"406\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><rect class=\"box-bad\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-bad\" x=\"582\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "Segments 2 and 3 arrive whole. TCP keeps them in the receive buffer, because it may hand the program bytes only in order, and the first 1,000 are missing. Streams 3 and 5 have every byte of their answers and still get nothing."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 400 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-a\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><rect class=\"box-dim\" x=\"160\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"238\" y=\"133\" text-anchor=\"middle\">seg 2: stream 3</text><rect class=\"box-dim\" x=\"330\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"408\" y=\"133\" text-anchor=\"middle\">seg 3: stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-bad\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-bad\" x=\"230\" y=\"222\" text-anchor=\"middle\">its bytes are lost</text><rect class=\"box-bad\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-bad\" x=\"406\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><rect class=\"box-bad\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-bad\" x=\"582\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "The client's ACKs keep asking for the missing bytes, and their SACK blocks list the ranges it already holds (in one run: `Ack=55`, `SLE=1064 SRE=3142`). That tells the sender exactly what to resend, and it does, about one round trip after the loss."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 450 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-ok\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-ok\" x=\"230\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">a round trip late</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "The resent segment fills the hole, and the kernel hands everything over at once. All three requests finish together, a little more than a round trip late (about 120 ms in the Try it). One loss delayed three requests: that's TCP head-of-line blocking."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/3 over QUIC</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 350 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-bad\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting for seg 1</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">done on time</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">done on time</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "The same answers over QUIC, with the same loss. QUIC numbers bytes per stream, so segments 2 and 3 complete streams 3 and 5, and QUIC hands them to the program as they arrive. Only stream 1 has a hole."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/3 over QUIC</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 450 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-a\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-ok\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-ok\" x=\"230\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">done on time</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">done on time</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
+            "say": "Stream 1 waits for its resend, and only stream 1. One loss, one late request. That's what HTTP/1.1 gets from three separate connections, here on a single connection with a single handshake."
+          }
+        ]
+      },
+      "try": {
+        "title": "Lose one segment on purpose",
+        "minutes": 5,
+        "steps": [
+          "Start a fresh lab box. It has the NET_ADMIN permission that these commands need to change the network. The first two lines make loopback (the computer talking to itself) behave like a real network with 50 ms each way, as in lesson 8. The server answers each request with 1,000 bytes after 300 ms, so each answer fits in one segment.",
+          "`lose1` adds a firewall rule with iptables that drops the next arriving segment containing \"hello from\", the first answer's data, exactly once. `fetch` asks for three addresses in parallel and prints each one's total time.",
+          "Predict before you run it: over HTTP/2 (one connection), which of the three requests are late? Over HTTP/1.1 (three connections)?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in a fresh lab box",
+          "src": "ip link set lo mtu 1500\ntc qdisc add dev lo root netem delay 50ms\njava /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java 8080 300 1000 > /tmp/h2.log &\nuntil grep -q listening /tmp/h2.log 2>/dev/null; do sleep 0.2; done\nfetch() { curl -s --parallel \"$@\" -w '  %{url_effective}  %{time_total} s\\n' \\\n  -o /dev/null http://127.0.0.1:8080/a -o /dev/null http://127.0.0.1:8080/b -o /dev/null http://127.0.0.1:8080/c; }\nlose1() { iptables -A INPUT -p tcp --sport 8080 -m string --string 'hello from' --algo bm -m statistic --mode nth --every 1000 --packet 0 -j DROP; }\nfetch --http2-prior-knowledge > /dev/null\nfor v in --http2-prior-knowledge --http1.1; do\n  echo \"$v, nothing lost\"; fetch $v\n  echo \"$v, one segment lost\"; lose1; fetch $v; iptables -F INPUT\ndone\n",
+          "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
+        },
+        "expect": "From one run:\n\n```text\n--http2-prior-knowledge, nothing lost\n  http://127.0.0.1:8080/a  0.508999 s\n  http://127.0.0.1:8080/b  0.508872 s\n  http://127.0.0.1:8080/c  0.508867 s\n--http2-prior-knowledge, one segment lost\n  http://127.0.0.1:8080/a  0.627386 s\n  http://127.0.0.1:8080/b  0.627301 s\n  http://127.0.0.1:8080/c  0.627297 s\n--http1.1, nothing lost\n  http://127.0.0.1:8080/a  0.514387 s\n  http://127.0.0.1:8080/c  0.514296 s\n  http://127.0.0.1:8080/b  0.514830 s\n--http1.1, one segment lost\n  http://127.0.0.1:8080/b  0.514284 s\n  http://127.0.0.1:8080/c  0.514427 s\n  http://127.0.0.1:8080/a  0.841110 s\n```\n\nWithout loss, every request takes about 0.51 s: two round trips of 100 ms (connect, then request and answer) plus the server's 300 ms. Over HTTP/2, one lost segment made all three requests about 120 ms late, all by the same amount, because the other two answers sat behind the hole. Over HTTP/1.1, the loss hit one connection and one request, and `b` and `c` finished on time. Look at how late `a` was, though: 330 ms. Its answer was the only segment on its connection, so no later segment arrived to trigger a fast resend (lesson 8), and the sender had to wait for a timer. Under HTTP/2, the other streams' segments did that job. Your numbers will move by a few tens of milliseconds between runs."
+      },
+      "refs": [
+        {
+          "title": "High Performance Browser Networking: Building blocks of TCP",
+          "url": "https://hpbn.co/building-blocks-of-tcp/",
+          "kind": "read"
+        }
+      ],
+      "aside": {
+        "title": "So should everything move to one HTTP/2 connection?",
+        "body": "Not without measuring. HTTP/2 removed the HTTP/1.1 kind of blocking and kept TCP's, so one lost segment stalls every stream on the connection, and one congestion window slows them all. A team can see great results inside a data center, and then slower answers than before for phone users on weak networks. Measure the slowest requests under loss, not only the average on a clean network. Where the last stretch to the user loses packets, HTTP/3 is the fix. Where it can't be used, a few HTTP/2 connections instead of one limit how much a single loss can hold up."
+      }
+    },
+    {
+      "h": "HTTP/3: QUIC gives every stream its own order, on top of UDP",
+      "body": "QUIC (RFC 9000) is a transport protocol that runs over UDP, the plain protocol that sends single packets with no promise of delivery or order. Lesson 6 of this track, UDP and the sockets API, built reliability on UDP by hand: numbers on each message, acknowledgements, resending. QUIC does all of that, plus congestion control (RFC 9002), in a library inside the program instead of in the kernel. And it adds what TCP lacks: the streams belong to the transport. Each stream has its own byte order, so in RFC 9000's words, \"only streams with data in that packet are blocked\". In the café, every order now has its own hatch. HTTP/3 (RFC 9114) is HTTP carried on those streams, with headers compressed by QPACK, a variant of HPACK built so that compression doesn't bring the blocking back.\n\nQUIC also carries TLS 1.3 inside it (RFC 9001). Its first packet holds the ClientHello, so the transport's handshake and TLS's share one round trip, where TCP needs a round trip of its own before TLS can start. Here is curl 8.23 from Homebrew (a tool that installs programs on a Mac) fetching cloudflare-quic.com, a test site run by the network company Cloudflare, once per version. The times are seconds from the start:\n\n```text\n--http1.1      http 1.1  connect 0.044  tls 0.100  first byte 0.119\n--http2        http 2    connect 0.022  tls 0.047  first byte 0.066\n--http3-only   http 3    connect 0.030  tls 0.033  first byte 0.053\n```\n\nOver TCP, the TLS handshake ends a round trip after the connection is made. Over QUIC, it ends 3 ms after. (The first line also paid for a fresh DNS lookup, the question that turns a name into an address, and single runs vary.)\n\nLeaving TCP changes two more things. A TCP connection is named by four numbers: both addresses and both ports (lesson 7). A port is a number that picks out one program on a computer. A QUIC connection is named by connection IDs inside each packet instead. So it survives a NAT, a box that rewrites addresses and ports (lesson 3), changing your port, and a phone moving from Wi-Fi to the mobile network. And nearly the whole QUIC header, packet numbers included, is encrypted. Network boxes on the path can't read it, and nor can your tcpdump without the keys.\n\nA client can't know in advance that a server speaks HTTP/3. It learns it from an `Alt-Svc` header on an earlier HTTP/2 or HTTP/1.1 answer, such as `h3=\":443\"; ma=86400` (HTTP/3 on UDP port 443, good for a day), or from a DNS record. It falls back to TCP on networks that block UDP. In 2025, 21% of requests to Cloudflare used HTTP/3, while W3Techs, a company that surveys websites, counted 41.1% of websites supporting it in November 2026. Supporting HTTP/3 and using it are different numbers.\n\nWhat about Java? The JDK's HttpClient gained HTTP/3 in JDK 26 (JEP 517, the proposal that added it), and you turn it on with `HttpClient.Version.HTTP_3`. So JDK 25 can't speak it, and neither can the lab box's curl 8.5. Inside a data center, where loss is rare and pooled connections live for minutes, HTTP/2 or a pool of HTTP/1.1 connections is enough. HTTP/3 pays off on the last stretch, between phones and a company's nearest servers.\n\nWhichever version runs, it rides on connections that a program must open, reuse and close, and on servers that sometimes stop answering. That's the next lesson.",
+      "try": {
+        "title": "Find out who speaks HTTP/3",
+        "minutes": 2,
+        "steps": [
+          "In the lab box, ask the box's curl for HTTP/3. Then look at the headers of an HTTP/2 answer from a server that speaks HTTP/3.",
+          "If you have Homebrew curl on a Mac (`brew install curl`; it isn't on your PATH, the list of folders the shell searches, by default), you can reproduce the timing table above: `C=/opt/homebrew/opt/curl/bin/curl; for v in --http1.1 --http2 --http3-only; do $C -s -o /dev/null $v -w \"$v %{http_version} %{time_connect} %{time_appconnect} %{time_starttransfer}\\n\" https://cloudflare-quic.com/; done`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "curl --http3 https://cloudflare-quic.com/ 2>&1 | head -1\ncurl -sI https://cloudflare-quic.com/ | grep -i -E '^(HTTP|alt-svc)'\n"
+        },
+        "expect": "From one run:\n\n```text\ncurl: option --http3: the installed libcurl version doesn't support this\nHTTP/2 200\nalt-svc: h3=\":443\"; ma=86400\n```\n\nUbuntu 24.04's curl 8.5 was built without HTTP/3, like JDK 25's HttpClient. Its HTTP/2 answer still carries the advertisement. `h3=\":443\"` means \"HTTP/3 is available on UDP port 443 of this host\", and `ma=86400` says the client may remember that for 86,400 seconds. A client that supports HTTP/3 tries it on its next connection, and falls back to TCP if nothing comes back over UDP."
+      },
+      "refs": [
+        {
+          "title": "RFC 9000: QUIC",
+          "url": "https://www.rfc-editor.org/rfc/rfc9000.html",
+          "kind": "docs"
+        },
+        {
+          "title": "The Illustrated QUIC Connection",
+          "url": "https://quic.xargs.org/",
+          "kind": "read"
+        },
+        {
+          "title": "JEP 517: HTTP/3 for the HTTP Client API",
+          "url": "https://openjdk.org/jeps/517",
+          "kind": "docs"
+        }
+      ]
+    }
   ],
-  "answer": 1,
-  "why": "An HTTP/1.1 connection carries one exchange at a time: responses have no labels, so a client sends the next request only after the previous answer is complete. Keep-alive saves the handshake, not the wait. Ten requests take ten times 300 ms. To get them done in 300 ms you need ten connections, or HTTP/2's streams on one connection."
- },
- "sections": [
-  {
-   "h": "HTTP/1.1 is text, and a connection carries one exchange at a time",
-   "body": "An HTTP/1.1 request is lines of text. This is what curl sent to the lab's server in the Try it below, and what came back:\n\n```http\nGET /auth/1 HTTP/1.1\nHost: 127.0.0.1:8080\nUser-Agent: curl/8.5.0\nAccept: */*\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\nContent-Length: 24\n\nhello from connection 1\n```\n\nA request line, header lines, an empty line, then the body if there is one. What all of it means (methods, status codes, headers such as `Content-Type`) is defined once, in RFC 9110, and all three versions in this lesson carry exactly that meaning. Only the way it's written on the wire changes: RFC 9112 for HTTP/1.1, RFC 9113 for HTTP/2, RFC 9114 for HTTP/3. Your `HttpClient.send` code is the same for all three.\n\nLesson 7 said that a TCP connection is a byte stream with no message boundaries, so the client has to find the end of the response by itself. `Content-Length: 24` tells it: the response ends 24 bytes after the empty line. A server that doesn't know the length in advance sends the body in chunks with each chunk's size in front. Knowing where a response ends is what lets one connection carry a second request. HTTP/1.0 closed the connection after every response, so every request paid a new handshake; HTTP/1.1 keeps connections open by default, and curl's `Re-using existing connection` is that.\n\nReuse has a limit. A response carries no label saying which request it answers, so responses must come back in the order the requests went out, and in practice a client sends the next request only when the previous response is complete. While the issuer spends 300 ms on one authorization, nothing else moves on that connection. That's **head-of-line blocking**: the first in the queue holds up everyone behind it. HTTP/1.1 allowed pipelining, sending several requests without waiting, but the answers still came back in order, so one slow answer still blocked the rest, and clients gave up on it.\n\nThe only way to get parallel requests out of HTTP/1.1 is more connections. Browsers open up to six per host. Your service's HTTP client keeps a pool, and a pool of 20 connections means at most 20 requests in flight. Every connection costs its own TCP and TLS handshakes (lesson 10: two round trips), memory on both ends, and its own congestion window, which starts small (lesson 8).",
-   "try": {
-    "title": "One connection, one request at a time",
-    "minutes": 4,
-    "steps": [
-     "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`. `H2Server.java` is a small server that speaks HTTP/1.1 and HTTP/2 on one port and answers every request after 300 ms, like a card issuer. It logs a line for every new connection, which `conns` counts.",
-     "First, two requests on one curl command line, with `-v`. Then ten requests one after another, and ten requests in parallel over HTTP/1.1. Predict both times and both connection counts."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java > /tmp/h2.log &\nuntil grep -q listening /tmp/h2.log 2>/dev/null; do sleep 0.2; done\ncurl -sv http://127.0.0.1:8080/auth/1 http://127.0.0.1:8080/auth/2 2>&1 | grep -E '^[<>] |^\\* (Re-using|Connected)|hello'\nurls() { for i in $(seq 1 10); do echo \"-o /dev/null http://127.0.0.1:8080/auth/$i\"; done; }\nconns() { grep -c ' from ' /tmp/h2.log; }\nTIMEFORMAT='took %R s'\nb=$(conns); time curl -s $(urls); echo \"new connections: $(( $(conns) - b ))\"\nb=$(conns); time curl -s --parallel --parallel-max 10 --http1.1 $(urls); echo \"new connections: $(( $(conns) - b ))\"\n",
-     "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
+  "compare": {
+    "title": "The same request, in HTTP/1.1 and in HTTP/2",
+    "a": {
+      "label": "HTTP/1.1",
+      "lang": "text",
+      "title": "text, 83 bytes, as curl -v printed it",
+      "src": "GET /auth/1 HTTP/1.1\\r\\n\nHost: 127.0.0.1:8080\\r\\n\nUser-Agent: curl/8.5.0\\r\\n\nAccept: */*\\r\\n\n\\r\\n\n\nthe end of the request: the empty line\nthe next request waits for the whole answer\n"
     },
-    "expect": "From one run:\n\n```text\n* Connected to 127.0.0.1 (127.0.0.1) port 8080\n> GET /auth/1 HTTP/1.1\n> Host: 127.0.0.1:8080\n> User-Agent: curl/8.5.0\n> Accept: */*\n>\n< HTTP/1.1 200 OK\n< Content-Type: text/plain\n< Content-Length: 24\n<\nhello from connection 1\n* Re-using existing connection with host 127.0.0.1\n> GET /auth/2 HTTP/1.1\n...\nhello from connection 1\ntook 3.066 s\nnew connections: 1\ntook 0.323 s\nnew connections: 10\n```\n\nThe second request went over the same connection, after the first answer was complete. Ten requests in a row on one connection took ten times 300 ms. In parallel they took one 300 ms, but only because curl opened ten connections: ten handshakes, ten sockets on each side, and ten TIME-WAIT entries afterwards (lesson 7). Your times will differ by a few milliseconds."
-   },
-   "refs": [
-    {
-     "title": "RFC 9112: HTTP/1.1",
-     "url": "https://www.rfc-editor.org/rfc/rfc9112.html",
-     "kind": "docs"
+    "b": {
+      "label": "HTTP/2",
+      "lang": "text",
+      "title": "one HEADERS frame, 45 bytes, from the capture",
+      "src": "00 00 24       length 36\n01             type 1: HEADERS\n05             flags: END_STREAM + END_HEADERS\n00 00 00 01    stream 1\n82             :method: GET            (static entry 2)\n86             :scheme: http           (static entry 6)\n41 8a ...      :authority, 10 Huffman-coded bytes\n04 85 ...      :path /auth/1, 5 Huffman-coded bytes\n7a 88 ...      user-agent, 8 Huffman-coded bytes\n53 03 2a 2f 2a accept: */*\n"
     },
-    {
-     "title": "MDN: Evolution of HTTP",
-     "url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Evolution_of_HTTP",
-     "kind": "read"
-    }
-   ]
+    "note": "The meaning is identical: RFC 9110 defines it once for every version. HTTP/1.1 writes it as text and marks the end with an empty line, so a connection can only be read in order. HTTP/2 writes it as a frame with a length and a stream number, so the receiver always knows where the frame ends and which request it belongs to. Frames from many streams can then share the connection. The second and third requests in the capture had 12 bytes of headers each, because `c0`, `bf` and `be` point at entries HPACK stored after the first."
   },
-  {
-   "h": "HTTP/2 cuts messages into frames, and many requests share one connection",
-   "body": "HTTP/2 keeps one connection and solves the ordering problem with labels. Build it up in two steps. First, give every request a number and stamp the same number on its response; then responses may come back in any order. That alone isn't enough: a 2 MB settlement file being sent as one labelled response would still hold the connection for as long as it takes, and the 300-byte authorization behind it would wait. So the second step is to cut every message into small pieces that can take turns.\n\nThat is HTTP/2's design. A request and its response form a **stream** with a number, and the client numbers its streams 1, 3, 5 and so on. Every message is cut into **frames**, and every frame starts with the same 9-byte header:\n\n```text\nlength (3 bytes)   type (1)   flags (1)   stream id (4 bytes, top bit reserved)\n```\n\nBecause each frame says which stream it belongs to, frames of different streams can take turns on one connection, and the receiver puts each stream back together. A slow answer no longer blocks the others: the server sends each response's frames when that response is ready. `H2Server.java` does exactly that: when a HEADERS frame with END_STREAM arrives, it starts a virtual thread for that stream, and each thread writes its answer's frames when its 300 ms are up. A frame's length field allows 16 MB, but by default a frame carries at most 16,384 bytes of payload, so a large body is many DATA frames, and small answers can slip in between them.\n\nA handful of frame types do the work. HEADERS (type 1) carries a request's or a response's headers, and DATA (type 0) the body; the END_STREAM flag (0x1) marks a stream's last frame. SETTINGS (type 4) carries each side's limits, such as how many streams may be open at once. WINDOW_UPDATE (type 8) is flow control: the same idea as TCP's receive window from lesson 8, but for each stream as well as for the whole connection. Every window starts at 65,535 bytes, a sender may never have more unacknowledged DATA out than the window allows, and WINDOW_UPDATE opens it again. TCP's window can't do this job any more, because it covers all streams at once: one slow reader would stop the whole connection. curl raised its windows to 10 MB per stream and about 1 GB for the connection, so in the Try it flow control never bites. PING, RST_STREAM (cancel one stream) and GOAWAY (close the connection politely) cover the rest.\n\nHeaders are compressed with **HPACK**. The request line becomes four pseudo-headers: `:method`, `:scheme`, `:authority` and `:path`. A static table numbers 61 common headers, so `:method: GET` is the single byte `0x82` and `:status: 200` is `0x88`. A dynamic table remembers the headers already sent on this connection, so a later request's `user-agent` and `accept` cost one byte each. In the Try it the first request's headers took 36 bytes and the next two took 12 bytes each.\n\nOver TLS, the client offers `h2` in the ALPN extension of its ClientHello (you saw it in lesson 10's capture) and the server chooses. Lesson 10's JDK client offered `h2` and got `http/1.1`, because the JDK's HTTPS server speaks only HTTP/1.1. Without TLS, as in the lab box, curl can skip the choice and open with HTTP/2's 24-byte preface right away (`--http2-prior-knowledge`).",
-   "figure": {
-    "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"One HTTP/2 connection between a client and a server: three HEADERS frames for streams 1, 3 and 5 go to the server, and six frames come back, HEADERS and DATA for streams 1, 5 and 3, interleaved; below, the 9-byte frame header: length, type, flags and stream id\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"40\" width=\"84\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"56.0\" y=\"120\" text-anchor=\"middle\">client</text><rect class=\"box\" x=\"582\" y=\"40\" width=\"84\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"624.0\" y=\"120\" text-anchor=\"middle\">server</text><rect class=\"ln-d\" x=\"108\" y=\"40\" width=\"464\" height=\"150\" rx=\"8\"/><text class=\"t-s t-m\" x=\"340\" y=\"30\" text-anchor=\"middle\">one TCP connection</text><rect class=\"box-a\" x=\"128\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"164\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"164\" y=\"90\" text-anchor=\"middle\">1</text><rect class=\"box-a\" x=\"210\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"246\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"246\" y=\"90\" text-anchor=\"middle\">3</text><rect class=\"box-a\" x=\"292\" y=\"54\" width=\"72\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"328\" y=\"72\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"328\" y=\"90\" text-anchor=\"middle\">5</text><line class=\"ln\" x1=\"380\" y1=\"76\" x2=\"560\" y2=\"76\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"470\" y=\"68\" text-anchor=\"middle\">3 requests</text><rect class=\"box\" x=\"118\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"153\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"153\" y=\"160\" text-anchor=\"middle\">1</text><rect class=\"box-b\" x=\"194\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"229\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"229\" y=\"160\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"270\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"305\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"305\" y=\"160\" text-anchor=\"middle\">5</text><rect class=\"box-b\" x=\"346\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"381\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"381\" y=\"160\" text-anchor=\"middle\">5</text><rect class=\"box\" x=\"422\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"457\" y=\"142\" text-anchor=\"middle\">HEADERS</text><text class=\"t-s t-a\" x=\"457\" y=\"160\" text-anchor=\"middle\">3</text><rect class=\"box-b\" x=\"498\" y=\"124\" width=\"70\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"533\" y=\"142\" text-anchor=\"middle\">DATA</text><text class=\"t-s t-a\" x=\"533\" y=\"160\" text-anchor=\"middle\">3</text><line class=\"ln\" x1=\"566\" y1=\"182\" x2=\"120\" y2=\"182\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"340\" y=\"210\" text-anchor=\"middle\">answers in the order they finished: 1, 5, 3</text><rect class=\"box\" x=\"70\" y=\"230\" width=\"150\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"145.0\" y=\"252\" text-anchor=\"middle\">length</text><text class=\"t-s t-code\" x=\"145.0\" y=\"272\" text-anchor=\"middle\">3 bytes</text><rect class=\"box\" x=\"230\" y=\"230\" width=\"90\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"275.0\" y=\"252\" text-anchor=\"middle\">type</text><text class=\"t-s t-code\" x=\"275.0\" y=\"272\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"330\" y=\"230\" width=\"90\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"375.0\" y=\"252\" text-anchor=\"middle\">flags</text><text class=\"t-s t-code\" x=\"375.0\" y=\"272\" text-anchor=\"middle\">1</text><rect class=\"box\" x=\"430\" y=\"230\" width=\"190\" height=\"54\" rx=\"8\"/><text class=\"t-s\" x=\"525.0\" y=\"252\" text-anchor=\"middle\">R + stream id</text><text class=\"t-s t-code\" x=\"525.0\" y=\"272\" text-anchor=\"middle\">4 bytes</text></svg>",
-    "caption": "Three requests and three answers on one connection, as in the lab's capture. The numbers are stream ids; every frame starts with the 9-byte header below."
-   },
-   "try": {
-    "title": "Ten requests, one connection",
-    "minutes": 4,
+  "worked": {
+    "title": "Decode one HTTP/2 exchange by hand",
     "steps": [
-     "In the lab box from the last Try it (the first line starts `H2Server.java` only if nothing listens on port 8080). Send the same ten requests in parallel, this time over HTTP/2. Predict the time and the number of connections.",
-     "Then capture three parallel HTTP/2 requests and let tshark decode the frames. `-d tcp.port==8080,http2` tells it that port 8080 carries HTTP/2, which it can't guess without TLS."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "ss -ltn | grep -q ':8080 ' || { java /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java > /tmp/h2.log & }\nuntil ss -ltn | grep -q ':8080 '; do sleep 0.2; done\nurls() { for i in $(seq 1 10); do echo \"-o /dev/null http://127.0.0.1:8080/auth/$i\"; done; }\nconns() { grep -c ' from ' /tmp/h2.log; }\nTIMEFORMAT='took %R s'\nb=$(conns); time curl -s --parallel --parallel-max 10 --http2-prior-knowledge $(urls); echo \"new connections: $(( $(conns) - b ))\"\ntcpdump -i lo -nn --immediate-mode -w /tmp/h2.pcap 'tcp port 8080' 2>/dev/null &\nsleep 1\ncurl -s --parallel --http2-prior-knowledge http://127.0.0.1:8080/auth/1 http://127.0.0.1:8080/auth/2 http://127.0.0.1:8080/auth/3\nsleep 1; kill %%\ntshark -r /tmp/h2.pcap -d tcp.port==8080,http2 -Y http2 -T fields -e frame.number -e tcp.srcport -e frame.len -e _ws.col.Info 2>/dev/null\n",
-     "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
-    },
-    "expect": "From one run (bash prints the time when curl finishes, before the capture):\n\n```text\ntook 0.543 s\nnew connections: 1\nhello from stream 5\nhello from stream 3\nhello from stream 1\n4\t40592\t130\tMagic, SETTINGS[0], WINDOW_UPDATE[0]\n6\t40592\t111\tHEADERS[1]: GET /auth/1\n8\t40592\t87\tHEADERS[3]: GET /auth/2\n10\t40592\t87\tHEADERS[5]: GET /auth/3\n12\t8080\t81\tSETTINGS[0]\n14\t40592\t75\tSETTINGS[0]\n15\t8080\t75\tSETTINGS[0]\n17\t8080\t94\tHEADERS[5]: 200 OK\n19\t8080\t95\tDATA[5] (text/plain)\n21\t8080\t94\tHEADERS[3]: 200 OK\n23\t8080\t95\tDATA[3] (text/plain)\n25\t8080\t94\tHEADERS[1]: 200 OK\n27\t8080\t95\tDATA[1] (text/plain)\n```\n\nTen requests, one connection, about 300 ms of waiting plus the JVM warming up on its first HTTP/2 connection. In the capture, the client's first segment holds the preface (tshark's \"Magic\"), its SETTINGS and a WINDOW_UPDATE that raises the connection's window. The three HEADERS frames went out before any answer came back; the first is 111 bytes on the wire and the next two 87, because HPACK's dynamic table already knew their headers. Each side then acknowledges the other's SETTINGS with an empty SETTINGS frame. The answers came back in the order they finished (5, 3, 1 in this run; yours may differ), all on the same connection. The lab decodes these exact bytes."
-   },
-   "refs": [
-    {
-     "title": "RFC 9113: HTTP/2",
-     "url": "https://www.rfc-editor.org/rfc/rfc9113.html",
-     "kind": "docs"
-    },
-    {
-     "title": "High Performance Browser Networking: HTTP/2",
-     "url": "https://hpbn.co/http2/",
-     "kind": "read"
-    }
-   ]
-  },
-  {
-   "h": "One lost packet stalls every HTTP/2 stream",
-   "body": "HTTP/2 removed head-of-line blocking from HTTP and kept it one layer down. Lesson 8 showed what TCP does when a segment goes missing: the receiver keeps the segments that arrive after the hole, tells the sender with duplicate ACKs and SACK blocks (the byte ranges it does have), and hands nothing past the hole to the application until the retransmission fills it. TCP promises one ordered byte stream, and it keeps that promise even when the bytes behind the hole are complete.\n\nNow put three HTTP/2 streams on that connection. The server sends stream 1's DATA, then stream 3's, then stream 5's. Stream 1's segment is lost. Streams 3 and 5 arrive whole, and the kernel holds them anyway: as far as TCP knows, they're just later bytes of the same stream. All three requests wait at least one round trip for the retransmission. RFC 9113 says so itself: \"TCP head-of-line blocking is not addressed by this protocol.\"\n\nWith HTTP/1.1 and three connections, the same loss hits one connection and one request, and the other two finish on time. How often does it matter? A busy HTTP/2 connection carries hundreds of segments a second. At 1% loss, common on a mobile link, that's several holes a second, and each one stalls every request in flight for at least a round trip, 100 ms on a path with 50 ms each way. So on a lossy network HTTP/2's single connection can do worse than HTTP/1.1's six. There's a second cost: one connection has one congestion window, and each loss shrinks it (lesson 8) for every stream at once, where six HTTP/1.1 connections would have shrunk only one of six windows.\n\nInside a data center, loss is far rarer and round trips are a fraction of a millisecond, so a stall costs little, and HTTP/2's one connection with many streams is a good default between services.\n\nThe Try it measures this. It drops one segment on purpose and times three requests, over HTTP/2 and over HTTP/1.1. The fix can't live in HTTP: the transport itself has to know which bytes belong to which stream. That's QUIC, and the last two frames of the stepper show the difference.",
-   "stepper": {
-    "title": "Three streams, one lost segment",
-    "intro": "The Try it below in pictures: three answers of 1,000 bytes, 50 ms each way, and one segment lost.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 300 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><rect class=\"box\" x=\"326\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"406\" y=\"67\" text-anchor=\"middle\">seg 2: DATA stream 3</text><rect class=\"box\" x=\"502\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"582\" y=\"67\" text-anchor=\"middle\">seg 3: DATA stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-m\" x=\"406\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-m\" x=\"582\" y=\"222\" text-anchor=\"middle\">waiting</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "The server finishes three answers at 300 ms and writes them on one connection, one segment each: stream 1's DATA, then stream 3's, then stream 5's. To TCP these are bytes 1 to 3,000 of one byte stream."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 300 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-bad\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><rect class=\"box\" x=\"326\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"406\" y=\"67\" text-anchor=\"middle\">seg 2: DATA stream 3</text><rect class=\"box\" x=\"502\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s\" x=\"582\" y=\"67\" text-anchor=\"middle\">seg 3: DATA stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-m\" x=\"406\" y=\"222\" text-anchor=\"middle\">waiting</text><rect class=\"box\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-m\" x=\"582\" y=\"222\" text-anchor=\"middle\">waiting</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "Segment 1 is lost on the way. In the Try it an iptables rule drops it; on a real network it would be a full queue or a bad radio link."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 350 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><rect class=\"box-dim\" x=\"160\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"238\" y=\"133\" text-anchor=\"middle\">seg 2: stream 3</text><rect class=\"box-dim\" x=\"330\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"408\" y=\"133\" text-anchor=\"middle\">seg 3: stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-bad\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-bad\" x=\"230\" y=\"222\" text-anchor=\"middle\">its bytes are lost</text><rect class=\"box-bad\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-bad\" x=\"406\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><rect class=\"box-bad\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-bad\" x=\"582\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "Segments 2 and 3 arrive whole. TCP keeps them in the receive buffer, because it may hand the application only bytes in order, and the first 1,000 are missing. Streams 3 and 5 have every byte of their answers and still get nothing."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 400 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-a\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><rect class=\"box-dim\" x=\"160\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"238\" y=\"133\" text-anchor=\"middle\">seg 2: stream 3</text><rect class=\"box-dim\" x=\"330\" y=\"110\" width=\"156\" height=\"36\" rx=\"8\"/><text class=\"t-s\" x=\"408\" y=\"133\" text-anchor=\"middle\">seg 3: stream 5</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-bad\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-bad\" x=\"230\" y=\"222\" text-anchor=\"middle\">its bytes are lost</text><rect class=\"box-bad\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-bad\" x=\"406\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><rect class=\"box-bad\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-bad\" x=\"582\" y=\"222\" text-anchor=\"middle\">held behind the hole</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "The client's ACKs keep asking for the missing bytes, and their SACK blocks list the ranges it already holds (in one run: `Ack=55`, `SLE=1064 SRE=3142`). That tells the sender exactly what to resend, and it does, about one round trip after the loss."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/2 over one TCP connection</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 450 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-ok\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-ok\" x=\"230\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">a round trip late</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "The retransmission fills the hole and the kernel hands everything over at once. All three requests finish together, a little more than a round trip late (about 120 ms in the Try it). One loss delayed three requests: TCP head-of-line blocking."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/3 over QUIC</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 350 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-bad\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-m\" x=\"230\" y=\"222\" text-anchor=\"middle\">waiting for seg 1</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">done on time</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">done on time</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "The same answers over QUIC, with the same loss. QUIC numbers bytes per stream, so segments 2 and 3 complete streams 3 and 5, and QUIC hands them to the application as they arrive. Only stream 1 has a hole."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"Three answers, for streams 1, 3 and 5, cross the network in three segments; one is lost; the picture shows what is on the wire, what the receiver holds back, and what each stream&#x27;s application code has\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t t-a\" x=\"20\" y=\"26\" text-anchor=\"start\">HTTP/3 over QUIC</text><text class=\"t-s t-m\" x=\"660\" y=\"26\" text-anchor=\"end\">t = 450 ms</text><text class=\"t-s t-m\" x=\"20\" y=\"56\" text-anchor=\"start\">on the wire</text><rect class=\"box-a\" x=\"150\" y=\"40\" width=\"160\" height=\"44\" rx=\"8\"/><text class=\"t-s t-a\" x=\"230\" y=\"67\" text-anchor=\"middle\">seg 1: DATA stream 1</text><text class=\"t-s t-m\" x=\"20\" y=\"128\" text-anchor=\"start\">receiver holds</text><rect class=\"ln-d\" x=\"150\" y=\"104\" width=\"512\" height=\"48\" rx=\"8\"/><text class=\"t-s t-m\" x=\"406\" y=\"133\" text-anchor=\"middle\">nothing held back</text><text class=\"t-s t-m\" x=\"20\" y=\"206\" text-anchor=\"start\">application</text><rect class=\"box-ok\" x=\"150\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"230\" y=\"200\" text-anchor=\"middle\">stream 1</text><text class=\"t-s t-ok\" x=\"230\" y=\"222\" text-anchor=\"middle\">a round trip late</text><rect class=\"box-ok\" x=\"326\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"406\" y=\"200\" text-anchor=\"middle\">stream 3</text><text class=\"t-s t-ok\" x=\"406\" y=\"222\" text-anchor=\"middle\">done on time</text><rect class=\"box-ok\" x=\"502\" y=\"176\" width=\"160\" height=\"64\" rx=\"8\"/><text class=\"t\" x=\"582\" y=\"200\" text-anchor=\"middle\">stream 5</text><text class=\"t-s t-ok\" x=\"582\" y=\"222\" text-anchor=\"middle\">done on time</text><text class=\"t-s t-m\" x=\"340\" y=\"276\" text-anchor=\"middle\">one segment per answer, as in the Try it, and the first one sent is lost</text></svg>",
-      "say": "Stream 1 waits for its retransmission, and only stream 1. One loss, one late request: what HTTP/1.1 gets from three separate connections, on a single connection with a single handshake."
-     }
+      {
+        "say": "The client's first segment starts with the 24-byte greeting, called the preface. Each pair of characters is one byte in hexadecimal (base 16), and the second line shows the same bytes as text. The preface is deliberately broken HTTP/1.1, so that an old server rejects it at once instead of misreading the frames that follow.",
+        "code": "50 52 49 20 2a 20 48 54 54 50 2f 32 2e 30 0d 0a 0d 0a 53 4d 0d 0a 0d 0a\n\"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n\"",
+        "lang": "text"
+      },
+      {
+        "say": "Then the client's SETTINGS frame: 18 bytes of payload (the part after the header), type 4, no flags, and stream 0, which means the connection itself. Each setting is a 2-byte id and a 4-byte value.",
+        "code": "00 00 12  04  00  00 00 00 00      length 18, SETTINGS, stream 0\n00 03  00 00 00 64                 MAX_CONCURRENT_STREAMS = 100\n00 04  00 a0 00 00                 INITIAL_WINDOW_SIZE = 10,485,760 (10 MB per stream)\n00 02  00 00 00 00                 ENABLE_PUSH = 0",
+        "lang": "text"
+      },
+      {
+        "say": "A WINDOW_UPDATE follows, also on stream 0, so it raises the window for the whole connection. Without it, the server could send only 65,535 bytes in total before waiting.",
+        "code": "00 00 04  08  00  00 00 00 00      length 4, WINDOW_UPDATE, stream 0\n3e 7f 00 01                        increment 1,048,510,465: about 1 GB",
+        "lang": "text"
+      },
+      {
+        "say": "The server's answer on stream 1: a HEADERS frame with a 19-byte header block that H2Server built by hand, then a DATA frame with END_STREAM.",
+        "code": "00 00 13  01  04  00 00 00 01      length 19, HEADERS, END_HEADERS, stream 1\n88                                 :status: 200 (static entry 8)\n0f 10  0a  text/plain              content-type (entry 31), not indexed, 10 bytes\n0f 0d  02  32 30                   content-length (entry 28): \"20\"\n\n00 00 14  00  01  00 00 00 01      length 20, DATA, END_STREAM, stream 1\nhello from stream 1\\n",
+        "lang": "text"
+      }
     ]
-   },
-   "try": {
-    "title": "Lose one segment on purpose",
-    "minutes": 5,
-    "steps": [
-     "Start a fresh lab box (it has the NET_ADMIN capability these commands need). The first two lines make loopback behave like an Ethernet path with 50 ms each way, as in lesson 8. The server answers each request with 1,000 bytes after 300 ms, so each answer is one segment.",
-     "`lose1` adds an iptables rule that drops the next arriving segment containing \"hello from\", that is, the first answer's data, exactly once. `fetch` asks for three URLs in parallel and prints each one's total time.",
-     "Predict before you run it: over HTTP/2 (one connection), which of the three requests are late? Over HTTP/1.1 (three connections)?"
+  },
+  "lab": {
+    "title": "An HTTP/2 frame decoder and a head-of-line blocking model",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/net/src/main/kotlin/sfz/net/l11/Http2Frames.kt",
+      "labs/net/src/main/kotlin/sfz/net/l11/HolModel.kt"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in a fresh lab box",
-     "src": "ip link set lo mtu 1500\ntc qdisc add dev lo root netem delay 50ms\njava /labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java 8080 300 1000 > /tmp/h2.log &\nuntil grep -q listening /tmp/h2.log 2>/dev/null; do sleep 0.2; done\nfetch() { curl -s --parallel \"$@\" -w '  %{url_effective}  %{time_total} s\\n' \\\n  -o /dev/null http://127.0.0.1:8080/a -o /dev/null http://127.0.0.1:8080/b -o /dev/null http://127.0.0.1:8080/c; }\nlose1() { iptables -A INPUT -p tcp --sport 8080 -m string --string 'hello from' --algo bm -m statistic --mode nth --every 1000 --packet 0 -j DROP; }\nfetch --http2-prior-knowledge > /dev/null\nfor v in --http2-prior-knowledge --http1.1; do\n  echo \"$v, nothing lost\"; fetch $v\n  echo \"$v, one segment lost\"; lose1; fetch $v; iptables -F INPUT\ndone\n",
-     "file": "labs/net/src/demo/java/sfz/net/l11/demo/H2Server.java"
-    },
-    "expect": "From one run:\n\n```text\n--http2-prior-knowledge, nothing lost\n  http://127.0.0.1:8080/a  0.508999 s\n  http://127.0.0.1:8080/b  0.508872 s\n  http://127.0.0.1:8080/c  0.508867 s\n--http2-prior-knowledge, one segment lost\n  http://127.0.0.1:8080/a  0.627386 s\n  http://127.0.0.1:8080/b  0.627301 s\n  http://127.0.0.1:8080/c  0.627297 s\n--http1.1, nothing lost\n  http://127.0.0.1:8080/a  0.514387 s\n  http://127.0.0.1:8080/c  0.514296 s\n  http://127.0.0.1:8080/b  0.514830 s\n--http1.1, one segment lost\n  http://127.0.0.1:8080/b  0.514284 s\n  http://127.0.0.1:8080/c  0.514427 s\n  http://127.0.0.1:8080/a  0.841110 s\n```\n\nWithout loss every request takes about 0.51 s: two round trips of 100 ms (connect, then request and answer) plus the server's 300 ms. Over HTTP/2, one lost segment made all three requests about 120 ms late, by exactly the same amount, because the other two answers sat behind the hole. Over HTTP/1.1 the loss hit one connection and one request; `b` and `c` finished on time. Look at how late `a` was, though: 330 ms. Its answer was the only segment on its connection, so no later segment arrived to trigger a fast retransmit (lesson 8), and the sender had to wait for a timer. Under HTTP/2 the other streams' segments did that job. Your numbers will move by a few tens of milliseconds between runs."
-   },
-   "refs": [
-    {
-     "title": "High Performance Browser Networking: Building blocks of TCP",
-     "url": "https://hpbn.co/building-blocks-of-tcp/",
-     "kind": "read"
-    }
-   ]
-  },
-  {
-   "h": "HTTP/3 moves the streams into QUIC, on top of UDP",
-   "body": "QUIC (RFC 9000) is a transport protocol that runs over UDP. Lesson 6 built reliability on UDP by hand: sequence numbers, ACKs, retransmission. QUIC does all of that, plus congestion control (RFC 9002), in a library inside the application instead of in the kernel, and it adds what TCP lacks: streams belong to the transport. Each stream has its own byte order, so in RFC 9000's words, \"only streams with data in that packet are blocked\". HTTP/3 (RFC 9114) is HTTP mapped onto those streams, with headers compressed by QPACK, a variant of HPACK built so that header compression doesn't bring the blocking back.\n\nQUIC also carries TLS 1.3 inside it (RFC 9001). Its first packet holds the ClientHello, so the transport handshake and the TLS handshake share one round trip, where TCP needs a round trip of its own before TLS can start. Homebrew curl 8.23 on a Mac, against cloudflare-quic.com, one run per version, seconds from the start:\n\n```text\n--http1.1      http 1.1  connect 0.044  tls 0.100  first byte 0.119\n--http2        http 2    connect 0.022  tls 0.047  first byte 0.066\n--http3-only   http 3    connect 0.030  tls 0.033  first byte 0.053\n```\n\nOver TCP the TLS handshake ends a round trip after the connect; over QUIC, 3 ms after it. (The first line also paid for a cold DNS lookup, and single runs vary.)\n\nLeaving TCP changes two more things. A QUIC connection is named by connection IDs inside each packet, not by lesson 7's 4-tuple, so it survives a NAT that changes your port (lesson 3) or a phone moving from Wi-Fi to cellular. And nearly the whole QUIC header, packet numbers included, is encrypted, so middleboxes can't read it, and nor can your tcpdump without keys.\n\nA client can't know in advance that a server speaks HTTP/3. It learns it from an `Alt-Svc` header on an earlier HTTP/2 or HTTP/1.1 response (`h3=\":443\"; ma=86400`: HTTP/3 on UDP port 443, good for a day) or from a DNS HTTPS record, and it falls back to TCP on networks that block UDP. In 2025, 21% of requests to Cloudflare used HTTP/3, while W3Techs counted 41.1% of websites supporting it in November 2026. Supporting HTTP/3 and actually using it are different numbers.\n\nFor your services: the JDK's HttpClient gained HTTP/3 in JDK 26 (JEP 517), opt-in with `HttpClient.Version.HTTP_3`, so JDK 25 can't speak it, and neither can the lab box's curl 8.5. Inside a data center, where loss is rare and pooled connections live for minutes, HTTP/2 or a pool of HTTP/1.1 connections is enough. HTTP/3 pays off on the last mile, between phones and your edge.",
-   "try": {
-    "title": "Find out who speaks HTTP/3",
-    "minutes": 2,
+    "run": "./gradlew :net:test --tests 'sfz.net.l11.*'",
     "steps": [
-     "In the lab box, ask the box's curl for HTTP/3, then look at the headers of an HTTP/2 response from a server that speaks HTTP/3.",
-     "If you have Homebrew curl on your Mac (`brew install curl`; it isn't on your PATH by default), you can reproduce the timing table above: `C=/opt/homebrew/opt/curl/bin/curl; for v in --http1.1 --http2 --http3-only; do $C -s -o /dev/null $v -w \"$v %{http_version} %{time_connect} %{time_appconnect} %{time_starttransfer}\\n\" https://cloudflare-quic.com/; done`."
+      "Run the tests once from the `labs` folder. All 13 fail. `Http2CodecTest` reads the capture from the second Try it, both directions, from `src/test/resources/sfz/net/l11/`. Its helper `Tcp.stream` joins each side's TCP data into one stream of bytes, the way the receiver's kernel does.",
+      "In `Http2Frames.kt`, write `decode`. Skip the client preface if it's there, then read 9-byte headers and their payloads until the bytes run out, and build a `Frame` for each type. Mask off the reserved bit of the stream id, and strip the padding when the PADDED flag is set. Write `header` too: it's the same layout, written instead of read.",
+      "In `HolModel.kt`, a small model of head-of-line blocking, write `arrival`, then `tcp` and `quic`. Both walk the packets in order and keep \"the latest arrival so far\": for TCP one value for the whole connection, for QUIC one value per stream. Each stream is done when its last packet is delivered.",
+      "Run the tests until all 13 pass. Then compare `HolModelTest`'s numbers with the stepper. The test loses stream 3's first packet of six, and only the TCP model makes streams 1 and 5 late."
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "curl --http3 https://cloudflare-quic.com/ 2>&1 | head -1\ncurl -sI https://cloudflare-quic.com/ | grep -i -E '^(HTTP|alt-svc)'\n"
-    },
-    "expect": "From one run:\n\n```text\ncurl: option --http3: the installed libcurl version doesn't support this\nHTTP/2 200\nalt-svc: h3=\":443\"; ma=86400\n```\n\nUbuntu 24.04's curl 8.5 was built without HTTP/3, like JDK 25's HttpClient. Its HTTP/2 response still carries the advertisement: `h3=\":443\"` means \"HTTP/3 is available on UDP port 443 of this host\", and `ma=86400` says the client may remember that for 86,400 seconds. A client that supports HTTP/3 tries it on its next connection and falls back to TCP if nothing comes back over UDP."
-   },
-   "refs": [
-    {
-     "title": "RFC 9000: QUIC",
-     "url": "https://www.rfc-editor.org/rfc/rfc9000.html",
-     "kind": "docs"
-    },
-    {
-     "title": "The Illustrated QUIC Connection",
-     "url": "https://quic.xargs.org/",
-     "kind": "read"
-    },
-    {
-     "title": "JEP 517: HTTP/3 for the HTTP Client API",
-     "url": "https://openjdk.org/jeps/517",
-     "kind": "docs"
+    "hints": [
+      "The length is 24 bits: `(u8(at) shl 16) or (u8(at + 1) shl 8) or u8(at + 2)`. The stream id is the next 4 bytes `and 0x7FFF_FFFF`.",
+      "Check that the whole payload is there before you slice it: `require(start + length <= bytes.size)`. A frame cut off at a segment boundary must fail, not come back short.",
+      "With PADDED (0x8), the payload's first byte is the pad length, and that many bytes at the end are padding. HEADERS with PRIORITY (0x20) has 5 more bytes to skip after the pad length.",
+      "SETTINGS values and WINDOW_UPDATE increments are unsigned 32-bit numbers: read them into a `Long`.",
+      "In the model, a packet that wasn't lost arrives at `i * gap + oneWay`, and a lost one at `i * gap + resendAfter + oneWay`. Delivery under TCP is a running maximum over all packets so far."
+    ],
+    "done_when": "All 13 tests in `Http2CodecTest` and `HolModelTest` pass."
+  },
+  "drill": {
+    "title": "Read a frame header from memory",
+    "minutes": 4,
+    "prompt": "Without looking, write a Kotlin function that reads the 9-byte HTTP/2 frame header at position `at` of a byte array and returns its length, type, flags and stream id. Then say in one sentence why HTTP/2 needs a stream id in every frame when HTTP/1.1 needed none.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "data class FrameHeader(val length: Int, val type: Int, val flags: Int, val streamId: Int)\n\nfun readHeader(b: ByteArray, at: Int): FrameHeader {\n    fun u8(i: Int) = b[at + i].toInt() and 0xFF\n    val length = (u8(0) shl 16) or (u8(1) shl 8) or u8(2)      // 24 bits\n    val stream = ((u8(5) and 0x7F) shl 24) or (u8(6) shl 16) or (u8(7) shl 8) or u8(8)  // drop the reserved bit\n    return FrameHeader(length, type = u8(3), flags = u8(4), streamId = stream)\n}\n\n// HTTP/1.1 sends one message at a time, so its position on the connection says which request it\n// belongs to; HTTP/2 interleaves frames of many requests, so every frame must carry its stream's number.\n"
     }
-   ]
-  }
- ],
- "analogy": "Think of a connection as a single checkout lane at a bank branch. HTTP/1.1 serves one customer at a time, and a customer who needs 300 ms of paperwork holds up the whole line, so busy branches open more lanes. HTTP/2 lets every teller work on several customers at once and hands back each document with a ticket number on it, so one slow customer no longer blocks the others, but all the documents still leave through one door in single file, and if one document is dropped in the doorway, everyone waits while it's fetched again. HTTP/3 gives every customer their own door. The analogy breaks on cost: opening a new lane at a bank takes staff, while a new connection costs a round trip or two and some memory, which is why opening more lanes was a perfectly good answer for HTTP/1.1 for twenty years.",
- "in_your_world": "Your payment services mostly speak HTTP/1.1 or HTTP/2 to partners through a pool. With HTTP/1.1, the pool's size is your concurrency: 20 connections to a 120 ms issuer cap you at about 160 authorizations a second, and the 21st request waits for a free connection however fast the network is. The JDK HttpClient asks for HTTP/2 by default and falls back to HTTP/1.1 when ALPN says so; on HTTP/2 one connection carries up to 100 concurrent streams (the client's `jdk.httpclient.maxstreams` default), so the limit moves to the server's SETTINGS. gRPC, which Temporal's SDKs use to talk to the Temporal service, runs on HTTP/2, so a loss on that one connection stalls every in-flight call to the service at once. HTTP/3 needs JDK 26 or newer; keep it for client-facing edges and don't chase it for calls inside your own network.",
- "mistake": "The common mistake is believing that HTTP/2 \"removed head-of-line blocking\" and moving everything onto one connection. It removed the HTTP/1.1 kind, where one slow response blocks the next request, and kept TCP's: one lost segment stalls every stream on the connection, and one congestion window throttles them all. A team sees good results in the data center, then sees worse tail latency than before from mobile clients on lossy networks. Measure your p99 under loss, not only the mean on a clean network. Where the last mile is lossy, HTTP/3 is the fix, and for server-to-server calls that can't use it, a few HTTP/2 connections instead of one limit how much a single loss can hold up.",
- "compare": {
-  "title": "The same request, in HTTP/1.1 and in HTTP/2",
-  "a": {
-   "label": "HTTP/1.1",
-   "lang": "text",
-   "title": "text, 83 bytes, as curl -v printed it",
-   "src": "GET /auth/1 HTTP/1.1\\r\\n\nHost: 127.0.0.1:8080\\r\\n\nUser-Agent: curl/8.5.0\\r\\n\nAccept: */*\\r\\n\n\\r\\n\n\nthe end of the request: the empty line\nthe next request waits for the whole answer\n"
   },
-  "b": {
-   "label": "HTTP/2",
-   "lang": "text",
-   "title": "one HEADERS frame, 45 bytes, from the capture",
-   "src": "00 00 24       length 36\n01             type 1: HEADERS\n05             flags: END_STREAM + END_HEADERS\n00 00 00 01    stream 1\n82             :method: GET            (static entry 2)\n86             :scheme: http           (static entry 6)\n41 8a ...      :authority, 10 Huffman-coded bytes\n04 85 ...      :path /auth/1, 5 Huffman-coded bytes\n7a 88 ...      user-agent, 8 Huffman-coded bytes\n53 03 2a 2f 2a accept: */*\n"
+  "recap": [
+    "HTTP's meaning (methods, status codes, headers) is written down once, in RFC 9110. HTTP/1.1, HTTP/2 and HTTP/3 are three ways of putting it on the wire.",
+    "An HTTP/1.1 connection carries one exchange at a time, and Content-Length or chunks mark where each answer ends. Answering requests side by side needs more connections, each with its own handshakes and congestion window.",
+    "HTTP/2 cuts messages into frames with a 9-byte header (length, type, flags, stream id) and lets streams take turns on one connection. HPACK shrinks repeated headers to one-byte references, and WINDOW_UPDATE does flow control per stream.",
+    "The limit of HTTP/2: TCP delivers one ordered stream of bytes, so one lost segment makes every stream on the connection wait for the resend.",
+    "QUIC runs over UDP with streams, loss recovery and TLS 1.3 built in. A loss blocks only its own stream, the handshake takes one round trip, and connection IDs survive a change of address.",
+    "Clients learn about HTTP/3 from Alt-Svc or DNS, and fall back to TCP. Java's HttpClient speaks HTTP/3 only from JDK 26, and only when you turn it on."
+  ],
+  "closing": "We started at a café with one till, where one slow card payment held up the whole queue. HTTP/1.1 opens more tills. HTTP/2 hands out numbered tickets at one till, and HTTP/3 gives every order its own hatch, so a dropped tray delays only its own order.\n\nNext time you open a website, open your browser's developer tools (F12) and choose the Network tab. Right-click the column titles and turn on Protocol: you'll see `http/1.1`, `h2` or `h3` beside each request.\n\nNext, we'll put a load balancer between the app and the bank, and ask what the app should do when a server behind it stops answering.",
+  "quiz": [
+    {
+      "q": "A phone app's requests go over one HTTP/2 connection, and the phone's mobile network loses about 2% of packets. What happens to the 6 requests in flight when one segment is lost?",
+      "options": [
+        "Only the request whose data was in that segment waits for the resend",
+        "All six can wait: TCP holds back every byte after the hole until the lost segment is resent",
+        "HTTP/2 resends the lost frame on another stream, so nothing waits",
+        "The connection is closed and all six are tried again"
+      ],
+      "answer": 1,
+      "why": "HTTP/2 shares one TCP stream of bytes between all its streams, and TCP hands the program nothing past a hole. Requests whose data came after the lost segment wait for it, even if their own bytes arrived. The first option describes HTTP/3 over QUIC, or HTTP/1.1 with one request per connection. HTTP/2 doesn't resend anything itself: TCP does."
+    },
+    {
+      "q": "In the lab's capture, the first request's HEADERS frame carries 36 bytes of headers and the next two only 12 each, although all three sent the same headers apart from the path. Why?",
+      "options": [
+        "HPACK's second table remembers the headers sent earlier on the connection, so they're sent again as one-byte references",
+        "curl left out the headers it had already sent",
+        "The later frames were compressed with gzip, a general-purpose compressor",
+        "The server asked for fewer headers in its SETTINGS"
+      ],
+      "answer": 0,
+      "why": "Every header is still sent in every request. `c0`, `bf` and `be` are references to entries that the first request added to HPACK's second table (its dynamic table) on this connection. That's also why HPACK's memory belongs to one connection, and why the decoder must see every frame in order. HTTP/2 doesn't use gzip for headers, and SETTINGS can't remove headers."
+    },
+    {
+      "q": "A payment app on a phone has an HTTP/3 connection open when the phone moves from Wi-Fi to the mobile network and gets a new IP address. What happens to the connection?",
+      "options": [
+        "It breaks, because the addresses and ports that name it changed, as they would for TCP",
+        "It continues only if the new network has the same NAT",
+        "It can continue: QUIC names the connection by connection IDs in each packet, not by addresses and ports",
+        "It is resumed with a new TLS handshake on the same connection"
+      ],
+      "answer": 2,
+      "why": "A TCP connection is its two addresses and two ports, so a new address means a new connection and new handshakes. QUIC packets carry connection IDs, so the server recognises the connection from the new address and, after checking that the new path works, carries on. No new TLS handshake is needed."
+    },
+    {
+      "q": "In the last lesson, TLS 1.3, certificates and mTLS, the JDK 25 HttpClient, which prefers HTTP/2, reported `HTTP_1_1` when it called `ApiServer.java` over TLS. Why?",
+      "options": [
+        "JDK 25's HttpClient can't speak HTTP/2 over TLS",
+        "HTTP/2 needs HTTP/3 to be available first",
+        "The certificate didn't allow HTTP/2",
+        "The client offered h2 and http/1.1 with ALPN in its ClientHello, and the server, which speaks only HTTP/1.1, chose http/1.1"
+      ],
+      "answer": 3,
+      "why": "Over TLS, the version is chosen in the handshake. The ClientHello's ALPN field listed `h2` and `http/1.1` (the last lesson's capture shows both), and the server picked from that list in its EncryptedExtensions. The JDK's HttpsServer speaks only HTTP/1.1. Against a server that supports h2, the same client would use HTTP/2 with no change to the code."
+    },
+    {
+      "q": "Lesson 8 of this track showed how TCP recovers a lost segment. In the Try it, the HTTP/1.1 request whose only segment was dropped finished about 330 ms late, while under HTTP/2 the loss cost about 115 ms. What explains the difference?",
+      "options": [
+        "HTTP/1.1 never resends lost data",
+        "Over HTTP/1.1 nothing arrived after the lost segment to trigger duplicate ACKs, so the sender waited for a timer; under HTTP/2 the other streams' segments triggered a fast resend (fast retransmit)",
+        "HTTP/2 sends every segment twice",
+        "netem, the delay tool, slowed HTTP/1.1 packets more"
+      ],
+      "answer": 1,
+      "why": "A fast resend needs later segments to arrive and produce duplicate ACKs (with SACK). When the last segment is the one lost, the sender waits for its resend timer instead. On the HTTP/2 connection, the two answers behind the hole produced those ACKs, so recovery took about a round trip, but all three requests paid for it. TCP resends lost data for both versions.",
+      "from": "net-08"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "How does an HTTP/1.1 client know where an answer ends?",
+      "back": "From Content-Length, or from chunked encoding, where every chunk carries its size and a chunk of size zero ends the body."
+    },
+    {
+      "front": "What are the fields of an HTTP/2 frame header?",
+      "back": "9 bytes: length (24 bits), type (8), flags (8), a reserved bit and the stream id (31 bits)."
+    },
+    {
+      "front": "Which frame types carry a request and its answer in HTTP/2?",
+      "back": "HEADERS (type 1) and DATA (type 0). The END_STREAM flag (0x1) marks the last frame of a stream."
+    },
+    {
+      "front": "What is TCP head-of-line blocking in HTTP/2?",
+      "back": "One lost segment holds back every byte after it, so all the streams on the connection wait for the resend."
+    },
+    {
+      "front": "What does QUIC do differently from TCP when a packet is lost?",
+      "back": "It keeps bytes in order per stream, so only the streams with data in the lost packet wait."
+    },
+    {
+      "front": "How does a client learn that a server speaks HTTP/3?",
+      "back": "From an Alt-Svc header such as `h3=\":443\"; ma=86400` on an earlier answer, or from a DNS record."
+    },
+    {
+      "front": "Which JDK first speaks HTTP/3, and how do you turn it on?",
+      "back": "JDK 26 (JEP 517). You opt in with `HttpClient.Version.HTTP_3` on the client or the request."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Persistent connection",
+      "plain": "An HTTP connection kept open to carry more than one request, one after another."
+    },
+    {
+      "term": "Head-of-line blocking",
+      "plain": "The first item in a queue holding up everything behind it."
+    },
+    {
+      "term": "Stream",
+      "plain": "One request and its answer inside an HTTP/2 or QUIC connection, with its own number."
+    },
+    {
+      "term": "Frame",
+      "plain": "A small piece of an HTTP/2 message, with a 9-byte header naming its length, type, flags and stream."
+    },
+    {
+      "term": "HPACK",
+      "plain": "HTTP/2's way of shrinking headers: a fixed table, a table of headers already sent on this connection, and a compact code for text."
+    },
+    {
+      "term": "ALPN",
+      "plain": "A field in the TLS handshake where the client lists the protocols it speaks and the server picks one."
+    },
+    {
+      "term": "QUIC",
+      "plain": "A transport protocol over UDP with streams, loss recovery, congestion control and TLS 1.3 built in."
+    },
+    {
+      "term": "Alt-Svc",
+      "plain": "An answer header saying that the same service is available another way, such as over HTTP/3."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend on your team says: \"We moved the app's calls to the bank from HTTP/1.1 to HTTP/2 to stop head-of-line blocking. Should we go to HTTP/3 next?\" Explain what HTTP/2 fixed, what it didn't, and when HTTP/3 would help these calls.",
+    "answer": "HTTP/2 fixed the HTTP/1.1 kind of blocking. On HTTP/1.1 a connection carries one exchange at a time, so a slow answer holds up the next request, and we needed a big pool of connections to send requests side by side. HTTP/2 puts a stream number on every frame, so many requests share one connection and a slow answer doesn't block the others. What it didn't fix is TCP's blocking. All those streams travel in one ordered stream of bytes, so a single lost segment makes every request on the connection wait for the resend, and one congestion window slows them all. HTTP/3 runs over QUIC, which keeps bytes in order per stream, so a loss delays only its own request. It also saves a round trip on new connections and survives a change of address. For calls between data centers, with very little loss and long-lived pooled connections, those gains are small, and we'd need JDK 26 or newer to use it from Java's HttpClient. I'd rather measure the slowest requests under loss first. If one HTTP/2 connection turns out to be the problem, a few connections instead of one is the cheaper fix."
   },
-  "note": "The meaning is identical: RFC 9110 defines it once for every version. HTTP/1.1 writes it as text and marks the end with an empty line, so a connection can only be read in order. HTTP/2 writes it as a frame with a length and a stream id, so the receiver always knows where the frame ends and which request it belongs to, and frames from many streams can share the connection. The second and third requests in the capture were 12 bytes of header block each, because `c0`, `bf` and `be` point at entries HPACK stored after the first."
- },
- "worked": {
-  "title": "Decode one HTTP/2 exchange by hand",
-  "steps": [
-   {
-    "say": "The client's first segment starts with the 24-byte preface. It's deliberately invalid HTTP/1.1, so that an old server rejects it at once instead of misreading frames.",
-    "code": "50 52 49 20 2a 20 48 54 54 50 2f 32 2e 30 0d 0a 0d 0a 53 4d 0d 0a 0d 0a\n\"PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n\"",
-    "lang": "text"
-   },
-   {
-    "say": "Then the client's SETTINGS frame: 18 bytes of payload, type 4, no flags, stream 0 (the connection itself). Each setting is a 2-byte id and a 4-byte value.",
-    "code": "00 00 12  04  00  00 00 00 00      length 18, SETTINGS, stream 0\n00 03  00 00 00 64                 MAX_CONCURRENT_STREAMS = 100\n00 04  00 a0 00 00                 INITIAL_WINDOW_SIZE = 10,485,760 (10 MB per stream)\n00 02  00 00 00 00                 ENABLE_PUSH = 0",
-    "lang": "text"
-   },
-   {
-    "say": "A WINDOW_UPDATE follows, also on stream 0, so it raises the connection's window. Without it the server could send only 65,535 bytes in total before waiting.",
-    "code": "00 00 04  08  00  00 00 00 00      length 4, WINDOW_UPDATE, stream 0\n3e 7f 00 01                        increment 1,048,510,465: about 1 GB",
-    "lang": "text"
-   },
-   {
-    "say": "The server's answer on stream 1: a HEADERS frame whose 19-byte header block H2Server built by hand, then a DATA frame with END_STREAM.",
-    "code": "00 00 13  01  04  00 00 00 01      length 19, HEADERS, END_HEADERS, stream 1\n88                                 :status: 200 (static entry 8)\n0f 10  0a  text/plain              content-type (entry 31), not indexed, 10 bytes\n0f 0d  02  32 30                   content-length (entry 28): \"20\"\n\n00 00 14  00  01  00 00 00 01      length 20, DATA, END_STREAM, stream 1\nhello from stream 1\\n",
-    "lang": "text"
-   }
+  "deeper": {
+    "minutes": 10,
+    "body": "**Server push is gone in practice.** HTTP/2 let a server send answers the client hadn't asked for yet. Browsers found it hard to use well, and Chrome removed support for it in 2022. You can ignore PUSH_PROMISE frames in new code.\n\n**Priorities.** HTTP/2's first way of ranking streams was a tree of priorities, complex and rarely done well. RFC 9218 replaced it with a simpler scheme: an `urgency` from 0 to 7 and an `incremental` flag, sent as a `Priority` header or a frame. Both HTTP/2 and HTTP/3 use it.\n\n**QPACK's careful design.** HPACK assumes header blocks arrive in order, which TCP guarantees. QUIC's streams don't, so QPACK sends its table updates on a separate stream. The sender chooses how much a header block may depend on updates that haven't arrived yet: better compression against the risk of blocking.\n\n**Why QUIC lives outside the kernel.** TCP is in every operating system, and every network box on the path has opinions about it, so changing it takes a decade. QUIC ships inside browsers and libraries, and it's encrypted, so network boxes can't depend on its details, and its designers can change it with a software update. The cost is processor time: handling UDP in a program costs more than the kernel's TCP, which network cards help with in hardware. That's part of why HTTP/3 rarely pays off inside a data center.\n\n**Extended CONNECT.** WebSockets, long-lived two-way connections that web pages use for chat and live updates, can run over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220). They open a stream with the CONNECT method instead of HTTP/1.1's Upgrade, so a WebSocket can share a connection with ordinary requests."
+  },
+  "sources": [
+    {
+      "title": "RFC 9110: HTTP Semantics",
+      "url": "https://www.rfc-editor.org/rfc/rfc9110.html"
+    },
+    {
+      "title": "RFC 9113: HTTP/2",
+      "url": "https://www.rfc-editor.org/rfc/rfc9113.html"
+    },
+    {
+      "title": "RFC 9114: HTTP/3",
+      "url": "https://www.rfc-editor.org/rfc/rfc9114.html"
+    },
+    {
+      "title": "RFC 9000: QUIC, a UDP-based multiplexed and secure transport",
+      "url": "https://www.rfc-editor.org/rfc/rfc9000.html"
+    },
+    {
+      "title": "JEP 517: HTTP/3 for the HTTP Client API",
+      "url": "https://openjdk.org/jeps/517"
+    }
   ]
- },
- "lab": {
-  "title": "An HTTP/2 frame decoder and a head-of-line blocking model",
-  "minutes": 15,
-  "needs": [],
-  "files": [
-   "labs/net/src/main/kotlin/sfz/net/l11/Http2Frames.kt",
-   "labs/net/src/main/kotlin/sfz/net/l11/HolModel.kt"
-  ],
-  "run": "./gradlew :net:test --tests 'sfz.net.l11.*'",
-  "steps": [
-   "Run the tests once from the `labs` folder. All 13 fail. `Http2CodecTest` reads the capture from the second Try it, both directions, from `src/test/resources/sfz/net/l11/`; the support helper `Tcp.stream` joins each side's TCP payloads into one byte stream, the way the receiver's kernel does.",
-   "In `Http2Frames.kt`, write `decode`: skip the client preface if it's there, then read 9-byte headers and payloads until the bytes run out, and build a `Frame` for each type. Mask off the reserved bit of the stream id, and strip padding when the PADDED flag is set. Write `header` too: it's the same layout backwards.",
-   "In `HolModel.kt`, write `arrival`, then `tcp` and `quic`. Both walk the packets in order and keep \"the latest arrival so far\": for TCP one value for the whole connection, for QUIC one per stream. Each stream is done when its last packet is delivered.",
-   "Run the tests until all 13 pass. Then compare `HolModelTest`'s numbers with the stepper: the test loses stream 3's first packet of six, and only the TCP model makes streams 1 and 5 late."
-  ],
-  "hints": [
-   "The length is 24 bits: `(u8(at) shl 16) or (u8(at + 1) shl 8) or u8(at + 2)`. The stream id is the next 4 bytes `and 0x7FFF_FFFF`.",
-   "Check that the whole payload is there before you slice it: `require(start + length <= bytes.size)`. A frame cut off by a segment boundary must fail, not come back short.",
-   "With PADDED (0x8), the payload's first byte is the pad length and that many bytes at the end are padding. HEADERS with PRIORITY (0x20) has 5 more bytes to skip after the pad length.",
-   "SETTINGS values and WINDOW_UPDATE increments are unsigned 32-bit: read them into a `Long`.",
-   "In the model, a packet that wasn't lost arrives at `i * gap + oneWay`; a lost one at `i * gap + resendAfter + oneWay`. Delivery under TCP is a running maximum over all packets so far."
-  ],
-  "done_when": "All 13 tests in `Http2CodecTest` and `HolModelTest` pass."
- },
- "drill": {
-  "title": "Read a frame header from memory",
-  "minutes": 4,
-  "prompt": "Without looking, write a Kotlin function that reads the 9-byte HTTP/2 frame header at offset `at` of a byte array and returns length, type, flags and stream id. Then say in one sentence why HTTP/2 needs a stream id in every frame when HTTP/1.1 needed none.",
-  "answer": {
-   "lang": "kotlin",
-   "src": "data class FrameHeader(val length: Int, val type: Int, val flags: Int, val streamId: Int)\n\nfun readHeader(b: ByteArray, at: Int): FrameHeader {\n    fun u8(i: Int) = b[at + i].toInt() and 0xFF\n    val length = (u8(0) shl 16) or (u8(1) shl 8) or u8(2)      // 24 bits\n    val stream = ((u8(5) and 0x7F) shl 24) or (u8(6) shl 16) or (u8(7) shl 8) or u8(8)  // drop the reserved bit\n    return FrameHeader(length, type = u8(3), flags = u8(4), streamId = stream)\n}\n\n// HTTP/1.1 sends one message at a time, so its position on the connection says which request it\n// belongs to; HTTP/2 interleaves frames of many requests, so every frame must carry its stream's number.\n"
-  }
- },
- "recap": [
-  "HTTP's meaning (methods, status codes, headers) is defined once in RFC 9110; HTTP/1.1, HTTP/2 and HTTP/3 are three ways of writing it on the wire.",
-  "An HTTP/1.1 connection carries one exchange at a time, ended by Content-Length or chunks. Parallel requests need parallel connections, each with its own handshakes and congestion window.",
-  "HTTP/2 cuts messages into frames with a 9-byte header (length, type, flags, stream id) and interleaves streams on one connection. HPACK shrinks repeated headers to one-byte indexes; WINDOW_UPDATE does flow control per stream.",
-  "TCP delivers one ordered byte stream, so one lost segment stalls every HTTP/2 stream on the connection until the retransmission arrives.",
-  "QUIC runs over UDP with streams, loss recovery and TLS 1.3 built in: a loss blocks only its own stream, the handshake takes one round trip, and connection IDs survive address changes.",
-  "Clients discover HTTP/3 through Alt-Svc or DNS and fall back to TCP. The JDK HttpClient speaks HTTP/3 only from JDK 26, and only when you opt in."
- ],
- "quiz": [
-  {
-   "q": "A mobile app's API calls go over one HTTP/2 connection. The phone's network loses about 2% of packets. What happens to the 6 requests in flight when one segment is lost?",
-   "options": [
-    "Only the request whose data was in that segment waits for the retransmission",
-    "All six can wait: TCP holds every byte after the hole until the lost segment is retransmitted",
-    "HTTP/2 resends the lost frame on another stream, so nothing waits",
-    "The connection is closed and all six are retried"
-   ],
-   "answer": 1,
-   "why": "HTTP/2 shares one TCP byte stream between all its streams, and TCP hands the application nothing past a hole. Requests whose data came after the lost segment wait for it even if their own bytes arrived. The first option describes HTTP/3 over QUIC, or HTTP/1.1 with one request per connection. HTTP/2 doesn't retransmit anything itself: TCP does."
-  },
-  {
-   "q": "In the lab's capture, the first request's HEADERS frame carries 36 bytes of header block and the next two only 12 each, although all three sent the same headers apart from the path. Why?",
-   "options": [
-    "HPACK's dynamic table remembers the headers sent earlier on the connection, so they're sent again as one-byte indexes",
-    "curl removed the headers it had already sent",
-    "The later frames were compressed with gzip",
-    "The server asked for fewer headers in its SETTINGS"
-   ],
-   "answer": 0,
-   "why": "Every header is still sent in every request: `c0`, `bf` and `be` are references to entries the first request added to HPACK's dynamic table on this connection. That's also why HPACK state is per connection and why the decoder must see every frame in order. HTTP/2 doesn't use gzip for headers, and SETTINGS can't remove headers."
-  },
-  {
-   "q": "A payment app on a phone has an HTTP/3 connection open when the phone moves from Wi-Fi to cellular and gets a new IP address. What happens to the connection?",
-   "options": [
-    "It breaks, because the 4-tuple changed, as it would for TCP",
-    "It continues only if the new network has the same NAT",
-    "It can continue: QUIC names the connection by connection IDs in each packet, not by addresses and ports",
-    "It is resumed with a new TLS handshake on the same connection"
-   ],
-   "answer": 2,
-   "why": "A TCP connection is its 4-tuple, so a new address means a new connection and new handshakes. QUIC packets carry connection IDs, so the server recognises the connection from the new address and, after checking that the new path works, carries on. No new TLS handshake is needed."
-  },
-  {
-   "q": "Lesson 10's JDK 25 HttpClient, which prefers HTTP/2, reported `HTTP_1_1` when it called `ApiServer.java` over TLS. Why?",
-   "options": [
-    "JDK 25's HttpClient can't speak HTTP/2 over TLS",
-    "HTTP/2 needs HTTP/3 to be available first",
-    "The certificate didn't allow HTTP/2",
-    "The client offered h2 and http/1.1 with ALPN in its ClientHello, and the server, which speaks only HTTP/1.1, chose http/1.1"
-   ],
-   "answer": 3,
-   "why": "Over TLS the version is chosen in the handshake: the ClientHello's ALPN extension listed `h2` and `http/1.1` (lesson 10's capture shows both), and the server picked from that list in its EncryptedExtensions. The JDK's HttpsServer speaks only HTTP/1.1. Against a server that supports h2, the same client would use HTTP/2 with no code change."
-  },
-  {
-   "q": "Lesson 8 showed how TCP recovers a lost segment. In the Try it, the HTTP/1.1 request whose only segment was dropped finished about 330 ms late, while under HTTP/2 the loss cost about 115 ms. What explains the difference?",
-   "options": [
-    "HTTP/1.1 has no retransmission",
-    "Over HTTP/1.1 nothing arrived after the lost segment to trigger duplicate ACKs, so the sender waited for a timer; under HTTP/2 the other streams' segments triggered a fast retransmit",
-    "HTTP/2 sends every segment twice",
-    "netem delayed HTTP/1.1 packets more"
-   ],
-   "answer": 1,
-   "why": "Fast retransmit needs later segments to arrive and produce duplicate ACKs (with SACK). A lost last segment, a tail loss, leaves the sender waiting for its retransmission timer instead. On the HTTP/2 connection, the two answers behind the hole produced those ACKs, so recovery took about a round trip, but all three requests paid for it. TCP retransmits for both versions.",
-   "from": "net-08"
-  }
- ],
- "flashcards": [
-  {
-   "front": "How does an HTTP/1.1 client know where a response ends?",
-   "back": "From Content-Length, or from chunked encoding, where every chunk carries its size and a zero-size chunk ends the body."
-  },
-  {
-   "front": "What are the fields of an HTTP/2 frame header?",
-   "back": "9 bytes: length (24 bits), type (8), flags (8), a reserved bit and the stream id (31 bits)."
-  },
-  {
-   "front": "Which frame types carry a request and its answer in HTTP/2?",
-   "back": "HEADERS (type 1) and DATA (type 0); END_STREAM (flag 0x1) marks the last frame of a stream."
-  },
-  {
-   "front": "What is TCP head-of-line blocking in HTTP/2?",
-   "back": "One lost segment holds back every byte after it, so all streams on the connection wait for the retransmission."
-  },
-  {
-   "front": "What does QUIC do differently from TCP when a packet is lost?",
-   "back": "It orders bytes per stream, so only the streams with data in the lost packet wait."
-  },
-  {
-   "front": "How does a client learn that a server speaks HTTP/3?",
-   "back": "From an Alt-Svc header such as `h3=\":443\"; ma=86400` on an earlier response, or from a DNS HTTPS record."
-  },
-  {
-   "front": "Which JDK first speaks HTTP/3, and how do you turn it on?",
-   "back": "JDK 26 (JEP 517), opt-in with `HttpClient.Version.HTTP_3` on the client or the request."
-  }
- ],
- "terms": [
-  {
-   "term": "Persistent connection",
-   "plain": "An HTTP connection kept open to carry more than one request, one after another."
-  },
-  {
-   "term": "Head-of-line blocking",
-   "plain": "The first item in a queue holding up everything behind it."
-  },
-  {
-   "term": "Stream",
-   "plain": "One request and its response inside an HTTP/2 or QUIC connection, with its own id."
-  },
-  {
-   "term": "Frame",
-   "plain": "A unit of HTTP/2 data with a 9-byte header naming its length, type, flags and stream."
-  },
-  {
-   "term": "HPACK",
-   "plain": "HTTP/2's header compression: a static table, a per-connection dynamic table and Huffman coding."
-  },
-  {
-   "term": "ALPN",
-   "plain": "A TLS extension in which the client lists the protocols it speaks and the server picks one."
-  },
-  {
-   "term": "QUIC",
-   "plain": "A transport over UDP with streams, loss recovery, congestion control and TLS 1.3 built in."
-  },
-  {
-   "term": "Alt-Svc",
-   "plain": "A response header announcing that the same service is available another way, such as HTTP/3."
-  }
- ],
- "explain_back": {
-  "prompt": "Your team lead asks: \"We moved the issuer calls from HTTP/1.1 to HTTP/2 to stop head-of-line blocking. Should we go to HTTP/3 next?\" Explain what HTTP/2 fixed, what it didn't, and when HTTP/3 would help these calls.",
-  "answer": "HTTP/2 fixed the HTTP/1.1 kind of blocking: on HTTP/1.1 a connection carries one exchange at a time, so a slow authorization holds up the next one, and we needed a big pool to get parallelism. HTTP/2 labels every frame with a stream id, so many requests share one connection and a slow answer doesn't block the others. What it didn't fix is TCP's blocking: all those streams travel in one ordered byte stream, so a single lost segment makes every request on the connection wait for the retransmission, and one congestion window throttles them all. HTTP/3 runs over QUIC, which orders bytes per stream, so a loss only delays its own request, and it also saves a round trip on new connections and survives address changes. For our issuer calls, between data centers with very little loss and long-lived pooled connections, those gains are small, and we'd need JDK 26 or newer to use it from the HttpClient. I'd rather measure p99 under loss first; if one HTTP/2 connection is the problem, a few connections instead of one is the cheaper fix."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "**Server push is gone in practice.** HTTP/2 let a server send responses the client hadn't asked for yet. Browsers found it hard to use well, and Chrome removed support for it in 2022. You can ignore PUSH_PROMISE frames in new code.\n\n**Priorities.** HTTP/2's original stream priority tree was complex and rarely implemented well. RFC 9218 replaced it with a simpler scheme: an `urgency` from 0 to 7 and an `incremental` flag, sent as a `Priority` header or a frame, used by both HTTP/2 and HTTP/3.\n\n**QPACK's careful design.** HPACK assumes header blocks arrive in order, which TCP guarantees. QUIC's streams don't, so QPACK sends dynamic table updates on a separate stream and lets the encoder choose how much a header block may depend on updates that haven't arrived yet: compression against the risk of blocking.\n\n**Why QUIC lives in user space.** TCP is in every kernel and every middlebox has opinions about it, so changing it takes a decade. QUIC ships inside browsers and libraries and is encrypted, so middleboxes can't depend on its details, and its designers can change it with a software update. The cost is CPU: user-space UDP processing is more expensive than the kernel's TCP with its hardware offloads, which is part of why HTTP/3 rarely pays off inside a data center.\n\n**Extended CONNECT.** WebSockets over HTTP/2 (RFC 8441) and HTTP/3 (RFC 9220) open a stream with the CONNECT method instead of an HTTP/1.1 Upgrade, so a WebSocket can share a connection with ordinary requests."
- },
- "sources": [
-  {
-   "title": "RFC 9110: HTTP Semantics",
-   "url": "https://www.rfc-editor.org/rfc/rfc9110.html"
-  },
-  {
-   "title": "RFC 9113: HTTP/2",
-   "url": "https://www.rfc-editor.org/rfc/rfc9113.html"
-  },
-  {
-   "title": "RFC 9114: HTTP/3",
-   "url": "https://www.rfc-editor.org/rfc/rfc9114.html"
-  },
-  {
-   "title": "RFC 9000: QUIC, a UDP-based multiplexed and secure transport",
-   "url": "https://www.rfc-editor.org/rfc/rfc9000.html"
-  },
-  {
-   "title": "JEP 517: HTTP/3 for the HTTP Client API",
-   "url": "https://openjdk.org/jeps/517"
-  }
- ]
 }

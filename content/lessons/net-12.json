@@ -1,422 +1,426 @@
 {
- "id": "net-12",
- "title": "Production networking: load balancers, timeouts, retries and pools",
- "minutes": 40,
- "goal": "By the end you can trace a request through an L4 and an L7 load balancer, set the separate timeouts a remote call needs, retry only what is safe with capped exponential backoff and full jitter, and find and fix the idle-timeout mismatch that turns pooled connections into resets.",
- "warmup": {
-  "q": "Your service's connection pool keeps idle connections for 10 minutes. The network load balancer in front of a partner forgets idle connections after 350 seconds. After a quiet 6 minutes, what happens to the next `POST /authorize`?",
-  "options": [
-   "It works: the pool checks connections before using them",
-   "It gets a TCP reset and fails, before any backend has seen it",
-   "It hangs until the connect timeout",
-   "The load balancer answers 408 Request Timeout"
+  "id": "net-12",
+  "title": "Production networking: load balancers, timeouts, retries and pools",
+  "minutes": 40,
+  "goal": "By the end, you can follow a request through the two kinds of load balancer, set the separate timeouts a call over the network needs, retry only what is safe with random, growing waits, and find and fix the mismatch of idle timers that turns pooled connections into resets.",
+  "opening": "Picture a café on a Monday morning. The first customer taps a card, and the reader shows an error. The cashier asks them to tap again, and this time it works. All day, every payment goes through. On Tuesday morning, the same thing happens: the first payment fails, and the second works.\n\nIt's tempting to call the network flaky and make the app try every failed payment again. Careful teams do exactly that, because a retry makes the error go away. But a payment sent twice can charge a card twice, and a thousand apps retrying at once can knock a bank over.\n\nThe last lesson, HTTP/1.1, HTTP/2 and HTTP/3 over QUIC, showed how one connection carries many requests. In this lesson, we'll follow a payment through what sits between the app and the bank. We'll meet a load balancer that spreads the work, timeouts, retries, and a pool of connections kept open for reuse. By the end, we'll know why the first payment of the morning fails. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "The payments app keeps idle connections in its pool for 10 minutes. The load balancer in front of the bank forgets idle connections after 350 seconds, without telling anyone. After a quiet 6 minutes, what happens to the next payment request?",
+    "options": [
+      "It works: the pool checks each connection before using it",
+      "It gets a reset and fails, before any of the bank's machines has seen it",
+      "It waits until the connect timeout runs out",
+      "The load balancer answers with an HTTP error saying the request took too long"
+    ],
+    "answer": 1,
+    "why": "The pool still lists the connection as idle and healthy, because the balancer forgot it without telling anyone. The request goes out on it, and the balancer, which has no record of the connection, answers with a TCP reset: TCP's way of saying \"I don't know this connection\". The AWS documentation describes exactly this for its network load balancer. None of the bank's machines saw the request. Java's HTTP client would quietly retry a GET in this case, but not a POST. That's the café's Monday morning, and the last section shows the fix: the pool's idle timeout must be shorter than the balancer's."
+  },
+  "sections": [
+    {
+      "h": "One address, many servers: a load balancer turns one request into two connections",
+      "body": "The bank runs its payment program on 20 machines, but the payments app knows one name. Something has to spread the app's requests over those machines, and stop sending to the one that has crashed. DNS can hand out several addresses (lesson 9 of this track, DNS: how a name becomes an address). But every copy of a DNS answer is kept until it expires, so a dead machine stays in use until all the copies run out. So almost every busy service sits behind a **load balancer**: one address that accepts connections and passes the work to a healthy backend, one of the machines behind it.\n\nThink of the front desk of a big office. A mail room reads the address on each envelope and drops it in the right tray, unopened. A receptionist opens each letter, reads it, and writes a fresh one to the right department. Load balancers come in the same two kinds. Network people number the layers of the stack. Layer 4 is the transport, where TCP lives (the protocol that carries a stream of bytes between two programs). Layer 7 is the application, where HTTP lives (the protocol of web requests).\n\nThe mail-room kind is an L4 load balancer. It picks a backend when a connection opens, in turn or by a hash (a number worked out from the addresses and the ports, the numbers that pick out each program). From then on it copies bytes both ways without reading them. Some rewrite the addresses on packets, like the NAT of lesson 3 (a box that rewrites addresses), so the backend sees the app's address. Others, like `Lb.java` in the Try it, accept the app's TCP connection and open a second one of their own to the backend. A program that sits in the middle like this, taking one connection and opening its own, is called a proxy. Either way, an L4 balancer spreads connections, not requests. An app with a pool of four long-lived connections sends all its traffic to at most four backends, however many there are.\n\nThe receptionist kind is an L7 load balancer. It ends the app's TCP connection and its TLS, the locking from lesson 10 (so it holds the certificate), reads each HTTP request, and picks a backend for each one. It can send `/authorize` and `/refunds` to different groups of machines. Then it forwards the request over its own pooled connections. AWS, Amazon's cloud service, describes its L7 balancer exactly so: it keeps \"one connection with the client and one connection with a target\".\n\nTwo connections mean the backend no longer sees the app. In the Try it, both backends log every request as coming from 10.10.2.2, the balancer. An L7 balancer passes the app's address on in the `X-Forwarded-For` header, an extra line in the request (or in the standard `Forwarded` header, from RFC 7239, the public document that defines it). An L4 proxy can put a PROXY protocol header in front of the bytes instead. Read `X-Forwarded-For` with care. A client can send its own, and the balancer only adds to the end of it, so in the Try it a forged `203.0.113.7` arrives ahead of the real address. Trust only the entries your own proxies added, counting from the right.\n\nA balancer also checks its backends. It sends a small request every few seconds, and stops routing to a backend that fails several in a row. When a backend is about to be replaced, the balancer drains it: no new requests, while those in flight may finish. The balancer decides where a request goes. Next, we'll decide how long the app should wait for the answer.",
+      "try": {
+        "title": "Watch an L4 and an L7 balancer forward the same request",
+        "minutes": 5,
+        "steps": [
+          "Work from the `labs` folder, with the lab network up: `docker compose -f env/net.yml up -d`. It's a small pretend network of containers, programs that each behave like a separate small computer. The commands start two backends on server: `Backend.java` on ports 8081 and 8082. Each answers with its name, the address the request came from, and the `X-Forwarded-For` header. They also start two balancers on router: `Lb.java l4` on port 8080 and `Lb.java l7` on 8090. The two `until` lines wait for the four Java programs to start.",
+          "client then sends two requests through each balancer, and one more through the L7 one with a forged `X-Forwarded-For`. Predict: which address does each backend see, and what's in the header?",
+          "The last lines list router's TCP connections with `ss`, a tool that shows connections, then stop the Java programs."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in labs/",
+          "src": "n() { docker compose -f env/net.yml exec \"$@\"; }\nD=/labs/net/src/demo/java/sfz/net/l12/demo\nn -d server sh -c \"java $D/Backend.java 8081 ledger-a > /tmp/a.log\"\nn -d server sh -c \"java $D/Backend.java 8082 ledger-b > /tmp/b.log\"\nn -d router sh -c \"java $D/Lb.java l4 8080 10.10.2.20:8081,10.10.2.20:8082 > /tmp/l4.log\"\nn -d router sh -c \"java $D/Lb.java l7 8090 10.10.2.20:8081,10.10.2.20:8082 > /tmp/l7.log\"\nn router sh -c 'until grep -q L4 /tmp/l4.log && grep -q L7 /tmp/l7.log; do sleep 0.5; done'\nn server sh -c 'until grep -q listening /tmp/a.log && grep -q listening /tmp/b.log; do sleep 0.5; done'\nn client sh -c 'for i in 1 2; do curl -s http://10.10.1.2:8080/authorize; done'\nn client sh -c 'for i in 1 2; do curl -s http://10.10.1.2:8090/authorize; done'\nn client curl -s -H 'X-Forwarded-For: 203.0.113.7' http://10.10.1.2:8090/authorize\nn router ss -tn\nn router pkill java; n server pkill java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l12/demo/Lb.java"
+        },
+        "expect": "From one run:\n\n```text\nledger-a GET /authorize from 10.10.2.2:55358, X-Forwarded-For: (none)\nledger-b GET /authorize from 10.10.2.2:56946, X-Forwarded-For: (none)\nledger-a GET /authorize from 10.10.2.2:55362, X-Forwarded-For: 10.10.1.10\nledger-b GET /authorize from 10.10.2.2:56954, X-Forwarded-For: 10.10.1.10\nledger-a GET /authorize from 10.10.2.2:55362, X-Forwarded-For: 203.0.113.7, 10.10.1.10\nState Recv-Q Send-Q      Local Address:Port         Peer Address:PortProcess\nESTAB 0      0      [::ffff:10.10.2.2]:55362 [::ffff:10.10.2.20]:8081\nESTAB 0      0      [::ffff:10.10.2.2]:56954 [::ffff:10.10.2.20]:8082\n```\n\nThrough either balancer, the backends see 10.10.2.2, router's address on the server's network, and never client's 10.10.1.10: each request travelled over two TCP connections. Both balancers took turns between the backends. Only the L7 one, which reads the HTTP request, could add `X-Forwarded-For: 10.10.1.10`. It added the real address after the forged `203.0.113.7`, so the rightmost entry is the one to trust. The last request reused local port 55362. The L7 balancer keeps its own pool of connections to the backends, and those two are still open, while the L4 connections closed with their clients. Your port numbers will differ."
+      },
+      "refs": [
+        {
+          "title": "AWS: Application Load Balancers (connections and X-Forwarded-For)",
+          "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html",
+          "kind": "docs"
+        },
+        {
+          "title": "HAProxy: the PROXY protocol",
+          "url": "https://www.haproxy.org/download/3.0/doc/proxy-protocol.txt",
+          "kind": "docs"
+        },
+        {
+          "title": "Envoy: terminology (downstream, upstream, listener, cluster)",
+          "url": "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/intro/terminology",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "How long to wait: one timeout is not enough",
+      "body": "Lesson 7 of this track, TCP connections, timed a connect to a computer behind a firewall (a box that filters traffic) that silently drops packets. Linux, the operating system in the lab, resends the first message of the handshake, the exchange that opens a connection (that message is the SYN). It gives up after about 136 seconds. A thread, one line of work inside a program, that waits 136 seconds for one payment serves nobody else in that time. A pool of 20 connections all stuck like that is an app that has stopped. Every call over the network needs a limit on how long it may wait, called a timeout. The question is: wait for what?\n\nOne call to the bank waits for several things, one after another:\n\n1. a free connection from the pool, if they're all busy;\n2. DNS, if the name's address isn't saved yet (lesson 9);\n3. the TCP handshake, one round trip there and back (lesson 7);\n4. the TLS handshake, another round trip (lesson 10);\n5. the answer's headers: the bank's own work, 120 ms (thousandths of a second) on a good day;\n6. the answer's body, which may arrive in pieces.\n\nEach one fails for its own reasons, so each deserves its own limit. A connect that takes more than a few round trips won't succeed: the address is wrong, a firewall drops it, or the machine is down. So the connect timeout can be short, a second or two. Waiting for the answer is the bank's work, so that limit comes from how long the bank takes, a little above its slowest normal answers. People measure those with the p99, the time that 99 answers in 100 beat. Waiting for a connection from the pool means the app itself is overloaded. There the right move is to fail within tens of milliseconds, not to join a queue.\n\nThe body hides a trap. A read timeout (`Socket.setSoTimeout` in Java) limits each read, not the whole answer. A server that sends one byte every 500 ms never trips a 1-second read timeout, and a 20-byte body takes 10 seconds. The request timeout of the JDK HttpClient, Java's built-in web client (`HttpRequest.Builder.timeout`), stops waiting once the answer's headers have arrived, so it doesn't catch this either. Only a deadline on the whole call does: `sendAsync(...).orTimeout(...)` with the JDK client. The Try it shows all four cases.\n\nThe JDK HttpClient has `connectTimeout` on the client and `timeout` on each request. Its HTTP/1.1 pool has no size limit, so it never waits for a connection. Pools with a maximum size, such as the one in Apache HttpClient (a popular free Java library), have a separate timeout for that wait, which Apache calls the connection request timeout. Set each one on purpose. And when the app calls another program, pass on the time that's left: a request with 2 seconds left shouldn't start a call that may take 5.\n\n**Every wait gets its own limit. The whole call gets a deadline.** A timeout tells the app when to give up. Next, we'll ask when it should try again.",
+      "try": {
+        "title": "Four calls, four timeouts",
+        "minutes": 3,
+        "steps": [
+          "In the lab box (`docker compose -f env/labbox.yml run --rm box`, a Linux shell in a container with this track's tools), run `Timeouts.java`. It starts a badly behaved server of its own on 127.0.0.1, the computer's own address. Then it makes four calls with the JDK HttpClient, all with a 1-second connect timeout and a 1-second request timeout.",
+          "Predict how long each call takes before you run it: a connect to an address nobody answers, a server that is silent for 3 s, a server that sends its headers at once and then one byte every 500 ms, and the same with a 2-second deadline on the whole call."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l12/demo/Timeouts.java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l12/demo/Timeouts.java"
+        },
+        "expect": "From one run:\n\n```text\n1. connect to a silent address           1.1 s  HttpConnectTimeoutException: HTTP connect timed out\n2. a server that takes 3 s to answer     1.0 s  HttpTimeoutException: request timed out\n3. a body that trickles in              10.3 s  200, 20 bytes of body\n4. the same, with a 2 s deadline         2.0 s  TimeoutException: null\n```\n\nThe connect timeout caught the silent address after 1 second, instead of Linux's 136. The request timeout caught the silent server. But the third call took 10.3 seconds with the same two timeouts. The headers came at once, which satisfied the request timeout, and the body then crawled in for 10 seconds with nothing left to stop it. Only the deadline on the whole call, `orTimeout` on the `CompletableFuture` (Java's object for a result that will arrive later), cut it off at 2 seconds. (`null` is the JDK's message for that exception.)"
+      },
+      "refs": [
+        {
+          "title": "JDK 25: java.net.http.HttpClient",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpClient.html",
+          "kind": "docs"
+        },
+        {
+          "title": "JDK 25: java.net.Socket (connect and setSoTimeout)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/Socket.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Trying again: retries help only when they're safe and spread out",
+      "body": "A retry turns a failure into a second request. Sometimes that's exactly right. The connection was reset, the backend restarted, and the next attempt lands on a healthy one. Sometimes it's a disaster.\n\nSafety first. Say `POST /authorize` timed out after the request went out. You don't know whether the bank approved the payment, and sending it again may charge the card twice. RFC 9110, the document that defines HTTP's methods, names the ones that are safe to repeat. A request is **idempotent** when sending it twice has the same effect as sending it once. GET, HEAD, OPTIONS, TRACE, PUT and DELETE are. POST isn't, unless the bank accepts an idempotency key: a unique id per payment, which the server stores with the result. A second request with the same key gets the first result back, not a second charge.\n\nSo sort failures by what they tell you. A request that never left is always safe to send again: connection refused (nothing was listening at that address) and connect timeout (lesson 7). After a reset or a read timeout, the request may have arrived, so only an idempotent request may go again. A 400 (\"bad request\") or a 500 (\"server error\") will come back the same the second time, so don't retry those at all.\n\nThen spread the retries out. Picture 1,000 cafés whose payments all fail at the same moment, because the bank's program restarted. If each one retries after a fixed 100 ms, all 1,000 retries arrive in the same instant. The bank falls over again, and the next round is packed as tightly. Exponential backoff, waiting 100 ms, then 200, 400, 800, up to a cap, slows the rounds down. But it keeps them in step, because every client works out the same waits. **Full jitter** breaks the rhythm: each client waits a random time between zero and the current ceiling. The Try it simulates exactly this case. With jitter, all 1,000 clients are answered within about 1.1 seconds. Without it, 600 of them never are.\n\nRetries also multiply. Say a request passes through three programs, each calling the next, and each one tries 3 times. One request at the top can become 27 at the bottom, at the moment the bottom can least afford them. A **retry budget** caps the extra load: retries may add at most about 10% to what a client sends, and once that budget is spent, failures go straight back to the caller. Retry at one layer, usually the one closest to the user, and let the others fail fast.\n\nA retry rescues a request that met a broken connection. Next, we'll find where most of those broken connections come from, and solve the café's Monday morning.",
+      "try": {
+        "title": "Simulate a retry storm",
+        "minutes": 3,
+        "steps": [
+          "In the lab box, run `Jitter.java`. It simulates 1,000 clients whose first request fails, because the bank (the code says issuer, the bank that issued the card) is down until 250 ms. After that, the bank answers at most 100 requests per 10 ms. Every failed client retries with exponential backoff, at most 6 attempts in all.",
+          "Predict before you run it: with jitter or without, which gets more clients answered, and which sends more requests in total?"
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java /labs/net/src/demo/java/sfz/net/l12/demo/Jitter.java\n",
+          "file": "labs/net/src/demo/java/sfz/net/l12/demo/Jitter.java"
+        },
+        "expect": "From one run (the numbers are the same every time, because the simulation uses a fixed random seed):\n\n```text\nno jitter: wait min(1 s, 100 ms x 2^n)\n     ms  arrived  answered\n      0     1000         0\n    100     1000         0\n    300     1000       100\n    700      900       100\n   1500      800       100\n  answered 400 of 1000 clients, the last at 2500 ms; 5400 requests in all; busiest 10 ms: 1000 retries\n\nfull jitter: wait random(0, min(1 s, 100 ms x 2^n))\n     ms  arrived  answered\n      0     2269         0\n    100      635         0\n    200      488       198\n    300      266       266\n    400      260       260\n    500      138       138\n    600       39        39\n    700       31        31\n    800       42        42\n    900       18        18\n   1000        6         6\n   1100        2         2\n  answered 1000 of 1000 clients, the last at 1128 ms; 4194 requests in all; busiest 10 ms: 155 retries\n```\n\nWithout jitter, every retry round lands in a single 10 ms slot: 1,000 requests where 100 fit. So 900 fail and come back together, 400 ms later, to fail again. After six attempts 600 clients have given up, and the bank saw 5,400 requests. With full jitter, retries spread out: never more than 155 in any 10 ms, every client answered within 1.13 seconds, and fewer requests in total. The busy first 100 ms with jitter is the original 1,000 requests plus early retries, hitting a bank that is still down. None of them can succeed before 250 ms either way."
+      },
+      "refs": [
+        {
+          "title": "AWS Architecture Blog: Exponential backoff and jitter",
+          "url": "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/",
+          "kind": "read"
+        },
+        {
+          "title": "Google SRE book: Addressing cascading failures",
+          "url": "https://sre.google/sre-book/addressing-cascading-failures/",
+          "kind": "read"
+        }
+      ],
+      "aside": {
+        "title": "Why not retry every failure three times, at every layer?",
+        "body": "It's the first fix many teams reach for, because the first failure they meet is a one-off reset that a retry makes go away. But it charges a card twice when a `POST /authorize` that timed out had in fact gone through. And during an outage at the bank, it multiplies the load at the very moment the bank tries to recover: three layers of three attempts turn one request into 27. Sort the failure first. Never sent is always safe to retry, maybe processed only for an idempotent request, and a 400 or a 500 never. Then wait with full jitter, keep a retry budget of about 10%, and retry at one layer only."
+      }
+    },
+    {
+      "h": "Why the first payment of the morning fails: idle connections and their timers",
+      "body": "Remember the café whose first payment of the morning fails? Here's where it starts. A new connection to a bank 70 ms away costs a TCP round trip and a TLS round trip: 140 ms before the request may leave. It also leaves a TIME-WAIT entry, a short wait a closed connection leaves behind, on whichever side closes first (lesson 7). A **connection pool** keeps connections open between requests, so only the first request pays. Three different things are all called \"keepalive\", and they're easy to mix up:\n\n- HTTP keep-alive is reuse: HTTP/1.1's connections that stay open (the last lesson), which make a pool possible.\n- TCP keepalive (`SO_KEEPALIVE`) sends empty probes on an idle connection to check that the other end is still there. On Linux the first probe goes out after 2 hours of silence.\n- Protocol pings, such as HTTP/2's PING frame (a small message) or gRPC's keepalive, do the same job inside the program's own protocol. (gRPC is a popular way for programs to call each other over HTTP/2.)\n\nEvery hop on the path keeps idle connections for a while and then forgets them, each by its own clock. The JDK's HttpClient keeps an idle connection for 30 seconds (`jdk.httpclient.keepalive.timeout`), and the JDK's HttpServer closes one after 30 seconds (`sun.net.httpserver.idleInterval`). AWS's application load balancer, its L7 kind, closes connections that have been idle for 60 seconds. Its network load balancer, the L4 kind, stops tracking a connection after 350 seconds. If data arrives later, the AWS documentation says, \"the client receives a TCP RST packet\": a reset, TCP's way of saying \"I don't know this connection\". The NAT gateways of lesson 3, boxes that share one address among many computers, behave the same way at 350 seconds.\n\nNow the mystery. The café's payments app keeps idle connections in its pool for 10 minutes. A network load balancer in front of the bank forgets them after 350 seconds, and tells nobody. The café is quiet overnight. In the morning, the first payment goes out on a pooled connection the balancer no longer knows. The balancer answers with a reset, and the payment fails before any of the bank's machines has seen it. The cashier taps again, the pool opens a fresh connection, and that works. It looks random: only the first call after a quiet spell fails, and never under load, which is when people test.\n\nIn the front-desk picture, the receptionist threw away the file on a conversation that had gone quiet, and when you call back about it, she has no idea what you mean. The picture breaks here. She would ask you to start again, while the balancer hangs up and leaves the app to guess whether its request ever arrived.\n\nThe fix follows from the picture. **Each client's idle timeout must be shorter than the next hop's.** The pool's must be below the load balancer's, and the load balancer's below the backend's, which is what AWS recommends for its own balancer. Add a maximum connection lifetime, so that connections also follow changes in DNS (lesson 9). And retry an idempotent request once, straight away, when a reused connection is reset before any answer. The JDK client already does that for GET, which is why the GET in the Try it survives the reset and the POST does not.\n\nAll of this lowers the odds of a failed payment. It can't bring them to zero: a request that was sent and got no answer still leaves the app not knowing what happened.",
+      "stepper": {
+        "title": "A timeout, a retry and an idle connection that turns into a reset",
+        "intro": "One payments app, one load balancer that forgets connections idle for 5 s, and two backends: the numbers of the last Try it, shrunk from minutes to seconds so you can watch.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-a\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">0.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">GET /payments/42 opens connection 1</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The balancer opens its own connection to ledger-a: one request, two TCP connections.</text></svg>",
+            "say": "A GET leaves the payments app. The pool has no idle connection, so it opens connection 1 (TCP, plus TLS in real life). A load balancer that acts as a proxy accepts it, and opens a second connection of its own to a backend, here ledger-a. ledger-a sees the balancer's address, not the app's."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-bad\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-bad\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">no answer: the request timeout fires</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">ledger-a is stuck. After 1 s the client gives up and closes the connection.</text></svg>",
+            "say": "ledger-a stops answering, say because Java paused it to clean up its memory (a garbage-collection pause). The app's request timeout of 1 s fires, and the app closes the connection, because a late answer could still arrive on it. Without that timeout, the call would wait as long as ledger-a does."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-bad\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box-a\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"122\" x2=\"492\" y2=\"152\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.04 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">retry after a random wait: 37 ms</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">A GET is safe to repeat. The ceiling was 100 ms and jitter picked 37.</text></svg>",
+            "say": "A GET is idempotent, so the app may try again. It waits a random time between 0 and the current ceiling of 100 ms (full jitter), 37 ms this time, so that a thousand clients that failed together don't come back together. The new connection lands on ledger-b, which answers 200."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: idle</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"438\" y1=\"122\" x2=\"492\" y2=\"152\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.1 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">done: connection 2 goes back to the pool</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The pool keeps it for 30 s; the balancer forgets idle ones after 5 s.</text></svg>",
+            "say": "The answer is in, and connection 2 goes back to the pool, idle and ready for the next call. Two clocks start. The pool will keep it for 30 seconds (the JDK HttpClient's default), and the balancer will forget it after 5 seconds without traffic."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: idle</text><rect class=\"box-dim\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">forgot connection 2</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-d\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">6.1 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">the balancer forgets connection 2</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">It closes its side to ledger-b and tells the client nothing.</text></svg>",
+            "say": "Five seconds of silence. The balancer drops connection 2 from its table and closes its own connection to ledger-b. It sends nothing to the app, as cloud network load balancers and NAT gateways do. The pool still lists connection 2 as idle and healthy."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-bad\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: reset</text><rect class=\"box-bad\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">answers with RST</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-bad\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">9.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">POST /authorize on connection 2: reset</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">IOException: HTTP/1.1 header parser received no bytes (Connection reset)</text></svg>",
+            "say": "The next payment takes the idle connection from the pool. The balancer has no record of it, and answers with a reset. No backend ever saw the request, but the app can't know that, and a POST without an idempotency key must not be sent again blindly. The JDK quietly retries a GET in this situation. The POST fails."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 4 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 2: closed at 5.1 s</text><text class=\"t-s t-code t-ok\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 3: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-ok\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">9.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">the fix: a pool idle timeout below 5 s</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The pool closed connection 2 first, so the POST opens connection 3: 200.</text></svg>",
+            "say": "The fix is a rule: each client's idle timeout must be shorter than the next hop's. With the pool's set to 4 seconds, the pool closes connection 2 at 5.1 s, before the balancer forgets it. The POST at 9 s opens a fresh connection and gets its 200. The Try it below runs both versions."
+          }
+        ]
+      },
+      "try": {
+        "title": "Reproduce the idle-timeout reset",
+        "minutes": 5,
+        "steps": [
+          "In the lab box, start one backend and an L4 balancer that forgets connections after 5 seconds of silence and resets them on their next use, like a cloud network load balancer. tcpdump, a program that records packets, notes every reset on port 8080.",
+          "`Caller.java` plays the payments app, with one long-lived JDK HttpClient. It sends a request at once, another 2 s later, and a third 9 s after the start, 7 s after the second. Predict what happens to the third call as a POST, as a GET, and as a POST with the pool's idle timeout set to 4 s.",
+          "The run takes about 40 seconds."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "D=/labs/net/src/demo/java/sfz/net/l12/demo\njava $D/Backend.java 8081 ledger-a > /tmp/b.log &\njava $D/Lb.java l4 8080 127.0.0.1:8081 5 > /tmp/lb.log &\nuntil grep -q listening /tmp/b.log 2>/dev/null && grep -q L4 /tmp/lb.log 2>/dev/null; do sleep 0.2; done\ntcpdump -i lo -nn --immediate-mode -w /tmp/rst.pcap 'tcp port 8080 and tcp[tcpflags] & tcp-rst != 0' 2>/dev/null &\njava $D/Caller.java http://127.0.0.1:8080/authorize POST 0,2,9\njava $D/Caller.java http://127.0.0.1:8080/payments/42 GET 0,2,9\njava -Djdk.httpclient.keepalive.timeout=4 $D/Caller.java http://127.0.0.1:8080/authorize POST 0,2,9\nkill %3; wait %3 2>/dev/null\ngrep -E 'forgotten|reset' /tmp/lb.log\ntcpdump -r /tmp/rst.pcap -nn 2>/dev/null\n",
+          "file": "labs/net/src/demo/java/sfz/net/l12/demo/Caller.java"
+        },
+        "expect": "From one run (the backend's reply after `200` trimmed, and tcpdump's options too):\n\n```text\npool idle timeout: 30 (the default) s\n22:06:34  t= 0.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:34980, ...\n22:06:36  t= 2.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:34980, ...\n22:06:43  t= 9.0 s  POST  failed: IOException: HTTP/1.1 header parser received no bytes (SocketException: Connection reset)\npool idle timeout: 30 (the default) s\n22:06:47  t= 0.1 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:56602, ...\n22:06:49  t= 2.0 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:56602, ...\n22:06:56  t= 9.0 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:41334, ...\npool idle timeout: 4 s\n22:07:02  t= 0.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:51934, ...\n22:07:04  t= 2.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:51934, ...\n22:07:11  t= 9.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:50176, ...\n22:06:41  lb: connection 1: idle for 5 s, forgotten (backend side closed, client not told)\n22:06:43  lb: connection 1: data after the idle timeout, sending a reset\n22:06:54  lb: connection 2: idle for 5 s, forgotten (backend side closed, client not told)\n22:06:56  lb: connection 2: data after the idle timeout, sending a reset\n22:06:43.380409 IP 127.0.0.1.8080 > 127.0.0.1.43998: Flags [R.], seq 454177905, ack 4048227309, win 512, length 0\n22:06:56.417297 IP 127.0.0.1.8080 > 127.0.0.1.42254: Flags [R.], seq 814232598, ack 941334079, win 512, length 0\n```\n\nThe first two calls of each run share a connection: the backend sees the same port. At 9 s, the POST went out on a connection the balancer had forgotten 2 seconds earlier, and the reset came back. That's the first RST in the capture, and the JDK's confusing \"header parser received no bytes\". The GET met the same reset (the second RST), but the JDK quietly retried it on a new connection, which is why the backend saw a new port, 41334. The JDK does that only for requests it considers idempotent. With the pool's idle timeout at 4 s, the pool closed the connection before the balancer forgot it, and the third POST opened a new one without any fuss. Your times and ports will differ."
+      },
+      "refs": [
+        {
+          "title": "AWS: Network Load Balancers (connection idle timeout)",
+          "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html",
+          "kind": "docs"
+        },
+        {
+          "title": "JDK 25: java.net.http module (jdk.httpclient.keepalive.timeout)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/module-summary.html",
+          "kind": "docs"
+        }
+      ]
+    }
   ],
-  "answer": 1,
-  "why": "The pool still lists the connection as idle and healthy, because the balancer forgot it without telling anyone. The request goes out on it, the balancer has no record of the connection, and it answers with a TCP reset, which the AWS documentation describes for its network load balancer. No backend saw the request. The JDK would quietly retry a GET in this case, but not a POST. The pool's idle timeout must be shorter than the balancer's."
- },
- "sections": [
-  {
-   "h": "A load balancer is a proxy: one request, two connections",
-   "body": "The card issuer you call runs its API on 20 machines, and your service knows one name. Something has to spread your traffic over those machines and stop sending to the one that just crashed. DNS can hand out several addresses (lesson 9), but every cache along the way keeps its copy, and a dead machine stays in rotation until all the copies expire. So almost every API sits behind a **load balancer**: one address that accepts your connections and passes the work to a healthy backend.\n\nThe simplest kind works at layer 4, the transport (the L4 of lesson 1). An L4 load balancer picks a backend when a connection opens, in turn or by a hash of the addresses and ports, and from then on moves bytes in both directions without reading them. Some rewrite packet addresses like lesson 3's NAT, so the backend sees your IP. Others, like `Lb.java` in the Try it, accept your TCP connection and open a second one of their own to the backend. Either way an L4 balancer balances connections, not requests: a service with a pool of four long-lived connections sends all its traffic to at most four backends, however many there are.\n\nAn L7 load balancer works at the application layer. It ends your TCP connection and your TLS (it holds the certificate from lesson 10), reads each HTTP request, picks a backend per request (it can send `/authorize` and `/refunds` to different pools) and forwards the request over its own pooled connections. AWS describes its L7 balancer exactly so: it keeps \"one connection with the client and one connection with a target\".\n\nTwo connections mean the backend no longer sees the client. In the Try it, both backends log every request as coming from 10.10.2.2, the balancer. An L7 balancer passes your address on in the `X-Forwarded-For` header (or the standard `Forwarded` header of RFC 7239); an L4 proxy can put a PROXY protocol header in front of the byte stream instead. Read `X-Forwarded-For` with care. A client can send its own, and the balancer only appends to it, so in the Try it a forged `203.0.113.7` arrives ahead of the real address. Trust only the entries your own proxies added, counting from the right.\n\nA balancer also checks its backends: it sends a request every few seconds and stops routing to a backend that fails several in a row. During a deploy it drains a backend: no new requests, while those in flight may finish.",
-   "try": {
-    "title": "Watch an L4 and an L7 balancer forward the same request",
-    "minutes": 5,
-    "steps": [
-     "From the `labs` folder, with the lab network up (`docker compose -f env/net.yml up -d`). The commands start two backends on server (`Backend.java`, ports 8081 and 8082, each answering with its name, the address the request came from and the `X-Forwarded-For` header), and two balancers on router: `Lb.java l4` on port 8080 and `Lb.java l7` on 8090. The two `until` lines wait for the four JVMs to start.",
-     "client then sends two requests through each balancer, and one more through the L7 one with a forged `X-Forwarded-For`. Predict: which address does each backend see, and what's in the header?",
-     "The last lines show router's TCP connections, then stop the Java processes."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in labs/",
-     "src": "n() { docker compose -f env/net.yml exec \"$@\"; }\nD=/labs/net/src/demo/java/sfz/net/l12/demo\nn -d server sh -c \"java $D/Backend.java 8081 ledger-a > /tmp/a.log\"\nn -d server sh -c \"java $D/Backend.java 8082 ledger-b > /tmp/b.log\"\nn -d router sh -c \"java $D/Lb.java l4 8080 10.10.2.20:8081,10.10.2.20:8082 > /tmp/l4.log\"\nn -d router sh -c \"java $D/Lb.java l7 8090 10.10.2.20:8081,10.10.2.20:8082 > /tmp/l7.log\"\nn router sh -c 'until grep -q L4 /tmp/l4.log && grep -q L7 /tmp/l7.log; do sleep 0.5; done'\nn server sh -c 'until grep -q listening /tmp/a.log && grep -q listening /tmp/b.log; do sleep 0.5; done'\nn client sh -c 'for i in 1 2; do curl -s http://10.10.1.2:8080/authorize; done'\nn client sh -c 'for i in 1 2; do curl -s http://10.10.1.2:8090/authorize; done'\nn client curl -s -H 'X-Forwarded-For: 203.0.113.7' http://10.10.1.2:8090/authorize\nn router ss -tn\nn router pkill java; n server pkill java\n",
-     "file": "labs/net/src/demo/java/sfz/net/l12/demo/Lb.java"
+  "compare": {
+    "title": "The same three calls, with two pool idle timeouts",
+    "a": {
+      "label": "Pool keeps idle connections 30 s",
+      "lang": "text",
+      "title": "load balancer forgets after 5 s",
+      "src": "t= 0.0 s  POST  200  from 127.0.0.1:34980\nt= 2.0 s  POST  200  from 127.0.0.1:34980   (same connection)\nt= 9.0 s  POST  failed: IOException: HTTP/1.1 header parser\n          received no bytes (Connection reset)\n\nlb: connection 1: idle for 5 s, forgotten\nlb: connection 1: data after the idle timeout, sending a reset\n"
     },
-    "expect": "From one run:\n\n```text\nledger-a GET /authorize from 10.10.2.2:55358, X-Forwarded-For: (none)\nledger-b GET /authorize from 10.10.2.2:56946, X-Forwarded-For: (none)\nledger-a GET /authorize from 10.10.2.2:55362, X-Forwarded-For: 10.10.1.10\nledger-b GET /authorize from 10.10.2.2:56954, X-Forwarded-For: 10.10.1.10\nledger-a GET /authorize from 10.10.2.2:55362, X-Forwarded-For: 203.0.113.7, 10.10.1.10\nState Recv-Q Send-Q      Local Address:Port         Peer Address:PortProcess\nESTAB 0      0      [::ffff:10.10.2.2]:55362 [::ffff:10.10.2.20]:8081\nESTAB 0      0      [::ffff:10.10.2.2]:56954 [::ffff:10.10.2.20]:8082\n```\n\nThrough either balancer, the backends see 10.10.2.2, router's address on wan, never client's 10.10.1.10: each request travelled over two TCP connections. Both balancers took turns between the backends. Only the L7 one, which reads the HTTP request, could add `X-Forwarded-For: 10.10.1.10`, and it appended the real address after the forged `203.0.113.7`, so the rightmost entry is the one to trust. The last request reused local port 55362: the L7 balancer keeps its own pool of connections to the backends, and those two are still open, while the L4 connections closed with their clients. Your port numbers will differ."
-   },
-   "refs": [
-    {
-     "title": "AWS: Application Load Balancers (connections and X-Forwarded-For)",
-     "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html",
-     "kind": "docs"
+    "b": {
+      "label": "Pool keeps idle connections 4 s",
+      "lang": "text",
+      "title": "the same load balancer",
+      "src": "t= 0.0 s  POST  200  from 127.0.0.1:51934\nt= 2.0 s  POST  200  from 127.0.0.1:51934   (same connection)\nt= 9.0 s  POST  200  from 127.0.0.1:50176   (a new connection)\n\nthe pool closed the idle connection at 6 s,\nbefore the balancer forgot it at 7 s\n"
     },
-    {
-     "title": "HAProxy: the PROXY protocol",
-     "url": "https://www.haproxy.org/download/3.0/doc/proxy-protocol.txt",
-     "kind": "docs"
-    },
-    {
-     "title": "Envoy: terminology (downstream, upstream, listener, cluster)",
-     "url": "https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/intro/terminology",
-     "kind": "read"
-    }
-   ]
+    "note": "Both come from the last Try it. The only change is `-Djdk.httpclient.keepalive.timeout=4`. When the client gives up on an idle connection first, the worst that can happen is a new handshake. When the balancer gives up first, the next request on that connection is lost. Set every client's idle timeout below the next hop's, all the way down the path."
   },
-  {
-   "h": "One timeout is not enough",
-   "body": "Lesson 7 timed a connect to a host behind a firewall that drops packets: Linux resends the SYN and gives up after about 136 seconds. A thread that waits 136 seconds for one authorization serves nobody else in that time, and a pool of 20 connections all stuck like that is a service that has stopped. Every remote call needs a limit on how long it may wait. The question is: wait for what?\n\nOne call to an issuer waits for several different things, one after another:\n\n1. a free connection from the pool, if they are all busy;\n2. DNS, if the name isn't cached (lesson 9);\n3. the TCP handshake, one round trip (lesson 7);\n4. the TLS handshake, another round trip (lesson 10);\n5. the response headers: the issuer's own work, 120 ms on a good day;\n6. the response body, which may arrive in pieces.\n\nEach one fails for its own reasons, so each deserves its own limit. A connect that takes more than a few round trips won't succeed: the address is wrong, a firewall drops it or the host is down, so the connect timeout can be short, a second or two. Waiting for the response is the issuer's work, so that limit comes from its latency, a little above its p99. Waiting for a connection from the pool means your own service is overloaded, and the right answer there is to fail within tens of milliseconds rather than queue.\n\nThe body hides a trap. A read timeout (`Socket.setSoTimeout` in Java) limits each read, not the whole response. A server that sends one byte every 500 ms never trips a 1-second read timeout, and a 20-byte body takes 10 seconds. The JDK HttpClient's request timeout (`HttpRequest.Builder.timeout`) stops waiting once the response headers have arrived, so it doesn't catch this either. Only a deadline on the whole call does: `sendAsync(...).orTimeout(...)` with the JDK client. The Try it shows all four cases.\n\nThe JDK HttpClient has `connectTimeout` on the client and `timeout` on each request. Its HTTP/1.1 pool has no size limit, so it never waits for a connection; pools with a maximum size, such as Apache HttpClient's, have a separate timeout for that wait (Apache calls it the connection request timeout). Set each one deliberately, and pass the remaining time on when your service calls another: a request with 2 seconds left shouldn't start a call that may take 5.",
-   "try": {
-    "title": "Four calls, four timeouts",
-    "minutes": 3,
+  "worked": {
+    "title": "Choose the timeouts and the pool for one issuer call",
     "steps": [
-     "In the lab box (`docker compose -f env/labbox.yml run --rm box`), run `Timeouts.java`. It starts a misbehaving server of its own on 127.0.0.1 and makes four calls with the JDK HttpClient, all with a 1-second connect timeout and a 1-second request timeout.",
-     "Predict how long each call takes before you run it: a connect to an address nobody answers, a server that is silent for 3 s, a server that sends its headers at once and then one byte every 500 ms, and the same with a 2-second deadline on the whole call."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java /labs/net/src/demo/java/sfz/net/l12/demo/Timeouts.java\n",
-     "file": "labs/net/src/demo/java/sfz/net/l12/demo/Timeouts.java"
-    },
-    "expect": "From one run:\n\n```text\n1. connect to a silent address           1.1 s  HttpConnectTimeoutException: HTTP connect timed out\n2. a server that takes 3 s to answer     1.0 s  HttpTimeoutException: request timed out\n3. a body that trickles in              10.3 s  200, 20 bytes of body\n4. the same, with a 2 s deadline         2.0 s  TimeoutException: null\n```\n\nThe connect timeout caught the silent address after 1 second instead of Linux's 136. The request timeout caught the silent server. But the third call took 10.3 seconds with the same two timeouts: the headers came at once, which satisfied the request timeout, and the body then crawled in for 10 seconds with nothing left to stop it. Only the deadline on the whole call, `orTimeout` on the `CompletableFuture`, cut it off at 2 seconds. (`null` is the JDK's message for that exception.)"
-   },
-   "refs": [
-    {
-     "title": "JDK 25: java.net.http.HttpClient",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/java/net/http/HttpClient.html",
-     "kind": "docs"
-    },
-    {
-     "title": "JDK 25: java.net.Socket (connect and setSoTimeout)",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/net/Socket.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Retries help only when they are safe and spread out",
-   "body": "A retry turns a failure into a second request. Sometimes that's exactly right: the connection was reset, the backend restarted, and the next attempt lands on a healthy one. Sometimes it's a disaster.\n\nSafety first. If `POST /authorize` timed out after the request went out, you don't know whether the issuer authorized the payment, and sending it again may charge the card twice. RFC 9110 names the methods that are safe to repeat: a request is **idempotent** when sending it twice has the same effect as sending it once, and GET, HEAD, OPTIONS, TRACE, PUT and DELETE are. POST isn't, unless the API accepts an idempotency key: a unique id per payment that the server stores with the result, so that a second request with the same key gets the first result back instead of a second charge. A request that never left is always safe to retry: connection refused and connect timeout (lesson 7). After a reset or a read timeout, only idempotent requests are. A 400 or a 500 will come back the same the second time, so don't retry those at all.\n\nThen spread the retries out. Picture 1,000 clients that all get an error at the same moment, because the issuer restarted. If each one retries after a fixed 100 ms, all 1,000 retries arrive in the same instant, the issuer falls over again, and the next round is just as synchronized. Exponential backoff (wait 100 ms, then 200, 400, 800, up to a cap) slows the rounds down but keeps them synchronized, because every client computes the same waits. **Full jitter** breaks the rhythm: each client waits a random time between zero and the current ceiling. The Try it simulates exactly this case. With jitter, all 1,000 clients are answered within about 1.1 seconds; without it, 600 of them never are.\n\nRetries also multiply. If every layer of a call chain tries 3 times, one request to a service three layers deep can become 27 requests at the bottom, at the moment the bottom can least afford them. A **retry budget** caps the extra load: retries may add at most about 10% to what a client sends, and once that budget is spent, failures go straight back to the caller. Retry at one layer, usually the one closest to the user, and let the others fail fast.",
-   "try": {
-    "title": "Simulate a retry storm",
-    "minutes": 3,
-    "steps": [
-     "In the lab box, run `Jitter.java`. It simulates 1,000 clients whose first request fails because the issuer is down until 250 ms; after that the issuer answers at most 100 requests per 10 ms. Every failed client retries with exponential backoff, at most 6 attempts in all.",
-     "Predict before you run it: with jitter or without, which gets more clients answered, and which sends more requests in total?"
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java /labs/net/src/demo/java/sfz/net/l12/demo/Jitter.java\n",
-     "file": "labs/net/src/demo/java/sfz/net/l12/demo/Jitter.java"
-    },
-    "expect": "From one run (the numbers are the same every time: the simulation uses a fixed random seed):\n\n```text\nno jitter: wait min(1 s, 100 ms x 2^n)\n     ms  arrived  answered\n      0     1000         0\n    100     1000         0\n    300     1000       100\n    700      900       100\n   1500      800       100\n  answered 400 of 1000 clients, the last at 2500 ms; 5400 requests in all; busiest 10 ms: 1000 retries\n\nfull jitter: wait random(0, min(1 s, 100 ms x 2^n))\n     ms  arrived  answered\n      0     2269         0\n    100      635         0\n    200      488       198\n    300      266       266\n    400      260       260\n    500      138       138\n    600       39        39\n    700       31        31\n    800       42        42\n    900       18        18\n   1000        6         6\n   1100        2         2\n  answered 1000 of 1000 clients, the last at 1128 ms; 4194 requests in all; busiest 10 ms: 155 retries\n```\n\nWithout jitter, every retry round lands in a single 10 ms slot: 1,000 requests where 100 fit, so 900 fail and come back together, 400 ms later, to fail again. After six attempts 600 clients have given up, and the issuer saw 5,400 requests. With full jitter, retries spread out: never more than 155 in any 10 ms, every client answered within 1.13 seconds, and fewer requests in total. The busy first 100 ms with jitter is the original 1,000 requests plus early retries hitting an issuer that is still down; none of them can succeed before 250 ms either way."
-   },
-   "refs": [
-    {
-     "title": "AWS Architecture Blog: Exponential backoff and jitter",
-     "url": "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/",
-     "kind": "read"
-    },
-    {
-     "title": "Google SRE book: Addressing cascading failures",
-     "url": "https://sre.google/sre-book/addressing-cascading-failures/",
-     "kind": "read"
-    }
-   ]
-  },
-  {
-   "h": "Pools keep connections, and every hop forgets idle ones on its own clock",
-   "body": "A new connection to an issuer 70 ms away costs a TCP round trip and a TLS round trip, 140 ms before the request may leave, and leaves a TIME-WAIT entry on whichever side closes it first (lesson 7). A **connection pool** keeps connections open between requests, so only the first request pays. Three different mechanisms are all called \"keepalive\", and they're easy to mix up:\n\n- HTTP keep-alive is connection reuse: HTTP/1.1's persistent connections from lesson 11, which are what make a pool possible.\n- TCP keepalive (`SO_KEEPALIVE`) sends empty probes on an idle connection to check that the peer is still there. On Linux the first probe goes out after 2 hours of silence.\n- Protocol pings, such as HTTP/2's PING frame or gRPC's keepalive, do the same job inside the application protocol.\n\nEvery hop on the path keeps idle connections for a while and then forgets them, each by its own clock. The JDK's HttpClient keeps an idle connection for 30 seconds (`jdk.httpclient.keepalive.timeout`), and the JDK's HttpServer closes one after 30 seconds (`sun.net.httpserver.idleInterval`). AWS's application load balancer closes connections that have been idle for 60 seconds. Its network load balancer stops tracking a connection after 350 seconds, and if data arrives later, the AWS documentation says, \"the client receives a TCP RST packet\". Lesson 3's NAT gateways behave the same way at 350 seconds.\n\nNow the incident. A client's pool keeps idle connections for 10 minutes. A network load balancer in front of the issuer forgets them after 350 seconds, and tells nobody. After a quiet six minutes, the next authorization goes out on a pooled connection the balancer no longer knows. The balancer answers with a reset, and the request fails before any backend has seen it. It looks random: only the first call after a quiet spell fails, only on some instances, and never under load, which is when people test.\n\nThe rule follows from the picture: each client's idle timeout must be shorter than the idle timeout of the next hop. Your pool's must be below the load balancer's, and the load balancer's below the backend's, which is what AWS recommends for its own balancer. Add a maximum connection lifetime, so that connections also follow DNS changes (lesson 9), and retry an idempotent request once, immediately, when a reused connection is reset before any answer. The JDK client already does that for GET, which is why the GET in the Try it survives the reset and the POST does not.",
-   "stepper": {
-    "title": "A timeout, a retry and an idle connection that turns into a reset",
-    "intro": "One payment service, one load balancer that forgets connections idle for 5 s, and two backends: the numbers of the last Try it.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-a\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">0.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">GET /payments/42 opens connection 1</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The balancer opens its own connection to ledger-a: one request, two TCP connections.</text></svg>",
-      "say": "A GET leaves the payment service. The pool has nothing idle, so it opens connection 1 (TCP, and TLS in real life). A proxying load balancer accepts it and opens a second connection of its own to a backend, here ledger-a, which sees the balancer's address, not yours."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-bad\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-bad\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">no answer: the request timeout fires</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">ledger-a is stuck. After 1 s the client gives up and closes the connection.</text></svg>",
-      "say": "ledger-a stops answering, say in a long garbage-collection pause. The client's request timeout of 1 s fires, and the client closes the connection, because a late answer could still arrive on it. Without that timeout the call would wait as long as ledger-a does."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-bad\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box-a\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"122\" x2=\"492\" y2=\"152\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.04 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">retry after a random wait: 37 ms</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">A GET is safe to repeat. The ceiling was 100 ms and jitter picked 37.</text></svg>",
-      "say": "A GET is idempotent, so the client may try again. It waits a random time between 0 and the current ceiling of 100 ms (full jitter), 37 ms this time, so that a thousand clients that failed together don't come back together. The new connection lands on ledger-b, which answers 200."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: idle</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln\" x1=\"438\" y1=\"122\" x2=\"492\" y2=\"152\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">1.1 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">done: connection 2 goes back to the pool</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The pool keeps it for 30 s; the balancer forgets idle ones after 5 s.</text></svg>",
-      "say": "The answer is in, and connection 2 goes back to the pool, idle, ready for the next call. Two clocks start: the pool will keep it for 30 seconds (the JDK HttpClient's default), and the balancer will forget it after 5 seconds without traffic."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-a\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: idle</text><rect class=\"box-dim\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">forgot connection 2</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-d\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">6.1 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">the balancer forgets connection 2</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">It closes its side to ledger-b and tells the client nothing.</text></svg>",
-      "say": "Five seconds of silence: the balancer drops connection 2 from its table and closes its own connection to ledger-b. It sends nothing to the client, as cloud network load balancers and NAT gateways do. The pool still lists connection 2 as idle and healthy."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 30 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 1: closed</text><text class=\"t-s t-code t-bad\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 2: reset</text><rect class=\"box-bad\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">answers with RST</text><rect class=\"box\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-bad\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">9.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">POST /authorize on connection 2: reset</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">IOException: HTTP/1.1 header parser received no bytes (Connection reset)</text></svg>",
-      "say": "The next authorization takes the idle connection from the pool. The balancer has no record of it and answers with a reset. No backend ever saw the request, but the client can't know that, and a POST without an idempotency key must not be resent blindly. The JDK silently retries a GET in this situation; the POST fails."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A payment service with a connection pool calls two ledger backends through a load balancer; the status line says what happened at this moment\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"14\" y=\"36\" width=\"210\" height=\"150\" rx=\"8\"/><text class=\"t\" x=\"119\" y=\"60\" text-anchor=\"middle\">payment service</text><text class=\"t-s t-m\" x=\"119\" y=\"80\" text-anchor=\"middle\">pool, idle timeout 4 s</text><text class=\"t-s t-code\" x=\"30\" y=\"112\" text-anchor=\"start\">conn 2: closed at 5.1 s</text><text class=\"t-s t-code t-ok\" x=\"30\" y=\"134\" text-anchor=\"start\">conn 3: in use</text><rect class=\"box\" x=\"276\" y=\"76\" width=\"160\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"356.0\" y=\"107\" text-anchor=\"middle\">load balancer</text><text class=\"t-s t-m\" x=\"356.0\" y=\"126\" text-anchor=\"middle\">idle timeout 5 s</text><rect class=\"box-ok\" x=\"496\" y=\"36\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"62\" text-anchor=\"middle\">ledger-a</text><text class=\"t-s t-code\" x=\"581.0\" y=\"81\" text-anchor=\"middle\">10.10.2.20:8081</text><rect class=\"box\" x=\"496\" y=\"126\" width=\"170\" height=\"60\" rx=\"8\"/><text class=\"t\" x=\"581.0\" y=\"152\" text-anchor=\"middle\">ledger-b</text><text class=\"t-s t-code\" x=\"581.0\" y=\"171\" text-anchor=\"middle\">10.10.2.20:8082</text><line class=\"ln-a\" x1=\"226\" y1=\"111\" x2=\"272\" y2=\"111\" marker-end=\"url(#arr)\"/><line class=\"ln-a\" x1=\"438\" y1=\"100\" x2=\"492\" y2=\"70\" marker-end=\"url(#arr)\"/><rect class=\"box\" x=\"14\" y=\"206\" width=\"652\" height=\"80\" rx=\"8\"/><text class=\"t t-a\" x=\"30\" y=\"232\" text-anchor=\"start\">9.0 s</text><text class=\"t\" x=\"110\" y=\"232\" text-anchor=\"start\">the fix: a pool idle timeout below 5 s</text><text class=\"t-s\" x=\"30\" y=\"262\" text-anchor=\"start\">The pool closed connection 2 first, so the POST opens connection 3: 200.</text></svg>",
-      "say": "The fix is a rule: each client's idle timeout must be shorter than the next hop's. With the pool's set to 4 seconds, the pool closes connection 2 at 5.1 s, before the balancer forgets it, and the POST at 9 s opens a fresh connection and gets its 200. The Try it below reproduces both runs."
-     }
+      {
+        "say": "Start from measurements, not defaults. Suppose the bank (the issuer, in the code: the bank that issued the card) is 70 ms away. It answers in 120 ms on average, and in 400 ms at the p99, the time 99 answers in 100 beat. The app's own checkout promises its callers an answer within 2 seconds. At the busiest time, 200 payments arrive every second.",
+        "code": "round trip           70 ms\nissuer p50 / p99     120 ms / 400 ms\nour own deadline     2 s for the whole checkout call\npeak load            200 authorizations / s",
+        "lang": "text"
+      },
+      {
+        "say": "Size the pool with Little's law: requests in flight = arrival rate x the time each one takes. At the average, that's 24 connections busy at once. Give it room for slow spells, because when the bank slows down, more requests overlap.",
+        "code": "200 / s x 0.12 s = 24 in flight on average\n200 / s x 0.40 s = 80 if every call took the p99\npool: 40 connections; wait at most 50 ms for one, then fail fast",
+        "lang": "text"
+      },
+      {
+        "say": "Connect timeout: a handshake takes one round trip, 70 ms. Linux resends a lost SYN, the first handshake message, after 1 second (lesson 7), so 1.5 s lets one resend through and still fails fast on a dead address. Response timeout: twice the p99. Deadline: whatever is left of the caller's 2 seconds, so one retry of 800 ms plus its wait still fits.",
+        "code": "connect timeout      1.5 s     one SYN resend fits\nresponse timeout     800 ms    2 x p99, until the headers\ndeadline             2 s       the whole call, body and one retry included\nretry                1, only with the Idempotency-Key, after random(0, 100 ms)",
+        "lang": "text"
+      },
+      {
+        "say": "Idle timeouts: the pool's below the balancer's, and the balancer's below the backend's. Then write it all down in code. The JDK client takes the pool's idle timeout as a system property, a setting given on the command line.",
+        "code": "// -Djdk.httpclient.keepalive.timeout=30   (pool idle 30 s < balancer 60 s < backend 75 s)\nval client: HttpClient = HttpClient.newBuilder()\n    .connectTimeout(Duration.ofMillis(1_500))           // one SYN resend fits\n    .build()\n\nfun authorize(json: String, key: String): HttpResponse<String> {\n    val request = HttpRequest.newBuilder(URI.create(\"https://api.issuer.example/authorize\"))\n        .timeout(Duration.ofMillis(800))                // until the response headers\n        .header(\"Idempotency-Key\", key)                 // makes one retry safe\n        .POST(HttpRequest.BodyPublishers.ofString(json))\n        .build()\n    return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())\n        .orTimeout(2, TimeUnit.SECONDS)                 // the deadline: body included\n        .join()\n}",
+        "lang": "kotlin"
+      }
     ]
-   },
-   "try": {
-    "title": "Reproduce the idle-timeout reset",
-    "minutes": 5,
-    "steps": [
-     "In the lab box, start one backend and an L4 balancer that forgets connections after 5 seconds of silence and resets them on their next use, like a cloud network load balancer. tcpdump records every reset on port 8080.",
-     "`Caller.java` is a payment service with one long-lived JDK HttpClient. It sends a request at once, another 2 s later, and a third 9 s after the start, 7 s after the second. Predict the third call's fate as a POST, as a GET, and as a POST with the pool's idle timeout set to 4 s.",
-     "The run takes about 40 seconds."
+  },
+  "lab": {
+    "title": "A retry policy and a connection pool against a load balancer that forgets",
+    "minutes": 15,
+    "needs": [],
+    "files": [
+      "labs/net/src/main/kotlin/sfz/net/l12/RetryPolicy.kt",
+      "labs/net/src/main/kotlin/sfz/net/l12/ConnectionPool.kt",
+      "labs/net/src/main/kotlin/sfz/net/l12/Caller.kt",
+      "labs/net/src/main/kotlin/sfz/net/l12/Http.kt"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "D=/labs/net/src/demo/java/sfz/net/l12/demo\njava $D/Backend.java 8081 ledger-a > /tmp/b.log &\njava $D/Lb.java l4 8080 127.0.0.1:8081 5 > /tmp/lb.log &\nuntil grep -q listening /tmp/b.log 2>/dev/null && grep -q L4 /tmp/lb.log 2>/dev/null; do sleep 0.2; done\ntcpdump -i lo -nn --immediate-mode -w /tmp/rst.pcap 'tcp port 8080 and tcp[tcpflags] & tcp-rst != 0' 2>/dev/null &\njava $D/Caller.java http://127.0.0.1:8080/authorize POST 0,2,9\njava $D/Caller.java http://127.0.0.1:8080/payments/42 GET 0,2,9\njava -Djdk.httpclient.keepalive.timeout=4 $D/Caller.java http://127.0.0.1:8080/authorize POST 0,2,9\nkill %3; wait %3 2>/dev/null\ngrep -E 'forgotten|reset' /tmp/lb.log\ntcpdump -r /tmp/rst.pcap -nn 2>/dev/null\n",
-     "file": "labs/net/src/demo/java/sfz/net/l12/demo/Caller.java"
-    },
-    "expect": "From one run (the backend's reply after `200` trimmed, and tcpdump's options too):\n\n```text\npool idle timeout: 30 (the default) s\n22:06:34  t= 0.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:34980, ...\n22:06:36  t= 2.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:34980, ...\n22:06:43  t= 9.0 s  POST  failed: IOException: HTTP/1.1 header parser received no bytes (SocketException: Connection reset)\npool idle timeout: 30 (the default) s\n22:06:47  t= 0.1 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:56602, ...\n22:06:49  t= 2.0 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:56602, ...\n22:06:56  t= 9.0 s  GET  200  ledger-a GET /payments/42 from 127.0.0.1:41334, ...\npool idle timeout: 4 s\n22:07:02  t= 0.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:51934, ...\n22:07:04  t= 2.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:51934, ...\n22:07:11  t= 9.0 s  POST  200  ledger-a POST /authorize from 127.0.0.1:50176, ...\n22:06:41  lb: connection 1: idle for 5 s, forgotten (backend side closed, client not told)\n22:06:43  lb: connection 1: data after the idle timeout, sending a reset\n22:06:54  lb: connection 2: idle for 5 s, forgotten (backend side closed, client not told)\n22:06:56  lb: connection 2: data after the idle timeout, sending a reset\n22:06:43.380409 IP 127.0.0.1.8080 > 127.0.0.1.43998: Flags [R.], seq 454177905, ack 4048227309, win 512, length 0\n22:06:56.417297 IP 127.0.0.1.8080 > 127.0.0.1.42254: Flags [R.], seq 814232598, ack 941334079, win 512, length 0\n```\n\nThe first two calls of each run share a connection: the backend sees the same port. At 9 s the POST went out on a connection the balancer had forgotten 2 seconds earlier, and the reset came back: the first RST in the capture, and the JDK's confusing \"header parser received no bytes\". The GET met the same reset (the second RST), but the JDK quietly retried it on a new connection, which is why the backend saw a new port, 41334. The JDK does that only for requests it considers idempotent. With the pool's idle timeout at 4 s, the pool closed the connection before the balancer forgot it, and the third POST simply opened a new one. Your times and ports will differ."
-   },
-   "refs": [
-    {
-     "title": "AWS: Network Load Balancers (connection idle timeout)",
-     "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html",
-     "kind": "docs"
-    },
-    {
-     "title": "JDK 25: java.net.http module (jdk.httpclient.keepalive.timeout)",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.net.http/module-summary.html",
-     "kind": "docs"
+    "run": "./gradlew :net:test --tests 'sfz.net.l12.*'",
+    "steps": [
+      "Run the tests once from the `labs` folder. All 17 fail. `Http.kt` (requests, outcomes and the `Connection` interface) and `Caller.kt` (one call: take a connection, send, give it back, ask the policy) are finished. The tests use `FakeLb` from the test folder: a load balancer that forgets connections idle for 350 seconds and resets them on their next use, timed by a `ManualClock` that the test moves forward by hand.",
+      "In `RetryPolicy.kt`, write `RetryBudget` first, then `isIdempotent`, `mayRetry`, `backoffMs` (full jitter below a capped exponential ceiling) and `decide`. `RetryPolicyTest` passes in a fixed random number, so the waits come out exact.",
+      "In `ConnectionPool.kt`, write `acquire` and `release`. Throw out idle connections past the idle timeout or the maximum lifetime, reuse the one released most recently, open a new one while below the maximum size, and throw `PoolExhausted` above it.",
+      "`IdleMismatchTest` puts it all together: a pool that keeps idle connections for 600 s meets the balancer's 350 s, and then a pool with 300 s does not. Run the tests until all 17 pass, then read the test's log lines next to the stepper."
+    ],
+    "hints": [
+      "`baseMs shl (retry - 1)` doubles the ceiling. Cap the shift (say at 30) so that a large retry number can't overflow, then take `min(capMs, ...)` and multiply by `random()`.",
+      "In `decide`, check attempts, then `mayRetry`, and only then `budget.tryRetry()`: a retry you refuse anyway must not use up a token.",
+      "Ten additions of 0.1 make 0.9999999999999999, so compare the budget's tokens with `1.0 - 1e-9`, not `1.0`.",
+      "In the pool, keep `id -> openedAt` for every open connection, and a deque (a list you can use from both ends) of `(connection, idleSince)` for idle ones. `ArrayDeque.removeAll { ... }` throws out old ones, and `removeLastOrNull()` takes the newest.",
+      "A connection counts toward the maximum size whether it's in use or idle, so `open` is the size of the `openedAt` map, not of the idle deque."
+    ],
+    "done_when": "All 17 tests in `RetryPolicyTest`, `ConnectionPoolTest` and `IdleMismatchTest` pass."
+  },
+  "drill": {
+    "title": "Write the retry decision from memory",
+    "minutes": 5,
+    "prompt": "Without looking, write `mayRetry(method, hasKey, outcome)` for the outcomes refused, connect timeout, reset, read timeout and an HTTP status, and `backoffMs(retry)` with full jitter, a base of 100 ms and a cap of 2 s. Then put the idle timeouts of the pool, the load balancer and the backend in the order they must follow.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "fun isIdempotent(method: String, hasKey: Boolean) =\n    method in setOf(\"GET\", \"HEAD\", \"OPTIONS\", \"TRACE\", \"PUT\", \"DELETE\") || (method == \"POST\" && hasKey)\n\nfun mayRetry(method: String, hasKey: Boolean, outcome: Outcome): Boolean = when (outcome) {\n    Outcome.ConnectRefused, Outcome.ConnectTimeout -> true            // never sent\n    Outcome.Reset, Outcome.ReadTimeout -> isIdempotent(method, hasKey)  // maybe processed\n    is Outcome.Status -> outcome.code in setOf(429, 502, 503, 504) && isIdempotent(method, hasKey)\n}\n\nfun backoffMs(retry: Int, random: () -> Double = Math::random): Long {\n    val ceiling = minOf(2_000L, 100L shl (retry - 1).coerceAtMost(30))  // 100, 200, 400 ... 2,000\n    return (random() * ceiling).toLong()                                // anywhere below it\n}\n\n// Idle timeouts, shortest first: client pool < load balancer < backend server.\n"
     }
-   ]
-  }
- ],
- "analogy": "An L4 load balancer is the mail room of a big office: it reads the address on each envelope and drops it in the right tray, unopened, and every letter in one envelope goes to the same desk. An L7 balancer is a receptionist who opens each letter, reads it, and writes a fresh one to the right department, signing it with her own name unless she copies the sender's onto it (`X-Forwarded-For`). Idle timeouts are the receptionist's habit of throwing away the file on any conversation that has been quiet for five minutes; when you call back about it, she has no idea what you mean. The analogy breaks there: a receptionist would ask you to start over, while a load balancer answers with a reset and leaves your client to guess whether the request was ever delivered.",
- "in_your_world": "Your Quarkus services sit behind a load balancer and call partners through others, so every outbound call crosses at least two pools and two idle timers. Fraud checks that need the customer's IP must read `X-Forwarded-For`, and Quarkus has to be told to trust it, because a client can forge it. Give every issuer call a connect timeout, a response timeout from the issuer's p99 and a deadline for the whole call, and make retries the job of one layer, with an idempotency key on every `POST /authorize` so that a retry can't charge twice. Watch the quiet paths: a Kafka producer that sends rarely keeps idle connections for 9 minutes (`connections.max.idle.ms` defaults to 540,000), longer than a network load balancer's 350 seconds, and a Temporal worker's long-lived gRPC connection needs keepalive pings inside that window. And when a partner says \"we saw a reset, but our backend logs are empty\", the reset most likely came from a balancer that had forgotten an idle connection.",
- "mistake": "The common mistake is wrapping every outbound call in a generic retry: three attempts on any IOException, at once, at every layer. It double-charges when a `POST /authorize` that timed out had in fact gone through, and during an issuer outage it multiplies the load just when the issuer is trying to recover: three layers of three attempts make 27 requests out of one. People reach for it because the first incident they see is a transient reset, and a retry makes it disappear. Classify the failure instead: never sent (refused, connect timeout) is always safe to retry; maybe processed (reset, read timeout, 502 to 504) only with an idempotent method or an idempotency key; a 4xx or a 500 never. Wait with capped exponential backoff and full jitter, cap retries with a budget of about 10% of requests, and retry at one layer only.",
- "compare": {
-  "title": "The same three calls, with two pool idle timeouts",
-  "a": {
-   "label": "Pool keeps idle connections 30 s",
-   "lang": "text",
-   "title": "load balancer forgets after 5 s",
-   "src": "t= 0.0 s  POST  200  from 127.0.0.1:34980\nt= 2.0 s  POST  200  from 127.0.0.1:34980   (same connection)\nt= 9.0 s  POST  failed: IOException: HTTP/1.1 header parser\n          received no bytes (Connection reset)\n\nlb: connection 1: idle for 5 s, forgotten\nlb: connection 1: data after the idle timeout, sending a reset\n"
   },
-  "b": {
-   "label": "Pool keeps idle connections 4 s",
-   "lang": "text",
-   "title": "the same load balancer",
-   "src": "t= 0.0 s  POST  200  from 127.0.0.1:51934\nt= 2.0 s  POST  200  from 127.0.0.1:51934   (same connection)\nt= 9.0 s  POST  200  from 127.0.0.1:50176   (a new connection)\n\nthe pool closed the idle connection at 6 s,\nbefore the balancer forgot it at 7 s\n"
+  "recap": [
+    "A load balancer that acts as a proxy turns one request into two TCP connections. L4 picks a backend per connection and never reads HTTP. L7 ends TLS, reads every request, and routes each one over its own pool.",
+    "Backends behind a proxy see the proxy's address. The client's address travels in `X-Forwarded-For` (L7) or a PROXY protocol header (L4). Trust only the entries your own proxies added.",
+    "Every wait gets its own limit: a connection from the pool (milliseconds), the connect (a second or two), the answer (a little above the p99) and a deadline for the whole call. A limit on each read never catches a body that trickles in.",
+    "Retry only what is safe: anything never sent, and anything idempotent (GET, HEAD, PUT, DELETE, or a POST with an idempotency key). Wait `random(0, min(cap, base x 2^n))`, keep a retry budget, and retry at one layer.",
+    "Every hop forgets idle connections by its own clock (JDK client 30 s, AWS's L7 balancer 60 s, its L4 balancer and NAT gateways 350 s). Keep each client's idle timeout below the next hop's, or the first call after a quiet spell meets a reset.",
+    "The limit: none of this makes the network reliable. A request that was sent and got no answer still leaves the app not knowing what happened, and only an idempotency key, or asking the bank, settles it."
+  ],
+  "closing": "We started with a café whose first card payment of every morning failed. Two clocks disagreed: the app's pool kept a quiet connection for 10 minutes, and the load balancer forgot it after 350 seconds.\n\nAfter a minute of browsing, run `netstat -an | grep ESTABLISHED` in a terminal on a Mac or Linux computer. Each line is a connection your browser keeps open to reuse. Stop browsing for a few minutes, run it again, and see which have gone.\n\nEvery connection, timer and resend in this track was run by the kernel, the core of the operating system. Next, in the Operating systems track, we'll ask what a kernel is, and why a program must ask it before it can send a single byte.",
+  "quiz": [
+    {
+      "q": "The bank's backend logs show every request coming from 10.0.3.17, the load balancer's address. But its fraud check, a program that spots suspicious payments, needs the customer's address. Where is it?",
+      "options": [
+        "Gone: once a proxy is involved, the backend can never know",
+        "In `X-Forwarded-For`, added by an L7 balancer (or in a PROXY protocol header from an L4 proxy); trust only the entries your own proxies added",
+        "In the TCP source port of each request",
+        "In the Host header"
+      ],
+      "answer": 1,
+      "why": "A balancer that acts as a proxy opens its own connection to the backend, so the TCP source is the balancer. L7 balancers add the address they saw to the end of `X-Forwarded-For`, and L4 proxies can send a PROXY protocol header instead. A client can send a forged `X-Forwarded-For` of its own, so count from the right and trust only the entries your proxies added. The Host header names the server, not the client."
+    },
+    {
+      "q": "An app keeps a pool of 4 long-lived HTTP/1.1 connections to a bank whose servers sit behind an L4 load balancer with 8 backends. How is the app's traffic spread over the backends?",
+      "options": [
+        "Evenly over all 8, request by request",
+        "At random, packet by packet",
+        "Over at most 4 backends: an L4 balancer picks a backend once per connection",
+        "All on one backend, because the client's address is hashed"
+      ],
+      "answer": 2,
+      "why": "An L4 balancer never reads the requests, so it can only choose when a connection opens. Every request on that connection then goes to the same backend. With 4 pooled connections, at most 4 backends get this app's traffic, and adding backends doesn't help until connections are replaced. That's one reason pools have a maximum connection lifetime. An L7 balancer would spread the requests."
+    },
+    {
+      "q": "A server sends its answer's headers at once, then one byte of body every 500 ms. The app's socket has a 1-second read timeout, and its JDK `HttpRequest` has a 1-second timeout. What stops the call?",
+      "options": [
+        "The read timeout, after 1 second",
+        "The request timeout, after 1 second",
+        "Nothing, until the body ends: only a deadline on the whole call would",
+        "The partner's idle timeout"
+      ],
+      "answer": 2,
+      "why": "A read timeout limits each read, and every read returns within 500 ms. The JDK's request timeout stops waiting once the answer's headers have arrived, and they arrived at once. In the Try it, a 20-byte body took 10.3 seconds with both timeouts set. Only a deadline on the whole call, such as `orTimeout` on the `CompletableFuture`, cuts it off."
+    },
+    {
+      "q": "`POST /authorize` without an idempotency key fails with a read timeout after the request was sent. What should the app do?",
+      "options": [
+        "Retry at once: timeouts are usually one-offs",
+        "Retry with capped exponential backoff and full jitter",
+        "Retry on a fresh connection, which makes it safe",
+        "Not send it again blindly: the bank may have approved it, so look up the payment's status, and send idempotency keys from now on"
+      ],
+      "answer": 3,
+      "why": "A read timeout after sending says nothing about whether the bank acted. Sending a POST that isn't idempotent again can approve the payment twice, however politely you wait first, and a new connection changes nothing about that. With an idempotency key, the bank would return the first result to the second request, and that is what makes such a retry safe."
+    },
+    {
+      "q": "Lesson 7 of this track, TCP connections, told a refused connection apart from one that timed out. A call fails within 1 ms with `ConnectException: Connection refused`. May the app retry it, even if it's a POST?",
+      "options": [
+        "No: a POST is never safe to retry",
+        "Yes: a refusal is a reset answering the first handshake message (the SYN), so the request was never sent; retry, ideally to another backend",
+        "Only after waiting out the 60-second TIME-WAIT",
+        "Only if the error had been a connect timeout instead"
+      ],
+      "answer": 1,
+      "why": "Connection refused means the SYN reached a computer where nothing was listening, and its kernel answered with a reset (RST). No HTTP request ever left, so sending it again can't charge anyone twice. Refused does say that nothing listens there, so another backend or a short wait is better than hammering the same address. TIME-WAIT belongs to connections that were set up and then closed, which this one never was.",
+      "from": "net-07"
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "L4 or L7 load balancer: what's the difference?",
+      "back": "L4 picks a backend per connection and copies bytes without reading them. L7 ends TCP and TLS, reads each HTTP request and routes it, request by request."
+    },
+    {
+      "front": "Which `X-Forwarded-For` entries can you trust?",
+      "back": "Only those your own proxies added, counted from the right. Anything to their left came from the client and may be forged."
+    },
+    {
+      "front": "Name the separate waits in one HTTP call.",
+      "back": "A connection from the pool, DNS, the TCP connect, the TLS handshake, the answer's headers and the body. Give each a limit, plus a deadline for the whole call."
+    },
+    {
+      "front": "What is full jitter?",
+      "back": "Waiting `random(0, min(cap, base x 2^attempt))` before a retry, so clients that failed together don't retry together."
+    },
+    {
+      "front": "Which failures are safe to retry for a POST without an idempotency key?",
+      "back": "Only those where nothing was sent: connection refused and connect timeout."
+    },
+    {
+      "front": "What's the idle-timeout rule for a path with a pool, a load balancer and a backend?",
+      "back": "Shortest first: the client pool's idle timeout below the balancer's, and the balancer's below the backend's."
+    },
+    {
+      "front": "What are the three kinds of keepalive?",
+      "back": "HTTP keep-alive (reusing a connection), TCP keepalive (SO_KEEPALIVE probes after idle time) and protocol pings (HTTP/2 PING, gRPC keepalive)."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Load balancer",
+      "plain": "One address that accepts connections and passes the work to one of several machines behind it."
+    },
+    {
+      "term": "L4 load balancer",
+      "plain": "A balancer that chooses a backend per connection, without reading the data inside."
+    },
+    {
+      "term": "L7 load balancer",
+      "plain": "A balancer that ends TCP and TLS, reads each HTTP request and routes it."
+    },
+    {
+      "term": "X-Forwarded-For",
+      "plain": "An HTTP header to which each proxy adds the address it received the request from."
+    },
+    {
+      "term": "Connection pool",
+      "plain": "A set of open connections a program reuses, instead of opening one per request."
+    },
+    {
+      "term": "Idempotent request",
+      "plain": "A request that has the same effect whether it is sent once or twice."
+    },
+    {
+      "term": "Full jitter",
+      "plain": "A random wait between zero and the current ceiling before a retry, so clients don't retry in step."
+    },
+    {
+      "term": "Retry budget",
+      "plain": "A cap on retries as a share of all requests, so that retries can't multiply the load."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend who looks after the café's payments app asks: \"Every morning the first few payments after the quiet night fail with `Connection reset`, then everything is fine all day. The bank says its machines never saw those requests.\" Explain what is happening, and what you would change.",
+    "answer": "The app's pool keeps idle connections longer than something between the app and the bank does. Overnight the connections sit unused. The load balancer (or a NAT gateway) in front of the bank forgets them after its own idle timeout, 350 seconds for a network load balancer, and tells nobody. In the morning, the pool hands out one of those connections as if it were healthy. The request goes out, and the balancer, which no longer knows the connection, answers with a TCP reset. That's why the bank's machines never saw anything, and why it only happens after quiet spells. I'd set the pool's idle timeout below the balancer's, and add a maximum lifetime for each connection. I'd also allow one immediate retry on a fresh connection when a reused connection is reset before any answer, but only for idempotent requests, which for payments means sending an idempotency key. TCP keepalive probes sent more often than the balancer's timeout would also keep the connections alive."
   },
-  "note": "Both come from the last Try it. The only change is `-Djdk.httpclient.keepalive.timeout=4`. When the client gives up on an idle connection first, the worst that can happen is a new handshake; when the balancer gives up first, the next request on that connection is lost. Set every client's idle timeout below the next hop's, all the way down the path."
- },
- "worked": {
-  "title": "Choose the timeouts and the pool for one issuer call",
-  "steps": [
-   {
-    "say": "Start from measurements, not defaults. Suppose the issuer is 70 ms away, answers in 120 ms on average and 400 ms at p99, and your checkout endpoint promises its own callers an answer within 2 seconds. Peak traffic is 200 authorizations a second.",
-    "code": "round trip           70 ms\nissuer p50 / p99     120 ms / 400 ms\nour own deadline     2 s for the whole checkout call\npeak load            200 authorizations / s",
-    "lang": "text"
-   },
-   {
-    "say": "Size the pool with Little's law: requests in flight = arrival rate x time each takes. At the average that's 24 connections busy at once; give it room for slow periods, because when the issuer slows down, more requests overlap.",
-    "code": "200 / s x 0.12 s = 24 in flight on average\n200 / s x 0.40 s = 80 if every call took the p99\npool: 40 connections; wait at most 50 ms for one, then fail fast",
-    "lang": "text"
-   },
-   {
-    "say": "Connect timeout: a handshake takes one round trip, 70 ms. Linux resends a lost SYN after 1 second (lesson 7), so 1.5 s lets one resend through and still fails fast on a dead address. Response timeout: twice the p99. Deadline: whatever is left of the caller's 2 seconds, so one retry of 800 ms plus its backoff still fits.",
-    "code": "connect timeout      1.5 s     one SYN resend fits\nresponse timeout     800 ms    2 x p99, until the headers\ndeadline             2 s       the whole call, body and one retry included\nretry                1, only with the Idempotency-Key, after random(0, 100 ms)",
-    "lang": "text"
-   },
-   {
-    "say": "Idle timeouts: the pool's below the balancer's, the balancer's below the backend's. Then write it down in code. The JDK client takes the pool's idle timeout as a system property.",
-    "code": "// -Djdk.httpclient.keepalive.timeout=30   (pool idle 30 s < balancer 60 s < backend 75 s)\nval client: HttpClient = HttpClient.newBuilder()\n    .connectTimeout(Duration.ofMillis(1_500))           // one SYN resend fits\n    .build()\n\nfun authorize(json: String, key: String): HttpResponse<String> {\n    val request = HttpRequest.newBuilder(URI.create(\"https://api.issuer.example/authorize\"))\n        .timeout(Duration.ofMillis(800))                // until the response headers\n        .header(\"Idempotency-Key\", key)                 // makes one retry safe\n        .POST(HttpRequest.BodyPublishers.ofString(json))\n        .build()\n    return client.sendAsync(request, HttpResponse.BodyHandlers.ofString())\n        .orTimeout(2, TimeUnit.SECONDS)                 // the deadline: body included\n        .join()\n}",
-    "lang": "kotlin"
-   }
+  "deeper": {
+    "minutes": 10,
+    "body": "**CDNs are caching L7 proxies.** A CDN (content delivery network) is a fleet of L7 proxies close to users that keep copies of answers, following HTTP's caching rules (RFC 9111). `Cache-Control: max-age` says how long a copy stays fresh, `Age` how old it already is, and `Vary` which request headers change the answer. Most CDNs reach users through anycast, the same address announced from many places (lesson 4's Go deeper). For an API that moves money, almost nothing may be cached. A CDN still gives you TLS close to the user, and a long-lived pooled connection back to your own servers.\n\n**Choosing a backend.** Taking turns (round robin) ignores how busy each backend is. \"Least outstanding requests\" sends each request to the backend with the fewest in flight, which copes better when some requests are slow. \"Power of two choices\" picks two backends at random and takes the less busy one, which is nearly as good and much cheaper to work out. Outlier detection takes a backend out as soon as it starts returning errors, without waiting for health checks to fail.\n\n**Hedged requests.** For idempotent reads where a few answers are very slow, a client can send a second copy to another backend if the first hasn't answered by, say, the p95 (the time 95 answers in 100 beat), and use whichever answer comes first. The slowest answers get much faster for a few percent more load. Never hedge a payment.\n\n**When the request was sent but the answer never came.** `TCP_USER_TIMEOUT` limits how long the kernel keeps resending unacknowledged data before it gives up on a connection. A read timeout doesn't do that if your code is busy writing, as Cloudflare's write-up of sockets that refuse to die explains. HTTP/2 PING frames can spot a dead connection without sending a request."
+  },
+  "sources": [
+    {
+      "title": "AWS Builders' Library: Timeouts, retries and backoff with jitter",
+      "url": "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
+    },
+    {
+      "title": "AWS Architecture Blog: Exponential backoff and jitter",
+      "url": "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/"
+    },
+    {
+      "title": "Google SRE book: Addressing cascading failures",
+      "url": "https://sre.google/sre-book/addressing-cascading-failures/"
+    },
+    {
+      "title": "AWS: Network Load Balancers, connection idle timeout",
+      "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html"
+    },
+    {
+      "title": "RFC 9110: HTTP Semantics (idempotent methods)",
+      "url": "https://www.rfc-editor.org/rfc/rfc9110.html"
+    }
   ]
- },
- "lab": {
-  "title": "A retry policy and a connection pool against a load balancer that forgets",
-  "minutes": 15,
-  "needs": [],
-  "files": [
-   "labs/net/src/main/kotlin/sfz/net/l12/RetryPolicy.kt",
-   "labs/net/src/main/kotlin/sfz/net/l12/ConnectionPool.kt",
-   "labs/net/src/main/kotlin/sfz/net/l12/Caller.kt",
-   "labs/net/src/main/kotlin/sfz/net/l12/Http.kt"
-  ],
-  "run": "./gradlew :net:test --tests 'sfz.net.l12.*'",
-  "steps": [
-   "Run the tests once from the `labs` folder. All 17 fail. `Http.kt` (requests, outcomes and the `Connection` interface) and `Caller.kt` (one call: take a connection, send, give it back, ask the policy) are finished. The tests use `FakeLb` from the test folder: a load balancer that forgets connections idle for 350 seconds and resets them on their next use, driven by a `ManualClock`.",
-   "In `RetryPolicy.kt`, write `RetryBudget` first, then `isIdempotent`, `mayRetry`, `backoffMs` (full jitter below a capped exponential ceiling) and `decide`. `RetryPolicyTest` passes a fixed random number, so the waits are exact.",
-   "In `ConnectionPool.kt`, write `acquire` and `release`: evict idle connections past the idle timeout or the maximum lifetime, reuse the most recently released one, open a new one below the maximum size, and throw `PoolExhausted` above it.",
-   "`IdleMismatchTest` puts it all together: a pool that keeps idle connections for 600 s meets the balancer's 350 s, then a pool with 300 s does not. Run the tests until all 17 pass, then read the test's log lines next to the stepper."
-  ],
-  "hints": [
-   "`baseMs shl (retry - 1)` doubles the ceiling; cap the shift (say at 30) so that a large retry number can't overflow, then take `min(capMs, ...)` and multiply by `random()`.",
-   "In `decide`, check attempts, then `mayRetry`, and only then `budget.tryRetry()`: a retry you refuse anyway must not use up a token.",
-   "Ten additions of 0.1 make 0.9999999999999999, so compare the budget's tokens with `1.0 - 1e-9`, not `1.0`.",
-   "In the pool, keep `id -> openedAt` for every open connection and a deque of `(connection, idleSince)` for idle ones. `ArrayDeque.removeAll { ... }` evicts; `removeLastOrNull()` takes the newest.",
-   "A connection counts toward the maximum size whether it's in use or idle, so `open` is the size of the `openedAt` map, not of the idle deque."
-  ],
-  "done_when": "All 17 tests in `RetryPolicyTest`, `ConnectionPoolTest` and `IdleMismatchTest` pass."
- },
- "drill": {
-  "title": "Write the retry decision from memory",
-  "minutes": 5,
-  "prompt": "Without looking, write `mayRetry(method, hasKey, outcome)` for the outcomes refused, connect timeout, reset, read timeout and an HTTP status, and `backoffMs(retry)` with full jitter, base 100 ms and cap 2 s. Then name the order in which a client should compare the idle timeouts of its pool, its load balancer and the backend.",
-  "answer": {
-   "lang": "kotlin",
-   "src": "fun isIdempotent(method: String, hasKey: Boolean) =\n    method in setOf(\"GET\", \"HEAD\", \"OPTIONS\", \"TRACE\", \"PUT\", \"DELETE\") || (method == \"POST\" && hasKey)\n\nfun mayRetry(method: String, hasKey: Boolean, outcome: Outcome): Boolean = when (outcome) {\n    Outcome.ConnectRefused, Outcome.ConnectTimeout -> true            // never sent\n    Outcome.Reset, Outcome.ReadTimeout -> isIdempotent(method, hasKey)  // maybe processed\n    is Outcome.Status -> outcome.code in setOf(429, 502, 503, 504) && isIdempotent(method, hasKey)\n}\n\nfun backoffMs(retry: Int, random: () -> Double = Math::random): Long {\n    val ceiling = minOf(2_000L, 100L shl (retry - 1).coerceAtMost(30))  // 100, 200, 400 ... 2,000\n    return (random() * ceiling).toLong()                                // anywhere below it\n}\n\n// Idle timeouts, shortest first: client pool < load balancer < backend server.\n"
-  }
- },
- "recap": [
-  "A proxying load balancer turns one request into two TCP connections. L4 picks a backend per connection and never reads HTTP; L7 terminates TLS, reads every request and routes each one, over its own pool.",
-  "Backends behind a proxy see the proxy's address. The client's travels in `X-Forwarded-For` (L7) or a PROXY protocol header (L4); trust only the entries your own proxies appended.",
-  "Every wait gets its own limit: pool acquire (milliseconds), connect (a second or two), response (above the p99) and a deadline for the whole call. A per-read timeout never catches a trickling body.",
-  "Retry only what is safe: anything never sent; anything idempotent (GET, HEAD, PUT, DELETE, or a POST with an idempotency key). Wait `random(0, min(cap, base x 2^n))`, keep a retry budget, and retry at one layer.",
-  "Every hop forgets idle connections by its own clock (JDK client 30 s, ALB 60 s, NLB and NAT gateway 350 s). Keep each client's idle timeout below the next hop's, or the first call after a quiet spell meets a reset."
- ],
- "quiz": [
-  {
-   "q": "Your backend logs show every request coming from 10.0.3.17, the load balancer's address, but the fraud check needs the customer's IP. Where is it?",
-   "options": [
-    "Gone: once a proxy is involved, the backend can never know",
-    "In `X-Forwarded-For`, appended by an L7 balancer (or a PROXY protocol header from an L4 proxy); trust only the entries your own proxies added",
-    "In the TCP source port of each request",
-    "In the Host header"
-   ],
-   "answer": 1,
-   "why": "A proxying balancer opens its own connection to the backend, so the TCP source is the balancer. L7 balancers append the address they saw to `X-Forwarded-For`; L4 proxies can send a PROXY protocol header instead. Because a client can send a forged `X-Forwarded-For` of its own, count from the right and trust only the entries your proxies added. The Host header names the server, not the client."
-  },
-  {
-   "q": "A service keeps a pool of 4 long-lived HTTP/1.1 connections to a partner whose API is behind an L4 load balancer with 8 backends. How is the service's traffic spread over the backends?",
-   "options": [
-    "Evenly over all 8, request by request",
-    "Randomly, packet by packet",
-    "Over at most 4 backends: an L4 balancer picks a backend once per connection",
-    "All on one backend, because the client's IP address is hashed"
-   ],
-   "answer": 2,
-   "why": "An L4 balancer never reads the requests, so it can only choose when a connection opens; every request on that connection then goes to the same backend. With 4 pooled connections, 4 backends at most get this service's traffic, and adding backends doesn't help until connections are replaced, which is one reason pools have a maximum connection lifetime. An L7 balancer would spread the requests."
-  },
-  {
-   "q": "A partner's server sends response headers at once and then one byte of body every 500 ms. Your socket has a 1-second read timeout, and your JDK `HttpRequest` has a 1-second timeout. What stops the call?",
-   "options": [
-    "The read timeout, after 1 second",
-    "The request timeout, after 1 second",
-    "Nothing, until the body ends: only a deadline on the whole call would",
-    "The partner's idle timeout"
-   ],
-   "answer": 2,
-   "why": "A read timeout limits each read, and every read returns within 500 ms. The JDK's request timeout stops waiting once the response headers have arrived, and they arrived at once. In the Try it, a 20-byte body took 10.3 seconds with both timeouts set. Only a deadline on the whole call, such as `orTimeout` on the `CompletableFuture`, cuts it off."
-  },
-  {
-   "q": "`POST /authorize` without an idempotency key fails with a read timeout after the request was sent. What should the client do?",
-   "options": [
-    "Retry at once: timeouts are usually transient",
-    "Retry with capped exponential backoff and full jitter",
-    "Retry on a fresh connection, which makes it safe",
-    "Not resend it blindly: the issuer may have authorized it, so look up the payment's status, and send idempotency keys from now on"
-   ],
-   "answer": 3,
-   "why": "A read timeout after sending says nothing about whether the issuer acted. Resending a non-idempotent POST can authorize the payment twice, however politely you wait first, and a new connection changes nothing about that. With an idempotency key the issuer would return the first result to the second request, which is what makes such retries safe."
-  },
-  {
-   "q": "Lesson 7 told refused from timed out. A call fails within 1 ms with `ConnectException: Connection refused`. May the client retry it, even if it's a POST?",
-   "options": [
-    "No: a POST is never safe to retry",
-    "Yes: a refusal is an RST answering the SYN, so the request was never sent; retry, ideally to another backend",
-    "Only after waiting out the 60-second TIME-WAIT",
-    "Only if the error had been a connect timeout instead"
-   ],
-   "answer": 1,
-   "why": "Connection refused means the SYN reached a host where nothing listened, and its kernel answered with an RST. No HTTP request ever left, so repeating it can't charge anyone twice. Refused does say that nothing listens there, so another backend or a short backoff is better than hammering the same address. TIME-WAIT belongs to connections that were established and closed, which this one never was.",
-   "from": "net-07"
-  }
- ],
- "flashcards": [
-  {
-   "front": "L4 vs L7 load balancer?",
-   "back": "L4 picks a backend per connection and copies bytes without reading them. L7 terminates TCP and TLS, reads each HTTP request and routes it per request."
-  },
-  {
-   "front": "Which `X-Forwarded-For` entries can you trust?",
-   "back": "Only those your own proxies appended, counted from the right. Anything to their left came from the client and may be forged."
-  },
-  {
-   "front": "Name the separate waits in one HTTP call.",
-   "back": "Pool acquire, DNS, TCP connect, TLS handshake, response headers and the body. Give each a limit, plus a deadline for the whole call."
-  },
-  {
-   "front": "What is full jitter?",
-   "back": "Wait `random(0, min(cap, base x 2^attempt))` before a retry, so clients that failed together don't retry together."
-  },
-  {
-   "front": "Which failures are safe to retry for a POST without an idempotency key?",
-   "back": "Only those where nothing was sent: connection refused and connect timeout."
-  },
-  {
-   "front": "The idle-timeout rule for a path with a pool, a load balancer and a backend?",
-   "back": "Shortest first: the client pool's idle timeout below the balancer's, the balancer's below the backend's."
-  },
-  {
-   "front": "What are the three kinds of keepalive?",
-   "back": "HTTP keep-alive (connection reuse), TCP keepalive (SO_KEEPALIVE probes after idle time) and protocol pings (HTTP/2 PING, gRPC keepalive)."
-  }
- ],
- "terms": [
-  {
-   "term": "Load balancer",
-   "plain": "One address that accepts connections and passes the work to one of several backends."
-  },
-  {
-   "term": "L4 load balancer",
-   "plain": "A balancer that chooses a backend per connection without reading the application data."
-  },
-  {
-   "term": "L7 load balancer",
-   "plain": "A balancer that ends TCP and TLS, reads each HTTP request and routes it."
-  },
-  {
-   "term": "X-Forwarded-For",
-   "plain": "An HTTP header to which each proxy appends the address it received the request from."
-  },
-  {
-   "term": "Connection pool",
-   "plain": "A set of open connections a client reuses instead of opening one per request."
-  },
-  {
-   "term": "Idempotent request",
-   "plain": "A request that has the same effect whether it is sent once or twice."
-  },
-  {
-   "term": "Full jitter",
-   "plain": "A random wait between zero and the current backoff ceiling before a retry."
-  },
-  {
-   "term": "Retry budget",
-   "plain": "A cap on retries as a share of all requests, so retries can't multiply the load."
-  }
- ],
- "explain_back": {
-  "prompt": "On-call question: \"Every morning the first few authorizations after the night's quiet period fail with `Connection reset`, then everything is fine all day. The issuer says their backends never saw those requests.\" Explain what is happening and what you would change.",
-  "answer": "Our HTTP client keeps idle connections in its pool longer than something between us and the issuer keeps them. Overnight the connections sit idle; the load balancer (or a NAT gateway) in front of the issuer forgets them after its idle timeout, a network load balancer after 350 seconds, without telling us. In the morning the pool hands out one of those connections as if it were healthy, the request goes out, and the balancer, which no longer knows the connection, answers with a TCP reset. That's why the issuer's backends never saw anything, and why it only happens after quiet periods. I'd set the pool's idle timeout below the balancer's, add a maximum connection lifetime, and allow one immediate retry on a fresh connection when a reused connection is reset before any answer, but only for idempotent requests, which for authorizations means sending an idempotency key. TCP keepalives more often than the balancer's timeout would also keep the connections alive."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "**CDNs are caching L7 proxies.** A CDN is a fleet of L7 proxies close to your users that keep copies of responses, following HTTP's caching rules (RFC 9111): `Cache-Control: max-age` says how long a copy is fresh, `Age` how old it already is, and `Vary` which request headers change the answer. Most CDN edges reach users through anycast, the same address announced from many places (lesson 4's Go deeper). For an API that moves money, almost nothing may be cached, but the CDN still gives you TLS close to the user and a long-lived pooled connection back to your origin.\n\n**Choosing a backend.** Round robin ignores load. \"Least outstanding requests\" sends each request to the backend with the fewest in flight, which copes better when some requests are slow, and \"power of two choices\" picks two backends at random and takes the less busy, which is nearly as good and much cheaper to compute. Outlier detection removes a backend that starts returning errors, without waiting for health checks to fail.\n\n**Hedged requests.** For idempotent reads with a long tail, a client can send a second copy to another backend if the first hasn't answered by, say, the p95, and use whichever answer comes first. Tail latency falls sharply for a few percent more load. Never hedge a payment.\n\n**When the request was sent but the answer never came.** `TCP_USER_TIMEOUT` bounds how long the kernel keeps retransmitting unacknowledged data before it gives up on a connection, which a read timeout doesn't do if your code is busy writing, as Cloudflare's write-up of sockets that refuse to die explains. HTTP/2 PING frames detect a dead connection without sending a request."
- },
- "sources": [
-  {
-   "title": "AWS Builders' Library: Timeouts, retries and backoff with jitter",
-   "url": "https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/"
-  },
-  {
-   "title": "AWS Architecture Blog: Exponential backoff and jitter",
-   "url": "https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/"
-  },
-  {
-   "title": "Google SRE book: Addressing cascading failures",
-   "url": "https://sre.google/sre-book/addressing-cascading-failures/"
-  },
-  {
-   "title": "AWS: Network Load Balancers, connection idle timeout",
-   "url": "https://docs.aws.amazon.com/elasticloadbalancing/latest/network/network-load-balancers.html"
-  },
-  {
-   "title": "RFC 9110: HTTP Semantics (idempotent methods)",
-   "url": "https://www.rfc-editor.org/rfc/rfc9110.html"
-  }
- ]
 }
