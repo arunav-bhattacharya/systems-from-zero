@@ -62,7 +62,7 @@ python3 site/build.py             # writes web/index.html and web/lessons/*.json
 
 ## Deploy to Cloudflare
 
-Step-by-step instructions are in [DEPLOY.md](DEPLOY.md). In short, the site is a Cloudflare Worker that serves `web/` as static assets (`wrangler.jsonc`); a small script, `site/worker.js`, runs only for `/video/*` to answer the byte-range requests video players send (Safari needs them to play MP4). Either connect this repo in the Cloudflare dashboard with deploy command `npx wrangler deploy`, add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository secrets so the `ci` workflow deploys after the checks pass, or run `npx wrangler deploy` from the repo root.
+Step-by-step instructions are in [DEPLOY.md](DEPLOY.md). In short, the site is a Cloudflare Worker that serves `web/` as static assets (`wrangler.jsonc`); a small script, `site/worker.js`, runs only for `/video/*`. The MP4s aren't uploaded to Cloudflare (`web/.assetsignore` leaves them out): they live on this repo's [`videos` release](https://github.com/arunav-bhattacharya/systems-from-zero/releases/tag/videos), and the worker fetches each one from GitHub, passes byte-range requests through and labels it `video/mp4` (GitHub labels every download as a generic binary, which Safari won't play). Posters and captions stay in `web/video/`. When a video is remade, replace its file on the release with `gh release upload videos web/video/<slug>.mp4 --clobber`; its link doesn't change. Either connect this repo in the Cloudflare dashboard with deploy command `npx wrangler deploy`, add `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` as repository secrets so the `ci` workflow deploys after the checks pass, or run `npx wrangler deploy` from the repo root.
 
 ## What is in this repo
 

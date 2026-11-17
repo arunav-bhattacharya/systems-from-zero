@@ -54,9 +54,8 @@ says what changes. Where they disagree, this file wins.
 2. Render at full 1440p. Look at three or more full-size frames at the busiest moments.
 3. `.venv/bin/python check_audio.py <slug>` and fix real mispronunciations with `SAY` rules at the top of your
    scene file (delete the cached line before re-rendering).
-4. The final `.mp4` must be under 24 MiB: Cloudflare refuses any file over 25 MiB, and one oversized file fails
-   the whole deploy. If it's larger, re-encode it at 1440p with a higher CRF, for example
-   `ffmpeg -i in.mp4 -c:v libx264 -preset slow -crf 21 -tune animation -pix_fmt yuv420p -c:a copy -movflags +faststart out.mp4`.
+4. Keep the final `.mp4` reasonably small for streaming (most are 13 to 24 MiB). The site serves MP4s from the GitHub
+   release, not from Cloudflare, so there's no hard 25 MiB cap any more; the coordinator uploads each file when it ships.
 5. `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 ../web/video/<slug>.mp4`
    must print `2560,1440`.
 

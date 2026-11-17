@@ -107,4 +107,6 @@ Resume after the weekly reset (2026-11-21 21:00 UTC), in this order:
 3. store-09..13: volcano-vs-vector, join-order, column-compression, view-maintenance, graph-records.
 4. Then cache (10), enc (5), repl (8), shard (9), txn (8), dist (7), cons (6), msg (12), stream (7), batch (11),
    derive (4): 87 videos. At most 4 makers at once; each maker takes 4 videos (about an hour each batch).
-Ship with the clean-worktree script, keep every mp4 under 24 MiB, and check live byte sizes after CI deploys.
+Ship with the clean-worktree script: it uploads each shipped mp4 to the GitHub release `videos` (--clobber) and
+deploys the rest. Since 2026-11-17 the repo is public and every MP4 is served from that release through
+site/worker.js; Cloudflare holds no videos. Check live byte sizes after shipping.
