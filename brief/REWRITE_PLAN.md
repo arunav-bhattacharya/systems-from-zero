@@ -88,3 +88,10 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
   render failed a whole deploy silently, so the ship script now checks sizes and fails loudly. Running at 44%:
   sql 6-9, model (5), store 1-4, store 5-8. Next after the reset: store 9-13, cache, enc, repl, shard, txn, dist,
   cons, msg, stream, batch, derive.
+- 2026-11-17: usage reached 57%, so the wind-down started: makers finish their current video and stop.
+  Data models: 4 of 5 shipped. graph-hops is half done: new script and scene are written (uncommitted) and a
+  QUICK draft is at `videos/media/graph-hops-draft.mp4`; it still needs a contact-sheet review, the 1440p render
+  with POSTER=, check_audio and ffprobe. Title: "Follow the strings".
+- hnsw-search is rendered (1440p, 13.1 MiB, script and scene in place, uncommitted) but held back: check_audio
+  heard "bike rental" in the first line as "by grantal" and "PostgreSQL" once as "posters". Listen to both, add
+  SAY rules if they're real, re-render, then ship. Title: "Nearest by meaning: walking a graph from the top layer down".
