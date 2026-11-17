@@ -1,46 +1,56 @@
 // Systems from Zero: static site on Cloudflare Workers.
-// Every path is served straight from the static assets in web/. Only /video/* runs this script first,
-// to answer HTTP range requests: Safari (macOS and iOS) plays an MP4 only from a server that returns
-// 206 Partial Content, and range support is what lets every browser seek without downloading the file.
+// Every path is served straight from the static assets in web/. Only /video/* runs this script first.
+//
+// The MP4s live on GitHub, as files on the "videos" release of the public repo, not in Cloudflare's asset
+// store (web/.assetsignore keeps them out of every deploy). GitHub answers range requests but labels every
+// download application/octet-stream and as an attachment, and Safari (macOS and iOS) won't play a video
+// labelled that way. So this script fetches the video from GitHub, passes the browser's Range header through,
+// and answers with the right type. Posters (.jpg) and captions (.vtt) are small and stay in web/video/, so
+// captions come from the site's own origin, which <track> needs.
 
-function parseRange(header, size) {
-  const m = /^bytes=(\d*)-(\d*)$/.exec((header || "").trim());
-  if (!m || (m[1] === "" && m[2] === "")) return null;
-  let start, end;
-  if (m[1] === "") {
-    // suffix range: the last N bytes
-    start = Math.max(0, size - Number(m[2]));
-    end = size - 1;
-  } else {
-    start = Number(m[1]);
-    end = m[2] === "" ? size - 1 : Math.min(Number(m[2]), size - 1);
-  }
-  return { start, end };
-}
+const RELEASE = "https://github.com/arunav-bhattacharya/systems-from-zero/releases/download/videos/";
 
 export default {
   async fetch(request, env) {
-    if (request.method !== "GET" && request.method !== "HEAD") return env.ASSETS.fetch(request);
-    // ask the asset store for the whole file; the slicing happens here
-    const res = await env.ASSETS.fetch(new Request(request.url, { method: "GET" }));
-    if (res.status !== 200) return res;
-
-    const headers = new Headers(res.headers);
-    headers.set("Accept-Ranges", "bytes");
-    headers.set("Cache-Control", "public, max-age=86400");
-    const range = request.headers.get("Range");
-    if (!range) return new Response(request.method === "HEAD" ? null : res.body, { status: 200, headers });
-
-    // the asset store streams without a Content-Length, so read the (at most ~8 MB) video to know its size
-    const buf = await res.arrayBuffer();
-    const size = buf.byteLength;
-    const r = parseRange(range, size);
-    if (!r || r.start >= size || r.start > r.end) {
-      return new Response(null, { status: 416, headers: { "Content-Range": `bytes */${size}`, "Accept-Ranges": "bytes" } });
+    const url = new URL(request.url);
+    const name = url.pathname.split("/").pop();
+    if (!name.endsWith(".mp4") || !/^[a-z0-9-]+\.mp4$/.test(name)) return env.ASSETS.fetch(request);
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      return new Response(null, { status: 405, headers: { Allow: "GET, HEAD" } });
     }
-    headers.set("Content-Range", `bytes ${r.start}-${r.end}/${size}`);
-    headers.set("Content-Length", String(r.end - r.start + 1));
-    if (request.method === "HEAD") return new Response(null, { status: 206, headers });
-    return new Response(r.start === 0 && r.end === size - 1 ? buf : buf.slice(r.start, r.end + 1), { status: 206, headers });
+
+    const upstreamHeaders = {};
+    let range = request.headers.get("Range");
+    // GitHub's storage refuses suffix ranges ("the last N bytes"), which some players use to read the end of an
+    // MP4. Ask for one byte to learn the size, then turn the suffix into an explicit range.
+    const suffix = /^bytes=-(\d+)$/.exec((range || "").trim());
+    if (suffix) {
+      const probe = await fetch(RELEASE + name, { headers: { Range: "bytes=0-0" }, redirect: "follow" });
+      const total = Number((probe.headers.get("Content-Range") || "").split("/")[1]);
+      if (!total) return new Response("Video unavailable", { status: 502 });
+      range = `bytes=${Math.max(0, total - Number(suffix[1]))}-${total - 1}`;
+    }
+    if (range) upstreamHeaders["Range"] = range;
+    // GitHub redirects to a signed storage URL that changes on every request, so there's nothing to cache by URL.
+    const upstream = await fetch(RELEASE + name, { method: request.method, headers: upstreamHeaders, redirect: "follow" });
+    if (upstream.status === 416) {
+      const h = { "Accept-Ranges": "bytes" };
+      if (upstream.headers.get("Content-Range")) h["Content-Range"] = upstream.headers.get("Content-Range");
+      return new Response(null, { status: 416, headers: h });
+    }
+    if (upstream.status !== 200 && upstream.status !== 206) {
+      return new Response(upstream.status === 404 ? "No such video" : "Video unavailable", { status: upstream.status === 404 ? 404 : 502 });
+    }
+
+    const headers = new Headers();
+    headers.set("Content-Type", "video/mp4");
+    headers.set("Accept-Ranges", "bytes");
+    // a remade video keeps its URL, so let browsers keep a copy for an hour, not a day
+    headers.set("Cache-Control", "public, max-age=3600");
+    for (const h of ["Content-Length", "Content-Range", "ETag", "Last-Modified"]) {
+      const v = upstream.headers.get(h);
+      if (v) headers.set(h, v);
+    }
+    return new Response(request.method === "HEAD" ? null : upstream.body, { status: upstream.status, headers });
   },
 };
