@@ -1,419 +1,419 @@
 {
- "id": "os-03",
- "title": "Threads, and how the JVM maps them to the OS",
- "minutes": 40,
- "goal": "By the end you can find any JVM thread from the kernel's side and back, explain why platform threads hit container limits, and say what virtual threads change and what they don't.",
- "warmup": {
-  "q": "A JVM in a container started with `--pids-limit 64` creates platform threads in a loop, each one waiting on a latch. About how many does it get before `OutOfMemoryError: unable to create native thread`?",
-  "options": [
-   "64",
-   "About 40 to 50",
-   "As many as the heap has room for",
-   "Thousands: the pids limit counts processes, not threads"
+  "id": "os-03",
+  "title": "Threads, and how the JVM maps them to the OS",
+  "minutes": 40,
+  "goal": "By the end, you can explain what a thread is to the kernel, find any thread of a Java program from the kernel's side and back, say why a limit on tasks stops a program that starts too many threads, and say what virtual threads change and what they don't.",
+  "opening": "Picture a café at the morning rush, with one barista. She takes an order, starts the milk, then stands and watches it for a whole minute. Twelve people wait in line, and the only thing working is the machine.\n\nThe café's payments program, which records every card payment, has the same habit. Each payment waits about 120 ms for the card's bank to say yes, and a program with one line of work does nothing meanwhile. The easy fix is the café's: one barista per customer, one thread per payment. It works for a dozen. Run the program in a container that allows 64 tasks, though, and the threads stop starting. The error blames memory, while the memory sits nearly empty.\n\nIn Processes: fork, exec, wait and signals, every process did one thing at a time. In this lesson, we'll put many lines of work in one process, count a Java program's threads, hit that limit on purpose and meet virtual threads, which wait without holding a barista. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "A Java program runs in a container, a boxed-off group of programs, that allows at most 64 tasks: things the kernel runs, such as processes and threads. The program starts threads in a loop, and each one waits. About how many does it start before it fails with `OutOfMemoryError: unable to create native thread`?",
+    "options": [
+      "64",
+      "About 40 to 50",
+      "As many as its memory has room for",
+      "Thousands: the limit counts programs, not threads"
+    ],
+    "answer": 1,
+    "why": "The limit counts tasks, and every thread is a task. The JVM, the program that runs Java code, starts its own threads (the garbage collector, the JIT compilers and others), and they take a good part of the 64 before your code starts any. In the lab box it stopped at 42 in one run and 50 in another. Memory has nothing to do with it, despite the error's name, which is why the third option tempts people. The last option is the trap the error message itself sets: to the kernel, a thread counts the same as a process."
+  },
+  "sections": [
+    {
+      "h": "Many waits at once: what a thread is to the kernel",
+      "body": "Back to the café's payments program. Fifty payments arrive in the same second, and each one waits 120 ms for the card's bank to answer. With a single line of work, payment 2 starts only after payment 1 has its answer. Fifty payments take 6 seconds, and the processor sits idle for almost all of it. You want all 50 waiting at once, each on its own.\n\nThe first way is the one the last lesson built: one process per payment. `fork` a copy for each, and the kernel, the core of the operating system, runs the copies side by side. Old web servers, the programs that hand out web pages, worked like that. It's a poor fit for a Java program. Processes don't share memory. Every copy has its own heap, the memory where objects live, and its own copy of everything the program has loaded or worked out. Ten copies need about ten times the memory, and they can't share a single list or count between them.\n\nWhat you want is several lines of work inside one process, all sharing its memory. In the café, that's more baristas behind one counter, sharing one fridge and one till. Each line of work needs only three things of its own. It needs a place in the code: a program counter, the address of the next instruction to run. It needs its own registers, the processor's small storage slots. And it needs its own **stack**, the piece of memory that holds each method call's local variables and the address to return to. One such line of work is a **thread**.\n\nLinux builds threads and processes from the same part. The kernel schedules one kind of thing: it picks which one runs on each processor, and for how long. That thing is a **task**: a program counter, registers, a stack and an ID, the **TID** (thread ID). The system call `clone` (a request to the kernel) creates tasks. Its flags, settings passed with the call, say what the new task shares with the one that made it. These are the flags on every `clone` the JVM made in What a kernel does:\n\n```text\nCLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|...\n```\n\n`fork` passes none of the sharing flags, so its new task gets copies of everything and becomes a new process. A thread is a task created with flags that say \"share, don't copy\". `CLONE_VM` shares the memory, `CLONE_FILES` the open files and `CLONE_SIGHAND` the signal handlers, the functions that run when a signal (a short notice from the kernel) arrives. `CLONE_THREAD` puts the new task in its creator's **thread group**. A process, to the kernel, is a thread group: a set of tasks that share one memory.\n\nThat explains a field from the last lesson. A process's PID is the TID of its first task. The `Tgid` (thread group ID) line in `/proc/<pid>/status` shows that same number in every thread of the group. A signal sent with `kill <pid>` goes to the group as a whole.\n\nThe figure below is the picture for the rest of this lesson: a process is a box of shared memory with tasks in it. In the café, each barista is a task and the counter they share is the process. The JVM decides how Java's threads map onto those tasks, and there are two ways it does that. First, let's count the tasks in a real Java program.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A process is a thread group: shared memory and files on top, three tasks below, each with its own stack, registers and TID\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"640\" height=\"260\" rx=\"8\"/><text class=\"t-s t-m\" x=\"40\" y=\"46\" text-anchor=\"start\">process PID 40 = thread group 40</text><rect class=\"box-b\" x=\"40\" y=\"60\" width=\"600\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"340.0\" y=\"90.0\" text-anchor=\"middle\">shared by every task in the group</text><text class=\"t-s t-m\" x=\"340.0\" y=\"110.0\" text-anchor=\"middle\">heap, code, open files, signal handlers</text><line class=\"ln-d\" x1=\"130\" y1=\"130\" x2=\"130\" y2=\"158\"/><line class=\"ln-d\" x1=\"340\" y1=\"130\" x2=\"340\" y2=\"158\"/><line class=\"ln-d\" x1=\"550\" y1=\"130\" x2=\"550\" y2=\"158\"/><rect class=\"box-a\" x=\"40\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"190\" text-anchor=\"middle\">task TID 40</text><text class=\"t-s t-code\" x=\"130\" y=\"214\" text-anchor=\"middle\">launcher</text><text class=\"t-s t-m\" x=\"130\" y=\"240\" text-anchor=\"middle\">own stack, registers</text><rect class=\"box-a\" x=\"250\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"190\" text-anchor=\"middle\">task TID 42</text><text class=\"t-s t-code\" x=\"340\" y=\"214\" text-anchor=\"middle\">main</text><text class=\"t-s t-m\" x=\"340\" y=\"240\" text-anchor=\"middle\">own stack, registers</text><rect class=\"box-a\" x=\"460\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"550\" y=\"190\" text-anchor=\"middle\">task TID 64</text><text class=\"t-s t-code\" x=\"550\" y=\"214\" text-anchor=\"middle\">fraud-scorer</text><text class=\"t-s t-m\" x=\"550\" y=\"240\" text-anchor=\"middle\">own stack, registers</text></svg>",
+        "caption": "Three of the demo program's 36 tasks. They share everything in the yellow box; each has its own stack, registers and TID, and the kernel schedules each one on its own."
+      },
+      "refs": [
+        {
+          "title": "clone(2): the flags that make a thread",
+          "url": "https://man7.org/linux/man-pages/man2/clone.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "OSTEP chapter 26: Concurrency: An Introduction",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf",
+          "kind": "read"
+        }
+      ]
+    },
+    {
+      "h": "Counting the threads inside one Java program",
+      "body": "Each task in a process shows up as a folder under `/proc/<pid>/task/`, named after its TID. Each folder has its own `status` and `stat` files, plus `comm`, which holds the thread's name. The JVM names its threads, so you can take a count by name.\n\nThis lesson's demo, `PaymentWorkers`, is a small pretend payments program. It starts two threads that would write to the ledger, the record of money moved, and mostly sleep. It starts one thread called `fraud-scorer` that pretends to check payments for signs of a stolen card, and keeps a processor busy. And it starts 1,000 virtual threads, the subject of the last section. Here are the most common names among its tasks in the lab box. (The lab box is the small Linux computer, run by Docker on your laptop, that this track's Try its use.)\n\n```text\n     13 ForkJoinPool-1-\n      2 java\n      2 C2 CompilerThre\n      1 VM Thread\n      1 VM Periodic Tas\n```\n\nThe program has 36 tasks, though it starts only three ordinary threads of its own. The kernel keeps only the first 15 characters of a thread's name, so `ForkJoinPool-1-worker-11` becomes `ForkJoinPool-1-`. Most of the rest belong to the JVM. There are garbage collector threads (`GC Thread#0`, `G1 Conc#0`), which find and free objects nobody uses. There are the JIT compilers (`C2 CompilerThread0`, `C1 CompilerThread0`), which turn often-run code into fast processor instructions. The `VM Thread` runs jobs that need every Java thread paused. The `Signal Dispatcher` turns `kill -3` into a thread dump, a list of what every thread is doing. The two called `java` are the launcher thread from What a kernel does, whose TID is the PID, and `main`.\n\nMany of these counts follow the number of processors the JVM sees. The lab box has 12, so the JVM made 12 carrier threads for virtual threads, which the last section explains. Start the same program with `-XX:ActiveProcessorCount=2`, a setting that makes the JVM believe there are 2 processors, and it has 25 tasks.\n\nSo a Java program is never one thread. Before your code starts a single one, it's already a few dozen tasks. Every one of them is something the kernel schedules, counts and can show you. Next, we'll find out which of them is using the processor.",
+      "try": {
+        "title": "Count a JVM's threads from outside",
+        "minutes": 4,
+        "steps": [
+          "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`. The demo is `os/src/demo/java/sfz/os/l03/demo/PaymentWorkers.java`: two sleeping ledger writers, one busy fraud scorer and 1,000 virtual threads.",
+          "Run the first block. `& pid=$!` starts the program in the background and keeps its PID. Before the `uniq` line, guess which name will be the most common.",
+          "Then run the second block, which starts the same program as if the computer had 2 processors. Predict whether the task count goes up or down."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l03/demo/*.java\njava -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 3\nls /proc/$pid/task | wc -l\ncat /proc/$pid/task/*/comm | sort | uniq -c | sort -rn | head -5\ngrep Threads /proc/$pid/status\nkill $pid\n\njava -XX:ActiveProcessorCount=2 -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 3; ls /proc/$pid/task | wc -l; kill $pid"
+        },
+        "expect": "```text\npid 41 running\n36\n     13 ForkJoinPool-1-\n      2 java\n      2 C2 CompilerThre\n      1 VM Thread\n      1 VM Periodic Tas\nThreads:\t36\npid 89 running\n25\n```\n\n36 tasks, and 13 of them belong to the virtual-thread scheduler's pool: 12 carriers plus `ForkJoinPool-1-delayScheduler`, the pool's timer thread, which wakes the sleeping virtual threads. With `ActiveProcessorCount=2` the pool shrinks to 2 carriers and the total drops to 25. Your counts depend on how many processors your Docker setup has (`nproc` tells you), and the JIT sometimes adds a second C2 compiler thread."
+      },
+      "refs": [
+        {
+          "title": "proc(5): /proc/pid/task",
+          "url": "https://man7.org/linux/man-pages/man5/proc.5.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Finding the busy thread from both sides: ps and jstack",
+      "body": "When a program burns processor time, the two halves of the story live in different places. The kernel knows which task is using the processor, by TID. The JVM knows what that thread is: its Java name and its stack trace, the chain of method calls it's in right now. To fix a loop that never rests, you need both, joined on something they share.\n\nThe join is easy for the threads you usually create. `Thread.ofPlatform().start(...)`, or the older `new Thread(...).start()`, ends in `pthread_create`. That's the thread-starting function of the C library, the code almost every Linux program uses to talk to the kernel. That ends in the `clone` from the first section. From then on, the Java thread and the task are one thing. The kernel schedules it, and `top` (a program that lists what uses the processor) shows its share. When it waits in `Thread.sleep` or a network read, the kernel puts that task to sleep. Java calls these **platform threads**, and the task under each one is often called an OS thread (OS is short for operating system). In the café, a platform thread is a barista who stays with one customer from order to cup.\n\nEach platform thread also gets its own stack, and the JVM reserves the whole stack when it creates the thread. In the lab box that's about 2 MB per thread. (When creation fails, the JVM's log line says `stacksize: 2040k`.) On x86-64 Linux, the processor family in most Windows laptops, the default is 1 MB. Reserved isn't the same as used, though. The kernel sets the addresses aside at once, but hands out real memory one 4 KB page at a time, as the thread first touches it.\n\n`jstack <pid>`, a tool that comes with Java, prints a thread dump, and every thread's first line carries its TID. Here is the busy thread of the demo program, found from both sides:\n\n```text\n$ ps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\n  145 99.7 fraud-scorer\n  123  0.3 java\n  140  0.2 C1 CompilerThre\n$ jstack $pid | grep -A3 \"nid=145 \"\n\"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s tid=0x0000ffffa014db90 nid=145 runnable  [0x0000ffff753aa000]\n   java.lang.Thread.State: RUNNABLE\n\tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)\n```\n\n`ps -L` lists threads, and here they're sorted by their share of a processor (`pcpu`). Now read the dump's first line from left to right. `fraud-scorer` is the Java name. `#27` is the Java thread ID, the number `Thread.threadId()` returns. `[145]` is the TID. `cpu=` is the processor time this thread has used. `tid=0x...` is the address of the JVM's own record for the thread, not an ID the kernel knows, despite its name. `nid=145`, the native ID, is the TID again.\n\nFrom JDK 18 on, `nid` is printed as a plain decimal number, so it matches `top` and `ps` as it is. (The JDK, the Java Development Kit, is the JVM plus its tools. Its versions are numbered, and 25 is the newest with long-term support.) JDK 17 and older print it in hexadecimal, base 16, as `nid=0x91`. You convert first, with `printf '%x\\n' 145`. Plenty of old how-to guides still say to convert. On JDK 21 or 25, that sends you looking for a thread that isn't there.\n\n**Names get cut short, and Java's IDs mean nothing to the kernel. Join on the TID.**\n\nThat's the whole method for a busy thread. `top -H -p <pid>` or `ps -L` gives the TID, and the thread dump gives the Java stack for that TID. The lab builds the join as a small tool. Next, we'll see what happens when a program asks the kernel for more threads than it allows.",
+      "try": {
+        "title": "From a hot TID to a Java stack",
+        "minutes": 4,
+        "steps": [
+          "In the box, start the demo again, and give the fraud scorer a few seconds to burn processor time.",
+          "List the threads by processor use, take the top TID, and search the thread dump for it. The `HOT=` line does the copying and pasting for you.",
+          "Print the TID in hexadecimal too. That's what you'd search for on JDK 17."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 5\nps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\nHOT=$(ps -L -p $pid -o tid,pcpu --no-headers | sort -k2 -nr | head -1 | awk '{print $1}')\njstack $pid | grep -A3 \"nid=$HOT \"\nprintf '%x\\n' $HOT\nkill $pid"
+        },
+        "expect": "TIDs change on every run:\n\n```text\npid 121 running\n  145 99.7 fraud-scorer\n  123  0.3 java\n  140  0.2 C1 CompilerThre\n\"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s tid=0x0000ffffa014db90 nid=145 runnable  [0x0000ffff753aa000]\n   java.lang.Thread.State: RUNNABLE\n\tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)\n\tat sfz.os.l03.demo.PaymentWorkers$$Lambda/0x000007fe01040438.run(Unknown Source)\n91\n```\n\nOne thread uses a whole processor, and the dump names the method: `PaymentWorkers.score`, line 45. `cpu=5142.71ms` after `elapsed=5.14s` says the same thing from the JVM's side: about 5.1 seconds of processor time in 5.1 seconds of life. On JDK 17 the line would say `nid=0x91`."
+      },
+      "refs": [
+        {
+          "title": "JDK-8268425: Show decimal nid of OSThread instead of hex format one",
+          "url": "https://bugs.openjdk.org/browse/JDK-8268425",
+          "kind": "read"
+        },
+        {
+          "title": "jstack command (JDK 25)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstack.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A limit on tasks, and an error that blames memory",
+      "body": "A program that calls `fork` in a loop, where every child does the same, is called a fork bomb. It fills the kernel's table of tasks in seconds. Then nothing new can start, not even the shell, the program where you'd type a command to stop it. On one computer shared by many containers, one bad container could do that to all of them. So the kernel can cap the number of tasks for a group of processes.\n\nThe groups are **cgroups** (control groups): sets of processes the kernel limits as one unit. Every container is one. (A container is a group of programs that Docker keeps in a box of their own.) Lesson 12, Containers are processes: namespaces and cgroups, takes them apart. The pids controller is the part of cgroups that caps tasks. Docker sets it with `--pids-limit`, and inside the container the limit sits in the file `/sys/fs/cgroup/pids.max`. A thread is a task, so every platform thread counts, along with every thread the JVM starts for itself and every process. In the café, it's a rule about how many baristas fit behind the counter.\n\nWhen the group is full, `clone` fails with `EAGAIN` (\"try again later\"), and the JVM throws an error with a misleading name. Here is `ThreadFlood`, a demo that starts platform threads that each wait, like payments waiting on a slow bank. It runs in a container started with `--pids-limit 64`:\n\n```text\n[0.322s][warning][os,thread] Failed to start thread \"Unknown thread\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\n[0.322s][warning][os,thread] Failed to start the native thread for java.lang.Thread \"Thread-42\"\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\n```\n\nIt got 42 threads. The JVM's own threads used most of the other 22 slots, and the container's shell used one. The error is an `OutOfMemoryError`, Java's error for running out of memory, but the heap was nearly empty: the kernel refused a new task. In the same run, the garbage collector also failed to start a helper thread (`GC Thread#2`), so a full limit hurts the JVM's own work too. The exact number changes from run to run (42 and 50 in two runs here), because the JVM starts helper threads when it needs them.\n\n**An error about native threads points at a task limit. Check the limits before you add memory.**\n\nThe usual limits are the cgroup's `pids.max` and the limit on processes per user (`ulimit -u`), which counts threads too. Inside a container, read `/sys/fs/cgroup/pids.events` first: its `max` counter goes up every time a `fork` or `clone` hits the limit. Raising the limit helps for a while. But each platform thread still costs a task and a 2 MB stack while it does nothing but wait. Next, we'll see a way to wait without a task each.",
+      "try": {
+        "title": "Hit the pids limit with platform threads",
+        "minutes": 4,
+        "steps": [
+          "This one runs from the `labs` folder on your Mac, not inside the box: it starts a new container with a limit of 64 tasks.",
+          "Predict how many of the 200 platform threads start.",
+          "Run it, and read the three parts of the output: the limit, the JVM's complaint, and the `pids.events` counter."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "on your Mac, in labs/",
+          "src": "docker run --rm --pids-limit 64 -v \"$PWD\":/labs -w /labs sfz-labbox:1 \\\n  bash -c 'cat /sys/fs/cgroup/pids.max; java os/src/demo/java/sfz/os/l03/demo/ThreadFlood.java platform 200; cat /sys/fs/cgroup/pids.events'"
+        },
+        "expect": "One run (yours will stop at a slightly different count):\n\n```text\n64\n[0.300s][warning][os,thread] Failed to start thread \"GC Thread#2\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\n[0.300s][error  ][gc,task  ] GC(0) Failed to create worker thread\n...\n[0.322s][warning][os,thread] Failed to start the native thread for java.lang.Thread \"Thread-42\"\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\nmax 12\n```\n\n`pthread_create failed (EAGAIN)` is the kernel refusing a new task. The JVM turns it into an `OutOfMemoryError` while the heap is almost empty. `max 12` in `pids.events` says the group hit its limit 12 times, the garbage collector's failed attempts included. The container is removed when the command ends."
+      },
+      "refs": [
+        {
+          "title": "Control Group v2: the PID controller",
+          "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Virtual threads: many waits on a few OS threads",
+      "body": "Now scale the waiting up: 10,000 payments in flight, each waiting 120 ms on the bank. As platform threads, that's 10,000 tasks, about 20 GB of stack addresses reserved, 10,000 entries against the pids limit, and a kernel juggling 10,000 sleepers. Most of that pays for waiting, and almost none for work.\n\nOne way out is to write the program so no thread ever waits. You start each request, hand over a function to run when the answer comes (a callback), and move on. In Java that's `CompletableFuture.thenCompose` and its relatives. It works, but the code turns into chains of callbacks, and when something fails, the error no longer shows the path that led there.\n\n**Virtual threads** have been a finished part of Java since JDK 21 (JEP 444, the proposal that added them). They keep plain code that waits, and move the switching from the kernel into the JVM. Run the same 10,000 waits on them in the same container, and nothing fails:\n\n```text\nstarted 10,000 virtual threads\nOS threads in this JVM: 37\n```\n\nA virtual thread is a Java object, not a task. To run, it **mounts** on a carrier: an ordinary platform thread from a pool, a `ForkJoinPool`, that the JVM keeps for this job. By default there's one carrier per processor, which is why the demo had 12 `ForkJoinPool-1-worker` threads in a box with 12 processors. Back in the café, the carriers are a few baristas, and the virtual threads are order slips on a rail.\n\nThe trick happens when a virtual thread waits, in `Thread.sleep`, a network read, `ReentrantLock.lock()` or `BlockingQueue.take()`. (A lock lets one thread at a time into a piece of code, and `take()` waits for the next item in a queue.) The JVM **unmounts** it. It saves the thread's stack frames, one per method call in progress, on the heap, and frees the carrier, which picks up another virtual thread. When the sleep ends or the data arrives, the virtual thread joins the queue again and mounts on whichever carrier is free. The barista pins the slip back on the rail while the milk steams, and takes the next one. The kernel sees 12 busy tasks. Your code sees 10,000 threads that each wait in plain, top-to-bottom style.\n\nThe café picture breaks on what gets put aside. An order slip is a few words, while a virtual thread's slip is its whole stack, copied to the heap and back. And some waits still hold on to the carrier, which is called **pinning**. Up to JDK 23, waiting inside a `synchronized` block pinned. (`synchronized` is Java's built-in way to let only one thread at a time into a block of code.) JEP 491 removed that in JDK 24. Three cases still pin in JDK 25. One is waiting inside a class initializer, a `static {}` block of code that runs once when a class is first used. Another is waiting for another thread to finish setting up a class. The third is waiting in native code, code written in C that called back into Java. A pinned carrier can't run any other virtual thread. So 12 pinned virtual threads can stall every other virtual thread in a JVM with 12 carriers, like baristas stuck holding one cup each.\n\nVirtual threads don't make code faster. JEP 444 says so in as many words: \"Virtual threads are not faster threads.\" They let far more tasks wait at once, without a kernel task each. That suits a program that spends its time waiting on a bank or a database, a program that stores records for others. It does nothing for the busy `fraud-scorer`. Don't keep them in a pool, either. Create one per job. To cap how many call the bank at the same time, use a `Semaphore`, a counter that lets only so many threads past at once.\n\n`jstack` lists platform threads only, carriers included, so the demo's 1,000 virtual threads aren't in it. To see them, use `jcmd`, another tool that comes with Java: `jcmd <pid> Thread.dump_to_file -format=json <file>`. Virtual threads remove the cost of waiting. The carriers still need processors, though, and the kernel still decides which task runs on which one, and for how long.",
+      "stepper": {
+        "title": "A platform thread, then virtual threads on carriers",
+        "intro": "Two carriers, three virtual threads and one platform thread. The TIDs come from the demo program in the lab box.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A platform thread is one OS thread, TID 62, for its whole life\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-dim\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, idle</text><rect class=\"box-dim\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, idle</text><rect class=\"box-a\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box-a\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "A platform thread is one OS thread for life. `ledger-writer-1` is TID 62 from start to finish. When it calls `Thread.sleep`, the kernel puts TID 62 to sleep, and that OS thread does nothing else until it wakes. 10,000 payments waiting on platform threads means 10,000 sleeping OS threads."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V1 and V2 mount on the two carriers; V3 waits in the queue\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-a\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">queued</text><rect class=\"box-a\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V2</text><line class=\"ln-a\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln-a\" x1=\"260\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "Virtual threads are Java objects. The scheduler **mounts** V1 on the carrier worker-1 (TID 66) and V2 on worker-2 (TID 67). V3 waits in the scheduler's queue. Only the carriers are OS threads."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V2 blocks on a socket read and unmounts; worker-2 is free\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">parked, on heap</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">queued</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, free</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "V2 calls the card's bank and waits for the answer over the network. The JVM **unmounts** it: V2's stack frames move to the heap, and V2 is parked. TID 67 is free again, even though V2's payment is still waiting for its reply."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"worker-2 mounts V3\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">parked, on heap</text><rect class=\"box-a\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln-a\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "worker-2 takes V3 from the queue and runs it. The kernel noticed nothing: TID 67 never stopped running. To the kernel, switching virtual threads is a carrier doing different work."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V2's reply arrives; V2 is runnable and queued for any free carrier\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-b\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">runnable, queued</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "The bank's reply arrives. V2 can run again and goes back in the queue. It mounts on whichever carrier is free first, which may be worker-1 this time. A virtual thread can run on several OS threads over its life."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V1 blocks inside a static initializer and pins worker-1\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-bad\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">pinned: static {}</text><rect class=\"box-b\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">runnable, queued</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-bad\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, stuck with V1</text><rect class=\"box\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln-bad\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
+            "say": "V1 waits inside a class's `static {}` initializer. That still **pins** in JDK 25: the JVM can't unmount V1, so worker-1 is stuck with it. Waiting inside `synchronized` pinned the same way until JEP 491 fixed it in JDK 24. If every carrier gets pinned, no other virtual thread in the JVM can run."
+          }
+        ]
+      },
+      "try": {
+        "title": "Run 10,000 virtual threads under the same limit",
+        "minutes": 3,
+        "steps": [
+          "Same container settings, same program, but virtual threads, and 50 times as many of them. Predict the number of OS threads.",
+          "Run it from the `labs` folder on your Mac."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "on your Mac, in labs/",
+          "src": "docker run --rm --pids-limit 64 -v \"$PWD\":/labs -w /labs sfz-labbox:1 \\\n  java os/src/demo/java/sfz/os/l03/demo/ThreadFlood.java virtual 10000"
+        },
+        "expect": "```text\nstarted 10,000 virtual threads\nOS threads in this JVM: 37\n```\n\nAll 10,000 started and waited at once, on about 37 OS threads: the JVM's usual helpers plus one carrier per processor. The count changes a little between runs (26 and 37 in two runs here), depending on which JIT and garbage collector threads exist at that moment. Every virtual thread waits on a `CountDownLatch`, a gate that opens once, and waiting there unmounts it, so the carriers stay free."
+      },
+      "refs": [
+        {
+          "title": "JEP 444: Virtual Threads",
+          "url": "https://openjdk.org/jeps/444",
+          "kind": "read"
+        },
+        {
+          "title": "JEP 491: Synchronize Virtual Threads without Pinning",
+          "url": "https://openjdk.org/jeps/491",
+          "kind": "read"
+        }
+      ]
+    }
   ],
-  "answer": 1,
-  "why": "The pids limit counts tasks, and every thread is a task. The JVM's own threads (GC, JIT compilers, carriers and the rest) take a good part of the 64 before your code starts any, so in the lab box it stopped at 42 one run and 50 another. The heap has nothing to do with it."
- },
- "sections": [
-  {
-   "h": "Threads exist so one program can wait on many things at once",
-   "body": "A payment service gets 50 authorization requests in the same second, and each one waits 120 ms for the card issuer. With a single line of execution, request 2 starts only after request 1 has its answer. 50 requests take 6 seconds, and the CPU sits idle for almost all of it. You want all 50 in flight at once, each waiting on its own.\n\nThe first way is the one lesson 2 of this track built: one process per request. `fork` a copy for each request and the kernel runs the copies side by side. Old web servers worked like that. It's a poor fit for a JVM service. Processes don't share memory, so every copy has its own heap, its own cache of exchange rates and its own connection pool, and the 20 Oracle connections you budgeted become 20 per copy.\n\nWhat you want is several lines of execution inside one process, all sharing its memory. Each line needs only three things of its own: a place in the code (the program counter from lesson 1), its own registers, and its own **stack**, the region of memory that holds each method call's local variables and the address to return to. One such line is a **thread**.\n\nLinux builds threads and processes from the same part. The kernel schedules one kind of thing (it picks which one runs on each CPU, and for how long), a **task**: a program counter, registers, a stack and an ID, the **TID**. When `clone` creates a task, flags say what the new task shares with its creator. These are the flags on every `clone` the JVM made in lesson 1:\n\n```text\nCLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|...\n```\n\n`fork` passes none of the sharing flags, so its new task gets copies of everything and becomes a new process. A thread is a task created with flags that say \"share, don't copy\". `CLONE_VM` shares the memory, `CLONE_FILES` the open files, `CLONE_SIGHAND` the signal handlers, and `CLONE_THREAD` puts the new task in the caller's **thread group**. A process, as you know it, is a thread group: a set of tasks that share one memory.\n\nThat explains a field you met in lesson 2. A process's PID is the TID of its first task, and the `Tgid` (thread group ID) line in `/proc/<pid>/status` shows that same number in every thread of the group. A signal sent with `kill <pid>` goes to the group as a whole.\n\nThe figure below is the model for the rest of this lesson. A process is a box of shared memory with tasks in it. The JVM decides how Java threads map onto those tasks, and the later sections look at the two ways it does that.",
-   "figure": {
-    "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A process is a thread group: shared memory and files on top, three tasks below, each with its own stack, registers and TID\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"20\" y=\"20\" width=\"640\" height=\"260\" rx=\"8\"/><text class=\"t-s t-m\" x=\"40\" y=\"46\" text-anchor=\"start\">process PID 40 = thread group 40</text><rect class=\"box-b\" x=\"40\" y=\"60\" width=\"600\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"340.0\" y=\"90.0\" text-anchor=\"middle\">shared by every task in the group</text><text class=\"t-s t-m\" x=\"340.0\" y=\"110.0\" text-anchor=\"middle\">heap, code, open files, signal handlers</text><line class=\"ln-d\" x1=\"130\" y1=\"130\" x2=\"130\" y2=\"158\"/><line class=\"ln-d\" x1=\"340\" y1=\"130\" x2=\"340\" y2=\"158\"/><line class=\"ln-d\" x1=\"550\" y1=\"130\" x2=\"550\" y2=\"158\"/><rect class=\"box-a\" x=\"40\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"130\" y=\"190\" text-anchor=\"middle\">task TID 40</text><text class=\"t-s t-code\" x=\"130\" y=\"214\" text-anchor=\"middle\">launcher</text><text class=\"t-s t-m\" x=\"130\" y=\"240\" text-anchor=\"middle\">own stack, registers</text><rect class=\"box-a\" x=\"250\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"190\" text-anchor=\"middle\">task TID 42</text><text class=\"t-s t-code\" x=\"340\" y=\"214\" text-anchor=\"middle\">main</text><text class=\"t-s t-m\" x=\"340\" y=\"240\" text-anchor=\"middle\">own stack, registers</text><rect class=\"box-a\" x=\"460\" y=\"160\" width=\"180\" height=\"100\" rx=\"8\"/><text class=\"t\" x=\"550\" y=\"190\" text-anchor=\"middle\">task TID 64</text><text class=\"t-s t-code\" x=\"550\" y=\"214\" text-anchor=\"middle\">fraud-scorer</text><text class=\"t-s t-m\" x=\"550\" y=\"240\" text-anchor=\"middle\">own stack, registers</text></svg>",
-    "caption": "Three of the demo service's 36 tasks. They share everything in the yellow box; each has its own stack, registers and TID, and the kernel schedules each one on its own."
-   },
-   "refs": [
-    {
-     "title": "clone(2): the flags that make a thread",
-     "url": "https://man7.org/linux/man-pages/man2/clone.2.html",
-     "kind": "docs"
+  "compare": {
+    "title": "Waiting on platform threads and on virtual threads, under --pids-limit 64",
+    "a": {
+      "label": "platform threads (200 asked for)",
+      "lang": "text",
+      "title": "ThreadFlood.java platform 200",
+      "src": "64\n[0.322s][warning][os,thread] Failed to start thread \"Unknown thread\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\nmax 12"
     },
-    {
-     "title": "OSTEP chapter 26: Concurrency: An Introduction",
-     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/threads-intro.pdf",
-     "kind": "read"
-    }
-   ]
+    "b": {
+      "label": "virtual threads (10,000 asked for)",
+      "lang": "text",
+      "title": "ThreadFlood.java virtual 10000",
+      "src": "started 10,000 virtual threads\nOS threads in this JVM: 37"
+    },
+    "note": "Same container, same JDK, same waiting code. Each platform thread is a kernel task with a 2 MB stack reserved, so the limit of 64 tasks stops the program at 42 threads of its own. A virtual thread is an object on the heap that needs a carrier only while it runs, and a thread waiting on a latch unmounts. So 10,000 of them fit on the JVM's usual 37 or so OS threads. The limit didn't change. The number of tasks the program asked the kernel for did."
   },
-  {
-   "h": "A JVM is a few dozen tasks before your code starts any",
-   "body": "Each task in a process shows up as a directory under `/proc/<pid>/task/`, named after its TID, with its own `status`, `stat` and `comm` (the thread's name) files. The JVM names its threads, so you can take a census by name. Here are the top lines for a small demo service in the lab box:\n\n```text\n     13 ForkJoinPool-1-\n      2 java\n      2 C2 CompilerThre\n      1 VM Thread\n      1 VM Periodic Tas\n```\n\nThat service has 36 tasks, though it starts only three ordinary threads of its own (plus 1,000 virtual threads, the subject of the last section). The kernel keeps only the first 15 characters of a thread's name, so `ForkJoinPool-1-worker-11` becomes `ForkJoinPool-1-`. Most of the rest belong to the JVM: garbage collector threads (`GC Thread#0`, `G1 Conc#0`), the JIT compilers (`C2 CompilerThread0`, `C1 CompilerThread0`), the `VM Thread`, which runs operations that need every Java thread paused, and the `Signal Dispatcher`, which turns `kill -3` into a thread dump. The two called `java` are the launcher thread from lesson 1, whose TID is the PID, and `main`.\n\nMany of these counts follow the number of CPUs the JVM sees. The lab box has 12, so the JVM made 12 carrier threads for virtual threads, which the last section explains. Start the same program with `-XX:ActiveProcessorCount=2` and it has 25 tasks.\n\nSo a JVM is never one thread. Before your code starts a single one, it is already a few dozen tasks, and every one of them is something the kernel schedules, counts and can show you.",
-   "try": {
-    "title": "Count a JVM's threads from outside",
-    "minutes": 4,
+  "worked": {
+    "title": "Find the thread that's burning a CPU",
     "steps": [
-     "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`. The demo is `os/src/demo/java/sfz/os/l03/demo/PaymentWorkers.java`: two sleeping ledger writers, one busy fraud scorer and 1,000 virtual threads.",
-     "Run the first block. Before the `uniq` line, guess which name will be the most common.",
-     "Then run the second block, which starts the same program as if the machine had 2 CPUs. Predict whether the task count goes up or down."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l03/demo/*.java\njava -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 3\nls /proc/$pid/task | wc -l\ncat /proc/$pid/task/*/comm | sort | uniq -c | sort -rn | head -5\ngrep Threads /proc/$pid/status\nkill $pid\n\njava -XX:ActiveProcessorCount=2 -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 3; ls /proc/$pid/task | wc -l; kill $pid"
-    },
-    "expect": "```text\npid 41 running\n36\n     13 ForkJoinPool-1-\n      2 java\n      2 C2 CompilerThre\n      1 VM Thread\n      1 VM Periodic Tas\nThreads:\t36\npid 89 running\n25\n```\n\n36 tasks, and 13 of them are the virtual-thread scheduler's pool: 12 carriers plus `ForkJoinPool-1-delayScheduler`, the pool's timer thread, which wakes the sleeping virtual threads. With `ActiveProcessorCount=2` the pool shrinks to 2 carriers and the total drops to 25. Your counts depend on how many CPUs your Docker VM has (`nproc` tells you), and the JIT sometimes adds a second C2 compiler thread."
-   },
-   "refs": [
-    {
-     "title": "proc(5): /proc/pid/task",
-     "url": "https://man7.org/linux/man-pages/man5/proc.5.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "A platform thread is one OS thread, and jstack knows which",
-   "body": "When a service burns CPU, the two halves of the story live in different places. The kernel knows which task is using the CPU, by TID. The JVM knows what that thread is: its Java name and its stack trace, the chain of method calls it is in. To fix a hot loop you need both, joined on something they share.\n\nThe join is easy for the threads you usually create. `Thread.ofPlatform().start(...)`, or the old `new Thread(...).start()`, ends in `pthread_create`, the C library's function for starting a thread, which ends in the `clone` you saw in the first section. From then on the Java thread and the task are one thing. The kernel schedules it, `top` shows its CPU use, and when it blocks in `Thread.sleep` or a socket read, the kernel puts that task to sleep. The JDK calls these **platform threads**.\n\nEach platform thread also gets its own stack, and the JVM reserves the whole stack when it creates the thread. In the lab box that's about 2 MB per thread (when creation fails, the JVM's log line says `stacksize: 2040k`). On x86-64 Linux the default is 1 MB. Reserved isn't the same as used. The kernel sets the address range aside at once, but hands out real memory one 4 KB page at a time, as the thread first touches it.\n\n`jstack <pid>` prints the JVM's side, and every thread's header line carries the TID. Here is the hot thread of the demo service, found from both sides:\n\n```text\n$ ps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\n  145 99.7 fraud-scorer\n  123  0.3 java\n  140  0.2 C1 CompilerThre\n$ jstack $pid | grep -A3 \"nid=145 \"\n\"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s tid=0x0000ffffa014db90 nid=145 runnable  [0x0000ffff753aa000]\n   java.lang.Thread.State: RUNNABLE\n\tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)\n```\n\nRead the header from left to right. `fraud-scorer` is the Java name. `#27` is the Java thread ID, the number `Thread.threadId()` returns. `[145]` is the TID. `cpu=` is the CPU time this thread has used. `tid=0x...` is the address of the JVM's internal thread object, not an OS ID, despite its name. `nid=145`, the native ID, is the TID again.\n\nOn JDK 18 and later `nid` is decimal, so it matches `top` and `ps` as is. JDK 17 and older print it in hex, `nid=0x91`, and you convert first with `printf '%x\\n' 145`. Plenty of runbooks still say to convert. On JDK 21 or 25 that sends you looking for a thread that isn't there.\n\nThat's the whole method for a hot thread in production: `top -H -p <pid>` or `ps -L` gives the TID, and the thread dump gives the Java stack for that TID. The lab builds the join as a small tool.",
-   "try": {
-    "title": "From a hot TID to a Java stack",
-    "minutes": 4,
-    "steps": [
-     "In the box, start the demo again and give the fraud scorer a few seconds to burn CPU.",
-     "List the threads by CPU use, take the top TID, and grep the thread dump for it. The `HOT=` line does the copy and paste for you.",
-     "Print the TID in hex too. That's what you'd search for on JDK 17."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java -cp /tmp/out sfz.os.l03.demo.PaymentWorkers 120 & pid=$!\nsleep 5\nps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\nHOT=$(ps -L -p $pid -o tid,pcpu --no-headers | sort -k2 -nr | head -1 | awk '{print $1}')\njstack $pid | grep -A3 \"nid=$HOT \"\nprintf '%x\\n' $HOT\nkill $pid"
-    },
-    "expect": "TIDs change on every run:\n\n```text\npid 121 running\n  145 99.7 fraud-scorer\n  123  0.3 java\n  140  0.2 C1 CompilerThre\n\"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s tid=0x0000ffffa014db90 nid=145 runnable  [0x0000ffff753aa000]\n   java.lang.Thread.State: RUNNABLE\n\tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)\n\tat sfz.os.l03.demo.PaymentWorkers$$Lambda/0x000007fe01040438.run(Unknown Source)\n91\n```\n\nOne thread uses a whole CPU, and the dump names the method: `PaymentWorkers.score`, line 45. `cpu=5142.71ms` after `elapsed=5.14s` says the same thing from the JVM's side. On JDK 17 the header would say `nid=0x91`."
-   },
-   "refs": [
-    {
-     "title": "JDK-8268425: Show decimal nid of OSThread instead of hex format one",
-     "url": "https://bugs.openjdk.org/browse/JDK-8268425",
-     "kind": "read"
-    },
-    {
-     "title": "jstack command (JDK 25)",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/specs/man/jstack.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Every platform thread counts against the pids limit",
-   "body": "A program that calls `fork` in a loop, where every child does the same, is called a fork bomb. It fills the kernel's table of tasks in seconds, and then nothing new can start, not even the shell you would use to stop it. On a host shared by many containers, one bad container would do that to all of them. So the kernel can cap the number of tasks per group of processes.\n\nThe groups are **cgroups** (control groups): sets of processes the kernel limits as one unit. Every container is one, and lesson 12 of this track takes them apart. The pids controller is the part of cgroups that caps tasks. Docker sets it with `--pids-limit`, and Kubernetes with the kubelet's `podPidsLimit`. Inside the container the limit is in `/sys/fs/cgroup/pids.max`. A thread is a task, so every platform thread counts, along with every thread the JVM starts for itself and every process.\n\nWhen the group is full, `clone` fails with `EAGAIN` (\"try again later\") and the JVM throws an error with a misleading name. Here is `ThreadFlood`, which starts platform threads that each wait (like requests waiting on a slow card issuer), in a container started with `--pids-limit 64`:\n\n```text\n[0.322s][warning][os,thread] Failed to start thread \"Unknown thread\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\n[0.322s][warning][os,thread] Failed to start the native thread for java.lang.Thread \"Thread-42\"\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\n```\n\nIt got 42 threads. The JVM's own threads used most of the other 22 slots, and the container's shell used one. The error is an `OutOfMemoryError`, but the heap was nearly empty: the kernel refused a new task. In the same run the garbage collector also failed to start a worker (`GC Thread#2`), so a full pids limit hurts the JVM's own work too. The exact number changes from run to run (I've seen 42 and 50), because the JVM starts helper threads when it needs them.\n\nSo when you see \"unable to create native thread\", suspect a task limit before memory. The usual ones are the cgroup's `pids.max` and the per-user process limit (`ulimit -u`), which counts threads too. Inside a container, read `/sys/fs/cgroup/pids.events` first: its `max` counter goes up every time a `fork` or `clone` hits the limit.",
-   "try": {
-    "title": "Hit the pids limit with platform threads",
-    "minutes": 4,
-    "steps": [
-     "This one runs from the `labs` folder on your Mac, not inside the box: it starts a fresh container with a limit of 64 tasks.",
-     "Predict how many of the 200 platform threads start.",
-     "Run it and read the three parts of the output: the limit, the JVM's complaint, and the `pids.events` counter."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "on your Mac, in labs/",
-     "src": "docker run --rm --pids-limit 64 -v \"$PWD\":/labs -w /labs sfz-labbox:1 \\\n  bash -c 'cat /sys/fs/cgroup/pids.max; java os/src/demo/java/sfz/os/l03/demo/ThreadFlood.java platform 200; cat /sys/fs/cgroup/pids.events'"
-    },
-    "expect": "One run (yours will stop at a slightly different count):\n\n```text\n64\n[0.300s][warning][os,thread] Failed to start thread \"GC Thread#2\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\n[0.300s][error  ][gc,task  ] GC(0) Failed to create worker thread\n...\n[0.322s][warning][os,thread] Failed to start the native thread for java.lang.Thread \"Thread-42\"\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\nmax 12\n```\n\n`pthread_create failed (EAGAIN)` is the kernel refusing a new task. The JVM turns it into an `OutOfMemoryError` with a heap that is almost empty. `max 12` in `pids.events` says the group hit its limit 12 times, including the GC's failed attempts. The container is removed when the command ends."
-   },
-   "refs": [
-    {
-     "title": "Control Group v2: the PID controller",
-     "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Virtual threads share a few carrier threads",
-   "body": "Now scale the waiting up: 10,000 requests in flight, each waiting 120 ms on the issuer. As platform threads that's 10,000 tasks, about 20 GB of stack address space reserved, 10,000 entries against the pids limit, and a kernel juggling 10,000 sleepers. Most of that pays for waiting, not work.\n\nOne way out is asynchronous code. A few threads start each I/O and hand the rest of the work to a callback (`CompletableFuture.thenCompose`, reactive streams), so no thread sits blocked. It works, but the code turns into chains of callbacks, and a stack trace no longer shows how you got somewhere.\n\n**Virtual threads**, final since JDK 21 (JEP 444), keep plain blocking code and move the switching from the kernel into the JDK. Run the same 10,000 waits on them in the same container, and nothing fails:\n\n```text\nstarted 10,000 virtual threads\nOS threads in this JVM: 37\n```\n\nA virtual thread is a Java object, not a task. To run, it **mounts** on a carrier: an ordinary platform thread from a `ForkJoinPool` that the JDK keeps for this job. By default there is one carrier per CPU, which is why the demo had 12 `ForkJoinPool-1-worker` threads in a box with 12 CPUs.\n\nThe trick happens when a virtual thread blocks. In `Thread.sleep`, a socket read, `ReentrantLock.lock()` or `BlockingQueue.take()`, the JDK **unmounts** it: it saves the thread's stack frames (one frame per method call in progress) on the heap and frees the carrier, which picks up another virtual thread. When the sleep ends or the data arrives, the virtual thread is queued again and mounts on whichever carrier is free. The kernel sees 12 busy tasks. Your code sees 10,000 threads that each block in plain, top-to-bottom style.\n\nSome blocking still holds on to the carrier. This is called **pinning**. Up to JDK 23, blocking inside a `synchronized` block pinned, and JEP 491 removed that in JDK 24. Three cases still pin in JDK 25: blocking inside a class initializer (a `static {}` block), waiting for another thread to finish initializing a class, and blocking in native code that called back into Java. A pinned carrier can't run any other virtual thread, so 12 pinned virtual threads can stall every other virtual thread in a 12-carrier JVM.\n\nVirtual threads don't make code faster. JEP 444 says so in as many words: \"Virtual threads are not faster threads.\" They let far more tasks wait at once without a kernel task each. That suits a service that spends its time waiting on Oracle, Kafka or a card issuer, and does nothing for the CPU-bound `fraud-scorer`. Don't pool them either. Create one per task, and use a `Semaphore` to cap how many hit a downstream service at once.\n\n`jstack` lists platform threads only, carriers included. The 1,000 virtual threads of the demo service aren't in it. To see virtual threads, use `jcmd <pid> Thread.dump_to_file -format=json <file>`.",
-   "stepper": {
-    "title": "A platform thread, then virtual threads on carriers",
-    "intro": "Two carriers, three virtual threads and one platform thread. The TIDs come from the demo service in the lab box.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A platform thread is one OS thread, TID 62, for its whole life\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-dim\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">not started</text><rect class=\"box-dim\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, idle</text><rect class=\"box-dim\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, idle</text><rect class=\"box-a\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box-a\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "A platform thread is one OS thread for life. `ledger-writer-1` is TID 62 from start to finish. When it calls `Thread.sleep`, the kernel puts TID 62 to sleep, and that OS thread does nothing else until it wakes. 10,000 requests waiting on platform threads means 10,000 sleeping OS threads."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V1 and V2 mount on the two carriers; V3 waits in the queue\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-a\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-a\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">queued</text><rect class=\"box-a\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V2</text><line class=\"ln-a\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln-a\" x1=\"260\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "Virtual threads are Java objects. The scheduler **mounts** V1 on carrier worker-1 (TID 66) and V2 on worker-2 (TID 67). V3 waits in the scheduler's queue. Only the carriers are OS threads."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V2 blocks on a socket read and unmounts; worker-2 is free\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">parked, on heap</text><rect class=\"box-dim\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">queued</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, free</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "V2 calls the card issuer and blocks reading the socket. The JDK **unmounts** it: V2's stack frames move to the heap and V2 is parked. TID 67 is free again, even though V2's request is still waiting for its reply."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"worker-2 mounts V3\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-dim\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">parked, on heap</text><rect class=\"box-a\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box-a\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln-a\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "worker-2 takes V3 from the queue and runs it. The kernel noticed nothing: TID 67 never stopped running. From the kernel's side, switching virtual threads is just a carrier doing different work."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V2's reply arrives; V2 is runnable and queued for any free carrier\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-b\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">runnable, queued</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, runs V1</text><rect class=\"box\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "The issuer's reply arrives. V2 becomes runnable and goes back in the queue. It mounts on whichever carrier frees up first, which may be worker-1 this time. A virtual thread can run on several OS threads over its life."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"V1 blocks inside a static initializer and pins worker-1\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"28\" text-anchor=\"start\">Java threads</text><text class=\"t-s t-m\" x=\"20\" y=\"288\" text-anchor=\"start\">OS threads: the kernel schedules these</text><rect class=\"box-bad\" x=\"20\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"95.0\" y=\"70.0\" text-anchor=\"middle\">virtual V1</text><text class=\"t-s t-m\" x=\"95.0\" y=\"90.0\" text-anchor=\"middle\">pinned: static {}</text><rect class=\"box-b\" x=\"185\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"260.0\" y=\"70.0\" text-anchor=\"middle\">virtual V2</text><text class=\"t-s t-m\" x=\"260.0\" y=\"90.0\" text-anchor=\"middle\">runnable, queued</text><rect class=\"box\" x=\"350\" y=\"40\" width=\"150\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"425.0\" y=\"70.0\" text-anchor=\"middle\">virtual V3</text><text class=\"t-s t-m\" x=\"425.0\" y=\"90.0\" text-anchor=\"middle\">running</text><rect class=\"box-bad\" x=\"40\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"140.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-1</text><text class=\"t-s t-m\" x=\"140.0\" y=\"240.0\" text-anchor=\"middle\">TID 66, stuck with V1</text><rect class=\"box\" x=\"280\" y=\"190\" width=\"200\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"380.0\" y=\"220.0\" text-anchor=\"middle\">carrier worker-2</text><text class=\"t-s t-m\" x=\"380.0\" y=\"240.0\" text-anchor=\"middle\">TID 67, runs V3</text><line class=\"ln-bad\" x1=\"95\" y1=\"110\" x2=\"140\" y2=\"188\"/><line class=\"ln\" x1=\"425\" y1=\"110\" x2=\"380\" y2=\"188\"/><rect class=\"box\" x=\"530\" y=\"40\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"70.0\" text-anchor=\"middle\">platform</text><text class=\"t-s t-m\" x=\"595.0\" y=\"90.0\" text-anchor=\"middle\">ledger-writer-1</text><rect class=\"box\" x=\"530\" y=\"190\" width=\"130\" height=\"70\" rx=\"8\"/><text class=\"t\" x=\"595.0\" y=\"220.0\" text-anchor=\"middle\">TID 62</text><text class=\"t-s t-m\" x=\"595.0\" y=\"240.0\" text-anchor=\"middle\">asleep</text><line class=\"ln\" x1=\"595\" y1=\"110\" x2=\"595\" y2=\"188\"/><text class=\"t-s t-m\" x=\"603\" y=\"155\" text-anchor=\"start\">1:1</text></svg>",
-      "say": "V1 blocks inside a class's `static {}` initializer. That still **pins** in JDK 25: the JDK can't unmount V1, so worker-1 is stuck with it. Blocking inside `synchronized` pinned the same way until JEP 491 fixed it in JDK 24. If every carrier gets pinned, no other virtual thread in the JVM can run."
-     }
+      {
+        "say": "The payments program sits at 100% of one processor, and payments are slow. First, find which thread uses the processor, from the kernel's side. `ps -L` lists threads with their share of a processor. In the demo, one TID stands out.",
+        "code": "ps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\n#   145 99.7 fraud-scorer\n#   123  0.3 java\n#   140  0.2 C1 CompilerThre",
+        "lang": "bash"
+      },
+      {
+        "say": "Then ask the JVM what that thread is doing. On JDK 18 and later, search the dump for the TID as it is. `jcmd <pid> Thread.print` prints the same dump if `jstack` isn't installed.",
+        "code": "jstack $pid | grep -A3 \"nid=145 \"\n# \"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s ... nid=145 runnable\n#    java.lang.Thread.State: RUNNABLE\n# \tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)",
+        "lang": "bash"
+      },
+      {
+        "say": "On JDK 17 or older, the dump shows `nid` in hexadecimal. Convert the TID first, then search.",
+        "code": "printf '%x\\n' 145\n# 91\njstack $pid | grep -A3 \"nid=0x91 \"",
+        "lang": "bash"
+      },
+      {
+        "say": "Take two or three dumps a few seconds apart. If the same method is on top every time, that's the loop to look at. If the busy TID belongs to a thread with no `#` number, such as `GC Thread#0` or `C2 CompilerThread0`, the processor time goes to the JVM itself. Heavy garbage collection points to a program that creates objects too fast, and a busy compiler usually calms down once the program has warmed up. If the busy TID isn't in the dump at all, check whether it's the launcher thread (TID = PID), or a thread that native code started.",
+        "code": "",
+        "lang": ""
+      }
     ]
-   },
-   "try": {
-    "title": "Run 10,000 virtual threads under the same limit",
-    "minutes": 3,
-    "steps": [
-     "Same container settings, same program, but virtual threads and 50 times as many of them. Predict the number of OS threads.",
-     "Run it from the `labs` folder on your Mac."
+  },
+  "lab": {
+    "title": "Join the kernel's threads to the JVM's",
+    "minutes": 15,
+    "files": [
+      "labs/os/src/main/kotlin/sfz/os/l03/ThreadDump.kt",
+      "labs/os/src/test/resources/sfz/os/l03/payment-workers.jstack.txt",
+      "labs/os/src/test/resources/sfz/os/l03/payment-workers.ps.txt"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "on your Mac, in labs/",
-     "src": "docker run --rm --pids-limit 64 -v \"$PWD\":/labs -w /labs sfz-labbox:1 \\\n  java os/src/demo/java/sfz/os/l03/demo/ThreadFlood.java virtual 10000"
-    },
-    "expect": "```text\nstarted 10,000 virtual threads\nOS threads in this JVM: 37\n```\n\nAll 10,000 started and waited at once on about 37 OS threads: the JVM's usual helpers plus one carrier per CPU. The count changes a little between runs (I've seen 26 and 37) depending on which JIT and GC threads exist at that moment. Every virtual thread waits on a `CountDownLatch`, which unmounts it, so the carriers stay free."
-   },
-   "refs": [
-    {
-     "title": "JEP 444: Virtual Threads",
-     "url": "https://openjdk.org/jeps/444",
-     "kind": "read"
-    },
-    {
-     "title": "JEP 491: Synchronize Virtual Threads without Pinning",
-     "url": "https://openjdk.org/jeps/491",
-     "kind": "read"
+    "run": "./gradlew :os:test --tests 'sfz.os.l03.*'",
+    "steps": [
+      "Open the two captured files. They are real output from this lesson's demo in the lab box: `ps -L -p <pid> -o tid,pcpu,time,comm`, and `jstack <pid>` a moment later.",
+      "Run the tests from the `labs` folder. All eight fail.",
+      "Write `ThreadDump.nidToTid`: read the text as hexadecimal when it starts with `0x`, and as decimal otherwise.",
+      "Write `ThreadDump.parse`. Match each line against `HEADER`, the pattern for a thread's first line. For each header, the thread's own lines run until the next blank line. Take the state from the line that starts with `java.lang.Thread.State:` (first word only), and the top frame from the first line that starts with `at ` (trim the spaces first).",
+      "Write the three `ThreadMap` methods. Build a `Map<Int, DumpedThread>` keyed by `osTid` once, and use it in all three.",
+      "Run the tests until all eight pass. Then look at what `tasksNotInDump` returns, and say which thread that is."
+    ],
+    "hints": [
+      "`HEADER.find(line)` returns null for every line that isn't a thread header, including the dump's date and title lines.",
+      "`lines.drop(i + 1).takeWhile { it.isNotBlank() }` gives the lines that belong to the header at index `i`.",
+      "`\"TIMED_WAITING (sleeping)\".substringBefore(\" \")` gives the first word.",
+      "The dump also has a thread the ps file doesn't: `Attach Listener`. `jstack` itself made the JVM start it, after `ps` had already run."
+    ],
+    "done_when": "All eight tests in `ThreadMapTest` pass."
+  },
+  "drill": {
+    "title": "Hot TID to Java stack, from memory",
+    "minutes": 4,
+    "prompt": "Write the commands that take you from \"this Java program uses a whole processor\" to the Java stack of the thread responsible, on JDK 25. Then write what changes on JDK 17. Check against the answer.",
+    "answer": {
+      "lang": "bash",
+      "src": "pid=$(pgrep -f ledger-service)                            # or: jcmd -l\nps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3    # or: top -H -p $pid\njstack $pid | grep -A10 \"nid=145 \"                       # JDK 18+: nid is decimal\n\n# JDK 17 and older: nid is hex\nprintf '%x\\n' 145                                          # 91\njstack $pid | grep -A10 \"nid=0x91 \""
     }
-   ]
-  }
- ],
- "analogy": "Platform threads are like giving every payment request its own phone line to the card issuer. While a request waits on hold, its line is busy, and the exchange (the kernel) has a fixed number of lines per building (the pids limit). Virtual threads are a call centre: a few agents (carriers) work through thousands of open cases (virtual threads). When a case is waiting on the issuer, the agent files it (unmounts) and picks up the next one. When the issuer calls back, any free agent reopens the file. The analogy breaks on what the case file holds. An agent's case file is a few notes. A virtual thread's file is its whole call stack, copied to the heap and back, and some kinds of waiting (a class initializer, a native call) force the agent to stay on the line.",
- "in_your_world": "A Quarkus service with a 200-thread worker pool, a Kafka consumer pool and a JDBC pool can easily run 300 platform threads, plus the JVM's own. In a pod with a small `podPidsLimit`, a traffic spike that makes the pool grow ends in \"unable to create native thread\" with a healthy heap, and the dashboards point at memory. Check `/sys/fs/cgroup/pids.events` before you raise `-Xmx`. When one pod sits at 100% of a CPU, `ps -L` (or `top -H`) plus `jstack` names the thread and the method in under a minute, and on JDK 21 you grep for the decimal TID. Virtual threads fit the parts of a payment service that mostly wait: calls to the card issuer, Oracle queries, Temporal activity calls. Keep a `Semaphore` in front of each downstream service, because 10,000 virtual threads will happily open 10,000 requests to a service that can take 50.",
- "mistake": "Reading `tid=` in a thread dump as the OS thread ID. It sits right there in the header, it says \"tid\", and people paste it into `top -H`. It is the address of the JVM's internal thread structure, `0x0000ffffa014db90`, and matches nothing in the kernel. The OS thread ID is `nid` (and, in JDK 25, the number in brackets after the Java ID). The second half of the same mistake is converting `nid` to hex on a modern JDK because an old runbook says so. Since JDK 18 `nid` is decimal and matches `ps -L` and `top -H` directly. Check which JDK the service runs before you convert anything.",
- "compare": {
-  "title": "Waiting on platform threads against virtual threads, under --pids-limit 64",
-  "a": {
-   "label": "platform threads (200 asked for)",
-   "lang": "text",
-   "title": "ThreadFlood.java platform 200",
-   "src": "64\n[0.322s][warning][os,thread] Failed to start thread \"Unknown thread\" - pthread_create failed (EAGAIN) for attributes: stacksize: 2040k, guardsize: 4k, detached.\nfailed after 42 platform threads: unable to create native thread: possibly out of memory or process/resource limits reached\nOS threads in this JVM: 63\nmax 12"
   },
-  "b": {
-   "label": "virtual threads (10,000 asked for)",
-   "lang": "text",
-   "title": "ThreadFlood.java virtual 10000",
-   "src": "started 10,000 virtual threads\nOS threads in this JVM: 37"
+  "recap": [
+    "Linux runs tasks. A thread is a task made by `clone` with flags that share memory, files and signal handlers. A process is a group of tasks, and its PID is the first task's TID.",
+    "Each thread has a folder under `/proc/<pid>/task/`. The kernel keeps only 15 characters of a thread's name, so join the kernel's side and the JVM's side on TIDs, never on names.",
+    "A platform thread is one OS thread for life, with about 2 MB of stack reserved on arm64 Linux (1 MB on x86-64). `jstack` shows its TID as `[145]` and `nid=145`; JDK 17 and older print `nid` in hexadecimal.",
+    "The pids limit counts threads. When it's reached, `clone` fails with `EAGAIN`, and the JVM throws `OutOfMemoryError: unable to create native thread` with memory to spare.",
+    "Virtual threads mount on a few carriers, one per processor by default, and unmount when they wait. Since JDK 24, `synchronized` doesn't pin; class initializers and native code still do.",
+    "The limit: virtual threads make waiting cheap, not work fast. A busy thread still needs a processor, and the kernel still decides who gets one and for how long."
+  ],
+  "closing": "We started with one barista watching the milk steam while twelve people waited. Threads gave the café's payments program more baristas, each one a task the kernel counts, until a limit of 64 stopped it with an error that blamed memory. Virtual threads put the waiting payments on a rail and let a few baristas work through them.\n\nOn a Mac, open Activity Monitor and add the Threads column (View, then Columns). Find your browser, and compare its thread count with the number of processors in your Mac.\n\nNext, we'll watch the kernel share a processor between tasks that all want it, and find out how it decides who runs next.",
+  "quiz": [
+    {
+      "q": "A payments program runs in a container whose `pids.max` is 512, and it starts a platform thread for every payment. During a busy hour it logs `OutOfMemoryError: unable to create native thread`, while its heap is 30% used. What happened?",
+      "options": [
+        "The heap filled up with `Thread` objects",
+        "The container reached its pids limit, because every platform thread is a task the kernel counts",
+        "The JVM ran out of room for the classes it loaded",
+        "The computer ran out of processor time"
+      ],
+      "answer": 1,
+      "why": "`clone` failed with `EAGAIN` because the group's count of tasks hit `pids.max`, and the JVM reports that as an `OutOfMemoryError`. The heap had room, which is what makes the first option tempting and wrong. `pids.events` would show its `max` counter going up."
+    },
+    {
+      "q": "`top -H` shows TID 3071 at 100% of a processor, in a program on JDK 21. What do you search for in the `jstack` output?",
+      "options": [
+        "`nid=0xbff`",
+        "`#3071`",
+        "`nid=3071`",
+        "`tid=3071`"
+      ],
+      "answer": 2,
+      "why": "Since JDK 18, `nid` is printed in decimal, so it matches `top` as it is. `nid=0xbff` is the JDK 17 form, and the old how-to guides that recommend it are the trap. `#` is the Java thread ID, and `tid=` is the address of the JVM's own record for the thread."
+    },
+    {
+      "q": "A virtual thread asks a database for some rows, and waits while the answer comes over the network. What happens to its carrier on JDK 25?",
+      "options": [
+        "The virtual thread unmounts, and the carrier runs other virtual threads while the answer is on its way",
+        "The carrier waits until the answer arrives",
+        "The JVM creates a new OS thread for the wait",
+        "The request fails, because virtual threads can't wait on the network"
+      ],
+      "answer": 0,
+      "why": "Waiting on the network is the case virtual threads were built for. The JVM saves the thread's frames on the heap and frees the carrier. It would stay on the carrier only if it were pinned, for example inside a class initializer. Since JDK 24, a `synchronized` block in the database code no longer pins."
+    },
+    {
+      "q": "Which of these still pins a virtual thread to its carrier on JDK 25?",
+      "options": [
+        "Waiting on a network read inside a `synchronized` block",
+        "Waiting in `ReentrantLock.lock()`",
+        "`Thread.sleep(100)`",
+        "Waiting inside a class's `static {}` initializer"
+      ],
+      "answer": 3,
+      "why": "JEP 491 (JDK 24) stopped `synchronized` from pinning, which is why the first option is the trap for anyone who learned virtual threads on JDK 21. `ReentrantLock` and `sleep` never pinned. Setting up a class still does: a virtual thread that waits in a `static {}` block keeps its carrier until the block finishes."
+    },
+    {
+      "q": "From Processes: fork, exec, wait and signals: a Java program with 35 threads runs `new ProcessBuilder(\"pdftotext\", \"invoice.pdf\").start()` to turn a PDF into text. How many threads does the new process have when `pdftotext` starts running?",
+      "options": [
+        "35, because creating a process copies every thread",
+        "One. A new process starts with a single thread, and `execve` gives it `pdftotext`'s program",
+        "35 threads, all paused",
+        "None until `pdftotext` creates one"
+      ],
+      "answer": 1,
+      "from": "os-02",
+      "why": "`fork` copies only the thread that called it, and Java's own way of starting programs also makes a child with one thread. Then `execve` replaces the program, so `pdftotext` starts with exactly one thread, its main thread, and makes more only if it wants them. The first option is tempting because `fork` copies the memory, and every thread's stack lives in that memory. Only the calling thread comes along as a thread that runs."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "On Linux, what separates a thread from a process?",
+      "back": "Both are tasks made by `clone`. A thread shares memory, files and signal handlers with its group (`CLONE_VM`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`). A new process gets copies."
+    },
+    {
+      "front": "Where do you list the threads of process 812?",
+      "back": "`/proc/812/task/`, one folder per TID, or `ps -L -p 812`."
+    },
+    {
+      "front": "In `\"fraud-scorer\" #27 [145] ... tid=0x0000ffffa014db90 nid=145`, which number is the OS thread ID?",
+      "back": "145, shown as `[145]` and `nid=145`. `#27` is the Java thread ID, and `tid=` is an address inside the JVM."
+    },
+    {
+      "front": "How does jstack print `nid` on JDK 17, compared with JDK 21?",
+      "back": "JDK 17 prints hexadecimal (`nid=0x91`). JDK 18 and later print decimal (`nid=145`), which matches `top -H` and `ps -L`."
+    },
+    {
+      "front": "Why can a JVM fail with \"unable to create native thread\" while its heap is mostly empty?",
+      "back": "Each platform thread is a kernel task. The cgroup's `pids.max` (or `ulimit -u`) counts them, and `clone` fails with `EAGAIN`."
+    },
+    {
+      "front": "What do mount and unmount mean for a virtual thread?",
+      "back": "Mount: run on a carrier, a platform thread. Unmount: when it waits, its frames are saved on the heap, and the carrier runs another virtual thread."
+    },
+    {
+      "front": "What still pins a virtual thread in JDK 25?",
+      "back": "Waiting in a class initializer, waiting for another thread to set up a class, and waiting in native code that called back into Java. `synchronized` stopped pinning in JDK 24."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Task",
+      "plain": "The thing the Linux kernel schedules: a program counter, registers, a stack and an ID. Every thread is a task with its own TID."
+    },
+    {
+      "term": "Thread group (TGID)",
+      "plain": "The tasks that share one memory, which you know as a process. Its ID is the first task's TID, the PID."
+    },
+    {
+      "term": "Platform thread",
+      "plain": "A Java thread that is one OS thread for its whole life."
+    },
+    {
+      "term": "Virtual thread",
+      "plain": "A Java thread that is an object on the heap, and runs by mounting on a carrier. JDK 21 and later."
+    },
+    {
+      "term": "Carrier thread",
+      "plain": "A platform thread in the JVM's `ForkJoinPool` that runs virtual threads, one at a time."
+    },
+    {
+      "term": "Pinning",
+      "plain": "A virtual thread that waits but can't unmount, so it keeps its carrier busy."
+    },
+    {
+      "term": "nid",
+      "plain": "The native (OS) thread ID in a thread dump. Decimal since JDK 18, hexadecimal before."
+    },
+    {
+      "term": "pids controller",
+      "plain": "The cgroup limit on the number of tasks in a group, threads included, set in `pids.max`."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend wants to move the café's payments program from a pool of 200 threads to virtual threads \"to make it faster\". Explain what virtual threads change at the level of the operating system, and when the move helps.",
+    "answer": "Today each of the 200 threads in the pool is an OS thread. The kernel schedules it, it has a couple of megabytes of stack reserved, and it counts against the container's pids limit. While a thread waits on the bank or the database, its OS thread sleeps and does nothing else. Virtual threads are Java objects. They run by mounting on a handful of carrier threads, about one per processor, and when they wait on the network, the JVM saves their frames on the heap and frees the carrier. So thousands of payments could wait at once on a dozen OS threads. That helps if the payments mostly wait, and the pool's size is what holds them back. It does nothing for work that keeps a processor busy, and no single payment gets any faster. I'd also keep a limit on how many payments call the bank at once, with a semaphore, so we don't flood it. And I'd check that nothing waits inside a class initializer or in native code, which would pin a carrier."
   },
-  "note": "Same container, same JDK, same waiting code. Each platform thread is a kernel task with a 2 MB stack reserved, so the 64-task limit stops the program at 42 of its own threads. A virtual thread is a heap object that only needs a carrier while it runs, and a thread waiting on a latch unmounts, so 10,000 of them fit on the JVM's usual 37 or so OS threads. The limit didn't change. The number of tasks the program asked the kernel for did."
- },
- "worked": {
-  "title": "Find the thread that's burning a CPU",
-  "steps": [
-   {
-    "say": "A ledger service's pod sits at 100% of one CPU and latency is up. First, find which thread uses the CPU, from the kernel's side. `ps -L` lists threads with their CPU share. In the demo, one TID stands out.",
-    "code": "ps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3\n#   145 99.7 fraud-scorer\n#   123  0.3 java\n#   140  0.2 C1 CompilerThre",
-    "lang": "bash"
-   },
-   {
-    "say": "Then ask the JVM what that thread is doing. On JDK 18 and later, search the dump for the TID as it is. `jcmd <pid> Thread.print` prints the same dump if `jstack` isn't installed.",
-    "code": "jstack $pid | grep -A3 \"nid=145 \"\n# \"fraud-scorer\" #27 [145] prio=5 os_prio=0 cpu=5142.71ms elapsed=5.14s ... nid=145 runnable\n#    java.lang.Thread.State: RUNNABLE\n# \tat sfz.os.l03.demo.PaymentWorkers.score(PaymentWorkers.java:45)",
-    "lang": "bash"
-   },
-   {
-    "say": "On JDK 17 or older, the dump shows `nid` in hex. Convert the TID first, then search.",
-    "code": "printf '%x\\n' 145\n# 91\njstack $pid | grep -A3 \"nid=0x91 \"",
-    "lang": "bash"
-   },
-   {
-    "say": "Take two or three dumps a few seconds apart. If the same frame is on top every time, that method is the loop to look at. If the hot TID belongs to a thread with no `#` number, such as `GC Thread#0` or `C2 CompilerThread0`, the CPU goes to the JVM itself: heavy garbage collection points to allocation, and a busy compiler usually settles after warm-up. If the hot TID is not in the dump at all, check whether it is the launcher thread (TID = PID) or a thread that native code started.",
-    "code": "",
-    "lang": ""
-   }
+  "deeper": {
+    "minutes": 10,
+    "body": "`jstack` can't show virtual threads, but `jcmd` can write a dump in JSON, a common text format for structured data, that groups every thread by what owns it. For the demo program in the lab box, summarized with a few lines of Python:\n\n```text\n$ jcmd $pid Thread.dump_to_file -format=json /tmp/threads.json\n<root>                                                    11 threads\nForkJoinPool-1/jdk.internal.vm.SharedThreadContainer@...  13 threads\njava.util.concurrent.ThreadPerTaskExecutor@133c6e62     1000 threads\n```\n\nThe 1,000 are the virtual threads from `newVirtualThreadPerTaskExecutor()`, each marked `\"virtual\": true`, with an empty name and a stack that ends in `Thread.sleep`. Their `tid` values are Java thread IDs. A virtual thread has no OS thread ID of its own, because it has no OS thread.\n\nThe carrier pool's size comes from `jdk.virtualThreadScheduler.parallelism`, which defaults to the number of processors the JVM sees. So `-XX:ActiveProcessorCount` and a container's limit on processors both change it, as the Try it showed.\n\nThread stacks are another reason platform threads cost more than they look. The JVM reserves the whole stack when it creates the thread, about 2 MB on arm64 Linux, plus a guard page. A thread that runs past the end of its stack hits the guard page and fails cleanly, instead of writing into its neighbour's memory. The reservation shows up at once in the process's virtual size (VSZ), the total of the addresses it has set aside. Resident memory (RSS), the real memory in use, grows only as the thread uses its stack, page by page. Lesson 6, Virtual memory: page tables, the TLB and page faults, explains how the kernel does that. Until then, remember that 500 threads reserve about 1 GB of addresses, and may use only a few dozen megabytes of real memory.\n\nJDK 25's thread list also has two names you won't find in a JDK 21 dump. `VirtualThread-unblocker` came with JEP 491 in JDK 24. It finds virtual threads that may carry on after waiting for a `synchronized` block, and hands them back to the scheduler. `ForkJoinPool-1-delayScheduler` is the carrier pool's timer thread. The pool starts it the first time something asks for a delayed task, and in the demo that something was 1,000 sleeping virtual threads waiting for their time to wake."
+  },
+  "sources": [
+    {
+      "title": "clone(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/clone.2.html"
+    },
+    {
+      "title": "JEP 444: Virtual Threads",
+      "url": "https://openjdk.org/jeps/444"
+    },
+    {
+      "title": "JEP 491: Synchronize Virtual Threads without Pinning",
+      "url": "https://openjdk.org/jeps/491"
+    },
+    {
+      "title": "Control Group v2 (Linux kernel documentation)",
+      "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
+    },
+    {
+      "title": "JDK-8268425: Show decimal nid of OSThread instead of hex format one",
+      "url": "https://bugs.openjdk.org/browse/JDK-8268425"
+    }
   ]
- },
- "lab": {
-  "title": "Join the kernel's threads to the JVM's",
-  "minutes": 15,
-  "files": [
-   "labs/os/src/main/kotlin/sfz/os/l03/ThreadDump.kt",
-   "labs/os/src/test/resources/sfz/os/l03/payment-workers.jstack.txt",
-   "labs/os/src/test/resources/sfz/os/l03/payment-workers.ps.txt"
-  ],
-  "run": "./gradlew :os:test --tests 'sfz.os.l03.*'",
-  "steps": [
-   "Open the two captured files. They are real output from this lesson's demo in the lab box: `ps -L -p <pid> -o tid,pcpu,time,comm`, and `jstack <pid>` a moment later.",
-   "Run the tests from the `labs` folder. All eight fail.",
-   "Write `ThreadDump.nidToTid`: hex when the text starts with `0x`, decimal otherwise.",
-   "Write `ThreadDump.parse`. Match each line against `HEADER`. For each header, the thread's own lines run until the next blank line. Take the state from the line that starts with `java.lang.Thread.State:` (first word only) and the top frame from the first line that starts with `at ` (trim first).",
-   "Write the three `ThreadMap` methods. Build a `Map<Int, DumpedThread>` keyed by `osTid` once and use it in all three.",
-   "Run the tests until all eight pass. Then look at what `tasksNotInDump` returns and say which thread that is."
-  ],
-  "hints": [
-   "`HEADER.find(line)` returns null for every line that isn't a thread header, including the dump's date and title lines.",
-   "`lines.drop(i + 1).takeWhile { it.isNotBlank() }` gives the lines that belong to the header at index `i`.",
-   "`\"TIMED_WAITING (sleeping)\".substringBefore(\" \")` gives the first word.",
-   "The dump also has a thread the ps file doesn't: `Attach Listener`. `jstack` itself made the JVM start it, after `ps` had already run."
-  ],
-  "done_when": "All eight tests in `ThreadMapTest` pass."
- },
- "drill": {
-  "title": "Hot TID to Java stack, from memory",
-  "minutes": 4,
-  "prompt": "Write the commands that take you from \"this JVM uses a whole CPU\" to the Java stack of the thread responsible, on JDK 25. Then write what changes on JDK 17. Check against the answer.",
-  "answer": {
-   "lang": "bash",
-   "src": "pid=$(pgrep -f ledger-service)                            # or: jcmd -l\nps -L -p $pid -o tid,pcpu,comm | sort -k2 -nr | head -3    # or: top -H -p $pid\njstack $pid | grep -A10 \"nid=145 \"                       # JDK 18+: nid is decimal\n\n# JDK 17 and older: nid is hex\nprintf '%x\\n' 145                                          # 91\njstack $pid | grep -A10 \"nid=0x91 \""
-  }
- },
- "recap": [
-  "Linux schedules tasks. A thread is a task made by `clone` with flags that share memory, files and signal handlers. A process is a group of tasks, and its PID is the first task's TID.",
-  "Each thread has a directory under `/proc/<pid>/task/`. The kernel keeps only 15 characters of a thread name, so join on TIDs, never names.",
-  "A platform thread is one OS thread for life, with about 2 MB of stack reserved on arm64 Linux (1 MB on x86-64). jstack shows its TID as `[145]` and `nid=145`; JDK 17 and older print `nid` in hex.",
-  "The pids limit counts threads. When it's reached, `clone` fails with `EAGAIN` and the JVM throws `OutOfMemoryError: unable to create native thread`.",
-  "Virtual threads mount on a few carriers, one per CPU by default, and unmount when they block. Since JDK 24 `synchronized` doesn't pin; class initializers and native frames still do."
- ],
- "quiz": [
-  {
-   "q": "A Quarkus service in a pod with `pids.max` set to 512 starts a platform thread per request. During a spike it logs `OutOfMemoryError: unable to create native thread` while the heap is 30% used. What happened?",
-   "options": [
-    "The heap filled up with `Thread` objects",
-    "The pod reached its pids limit, because every platform thread is a task the kernel counts",
-    "The JVM ran out of metaspace",
-    "The node ran out of CPU"
-   ],
-   "answer": 1,
-   "why": "`clone` failed with `EAGAIN` because the cgroup's task count hit `pids.max`, and the JVM reports that as `OutOfMemoryError`. The heap had room. `pids.events` would show the `max` counter going up."
-  },
-  {
-   "q": "`top -H` shows TID 3071 at 100% CPU in a service on JDK 21. What do you search for in the `jstack` output?",
-   "options": [
-    "`nid=0xbff`",
-    "`#3071`",
-    "`nid=3071`",
-    "`tid=3071`"
-   ],
-   "answer": 2,
-   "why": "Since JDK 18 `nid` is printed in decimal, so it matches `top` as is. `nid=0xbff` is the JDK 17 form. `#` is the Java thread ID, and `tid=` is the address of the JVM's internal thread object."
-  },
-  {
-   "q": "A virtual thread calls JDBC `executeQuery`, which blocks reading the database socket. What happens to its carrier on JDK 25?",
-   "options": [
-    "The virtual thread unmounts, and the carrier runs other virtual threads while the query waits",
-    "The carrier blocks until the query returns",
-    "The JVM creates a new OS thread for the query",
-    "The query fails because virtual threads can't do blocking I/O"
-   ],
-   "answer": 0,
-   "why": "Blocking on a socket is the case virtual threads were built for: the JDK saves the thread's frames on the heap and frees the carrier. It would stay on the carrier only if pinned, for example inside a class initializer. Since JDK 24 a `synchronized` block in the driver no longer pins."
-  },
-  {
-   "q": "Which of these still pins a virtual thread to its carrier on JDK 25?",
-   "options": [
-    "Blocking on a socket read inside a `synchronized` block",
-    "Waiting in `ReentrantLock.lock()`",
-    "`Thread.sleep(100)`",
-    "Blocking inside a class's `static {}` initializer"
-   ],
-   "answer": 3,
-   "why": "JEP 491 (JDK 24) stopped `synchronized` from pinning, and `ReentrantLock` and `sleep` never pinned. Class initialization still does: a virtual thread that blocks in a `static {}` block keeps its carrier until the initializer finishes."
-  },
-  {
-   "q": "From the last lesson: a JVM with 35 threads runs `ProcessBuilder(\"pdftotext\", \"invoice.pdf\").start()`. How many threads does the new child process have when `pdftotext` starts running?",
-   "options": [
-    "35, because creating a process copies every thread",
-    "One. A new process starts with a single thread, and `execve` gives it `pdftotext`'s program",
-    "35 threads, all paused",
-    "None until `pdftotext` creates one"
-   ],
-   "answer": 1,
-   "from": "os-02",
-   "why": "`fork` copies only the thread that called it, and the JDK's `posix_spawn` route makes a single-threaded child as well. Then `execve` replaces the program, so `pdftotext` starts with exactly one thread, its main thread, and makes more only if it wants them."
-  }
- ],
- "flashcards": [
-  {
-   "front": "On Linux, what separates a thread from a process?",
-   "back": "Both are tasks made by `clone`. A thread shares memory, files and signal handlers with its group (`CLONE_VM`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`). A process gets copies."
-  },
-  {
-   "front": "Where do you list the threads of process 812?",
-   "back": "`/proc/812/task/`, one directory per TID, or `ps -L -p 812`."
-  },
-  {
-   "front": "In `\"fraud-scorer\" #27 [145] ... tid=0x0000ffffa014db90 nid=145`, which number is the OS thread ID?",
-   "back": "145, shown as `[145]` and `nid=145`. `#27` is the Java thread ID and `tid=` is an address inside the JVM."
-  },
-  {
-   "front": "How does jstack print `nid` on JDK 17 compared with JDK 21?",
-   "back": "JDK 17 prints hex (`nid=0x91`). JDK 18 and later print decimal (`nid=145`), which matches `top -H` and `ps -L`."
-  },
-  {
-   "front": "Why can a JVM fail with \"unable to create native thread\" while its heap is mostly empty?",
-   "back": "Each platform thread is a kernel task. The cgroup's `pids.max` (or `ulimit -u`) counts them, and `clone` fails with `EAGAIN`."
-  },
-  {
-   "front": "What do mount and unmount mean for a virtual thread?",
-   "back": "Mount: run on a carrier platform thread. Unmount: when it blocks, its frames are saved on the heap and the carrier runs another virtual thread."
-  },
-  {
-   "front": "What still pins a virtual thread in JDK 25?",
-   "back": "Blocking in a class initializer, waiting for another thread's class initialization, and blocking in native code that called back into Java. `synchronized` stopped pinning in JDK 24."
-  }
- ],
- "terms": [
-  {
-   "term": "Task",
-   "plain": "The thing the Linux kernel schedules. Every thread is a task with its own TID."
-  },
-  {
-   "term": "Thread group (TGID)",
-   "plain": "The tasks that share one address space, which you know as a process. Its ID is the first task's TID, the PID."
-  },
-  {
-   "term": "Platform thread",
-   "plain": "A Java thread backed one-to-one by an OS thread for its whole life."
-  },
-  {
-   "term": "Virtual thread",
-   "plain": "A Java thread that is a heap object and runs by mounting on a carrier. JDK 21 and later."
-  },
-  {
-   "term": "Carrier thread",
-   "plain": "A platform thread in the JDK's `ForkJoinPool` that runs virtual threads, one at a time."
-  },
-  {
-   "term": "Pinning",
-   "plain": "A virtual thread that blocks but can't unmount, so it keeps its carrier busy."
-  },
-  {
-   "term": "nid",
-   "plain": "The native (OS) thread ID in a thread dump. Decimal since JDK 18, hex before."
-  },
-  {
-   "term": "pids controller",
-   "plain": "The cgroup v2 limit on the number of tasks, threads included, in a group (`pids.max`)."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate wants to move a Kafka consumer service from a 200-thread pool to virtual threads \"to make it faster\". Explain what virtual threads change at the OS level, and when the move helps.",
-  "answer": "Today each of the 200 pool threads is an OS thread: the kernel schedules it, it has a couple of megabytes of stack reserved, and it counts against the pod's pids limit. While a thread waits on Oracle or an HTTP call, its OS thread sleeps and does nothing else. Virtual threads are Java objects. They run by mounting on a handful of carrier threads, about one per CPU, and when they block on I/O the JDK saves their frames on the heap and frees the carrier. So we could have thousands of handlers waiting at once on a dozen OS threads. That helps if the handlers mostly wait and the pool size is what limits throughput. It does nothing for CPU-bound work, and each handler isn't any faster. We'd also keep a limit on concurrency with a semaphore, so we don't flood Oracle, and check that no handler blocks inside a class initializer or a native call, which would pin a carrier."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "`jstack` can't show virtual threads, but `jcmd` can write a JSON dump that groups every thread by the container that owns it. For the demo service in the lab box (summarized with a few lines of Python):\n\n```text\n$ jcmd $pid Thread.dump_to_file -format=json /tmp/threads.json\n<root>                                                    11 threads\nForkJoinPool-1/jdk.internal.vm.SharedThreadContainer@...  13 threads\njava.util.concurrent.ThreadPerTaskExecutor@133c6e62     1000 threads\n```\n\nThe 1,000 are the virtual threads from `newVirtualThreadPerTaskExecutor()`, each with `\"virtual\": true`, an empty name and a stack that ends in `Thread.sleep`. Their `tid` values are Java thread IDs. A virtual thread has no OS thread ID of its own, because it has no OS thread.\n\nThe carrier pool's size comes from `jdk.virtualThreadScheduler.parallelism`, which defaults to the number of CPUs the JVM sees. That means `-XX:ActiveProcessorCount` and a container's CPU limit both change it, as the Try-it showed.\n\nThread stacks are another reason platform threads cost more than they look. The JVM reserves the whole stack when it creates the thread, about 2 MB on arm64 Linux, plus a guard page that crashes the thread cleanly on overflow instead of letting it write into its neighbour's memory. That reservation shows up in the process's virtual size (VSZ) right away. Resident memory (RSS) grows only as the thread actually uses its stack, page by page. Lesson 6 of this track explains how the kernel does that. Until then, remember that 500 threads reserve about 1 GB of address space and might use only a few dozen megabytes of real memory.\n\nJDK 25's thread list also has two names you won't find in a JDK 21 dump. `VirtualThread-unblocker` came with JEP 491 in JDK 24: it asks the VM for virtual threads that may continue after waiting on a `synchronized` monitor and gives them back to the scheduler. `ForkJoinPool-1-delayScheduler` is the carrier pool's timer thread. The pool starts it the first time something schedules a delayed task, and in the demo that something was 1,000 sleeping virtual threads waiting for their wake-up time."
- },
- "sources": [
-  {
-   "title": "clone(2), Linux manual page",
-   "url": "https://man7.org/linux/man-pages/man2/clone.2.html"
-  },
-  {
-   "title": "JEP 444: Virtual Threads",
-   "url": "https://openjdk.org/jeps/444"
-  },
-  {
-   "title": "JEP 491: Synchronize Virtual Threads without Pinning",
-   "url": "https://openjdk.org/jeps/491"
-  },
-  {
-   "title": "Control Group v2 (Linux kernel documentation)",
-   "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
-  },
-  {
-   "title": "JDK-8268425: Show decimal nid of OSThread instead of hex format one",
-   "url": "https://bugs.openjdk.org/browse/JDK-8268425"
-  }
- ]
 }

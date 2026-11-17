@@ -1,421 +1,425 @@
 {
- "id": "os-07",
- "title": "Copy-on-write, mmap and the OOM killer",
- "minutes": 40,
- "goal": "By the end you can explain why fork of a 512 MB process copies almost nothing, tell anonymous from file-backed and shared from private mappings, read Committed_AS against CommitLimit, and tell a JVM OutOfMemoryError from a kernel OOM kill.",
- "warmup": {
-  "q": "A service holding 512 MB in memory calls `fork` to start a child. Right after `fork` returns, about how much extra RAM does the machine use?",
-  "options": [
-   "About 512 MB: the child gets its own copy of every page",
-   "About 1 MB, for the child's page table; the 512 MB stays shared until one side writes",
-   "Nothing at all: the child even shares the parent's page table",
-   "256 MB: the kernel splits the pages between the two"
+  "id": "os-07",
+  "title": "Copy-on-write, mmap and the OOM killer",
+  "minutes": 40,
+  "goal": "By the end, you can explain why copying a running 512 MB program copies almost nothing, tell memory filled from a file from memory that starts as zeros, read how much memory the kernel has promised, and tell a Java OutOfMemoryError from a kill by the kernel.",
+  "opening": "You've booked a seat on a flight and got a confirmation. At the gate, the agent says the plane is full. The airline sold 220 tickets for 200 seats, because on most days some people never turn up. Today everyone did, and someone has to stay behind.\n\nThe Linux kernel, the core of the operating system, hands out memory the same way. On a computer with 8 GB of memory, a program can ask for 100 GB and hear yes. Then one day a program vanishes, with no error message, and leaves only a number behind: 137.\n\nIt's easy to believe that a yes means the memory is there. From inside a program, nothing says otherwise.\n\nIn Virtual memory, we saw that a page of memory gets real RAM only when it's first touched. In this lesson, we'll see what the kernel builds on that: copies that share memory until one writes, files that appear in memory, promises bigger than the machine, and the killer that settles them. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "A program holding 512 MB in memory calls `fork`, which starts a second program as an exact copy of the first. Right after `fork` returns, about how much extra RAM (the computer's working memory) does the machine use?",
+    "options": [
+      "About 512 MB: the copy gets its own copy of every page of memory",
+      "About 1 MB, for the copy's own list of where its memory sits; the 512 MB stays shared until one side writes to it",
+      "Nothing at all: the copy even shares the original's list of where its memory sits",
+      "256 MB: the kernel splits the memory between the two"
+    ],
+    "answer": 1,
+    "why": "On Linux, `fork` copies the list, which is called the page table, and not the memory itself. In the lab box, the copy of a 512 MB program was running 1.7 ms after `fork`, with 512 MB shared and nothing of its own. Each program needs its own list, so the copy can't share the original's, and the kernel copies a 4 KB page only when one side first writes to it. That's copy-on-write, the first section. The first option is the tempting one, because a copy usually costs as much as the original."
+  },
+  "sections": [
+    {
+      "h": "Copy-on-write: how fork copies 512 MB without copying it",
+      "body": "`cow.c` is a short program in C, a language that runs close to the hardware, so nothing hides what the kernel does. It fills 512 MB of memory and then calls `fork`. A system call is a request a program makes to the kernel. `fork` is the system call that makes a second process (a running program) as an exact copy of the first. The copy is called the child, and the original is the parent. Processes: fork, exec, wait and signals said the child starts as a copy of the parent. For a big program that sounds slow, and it would be, without one trick.\n\nCopying 512 MB the plain way, with C's `memcpy` function, takes 33 ms (thousandths of a second) in the lab box, and needs a second 512 MB of RAM to copy into. Yet the child of `cow.c` is running 1.7 ms after `fork`. Something skips almost all of the work.\n\nA short reminder from Virtual memory first. A program names each byte of its memory by a number, its address. The kernel hands out memory in pages of 4 KB. Each process has a page table: the kernel's list of which of the process's pages sit in which frames, the 4 KB pieces of real RAM. The CPU, the chip that runs the program's instructions, follows that list on every memory access. Each entry also says whether the page may be written.\n\nNow let's design `fork` ourselves. The simplest version copies every page of the parent into fresh frames. It's correct, and it's slow exactly where it hurts. Take Redis, a program that keeps other programs' data in memory. To save a snapshot (all its data as it was at one moment) to disk, Redis forks a child that writes the file while the parent keeps working. With 10 GB of data, the child only reads, yet a plain copy would need 20 GB of RAM. Or take a program that starts another program. It calls `fork`, and the child at once calls `exec`, which throws the copied memory away and loads the new program. A 4 GB program would copy 4 GB for a millisecond's use.\n\nThe next try shares instead of copying. The child gets its own page table, but its entries point at the parent's frames. That costs only the table: about 1 MB of entries for 512 MB of pages. But now a write by the parent would change the child's memory too, and the child was promised its own copy.\n\nThe last piece is the bit in each entry that allows writes. At `fork`, the kernel marks every entry read-only, in the parent and in the child. Reads work as before. The first write to a page, by either side, isn't allowed, so the CPU stops and hands control to the kernel. That's a page fault. The kernel sees that the page is really writable and that its frame is shared. So it copies that one 4 KB page into a new frame, points the writer's entry at the copy, makes it writable and runs the write again. This is **copy-on-write**: share every page, and copy one only when someone writes to it. The kernel also counts the entries that point at each frame. When only one is left, a write fault makes that entry writable again and copies nothing. The stepper below walks through it.\n\nTo watch it happen, we need to count shared memory. The kernel writes a summary of each process's memory into a file, `/proc/<pid>/smaps_rollup`, where pid is the process's number. RSS, the resident set size, counts all of the process's pages in RAM. `Shared` counts the ones whose frame another process uses too. `Private` counts the ones only this process uses. **PSS**, the proportional set size, splits each shared page among its sharers: two processes that share a page count half of it each.\n\nRight after `fork`, the child has `Shared` 512 MB, `Private` 0 and `Pss` 256 MB. Then it writes one byte in every fourth page. The kernel makes 32,768 copies (128 MB) at about 1.8 µs (millionths of a second) each, and the child now shows `Shared` 384 MB and `Private` 128 MB. RSS says 513 MB for each process the whole time, so adding up RSS would claim 1 GB. The two really use 640 MB, and their PSS values add up to exactly that. **RSS counts a shared page in every process that uses it. To add up memory, add PSS.**\n\nCopy-on-write isn't free, though. When the child wrote to every page, the faults took 180 ms, several times one big `memcpy`. It wins because most children write a little, or call `exec` and write nothing. Next, we'll fill memory from a file, and meet the same trick there.",
+      "stepper": {
+        "title": "fork, then one write",
+        "intro": "Two page tables on top, RAM below. Each entry names the frame it points at, and says `rw` when a write may go straight through. Each frame shows `refs`: how many entries point at it.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The parent maps four pages, each writable, each frame used once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">rw</text><rect class=\"box-dim\" x=\"480\" y=\"34\" width=\"220\" height=\"152\" rx=\"8\"/><text class=\"t\" x=\"590.0\" y=\"115.0\" text-anchor=\"middle\">no child yet</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">idle</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
+            "say": "The parent has touched four pages. So its page table has four entries, each pointing at its own frame and each writable (`rw`). One entry points at each frame: `refs 1`. (`cow.c` does the same with 131,072 pages.)"
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"fork gives the child entries for the same frames and makes every entry read-only\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">fork()</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box-a\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
+            "say": "`fork` builds the child a page table whose entries point at the parent's frames. It marks every entry **read-only**, the parent's too, and each frame now has two references. No data moved. The only cost is the new page table, about 1 MB for 512 MB of memory."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The child reads page 1: reads are allowed, nothing happens\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">read page 1: ok</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
+            "say": "The child reads page 1. Read-only allows reads, so the CPU finds frame B and loads from it without calling the kernel. A child that only reads, like a snapshot writer, can run for minutes and never cost a copy."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The child writes page 2: the entry is read-only, so the CPU raises a page fault\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-bad\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box-b\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">write page 2: fault</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
+            "say": "The child writes to page 2. The entry says read-only, so the CPU stops the write and raises a **page fault**, the same hand-over to the kernel as a first touch in Virtual memory. The kernel checks the page. It may be written, so this isn't a bug. It's a write to a shared page."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The kernel copies frame C into frame E, points the child's entry at E and makes it writable\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame E</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">copy C to E</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 1, frames in use: 5</text></svg>",
+            "say": "Frame C has two references, so the kernel takes a free frame, E, and copies C's 4 KB into it. It points the child's entry at E and makes it writable, and C drops to one reference. Then the write runs again and lands in E. That one page cost about 1.8 µs in the lab box."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The parent writes page 2: frame C has one reference left, so the kernel makes the entry writable without copying\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame E</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">write page 2: reuse C</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 1, frames in use: 5</text></svg>",
+            "say": "Now the parent writes to page 2. Its entry is still read-only, so it faults too. But frame C has only one reference left: nobody else can see it now. The kernel flips the entry back to writable and copies nothing. Pages 0, 1 and 3 stay shared until someone writes to them."
+          }
+        ]
+      },
+      "try": {
+        "title": "Fork 512 MB and count the copies",
+        "minutes": 4,
+        "steps": [
+          "Start the lab box from the `labs` folder: `docker compose -f env/labbox.yml run --rm box`. The lab box is a small Linux machine that runs in Docker (a program that runs separate small machines, called containers, on your computer). Your `labs` folder appears inside it as `/labs`, and you start there.",
+          "`os/c/l07/cow.c` touches 512 MB in 4 KB pages and times one `memcpy` of it, to compare. Then it forks. The child writes one byte in every Nth page (N is the second number on the command line) and prints its `smaps_rollup` numbers before and after. The first line below compiles it with `gcc`, the C compiler, which turns the source code into a program you can run.",
+          "Predict the child's `Pss`, `Shared` and `Private` right after `fork`, and after it writes to every 4th page.",
+          "Run the three lines. The last one makes the child write to every page."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -o /tmp/cow os/c/l07/cow.c\n/tmp/cow 512 4\n/tmp/cow 512 1"
+        },
+        "expect": "Timings change from run to run (`...` marks lines left out):\n\n```text\ncopying 512 MB with memcpy: 33 ms\nparent before fork     Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\nfork returned in the child after 1.7 ms\nchild after fork       Rss  513 MB  Pss  256 MB  Shared  512 MB  Private    0 MB\nchild wrote to 32768 of 131072 pages: 32768 page faults in 58 ms (1.76 us each)\nchild after writes     Rss  513 MB  Pss  320 MB  Shared  384 MB  Private  128 MB\nparent after child exit Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\ncopying 512 MB with memcpy: 28 ms\n...\nchild wrote to 131072 of 131072 pages: 131072 page faults in 180 ms (1.37 us each)\nchild after writes     Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\n...\n```\n\nOne fault per page written, and each fault is one 4 KB copy. `Rss` never moves, because RSS counts a shared page in full in every process that uses it. `Pss` is the fair share: 256 MB each while everything is shared. When the child exits, the parent's pages are its own again. Writing everything cost 180 ms of faults, against 28 ms for one big `memcpy`. Copy-on-write pays per page, and it wins only because most children write little."
+      },
+      "refs": [
+        {
+          "title": "fork(2): copy-on-write pages",
+          "url": "https://man7.org/linux/man-pages/man2/fork.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "OSTEP chapter 23: Complete Virtual Memory Systems",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-complete.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "proc_pid_smaps(5): Pss, Shared and Private",
+          "url": "https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Mapping a file: memory filled from a file instead of zeros",
+      "body": "`MapFile`, a short Java program, ties a 256 MB file to its memory and reads one byte from every page. Its memory in RAM grows by 256 MB, but not the kind we've met so far. Every page so far started as zeros: its first touch got a zeroed frame. Memory like that belongs to no file, and it's called **anonymous memory**. A program's working memory is anonymous. That's its heap, where it keeps its data, and its stacks, where each of its threads (lines of work inside the program) keeps the local variables of the functions it's in. The other kind of memory is filled from a file. First, look at how a program normally reads one.\n\nThe kernel keeps file data in RAM, in the **page cache**: its copy of the file pages that programs have read or written lately, shared by every program. (The lesson after next, The page cache, writeback and fsync, opens it up.) `read()` is the system call a program uses to read a file, and it copies bytes from the page cache into the program's own memory. Now picture a fraud check, a program that looks at each card payment for signs of a stolen card. For every payment, it looks up a few spots in a 2 GB file. With `read()`, each look-up costs a system call and a copy, and the busy parts of the file sit in RAM twice: once in the page cache, once in the program.\n\n`mmap` removes both costs. It's the system call that asks the kernel for a region, a range of addresses, and it can tie that region to a file. The kernel records the region and puts nothing in RAM yet. The first touch of a page faults, as in Virtual memory, but this time the kernel doesn't hand over a zeroed frame. It finds the page cache frame that holds that part of the file, reading it from disk first if it isn't there, and points the entry at it. After that, a look-up is a plain memory read: no system call, no copy. Every process that maps the file points at the same frames. The kernel counts them as the process's `RssFile`, and its anonymous pages as `RssAnon`.\n\nA file mapping is either shared or private. With `MAP_SHARED`, a write goes into the page cache frame itself. The file changes, every other process mapping it sees the change, and the kernel writes it to disk later. With `MAP_PRIVATE`, the entries start read-only, and the first write is a copy-on-write fault, exactly as after `fork`. The writer gets its own anonymous copy of that page, and the file never changes. This is how every program loads `libc.so`, the C library that almost every program on Linux uses. Its code is mapped private, so a hundred processes share one copy of it in RAM.\n\nThe two kinds of memory also differ when RAM runs short. The kernel can drop a clean file page, one that matches the file on disk, at any moment, because it can read it back from the file. An anonymous page has no file to come back from. The kernel can only move it to swap, an area of the disk set aside for pages pushed out of RAM, and only if the machine has swap at all. That difference decides what the kernel can take back when memory runs out.\n\nJava programs run on the JVM (Java virtual machine), the program that runs Java code. Java maps files with the `FileChannel.map` method, which returns a `MappedByteBuffer`. `MapMode.READ_ONLY` and `MapMode.READ_WRITE` give shared mappings, and `MapMode.PRIVATE` gives the copy-on-write kind. Kafka, a program that keeps logs of messages for other programs, maps its index files this way.\n\nCopy-on-write and file mappings let a program have memory now and pay for it later, or never. Next, we'll see how much memory the kernel agrees to promise.",
+      "try": {
+        "title": "Map a file, then write through both kinds of mapping",
+        "minutes": 4,
+        "steps": [
+          "`MapFile` is a short Java program. It writes a 256 MB file in `/tmp`, maps it read-only, reads one byte per page, and prints the process's `RssAnon` and `RssFile` after each step. Then it maps the file's first page twice. It writes the letter `S` through a shared mapping and `P` through a private one, and reads the file's first two bytes back with a plain `read`.",
+          "Predict `RssFile` after the reads, and which of the two letters reaches the file.",
+          "Run it in the lab box. `javac` compiles the Java source, and `java` runs it. The program deletes the file at the end."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l07/demo/MapFile.java\njava -cp /tmp/out sfz.os.l07.demo.MapFile",
+          "file": "labs/os/src/demo/java/sfz/os/l07/demo/MapFile.java"
+        },
+        "expect": "```text\nbefore map     RssAnon   23 MB   RssFile   22 MB\nafter map      RssAnon   32 MB   RssFile   22 MB\nafter reading  RssAnon   33 MB   RssFile  278 MB\nmaps: ffff3c000000-ffff4c000000 r--s 00000000 00:ad 1336147                    /tmp/ledger.dat\nfile bytes 0-1: 'S' 0   private mapping sees 'S' 'P'\n```\n\nMapping cost nothing. Reading one byte per page brought 256 MB into `RssFile`: the page cache's frames for that file, now listed in the program's page table. The 9 MB that `RssAnon` gains at `map` is the JVM loading its own classes, not the file. In `/proc/self/maps`, the kernel's list of the program's regions, the file's region is `r--s`: readable and shared. The file got the shared `S`, not the private `P`. The private mapping still saw the `S`, because its page was copied only when it wrote the `P`, after the `S` was already there."
+      },
+      "refs": [
+        {
+          "title": "mmap(2): MAP_SHARED and MAP_PRIVATE",
+          "url": "https://man7.org/linux/man-pages/man2/mmap.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "FileChannel.MapMode (JDK 25)",
+          "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.MapMode.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Overcommit: the kernel promises more memory than it has",
+      "body": "`promise.c` asks for 100 GB with `mmap`. The lab box runs inside a virtual machine (a computer simulated in software, which Docker runs on your computer) with 7.9 GB of RAM. The call returns at once. Asking for 1,000 GB works too.\n\n`mmap` only records a region, and RAM arrives a page at a time, on first touch. So the kernel has to decide how much to promise before it knows how much will be used. The airline from the opening has the same problem. It sells tickets, its promises, months before the flight, without knowing how many people will turn up for a seat. In the kernel, a seat is a frame of RAM, and turning up is the first touch.\n\nThe simplest rule is honest bookkeeping: refuse any request that would push the total promised past RAM plus swap. It breaks on the first `fork` of a big process. Picture a 4 GB program on an 8 GB machine that starts a helper with `fork` and `exec`. The child is promised a private copy of all 4 GB, the total passes 8 GB, and `fork` fails. Yet copy-on-write would have copied a handful of pages before `exec`. Java breaks the rule too. At start-up, the JVM reserves the whole heap it may ever use, the size set by its `-Xmx` option. Every thread reserves a 2 MB stack. Much of that is never touched.\n\nSo Linux **overcommits**: it promises more memory than it has, and counts on most promises never being collected. The file `/proc/meminfo` keeps the books. `Committed_AS` is the total promised to all processes. `CommitLimit` is swap plus a share of RAM, set by `vm.overcommit_ratio` (50% by default). Here that's 1,024 MB of swap plus half of 7,935 MB, so 4,991 MB. A kernel setting, `vm.overcommit_memory`, picks the rule:\n\n| value | rule |\n|---|---|\n| 0 | the default: refuse any single request bigger than RAM plus swap, say yes to the rest |\n| 1 | always say yes |\n| 2 | never let `Committed_AS` pass `CommitLimit` |\n\nThe lab box's virtual machine runs with 1, so `Committed_AS` reached 104,612 MB on a machine with 7,935 MB of RAM. Mode 2 sounds safer. The manual of PostgreSQL, a popular database program, suggests it for machines that run the database. But on a busy machine in mode 2, `fork` and large reservations fail with `ENOMEM`, the out-of-memory error code, while plenty of RAM is still free. It's the airline that refuses to sell the 201st ticket and then flies with empty seats.\n\nThe real cost of promising is where the failure lands. A refused `mmap` returns an error code that the program can check and handle. A broken promise shows up later, inside a page fault. The program is in the middle of an ordinary write to memory, and there's no call that could return an error. So the kernel first tries to find a frame by reclaiming memory. It drops clean file pages, writes changed file pages to disk so it can drop them too, and moves anonymous pages to swap. If that can't free enough, there's one move left: kill a process and take its memory. Next, we'll see how it chooses.",
+      "try": {
+        "title": "Ask for 100 GB and 1,000 GB",
+        "minutes": 2,
+        "steps": [
+          "`os/c/l07/promise.c` prints the overcommit mode, then `CommitLimit` and `Committed_AS` before and after one `mmap` of the size you ask for, in GB. It touches nothing unless you give it a second number.",
+          "Predict whether 100 GB and 1,000 GB succeed on a machine with 8 GB, and how far `Committed_AS` moves. Then run the three lines in the lab box."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -o /tmp/promise os/c/l07/promise.c\n/tmp/promise 100 0\n/tmp/promise 1000 0"
+        },
+        "expect": "```text\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    2212 MB   MemTotal  7935 MB\nmmap of 100 GB returned 0xffe69de00000\nafter mmap       CommitLimit   4991 MB   Committed_AS  104612 MB   MemTotal  7935 MB\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    2212 MB   MemTotal  7935 MB\nmmap of 1000 GB returned 0xff05b7c00000\nafter mmap       CommitLimit   4991 MB   Committed_AS 1026212 MB   MemTotal  7935 MB\n```\n\nBoth succeed. `Committed_AS` counts each promise in full, and mode 1 ignores `CommitLimit`, so the machine happily promises 1,000 GB. These numbers are for the whole Docker virtual machine, because `/proc/meminfo` isn't limited to your container: other containers' promises are in the 2,212 MB. Under the default mode 0, a single request this far beyond RAM plus swap would be refused as an obvious overcommit."
+      },
+      "refs": [
+        {
+          "title": "Overcommit accounting (Linux kernel documentation)",
+          "url": "https://docs.kernel.org/mm/overcommit-accounting.html",
+          "kind": "docs"
+        },
+        {
+          "title": "proc_meminfo(5): CommitLimit and Committed_AS",
+          "url": "https://man7.org/linux/man-pages/man5/proc_meminfo.5.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "The OOM killer: who pays when the promises come due",
+      "body": "Let's break a promise on purpose. In a container limited to 256 MB, `promise.c` reserves 4 GB without complaint, touches 192 MB of it, and is gone. The shell (the program that reads your commands) prints `Killed`. The exit code, the number a program leaves behind when it ends, is 137. And a file the kernel keeps for the container says `oom_kill 1`.\n\nA container is a group of programs that the kernel runs apart from the rest of the machine and limits as one. Its limit lives in a cgroup, the kernel's record for a group of processes that it counts and limits together. `docker run --memory 256m` writes 268435456, which is 256 MB in bytes, into the group's `memory.max` file. The kernel charges the group for every page its processes bring into RAM, anonymous pages and page cache pages alike. When a fault would push the charge past `memory.max`, the kernel reclaims inside the group first. If that fails, it runs the **OOM killer** (OOM means out of memory) on the group's processes only. In the group's `memory.events` file, `max` counts the times the group hit its limit, and `oom_kill` counts the processes killed. Without a container limit, the same thing happens to the whole machine once RAM and swap run out.\n\nThe killer picks by size, not guilt. It gives each process a badness score: the pages it holds in RAM and in swap, plus its page tables. Then it adds `oom_score_adj`, a setting from -1000 to 1000 for each process. Each point counts as a thousandth of the memory allowed, so 500 adds half the limit to the score. The process with the highest score gets `SIGKILL`. A signal is a short message the kernel delivers to a process. `SIGKILL` ends it on the spot: the process can't catch it and gets no chance to clean up. A process set to -1000 is never picked. So the process that asked for the last page often isn't the one that dies. A 1 GB program next to a 50 MB script loses, whichever of them asked last.\n\nAt the gate, it's as if the agent took off the passenger with the most luggage, whoever booked last. The picture breaks at the moment of choice. An airline asks for volunteers before boarding, and pays them. The kernel finds out mid-flight, in the middle of a write, and removes a passenger without asking and without letting them pack.\n\nA Java program lives under two memory limits, and they fail in different ways. `-Xmx` is the JVM's own limit on the Java heap, the memory where a Java program keeps its objects. When the heap is full, the garbage collector (the part of the JVM that finds objects nothing uses any more and reuses their memory) tries to make room. If it can't free enough, the JVM throws `java.lang.OutOfMemoryError: Java heap space`. That's an ordinary exception. You get a stack trace, the list of functions that were running when it happened. The option `-XX:+HeapDumpOnOutOfMemoryError` saves a heap dump, a file of every object to study later. And the program's own code decides what happens next.\n\n`memory.max` is the kernel's limit, and it counts everything the process has in RAM. That's the heap pages it has touched, plus the JVM's memory outside the heap. Out there sit loaded classes, compiled code, the threads' stacks, the garbage collector's own records, and memory used by C libraries the program calls. Memory allocation, the next lesson, takes those apart. Cross the limit, and the kernel sends `SIGKILL`. No exception, no heap dump, nothing in the program runs. The container exits with 137, which is 128 plus 9, the number that stands for `SIGKILL` (Processes: fork, exec, wait and signals).\n\n`Hog` is a small Java program that holds on to 1 MB arrays until something stops it. In the 256 MB container with no `-Xmx`, the JVM gave itself a 121 MB heap, and the heap filled first: `OutOfMemoryError`. With `-Xmx1g`, the heap was allowed to outgrow the container, and the kernel killed the JVM at about 224 MB.\n\nSo the tempting setting, a heap as big as the container, is wrong. It feels like using all the memory you have, but it hands the last word to the kernel, and raising `-Xmx` after a kill makes things worse. **The heap is only part of a Java program. Keep it well under the limit.** A heap of half to three quarters of the limit is a common start, checked against the program's real RSS under load. What fills the rest is the next lesson's question.",
+      "try": {
+        "title": "Get killed by the kernel, then by the JVM",
+        "minutes": 5,
+        "steps": [
+          "From the `labs` folder on your Mac, start a lab box limited to 256 MB: `docker run --rm -it --memory 256m --memory-swap 256m -v \"$PWD\":/labs -w /labs sfz-labbox:1 bash`. `--memory 256m` sets the container's limit. `--memory-swap 256m` caps memory plus swap at the same 256 MB, so there's no swap to slow the end down.",
+          "Run the block below in that box. The programs run as children of `bash`, the shell (the program that reads your commands), so the box survives each kill and you can read `memory.events` after it.",
+          "Before each run, predict who stops the program: the kernel or the JVM."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the 256 MB lab box",
+          "src": "gcc -O2 -o /tmp/promise os/c/l07/promise.c\n/tmp/promise 4 1024\necho \"exit code $?\"\ngrep -E '^(max|oom_kill) ' /sys/fs/cgroup/memory.events\njavac -d /tmp/out os/src/demo/java/sfz/os/l07/demo/Hog.java\nfor heap in \"\" -Xmx1g; do\n  echo \"== java $heap\"\n  java $heap -cp /tmp/out sfz.os.l07.demo.Hog 2>&1 | grep -v '^\\s*at '\n  echo \"exit code ${PIPESTATUS[0]}\"\n  grep -E '^oom_kill ' /sys/fs/cgroup/memory.events\ndone",
+          "file": "labs/os/src/demo/java/sfz/os/l07/demo/Hog.java"
+        },
+        "expect": "```text\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    3153 MB   MemTotal  7935 MB\nmmap of 4 GB returned 0xfffe93200000\nafter mmap       CommitLimit   4991 MB   Committed_AS    7249 MB   MemTotal  7935 MB\ntouched   64 MB, RSS   65 MB\ntouched  128 MB, RSS  129 MB\ntouched  192 MB, RSS  193 MB\nbash: line 2:    12 Killed                  /tmp/promise 4 1024\nexit code 137\nmax 143\noom_kill 1\n== java \nmax heap 121 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nException in thread \"main\" java.lang.OutOfMemoryError: Java heap space\nexit code 1\noom_kill 1\n== java -Xmx1g\nmax heap 989 MB\nholding 32 MB\n...\nholding 224 MB\nexit code 137\noom_kill 2\n```\n\n`MemTotal` still says 7,935 MB inside a 256 MB container: `/proc/meminfo` shows the whole virtual machine, and the limit lives in `/sys/fs/cgroup/memory.max`. The C program died at a write to memory, with 137 and one `oom_kill`. The JVM with its own 121 MB heap stopped itself with an exception and exit code 1, and `oom_kill` didn't move. With `-Xmx1g` there was no exception and no stack trace, only 137 and a second `oom_kill`. The `max` count (143 here) is how many times the group hit its limit and the kernel had to reclaim; it changes between runs. (`...` marks lines left out.)"
+      },
+      "refs": [
+        {
+          "title": "Control Group v2: memory.max and memory.events",
+          "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "proc_pid_oom_score_adj(5)",
+          "url": "https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html",
+          "kind": "docs"
+        },
+        {
+          "title": "Kubernetes: node out of memory behavior and oom_score_adj",
+          "url": "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/",
+          "kind": "docs"
+        }
+      ],
+      "aside": {
+        "title": "Can a program protect itself from the OOM killer?",
+        "body": "Only partly. A process can raise its own `oom_score_adj` whenever it likes, which is like volunteering to leave the plane first. Lowering it below what was set before needs special permission, which an administrator has and an ordinary program doesn't. So the administrator decides which programs the machine must never lose, and sets them to -1000. That protects one process, but it makes no memory appear. The killer picks the biggest process that isn't protected instead."
+      }
+    }
   ],
-  "answer": 1,
-  "why": "On Linux `fork` copies the page table, not the pages. In the lab box the child of a 512 MB process was running 1.7 ms after `fork` with `Shared` 512 MB and `Private` 0 in `smaps_rollup`. Each process needs its own page table, so the child can't share the parent's, and the kernel copies a page only when one side first writes to it."
- },
- "sections": [
-  {
-   "h": "fork shares every page, and the first write copies it",
-   "body": "`cow.c` fills 512 MB of memory and then calls `fork`. The child is running 1.7 ms later. Copying the same 512 MB with `memcpy` takes 33 ms in the lab box, and needs a second 512 MB of RAM to copy into. Lesson 2 of this track said the child starts as a copy of the parent, and promised a trick that makes the copy cheap. This is the trick.\n\nStart with the simplest version that would work: at `fork`, the kernel copies every page of the parent into fresh frames (a frame is a 4 KB piece of physical RAM, from lesson 6). It's correct, and it's slow exactly where it hurts. A 4 GB JVM that starts a helper with `fork` and `exec` copies 4 GB, and `exec` throws it all away a millisecond later. A Redis server holding 10 GB forks a child to write a snapshot to disk. The child only reads, yet copying would need 20 GB.\n\nThe next try shares instead of copying. The kernel gives the child its own page table (the per-process map from virtual pages to frames, lesson 6), and its entries point at the parent's frames. That costs only the table: about 1 MB of entries for 512 MB of 4 KB pages. But now a write by the parent would change the child's memory too, and the child was promised its own copy.\n\nThe last piece is the permission bits in each entry. At `fork` the kernel marks every entry read-only, in the parent and in the child. Reads work as before. The first write to a page, by either side, isn't allowed, so the CPU raises a page fault (the exception that hands control to the kernel, lesson 6). The kernel's fault handler sees that the region is writable and the frame is shared. It copies that one 4 KB page into a new frame, points the writer's entry at the copy, makes it writable and restarts the store. This is **copy-on-write**. The kernel counts the entries that point at each frame, and when only one is left, a write fault just makes that entry writable again. The stepper walks through it.\n\n`/proc/<pid>/smaps_rollup` shows the result. `Shared` counts pages whose frame another process maps too, `Private` counts pages only this process maps, and **PSS** (proportional set size) splits each shared page among its sharers. Right after `fork` the child has `Shared` 512 MB, `Private` 0 and `Pss` 256 MB. After it writes one byte in every fourth page, the kernel has made 32,768 copies (128 MB) at 1.6 to 1.9 µs each, and the child shows `Shared` 384 MB and `Private` 128 MB. RSS says 513 MB for each process the whole time, so adding up RSS would claim 1 GB. The two use 640 MB, and their PSS values add up to that.\n\nCopy-on-write isn't free. Writing every page took the child 180 ms of faults, several times the `memcpy`. It wins because most children write a little, or call `exec` and write nothing.",
-   "stepper": {
-    "title": "fork, then one write",
-    "intro": "Two page tables on top, RAM below. Each entry names the frame it points at and whether a write may go straight through; each frame shows how many entries point at it.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The parent maps four pages, each writable, each frame used once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">rw</text><rect class=\"box-dim\" x=\"480\" y=\"34\" width=\"220\" height=\"152\" rx=\"8\"/><text class=\"t\" x=\"590.0\" y=\"115.0\" text-anchor=\"middle\">no child yet</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">idle</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
-      "say": "The parent has touched four pages, so its page table has four entries, each pointing at its own frame and each writable (`rw`). Every frame has one entry pointing at it: `refs 1`. (`cow.c` does the same with 131,072 pages.)"
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"fork gives the child entries for the same frames and makes every entry read-only\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box-a\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">fork()</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box-a\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
-      "say": "`fork` builds the child a page table whose entries point at the parent's frames, and marks every entry **read-only**, the parent's too. Each frame now has two references. No data moved: the cost is the new page table, about 1 MB for 512 MB of memory."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The child reads page 1: reads are allowed, nothing happens\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">read page 1: ok</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
-      "say": "The child reads page 1. Read-only allows reads, so the CPU translates the address and loads from frame B without involving the kernel. A child that only reads, like a snapshot writer, can run for minutes and never cost a copy."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The child writes page 2: the entry is read-only, so the CPU raises a page fault\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-bad\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box-b\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">write page 2: fault</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-dim\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">free</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 0, frames in use: 4</text></svg>",
-      "say": "The child stores to page 2. The entry says read-only, so the CPU stops the store and raises a **page fault**, the same exception as a first touch in lesson 6. The kernel's handler checks the region: it is writable, so this isn't a bug. It's a write to a shared page."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The kernel copies frame C into frame E, points the child's entry at E and makes it writable\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame E</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">copy C to E</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 1, frames in use: 5</text></svg>",
-      "say": "Frame C has two references, so the kernel takes a free frame, E, copies C's 4 KB into it, points the child's entry at E and makes it writable. C drops to one reference. Then the store runs again and lands in E. That one page cost about 1.8 µs in the lab box."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 720 312\" role=\"img\" aria-label=\"The parent writes page 2: frame C has one reference left, so the kernel makes the entry writable without copying\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"24\" text-anchor=\"start\">parent pid 40: page table</text><text class=\"t-s t-m\" x=\"480\" y=\"24\" text-anchor=\"start\">child pid 41: page table</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"226\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"20\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"226\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box-a\" x=\"20\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"135\" text-anchor=\"start\">page 2 → frame C</text><text class=\"t-s t-m\" x=\"226\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"20\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"34\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"226\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"34\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"55\" text-anchor=\"start\">page 0 → frame A</text><text class=\"t-s t-m\" x=\"686\" y=\"55\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"74\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"95\" text-anchor=\"start\">page 1 → frame B</text><text class=\"t-s t-m\" x=\"686\" y=\"95\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"480\" y=\"114\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"135\" text-anchor=\"start\">page 2 → frame E</text><text class=\"t-s t-m\" x=\"686\" y=\"135\" text-anchor=\"end\">rw</text><rect class=\"box\" x=\"480\" y=\"154\" width=\"220\" height=\"32\" rx=\"8\"/><text class=\"t-s t-code\" x=\"494\" y=\"175\" text-anchor=\"start\">page 3 → frame D</text><text class=\"t-s t-m\" x=\"686\" y=\"175\" text-anchor=\"end\">read-only</text><rect class=\"box\" x=\"260\" y=\"70\" width=\"200\" height=\"80\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"105.0\" text-anchor=\"middle\">kernel</text><text class=\"t-s t-code\" x=\"360.0\" y=\"125.0\" text-anchor=\"middle\">write page 2: reuse C</text><text class=\"t-s t-m\" x=\"20\" y=\"214\" text-anchor=\"start\">RAM: frames and how many entries point at each</text><rect class=\"box\" x=\"20\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"80.0\" y=\"243.0\" text-anchor=\"middle\">frame A</text><text class=\"t-s t-m\" x=\"80.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"160\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"220.0\" y=\"243.0\" text-anchor=\"middle\">frame B</text><text class=\"t-s t-m\" x=\"220.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box-a\" x=\"300\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"360.0\" y=\"243.0\" text-anchor=\"middle\">frame C</text><text class=\"t-s t-m\" x=\"360.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><rect class=\"box\" x=\"440\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"500.0\" y=\"243.0\" text-anchor=\"middle\">frame D</text><text class=\"t-s t-m\" x=\"500.0\" y=\"263.0\" text-anchor=\"middle\">refs 2</text><rect class=\"box\" x=\"580\" y=\"222\" width=\"120\" height=\"52\" rx=\"8\"/><text class=\"t\" x=\"640.0\" y=\"243.0\" text-anchor=\"middle\">frame E</text><text class=\"t-s t-m\" x=\"640.0\" y=\"263.0\" text-anchor=\"middle\">refs 1</text><text class=\"t-s t-a\" x=\"20\" y=\"300\" text-anchor=\"start\">copies: 1, frames in use: 5</text></svg>",
-      "say": "Now the parent writes page 2. Its entry is still read-only, so it faults too. But frame C's count is 1: nobody else can see it any more. The kernel flips the entry back to writable and copies nothing. Pages 0, 1 and 3 stay shared until someone writes them."
-     }
+  "compare": {
+    "title": "The same Hog, stopped by the JVM and by the kernel (256 MB container)",
+    "a": {
+      "label": "-Xmx128m: the JVM's limit",
+      "lang": "text",
+      "title": "java -Xmx128m ... Hog",
+      "src": "max heap 123 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nException in thread \"main\" java.lang.OutOfMemoryError: Java heap space\nexit code 1\noom_kill 0"
+    },
+    "b": {
+      "label": "-Xmx1g: the kernel's limit",
+      "lang": "text",
+      "title": "java -Xmx1g ... Hog",
+      "src": "max heap 989 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nholding 128 MB\nholding 160 MB\nholding 192 MB\nholding 224 MB\nexit code 137\noom_kill 1"
+    },
+    "note": "Same program, same container. With a heap that fits, the JVM's garbage collector notices first and throws an exception that the program can see, log and act on. With a heap bigger than the container, the kernel notices first, and its only tool is `SIGKILL`: the last line printed is whatever happened to be written out before the kill. The left run is the one you want. That's why the heap must be smaller than the limit by more than the JVM's memory outside the heap."
+  },
+  "worked": {
+    "title": "Find out why a container exited with 137",
+    "steps": [
+      {
+        "say": "Start from the exit code. 137 is 128 + 9, so the process got `SIGKILL`. Docker also records whether the kernel's OOM killer sent it, and `docker inspect` prints that record.",
+        "code": "docker inspect -f 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' sfz-os07-oom\n# ExitCode=137 OOMKilled=true",
+        "lang": "bash"
+      },
+      {
+        "say": "Confirm it from the container's cgroup. `oom_kill` counts the processes the OOM killer took from this group, and `max` counts how often the group hit `memory.max`. A `max` that grows with no kills means the kernel is reclaiming hard to stay under the limit.",
+        "code": "cat /sys/fs/cgroup/memory.events\n# low 0\n# high 0\n# max 45\n# oom 1\n# oom_kill 1\n# oom_group_kill 0",
+        "lang": "bash"
+      },
+      {
+        "say": "Check what the JVM believes. `-XshowSettings:system` prints the limits the JVM read from the cgroup, and `MaxHeapSize` is the heap size it chose, in bytes. In a 256 MB box with no options, the JVM took 126 MB for the heap.",
+        "code": "java -XshowSettings:system -version 2>&1 | grep Memory\n#     Memory Limit: 256.00M\n#     Memory Soft Limit: 0.00K\n#     Memory & Swap Limit: 256.00M\njava -XX:+PrintFlagsFinal -version 2>/dev/null | grep ' MaxHeapSize '\n#    size_t MaxHeapSize                              = 132120576                                 {product} {ergonomic}",
+        "lang": "bash"
+      },
+      {
+        "say": "Decide which limit to move. If the program's log shows `OutOfMemoryError`, the heap was too small, or something keeps filling it. If the log shows nothing and the exit code was 137, the heap plus the memory outside it crossed `memory.max`. Lower the heap or raise the limit, and measure the memory outside the heap with Native Memory Tracking, which the next lesson shows.",
+        "code": "# heap too small:   OutOfMemoryError in the log, exit 1, oom_kill unchanged\n# limit too small:  nothing in the log, exit 137, oom_kill + 1",
+        "lang": "text"
+      }
     ]
-   },
-   "try": {
-    "title": "Fork 512 MB and count the copies",
-    "minutes": 4,
-    "steps": [
-     "`os/c/l07/cow.c` touches 512 MB in 4 KB pages, times one `memcpy` of it for comparison, then forks. The child writes one byte in every Nth page (the second argument) and prints its `smaps_rollup` numbers before and after.",
-     "Predict the child's `Pss`, `Shared` and `Private` right after `fork` and after writing every 4th page.",
-     "Run both lines in the lab box. The second one makes the child write every page."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "gcc -O2 -o /tmp/cow os/c/l07/cow.c\n/tmp/cow 512 4\n/tmp/cow 512 1"
-    },
-    "expect": "Timings change from run to run:\n\n```text\ncopying 512 MB with memcpy: 33 ms\nparent before fork     Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\nfork returned in the child after 1.7 ms\nchild after fork       Rss  513 MB  Pss  256 MB  Shared  512 MB  Private    0 MB\nchild wrote to 32768 of 131072 pages: 32768 page faults in 58 ms (1.76 us each)\nchild after writes     Rss  513 MB  Pss  320 MB  Shared  384 MB  Private  128 MB\nparent after child exit Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\ncopying 512 MB with memcpy: 28 ms\n...\nchild wrote to 131072 of 131072 pages: 131072 page faults in 180 ms (1.37 us each)\nchild after writes     Rss  513 MB  Pss  512 MB  Shared    0 MB  Private  512 MB\n...\n```\n\nOne fault per page written, and each fault is one 4 KB copy. `Rss` never moves, because RSS counts shared pages in full in every process. `Pss` is the honest share: 256 MB each while everything is shared. When the child exits, the parent's pages are private again. Writing everything cost 180 ms in faults against 28 ms for one big `memcpy`: copy-on-write pays per page, and it wins only because most children write little."
-   },
-   "refs": [
-    {
-     "title": "fork(2): copy-on-write pages",
-     "url": "https://man7.org/linux/man-pages/man2/fork.2.html",
-     "kind": "docs"
-    },
-    {
-     "title": "OSTEP chapter 23: Complete Virtual Memory Systems",
-     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-complete.pdf",
-     "kind": "read"
-    },
-    {
-     "title": "proc_pid_smaps(5): Pss, Shared and Private",
-     "url": "https://man7.org/linux/man-pages/man5/proc_pid_smaps.5.html",
-     "kind": "docs"
-    }
-   ]
   },
-  {
-   "h": "mmap can fill a region from a file instead of zeros",
-   "body": "`MapFile` maps a 256 MB file with `FileChannel.map` and reads one byte from every page. The process's `RssFile` goes from 22 MB to 278 MB. `RssAnon` doesn't move.\n\nEvery region so far has been **anonymous memory**: it belongs to no file, and its pages start as zeros. The heap, thread stacks and the Java heap are all anonymous. The other kind of region is backed by a file. To see why it exists, look at how a program normally reads a file. The kernel keeps file data in RAM in the **page cache** (its in-memory copy of file pages, the subject of lesson 9 of this track). `read()` is a system call (lesson 1) that copies bytes from the page cache into the program's buffer. For a 2 GB index that a fraud check probes at random, that's a system call and a copy for every probe, and the hot pages sit in RAM twice.\n\n`mmap` of a file removes both costs. The kernel records a region whose backing is the file. The first touch of a page faults, as in lesson 6, but this time the handler doesn't zero a frame. It finds the page cache frame that holds that part of the file, reading it from disk first if it isn't cached (a major fault), and points the entry at it. After that a probe is a plain memory load. Every process that maps the file points at the same frames, and those frames count as `RssFile`.\n\nA file mapping is either shared or private. With `MAP_SHARED`, a write goes into the page cache frame itself, so the file changes, every other process mapping it sees the change, and the kernel writes it to disk later. With `MAP_PRIVATE`, the entries start read-only and the first write is a copy-on-write fault, exactly as after `fork`: the writer gets an anonymous copy of that page, and the file never changes. This is how every process loads `libc.so`. Its code is mapped private, so a hundred processes share one copy of it in RAM.\n\nThe difference matters when memory runs short. The kernel can drop a clean file page at any moment, because it can read it back from the file. An anonymous page has no file to come back from, so the kernel can only move it to swap (disk space set aside for evicted anonymous pages), if the machine has any.\n\nIn Java, `FileChannel.map` returns a `MappedByteBuffer`. `MapMode.READ_ONLY` and `MapMode.READ_WRITE` give shared mappings, and `MapMode.PRIVATE` gives the copy-on-write one. Kafka maps its index files this way.",
-   "try": {
-    "title": "Map a file, then write through both kinds of mapping",
-    "minutes": 4,
-    "steps": [
-     "`MapFile` writes a 256 MB file in `/tmp`, maps it read-only, reads one byte per page and prints the process's `RssAnon` and `RssFile` at each step. Then it maps the first page twice, writes `S` through a shared mapping and `P` through a private one, and reads the file's first two bytes back with a plain `read`.",
-     "Predict `RssFile` after the reads, and which of the two letters reaches the file.",
-     "Run it in the lab box. It deletes the file at the end."
+  "lab": {
+    "title": "Build a copy-on-write memory model with an OOM killer",
+    "minutes": 15,
+    "files": [
+      "labs/os/src/main/kotlin/sfz/os/l07/CopyOnWrite.kt",
+      "labs/os/src/test/resources/sfz/os/l07/cow-512m.txt"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "javac -d /tmp/out os/src/demo/java/sfz/os/l07/demo/MapFile.java\njava -cp /tmp/out sfz.os.l07.demo.MapFile",
-     "file": "labs/os/src/demo/java/sfz/os/l07/demo/MapFile.java"
-    },
-    "expect": "```text\nbefore map     RssAnon   23 MB   RssFile   22 MB\nafter map      RssAnon   32 MB   RssFile   22 MB\nafter reading  RssAnon   33 MB   RssFile  278 MB\nmaps: ffff3c000000-ffff4c000000 r--s 00000000 00:ad 1336147                    /tmp/ledger.dat\nfile bytes 0-1: 'S' 0   private mapping sees 'S' 'P'\n```\n\nMapping cost nothing; reading one byte per page brought 256 MB into `RssFile`, the page cache's frames for that file. The 9 MB that `RssAnon` gains at `map` is the JVM loading classes, not the file. In `/proc/self/maps` the region is `r--s`: readable and shared. The file got the shared `S` and not the private `P`. The private mapping still saw the `S`, because its page was copied only when it wrote the `P`, after the `S` was already there."
-   },
-   "refs": [
-    {
-     "title": "mmap(2): MAP_SHARED and MAP_PRIVATE",
-     "url": "https://man7.org/linux/man-pages/man2/mmap.2.html",
-     "kind": "docs"
-    },
-    {
-     "title": "FileChannel.MapMode (JDK 25)",
-     "url": "https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.MapMode.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "The kernel promises more memory than it has",
-   "body": "`promise.c` asks for 100 GB with `mmap` on the lab box's VM, which has 7.9 GB of RAM. The call returns at once. Asking for 1,000 GB works too.\n\nThat follows from lesson 6: `mmap` only records a region, and RAM arrives a page at a time on first touch. So the kernel has to decide how much to promise before it knows how much will be used. The simplest rule is honest bookkeeping: refuse any request that would push the total promised past RAM plus swap. It breaks on the first `fork` of a big process. A 4 GB JVM on an 8 GB machine forks a helper, the child is promised a private copy of all 4 GB, the total passes 8 GB, and `fork` fails, although copy-on-write would have copied a handful of pages before `exec`. The JVM's own habits break it too. It reserves its whole `-Xmx` heap at start-up, every thread reserves a 2 MB stack (lesson 3), and much of that is never touched.\n\nSo Linux **overcommits**: it promises more than it has and counts on most promises never being collected. `/proc/meminfo` keeps the books. `Committed_AS` is the total promised to all processes. `CommitLimit` is swap plus a share of RAM (`vm.overcommit_ratio`, 50% by default): here 1,024 MB of swap plus half of 7,935 MB, 4,991 MB. The setting `vm.overcommit_memory` picks the rule:\n\n| value | rule |\n|---|---|\n| 0 | the default: refuse requests that obviously can't fit, say yes to the rest |\n| 1 | always say yes |\n| 2 | never let `Committed_AS` pass `CommitLimit` |\n\nThe lab box's VM runs with 1, so `Committed_AS` reached 104,612 MB on a machine with 7,935 MB of RAM. Mode 2 sounds safer, and PostgreSQL's manual suggests it for database hosts, but on a busy machine `fork` and large reservations then fail with `ENOMEM` while plenty of RAM is still free.\n\nThe real cost of promising is where the failure lands. A refused `mmap` is an error code the program can handle. A broken promise shows up later, inside a page fault: the program is in the middle of an ordinary store instruction, and there's no call that could return an error. The kernel first tries to find a frame by reclaiming memory: it drops clean file pages, writes dirty ones back so it can drop them too, and moves anonymous pages to swap. If that can't free enough, there's one move left: kill a process and take its memory.",
-   "try": {
-    "title": "Ask for 100 GB and 1,000 GB",
-    "minutes": 2,
+    "run": "./gradlew :os:test --tests 'sfz.os.l07.*'",
     "steps": [
-     "`os/c/l07/promise.c` prints the overcommit mode, then `CommitLimit` and `Committed_AS` before and after one `mmap` of the size you ask for. It touches nothing unless you give it a second argument.",
-     "Predict whether 100 GB and 1,000 GB succeed on a VM with 8 GB, and how far `Committed_AS` moves. Then run it in the lab box."
+      "Open `cow-512m.txt`: a real run of `cow.c` in the lab box. One test replays it on your model and compares the copies and the `Shared`, `Private` and `Pss` numbers.",
+      "Read `CopyOnWrite.kt`. `Ram` counts how many page-table entries point at each frame, and `Pte` is one page-table entry. `spawn`, `mmap`, `read`, `exit`, `kill` and the private `frameFor` are written for you.",
+      "Run the tests from the `labs` folder with the command above. Tests are small programs that check your code and say what's wrong. All nine fail for now.",
+      "Write `fork`. The child gets the parent's regions and `oomScoreAdj`, and an entry for each of the parent's pages, pointing at the same frame. Make every entry read-only on both sides, and call `share` on each frame.",
+      "Write `write`, the page-fault handler's decisions. It has four outcomes: `ZERO_FILL` for a first touch, `NONE` for a writable entry, `REUSE` for a read-only entry whose frame has one reference, and `COPY` otherwise. Get new frames only through `frameFor`, and return `KILLED` when it gives you null.",
+      "Write `smaps` and `oomVictim`. Then read the last test: a forked snapshot writer whose parent rewrites everything, the way Redis behaves when many writes arrive during a snapshot."
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "gcc -O2 -o /tmp/promise os/c/l07/promise.c\n/tmp/promise 100 0\n/tmp/promise 1000 0"
-    },
-    "expect": "```text\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    2212 MB   MemTotal  7935 MB\nmmap of 100 GB returned 0xffe69de00000\nafter mmap       CommitLimit   4991 MB   Committed_AS  104612 MB   MemTotal  7935 MB\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    2212 MB   MemTotal  7935 MB\nmmap of 1000 GB returned 0xff05b7c00000\nafter mmap       CommitLimit   4991 MB   Committed_AS 1026212 MB   MemTotal  7935 MB\n```\n\nBoth succeed. `Committed_AS` counts each promise in full, and mode 1 ignores `CommitLimit`, so the VM happily promises 1 TB. These numbers are for the whole Docker VM (other containers' promises are in the 2,212 MB), because `/proc/meminfo` is not limited to your container. Under the default mode 0, a single request this far beyond RAM plus swap would be refused as an obvious overcommit."
-   },
-   "refs": [
-    {
-     "title": "Overcommit accounting (Linux kernel documentation)",
-     "url": "https://docs.kernel.org/mm/overcommit-accounting.html",
-     "kind": "docs"
-    },
-    {
-     "title": "proc_meminfo(5): CommitLimit and Committed_AS",
-     "url": "https://man7.org/linux/man-pages/man5/proc_meminfo.5.html",
-     "kind": "docs"
-    }
-   ]
+    "hints": [
+      "In `fork`, go over `parent.pages` and set `pte.writable = false` on the parent's own entry before you create the child's `Pte(pte.frame, writable = false)`.",
+      "In the `COPY` case, release the old frame only after you have the new one. If `frameFor` returns null, the old frame must still belong to this entry.",
+      "PSS is `sum(1.0 / ram.refCount(frame))` over the process's entries. `shared` counts the entries whose frame has more than one reference.",
+      "Badness is `rss + oomScoreAdj * ram.limit / 1000`, as a `Long`. Scan the processes oldest first and use `>=`, so a newer process wins a tie, as in the kernel."
+    ],
+    "done_when": "All nine tests in `CopyOnWriteTest` pass."
   },
-  {
-   "h": "When a promise can't be kept, the OOM killer picks a process",
-   "body": "In a container limited to 256 MB, `promise.c` reserves 4 GB without complaint, touches 192 MB of it, and is gone: `Killed`, exit code 137, and the container's `memory.events` file says `oom_kill 1`.\n\nA container's limit is a cgroup setting. A cgroup is a group of processes the kernel counts and limits together (lesson 12 of this track builds one by hand), and `docker run --memory 256m` writes 268435456 into the group's `memory.max`. The kernel charges every page that the group's processes bring into RAM to the group, anonymous pages and page cache pages alike. When a fault would push the charge past `memory.max`, the kernel reclaims inside the group first. If that fails it runs the **OOM killer** (out of memory) on the group's processes only. In `memory.events`, `max` counts the times the group hit its limit and `oom_kill` counts the processes killed. Without a limit, the same thing happens machine-wide once RAM and swap run out.\n\nThe killer picks by size, not by guilt. Each candidate gets a badness score: its RSS plus its swap plus its page tables, in pages, plus `oom_score_adj` (from -1000 to 1000) thousandths of the memory it's allowed. The highest score gets `SIGKILL`. A process set to -1000 is never picked. Kubernetes sets this value for you: -997 for containers in Guaranteed pods, 1000 for BestEffort ones. So the process that asked for the last page often isn't the one that dies. A 1 GB JVM next to a 50 MB shell script loses, whichever of them allocated last.\n\nA JVM lives under two memory limits, and they fail in different ways. `-Xmx` is the JVM's own limit on the Java heap. When the heap is full and garbage collection can't free enough, the JVM throws `java.lang.OutOfMemoryError: Java heap space`. That's an ordinary exception: you get a stack trace, `-XX:+HeapDumpOnOutOfMemoryError` writes a heap dump, and your code decides what happens next. `memory.max` is the kernel's limit on everything the process has in RAM: the heap pages it has touched, plus metaspace, the code cache, thread stacks, GC structures and native buffers (lesson 8 of this track takes those apart). Cross it and the kernel sends `SIGKILL`, which the JVM can't catch. No exception, no heap dump, no shutdown hook. The container exits with 137, which is 128 plus signal 9 (lesson 2).\n\n`Hog` holds on to 1 MB arrays until something stops it. In the 256 MB container with no `-Xmx`, the JVM gave itself a 121 MB heap, and the heap filled first: `OutOfMemoryError`. With `-Xmx1g` the heap could outgrow the container, and the kernel killed the JVM at about 224 MB.",
-   "try": {
-    "title": "Get killed by the kernel, then by the JVM",
+  "drill": {
+    "title": "Count the copies after a snapshot fork",
     "minutes": 5,
-    "steps": [
-     "From the `labs` folder on your Mac, start a lab box limited to 256 MB: `docker run --rm -it --memory 256m --memory-swap 256m -v \"$PWD\":/labs -w /labs sfz-labbox:1 bash`. `--memory-swap 256m` caps memory plus swap at 256 MB, so there's no swap to slow the end down.",
-     "Run the block below in that box. The programs run as children of `bash`, so the box survives each kill and you can read `memory.events` after it.",
-     "Before each run, predict who stops it: the kernel or the JVM."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the 256 MB lab box",
-     "src": "gcc -O2 -o /tmp/promise os/c/l07/promise.c\n/tmp/promise 4 1024\necho \"exit code $?\"\ngrep -E '^(max|oom_kill) ' /sys/fs/cgroup/memory.events\njavac -d /tmp/out os/src/demo/java/sfz/os/l07/demo/Hog.java\nfor heap in \"\" -Xmx1g; do\n  echo \"== java $heap\"\n  java $heap -cp /tmp/out sfz.os.l07.demo.Hog 2>&1 | grep -v '^\\s*at '\n  echo \"exit code ${PIPESTATUS[0]}\"\n  grep -E '^oom_kill ' /sys/fs/cgroup/memory.events\ndone",
-     "file": "labs/os/src/demo/java/sfz/os/l07/demo/Hog.java"
-    },
-    "expect": "```text\nvm.overcommit_memory = 1\nbefore mmap      CommitLimit   4991 MB   Committed_AS    3153 MB   MemTotal  7935 MB\nmmap of 4 GB returned 0xfffe93200000\nafter mmap       CommitLimit   4991 MB   Committed_AS    7249 MB   MemTotal  7935 MB\ntouched   64 MB, RSS   65 MB\ntouched  128 MB, RSS  129 MB\ntouched  192 MB, RSS  193 MB\nbash: line 2:    12 Killed                  /tmp/promise 4 1024\nexit code 137\nmax 143\noom_kill 1\n== java \nmax heap 121 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nException in thread \"main\" java.lang.OutOfMemoryError: Java heap space\nexit code 1\noom_kill 1\n== java -Xmx1g\nmax heap 989 MB\nholding 32 MB\n...\nholding 224 MB\nexit code 137\noom_kill 2\n```\n\n`MemTotal` still says 7,935 MB inside a 256 MB container: `/proc/meminfo` shows the whole VM, and the limit lives in `/sys/fs/cgroup/memory.max`. The C program died at a store, 137 and one `oom_kill`. The JVM with its own 121 MB heap stopped itself with an exception and exit code 1, and `oom_kill` didn't move. With `-Xmx1g` there was no exception and no stack trace, only 137 and a second `oom_kill`. The `max` count (143 here) is how many times the group hit its limit and the kernel had to reclaim; it varies between runs."
-   },
-   "refs": [
-    {
-     "title": "Control Group v2: memory.max and memory.events",
-     "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html",
-     "kind": "docs"
-    },
-    {
-     "title": "proc_pid_oom_score_adj(5)",
-     "url": "https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html",
-     "kind": "docs"
-    },
-    {
-     "title": "Kubernetes: node out of memory behavior and oom_score_adj",
-     "url": "https://kubernetes.io/docs/concepts/scheduling-eviction/node-pressure-eviction/",
-     "kind": "docs"
+    "prompt": "A program that keeps its data in memory, like Redis, holds 2 GB in 4 KB pages and forks a child to write a snapshot. While the child runs, the parent writes to a quarter of its pages, and the child only reads. Write Kotlin that prints how many pages the kernel copies, the RAM both use together, and the child's `Shared`, `Private` and `Pss` in MB.",
+    "answer": {
+      "lang": "kotlin",
+      "src": "val pages = 2L * 1024 * 1024 / 4           // 524,288 pages of 4 KB\nval written = pages / 4                    // the parent writes 131,072 of them\n\nval copies = written                       // one copy per page, on the parent's first write\nval ramMb = (pages + copies) * 4 / 1024    // 2,560 MB for the two processes\n\n// the parent's write moves the parent to the copy; the old frame is left to the child alone\nval childSharedMb = (pages - written) * 4 / 1024           // 1,536 MB still shared\nval childPrivateMb = written * 4 / 1024                     // 512 MB only the child maps now\nval childPssMb = childSharedMb / 2 + childPrivateMb         // 1,280 MB\nprintln(\"$copies copies, $ramMb MB, child shared $childSharedMb private $childPrivateMb pss $childPssMb\")\n// the parent has the same split, and 1,280 + 1,280 = 2,560: PSS adds up to the RAM used"
     }
-   ]
-  }
- ],
- "analogy": "Overcommit is an airline that sells 220 tickets for a 200-seat plane, because some passengers never show up. Copy-on-write is two travellers on one booking who share every detail until one of them changes a seat, and only that seat gets a new record. Most days nobody notices. On the day all 220 turn up, someone has to leave the plane, and the OOM killer is the gate agent who picks the passenger with the most luggage, whoever arrived last. The analogy breaks at the moment of choice. An airline asks for volunteers before boarding and pays them. The kernel finds out mid-flight, at a page fault in the middle of a store instruction, and removes the passenger with `SIGKILL`, without asking and without letting them pack.",
- "in_your_world": "A Quarkus payments service in a pod with a 1 GiB limit and `-Xmx900m` runs fine through testing and then restarts at peak with `OOMKilled` and exit code 137 in `kubectl describe pod`, with no `OutOfMemoryError` in the log and no heap dump. The heap never filled. The heap plus metaspace, thread stacks, Netty's direct buffers and malloc's arenas crossed 1 GiB, and the kernel killed the JVM. The fix is headroom: size the heap well under the limit and measure the rest (lesson 8). Copy-on-write shows up in the Redis your services call: `BGSAVE` forks, and a write-heavy minute during the snapshot copies pages until RSS nearly doubles, which in a tight container kills one of the two processes. And Kafka's brokers lean on file mappings: their index files are `mmap`ed, so after a restart the first lookups take major faults until the page cache is warm.",
- "mistake": "Sizing `-Xmx` to the container limit, or setting `-XX:MaxRAMPercentage=100`. It feels like using the memory you pay for. But the heap is only part of what the kernel counts: metaspace, the code cache, every thread's stack, GC bookkeeping and native buffers come on top, and the kernel kills at `memory.max` with `SIGKILL`. You get no `OutOfMemoryError`, so `-XX:+HeapDumpOnOutOfMemoryError` never fires, and the next move, raising `-Xmx`, makes it worse. Read the kill from outside instead: exit code 137, `OOMKilled` in `docker inspect` or `kubectl describe`, and `oom_kill` in the container's `memory.events`. Then leave real headroom: a heap of about half to three quarters of the limit, checked against the JVM's actual RSS under load.",
- "compare": {
-  "title": "The same Hog, stopped by the JVM and by the kernel (256 MB container)",
-  "a": {
-   "label": "-Xmx128m: the JVM's limit",
-   "lang": "text",
-   "title": "java -Xmx128m ... Hog",
-   "src": "max heap 123 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nException in thread \"main\" java.lang.OutOfMemoryError: Java heap space\nexit code 1\noom_kill 0"
   },
-  "b": {
-   "label": "-Xmx1g: the kernel's limit",
-   "lang": "text",
-   "title": "java -Xmx1g ... Hog",
-   "src": "max heap 989 MB\nholding 32 MB\nholding 64 MB\nholding 96 MB\nholding 128 MB\nholding 160 MB\nholding 192 MB\nholding 224 MB\nexit code 137\noom_kill 1"
+  "recap": [
+    "`fork` copies the page table, not the memory, and marks every entry read-only on both sides. The first write to a page faults, and the kernel copies just that 4 KB page: copy-on-write.",
+    "RSS counts a shared page in full in every process that uses it. PSS splits it among the sharers, so PSS values add up to the RAM really used.",
+    "A file mapping fills pages from the page cache instead of zeros. Writes through `MAP_SHARED` reach the file; writes through `MAP_PRIVATE` go to private copies. The kernel can drop a clean file page and read it again, but an anonymous page can only go to swap.",
+    "Linux overcommits: `mmap` and `fork` promise memory that may never be used. `Committed_AS` is the total promised, and `vm.overcommit_memory` decides whether `CommitLimit` is enforced.",
+    "A broken promise turns up as a page fault with no free frame. The kernel reclaims what it can, then the OOM killer sends `SIGKILL` to the process with the highest badness score, inside the container if `memory.max` was hit.",
+    "The limit: the kernel counts all of a program's memory, but `-Xmx` covers only the Java heap. `OutOfMemoryError` is an exception the program can handle; exit code 137 is a kill, and nothing in the program runs. What fills the memory outside the heap is a question for the next lesson."
+  ],
+  "closing": "We started at the gate of an overbooked flight, and the kernel turned out to run memory the same way. `fork` shares pages until someone writes, file mappings fill from the page cache, and every promise is checked only at the first touch. When too many come due, the OOM killer takes the biggest process, with `SIGKILL` and no message.\n\nOn a Linux machine you can reach, `grep -E 'CommitLimit|Committed_AS' /proc/meminfo` shows how far the kernel has promised past its limit. After a container vanishes, `docker inspect` tells you whether the OOM killer took it.\n\nNext, we'll look inside a program's own memory, and find out why it stays big after the program has freed most of it.",
+  "quiz": [
+    {
+      "q": "In Processes: fork, exec, wait and signals, `tinysh` runs a command with `fork` and then `exec`. With copy-on-write, roughly what does that `fork` cost when the parent is a Java program with 2 GB of touched memory in 4 KB pages?",
+      "options": [
+        "A 2 GB copy, which `exec` then throws away",
+        "A copy of the page table, a few MB, and no memory pages unless one side writes before `exec`",
+        "Nothing at all: the child shares the parent's page table until `exec`",
+        "A copy of the stack only, because `exec` needs nothing else"
+      ],
+      "answer": 1,
+      "from": "os-02",
+      "why": "The child needs its own page table, with read-only entries for all of the parent's pages. That's about 2 MB of tables per GB (Virtual memory), so about 4 MB here. Memory pages are copied only on a write, and `exec` throws the child's whole memory away before it writes much. Borrowing the parent's memory outright is what a different call, `vfork`, does; plain `fork` can't, because the child may write. The first option is the trap: it's what `fork` would cost without copy-on-write."
+    },
+    {
+      "q": "A program and three copies it forked each show RSS 900 MB in `ps`, a command that lists processes. `smaps_rollup` gives each one `Pss` 300 MB. About how much RAM do the four use together?",
+      "options": [
+        "3.6 GB: four times 900 MB",
+        "900 MB: they all use the same memory",
+        "About 1.2 GB: the sum of their PSS values",
+        "300 MB: the shared part counts only once"
+      ],
+      "answer": 2,
+      "why": "PSS splits each shared page equally among the processes that use it, so adding up PSS gives the frames really in use: 4 × 300 MB = 1.2 GB. For example, 800 MB shared by all four plus 100 MB of each one's own. Adding up RSS counts every shared page four times, which is how a screen of numbers can show more memory than the machine has. That's the tempting first option."
+    },
+    {
+      "q": "A program maps a 1 GB file of exchange rates with `MapMode.PRIVATE` and changes a few entries in memory for a test run. What happens to the file on disk?",
+      "options": [
+        "The kernel writes the changed pages to the file within about 30 seconds",
+        "Nothing: each changed page became a private anonymous copy, and the file never changes",
+        "The changes reach the file when the garbage collector frees the buffer",
+        "The JVM throws `ReadOnlyBufferException` at the first change"
+      ],
+      "answer": 1,
+      "why": "A private mapping is copy-on-write against the file. The first write to a page faults, and the kernel gives the program its own anonymous copy of that page. Other processes, and the file, keep seeing the original. Only `READ_WRITE`, a shared mapping, writes into the page cache, from where the kernel later writes the changed pages to disk. The first option describes that shared case."
+    },
+    {
+      "q": "A container started with `docker run --memory 2g` runs a Java program with `-Xmx1800m`. It runs for hours, then disappears with exit code 137. Its log ends in the middle of a request, with no exception. What happened?",
+      "options": [
+        "An `OutOfMemoryError` was thrown, but the log line was lost in the crash",
+        "A long garbage-collection pause made Docker stop the container with `SIGTERM`, the polite request to stop",
+        "The JVM ran out of heap and called `System.exit(137)`",
+        "The heap's touched pages plus the JVM's memory outside the heap crossed 2 GB, and the kernel's OOM killer sent `SIGKILL`"
+      ],
+      "answer": 3,
+      "why": "137 means `SIGKILL`, and the kernel kills at `memory.max` without the JVM getting a say. The heap grew toward 1.8 GB as the program touched it, and the JVM's memory outside the heap came on top. An `OutOfMemoryError` would have ended with exit code 1 and printed a stack trace, and `SIGTERM` would give 143 (128 + 15). The first option is tempting, but the JVM was never told anything: the kill came from outside."
+    },
+    {
+      "q": "In one container, a Java program with 1.2 GB in RAM and a 50 MB script share a 1.5 GB limit. The script's next command asks for 300 MB, and the group hits its limit. Both have `oom_score_adj` 0. Which process does the kernel kill?",
+      "options": [
+        "The Java program: it has by far the highest badness score",
+        "The script: it made the request that failed",
+        "Neither: the script's request returns `ENOMEM`",
+        "Both, because they share a cgroup"
+      ],
+      "answer": 0,
+      "why": "The OOM killer scores processes by the memory they hold (RAM plus swap plus page tables) plus `oom_score_adj`, not by who asked last. The Java program's 1.2 GB beats the script's 350 MB. The script's failing request is a page fault, not a call that could return `ENOMEM`. Killing the whole group at once needs `memory.oom.group` set to 1, and Docker leaves it at 0. The second option feels fair, but the killer doesn't look at fairness."
+    }
+  ],
+  "flashcards": [
+    {
+      "front": "What does `fork` copy on Linux?",
+      "back": "The page table, with every entry marked read-only, and the kernel's records of the process. Memory pages are shared and copied one at a time, at the first write to each: copy-on-write."
+    },
+    {
+      "front": "RSS or PSS: which one can you add up across processes?",
+      "back": "PSS. It splits each shared page among the processes that use it. RSS counts a shared page in full in each one."
+    },
+    {
+      "front": "`MAP_SHARED` or `MAP_PRIVATE` for a file?",
+      "back": "Shared: writes go into the page cache and reach the file. Private: the first write to a page copies it for the writer, and the file never changes."
+    },
+    {
+      "front": "Which pages can the kernel drop at once when memory runs short?",
+      "back": "Clean file pages, because it can read them again from the file. Anonymous pages can only go to swap, and changed file pages must be written to disk first."
+    },
+    {
+      "front": "What do `vm.overcommit_memory` 0, 1 and 2 mean?",
+      "back": "0: refuse any single request bigger than RAM plus swap, and say yes to the rest (the default). 1: always say yes. 2: never let `Committed_AS` pass `CommitLimit`."
+    },
+    {
+      "front": "How does the OOM killer choose which process to kill?",
+      "back": "The highest badness score: pages in RAM and swap plus page tables, plus `oom_score_adj` thousandths of the memory allowed. A process at -1000 is never chosen."
+    },
+    {
+      "front": "`OutOfMemoryError` or exit code 137?",
+      "back": "`OutOfMemoryError`: the Java heap hit `-Xmx`, and the JVM throws an exception. 137: `SIGKILL`, usually from the kernel's OOM killer at `memory.max`, and nothing in the JVM runs."
+    }
+  ],
+  "terms": [
+    {
+      "term": "Copy-on-write",
+      "plain": "Sharing a page between processes as read-only, and copying it only when one of them first writes to it."
+    },
+    {
+      "term": "PSS",
+      "plain": "Proportional set size: a process's pages in RAM, with each shared page divided by the number of processes that use it."
+    },
+    {
+      "term": "Anonymous memory",
+      "plain": "Memory that belongs to no file and starts as zeros, such as a program's heap and stacks."
+    },
+    {
+      "term": "File-backed mapping",
+      "plain": "A region of memory whose pages come from a file, through the page cache. `mmap` of a file sets one up."
+    },
+    {
+      "term": "Overcommit",
+      "plain": "Promising programs more memory than RAM and swap hold, because most promises are never fully used."
+    },
+    {
+      "term": "OOM killer",
+      "plain": "The part of the kernel that, when no memory can be freed, picks a process by its memory use and ends it with SIGKILL."
+    },
+    {
+      "term": "oom_score_adj",
+      "plain": "A number from -1000 to 1000 for each process, added to its OOM badness score. -1000 means never kill it."
+    },
+    {
+      "term": "memory.max",
+      "plain": "A cgroup's hard memory limit. Crossing it makes the kernel free what it can in the group, then use the OOM killer there."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend sees a program and four copies it forked each showing 1 GB of RSS in `ps`, on a machine that says only 2 GB of RAM is in use. They ask what's going on, and what would happen if each copy rewrote all its data inside a container limited to 4 GB. Explain.",
+    "answer": "`fork` doesn't copy memory. It gives each copy a page table that points at the parent's frames, with every entry marked read-only, so all five processes use mostly the same RAM. RSS counts every page a process uses, shared or not, so each one shows the full 1 GB, and adding them up counts the shared frames five times. PSS divides each shared page among the processes that share it. The five PSS values add up to roughly the 2 GB really in use: the shared data, plus whatever each process has written since the fork. The copying happens later, one page at a time. The first write to a shared page faults, and the kernel copies that 4 KB page for the writer. If every copy rewrote all its data, each would end up with a private copy of the whole 1 GB, about 5 GB of frames in total. In a container limited to 4 GB, the charge would hit `memory.max` partway through. The kernel would free what it could, and then the OOM killer would send `SIGKILL` to the process with the highest badness score. We'd see exit code 137, and `oom_kill` would go up in `memory.events`."
   },
-  "note": "Same program, same container. With a heap that fits, the JVM's garbage collector notices first and throws an exception your code can see, log and act on. With a heap bigger than the container, the kernel's memory controller notices first, and its only tool is `SIGKILL`: the last line printed is whatever happened to be flushed. The left run is the one you want in production, which is why the heap must be smaller than the limit by more than the JVM's non-heap memory."
- },
- "worked": {
-  "title": "Find out why a container exited with 137",
-  "steps": [
-   {
-    "say": "Start from the exit code. 137 is 128 + 9: the process got `SIGKILL`. Docker records whether the kernel's OOM killer sent it. (Kubernetes shows the same as `Reason: OOMKilled` under `Last State` in `kubectl describe pod`.)",
-    "code": "docker inspect -f 'ExitCode={{.State.ExitCode}} OOMKilled={{.State.OOMKilled}}' sfz-os07-oom\n# ExitCode=137 OOMKilled=true",
-    "lang": "bash"
-   },
-   {
-    "say": "Confirm it from the cgroup. `oom_kill` counts processes the OOM killer took from this group; `max` counts how often the group hit `memory.max`. A growing `max` with no kills means the kernel is reclaiming hard to stay under the limit.",
-    "code": "cat /sys/fs/cgroup/memory.events\n# low 0\n# high 0\n# max 45\n# oom 1\n# oom_kill 1\n# oom_group_kill 0",
-    "lang": "bash"
-   },
-   {
-    "say": "Check what the JVM believes. `-XshowSettings:system` prints the limits it read from the cgroup, and `MaxHeapSize` is the heap it chose. In a 256 MB box with no flags, the JVM took 126 MB for the heap.",
-    "code": "java -XshowSettings:system -version 2>&1 | grep Memory\n#     Memory Limit: 256.00M\n#     Memory Soft Limit: 0.00K\n#     Memory & Swap Limit: 256.00M\njava -XX:+PrintFlagsFinal -version 2>/dev/null | grep ' MaxHeapSize '\n#    size_t MaxHeapSize                              = 132120576                                 {product} {ergonomic}",
-    "lang": "bash"
-   },
-   {
-    "say": "Decide which limit to move. If the log shows `OutOfMemoryError`, the heap was too small or something leaks on it. If it shows nothing and the exit was 137, heap plus non-heap crossed `memory.max`: lower the heap or raise the limit, and measure the non-heap part with NMT (lesson 8).",
-    "code": "# heap too small:   OutOfMemoryError in the log, exit 1, oom_kill unchanged\n# limit too small:  nothing in the log, exit 137, oom_kill + 1",
-    "lang": "text"
-   }
+  "deeper": {
+    "minutes": 10,
+    "body": "Swap changes how running out of memory looks. With `--memory 256m` alone, Docker lets the container use as much swap again as its memory limit. Inside, `memory.swap.max` reads 268435456, and the JVM's `-XshowSettings:system` reports `Memory & Swap Limit: 512.00M`. A program that keeps asking for memory then slows down as its oldest anonymous pages move to swap, and dies later. That's why the Try-its in this lesson pass `--memory-swap 256m`, which sets memory plus swap to 256 MB, so no swap at all.\n\nThe cgroup has a softer limit too. `memory.high` makes the kernel reclaim and slow the group's requests down once usage passes it, and it never calls the OOM killer. `memory.max` is the hard stop. A third file, `memory.oom.group`, set to 1, makes the OOM killer take every process in the group together, instead of the single worst one. It was 0 in the lab box's containers.\n\nKubernetes, a system that runs containers across many machines, sets `oom_score_adj` for you. A pod (its word for a group of containers) whose reserved memory and CPU equal its limits is called Guaranteed, and gets -997. One with no reservations or limits at all is called BestEffort, and gets 1000, so it goes first. Many Kubernetes machines run without swap, which behaves like the Try-its here.\n\nThe page-table cost of `fork` is real for very big processes: about 2 MB of tables per GB of memory in 4 KB pages (Virtual memory). At the 1.7 ms per 512 MB measured above, a process with 30 GB touched spends about 100 ms in `fork` copying tables. That's one reason Java's `ProcessBuilder` on Linux starts programs through `posix_spawn`, which glibc (the usual C library on Linux) runs with `CLONE_VM` and `CLONE_VFORK`. The child borrows the parent's memory until it calls `exec`, and nothing is copied at all.\n\nFinally, `cow.c` asks for 4 KB pages with `madvise(MADV_NOHUGEPAGE)`, so that one write copies one 4 KB page. With transparent huge pages (Virtual memory), the kernel can map a region with 2 MB pages, and the fault counts after `fork` stop being one per 4 KB. The program turns them off to keep the numbers readable."
+  },
+  "sources": [
+    {
+      "title": "OSTEP chapter 23: Complete Virtual Memory Systems (copy-on-write, demand zeroing)",
+      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-complete.pdf"
+    },
+    {
+      "title": "fork(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/fork.2.html"
+    },
+    {
+      "title": "mmap(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/mmap.2.html"
+    },
+    {
+      "title": "Overcommit accounting (Linux kernel documentation)",
+      "url": "https://docs.kernel.org/mm/overcommit-accounting.html"
+    },
+    {
+      "title": "Control Group v2 (Linux kernel documentation)",
+      "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
+    }
   ]
- },
- "lab": {
-  "title": "Build a copy-on-write memory model with an OOM killer",
-  "minutes": 15,
-  "files": [
-   "labs/os/src/main/kotlin/sfz/os/l07/CopyOnWrite.kt",
-   "labs/os/src/test/resources/sfz/os/l07/cow-512m.txt"
-  ],
-  "run": "./gradlew :os:test --tests 'sfz.os.l07.*'",
-  "steps": [
-   "Open `cow-512m.txt`: a real run of `cow.c` in the lab box. One test replays it on your model and compares the copies, `Shared`, `Private` and `Pss`.",
-   "Read `CopyOnWrite.kt`. `Ram` counts references per frame, `Pte` is one page-table entry, and `spawn`, `mmap`, `read`, `exit`, `kill` and the private `frameFor` are written for you.",
-   "Run the tests from the `labs` folder. All nine fail.",
-   "Write `fork`: the child gets the parent's regions and `oomScoreAdj`, and an entry for each of the parent's pages pointing at the same frame. Make every entry read-only on both sides and `share` each frame.",
-   "Write `write`. It has four outcomes: `ZERO_FILL` for a first touch, `NONE` for a writable entry, `REUSE` for a read-only entry whose frame has one reference, and `COPY` otherwise. Get new frames only through `frameFor`, and return `KILLED` when it gives you null.",
-   "Write `smaps` and `oomVictim`. Then read the last test: a forked snapshot that rewrites everything, as Redis does under write load."
-  ],
-  "hints": [
-   "In `fork`, iterate over `parent.pages` and set `pte.writable = false` on the parent's own entry object before you create the child's `Pte(pte.frame, writable = false)`.",
-   "In the `COPY` case, release the old frame after you have the new one. If `frameFor` returns null, the old frame must still belong to this entry.",
-   "PSS is `sum(1.0 / ram.refCount(frame))` over the process's entries. `shared` counts entries whose frame has more than one reference.",
-   "Badness is `rss + oomScoreAdj * ram.limit / 1000` as a `Long`. Use `>=` while you scan oldest first, so a newer process wins a tie, as in the kernel."
-  ],
-  "done_when": "All nine tests in `CopyOnWriteTest` pass."
- },
- "drill": {
-  "title": "Count the copies after a snapshot fork",
-  "minutes": 5,
-  "prompt": "A Redis-like process holds 2 GB in 4 KB pages and forks a snapshot child. While the child runs, the parent writes to a quarter of its pages; the child only reads. Write Kotlin that prints how many pages the kernel copies, the RAM both use together, and the child's `Shared`, `Private` and `Pss` in MB.",
-  "answer": {
-   "lang": "kotlin",
-   "src": "val pages = 2L * 1024 * 1024 / 4           // 524,288 pages of 4 KB\nval written = pages / 4                    // the parent writes 131,072 of them\n\nval copies = written                       // one copy per page, on the parent's first write\nval ramMb = (pages + copies) * 4 / 1024    // 2,560 MB for the two processes\n\n// the parent's write moves the parent to the copy; the old frame is left to the child alone\nval childSharedMb = (pages - written) * 4 / 1024           // 1,536 MB still shared\nval childPrivateMb = written * 4 / 1024                     // 512 MB only the child maps now\nval childPssMb = childSharedMb / 2 + childPrivateMb         // 1,280 MB\nprintln(\"$copies copies, $ramMb MB, child shared $childSharedMb private $childPrivateMb pss $childPssMb\")\n// the parent has the same split, and 1,280 + 1,280 = 2,560: PSS adds up to the RAM used"
-  }
- },
- "recap": [
-  "`fork` copies the page table and marks every entry read-only on both sides. The first write to a page faults, and the kernel copies just that 4 KB page: copy-on-write.",
-  "RSS counts shared pages in full in every process; PSS splits them among the sharers, so PSS values add up to the RAM really used.",
-  "A file mapping fills pages from the page cache instead of zeros. `MAP_SHARED` writes reach the file; `MAP_PRIVATE` writes go to private copies. Clean file pages can be dropped and read again; anonymous pages can only go to swap.",
-  "Linux overcommits: `mmap` and `fork` promise memory that may never be used. `Committed_AS` is the total promised; `vm.overcommit_memory` decides whether `CommitLimit` is enforced.",
-  "A broken promise surfaces as a page fault with no frame. The kernel reclaims, then the OOM killer sends `SIGKILL` to the process with the highest badness (RSS plus `oom_score_adj`), inside the cgroup if `memory.max` was hit.",
-  "`OutOfMemoryError` is the JVM's heap limit and an exception you can handle. Exit 137 with `oom_kill` in `memory.events` is the kernel's limit, and nothing in the JVM runs."
- ],
- "quiz": [
-  {
-   "q": "Lesson 2's `tinysh` runs a command with `fork` and then `exec`. With copy-on-write, roughly what does that `fork` cost when the parent is a JVM with 2 GB of touched memory in 4 KB pages?",
-   "options": [
-    "A 2 GB copy, which `exec` then throws away",
-    "A copy of the page table, a few MB, and no data pages unless one side writes before `exec`",
-    "Nothing at all: the child shares the parent's page table until `exec`",
-    "A copy of the stack only, because `exec` needs nothing else"
-   ],
-   "answer": 1,
-   "from": "os-02",
-   "why": "The child needs its own page table with read-only entries for all of the parent's pages: about 2 MB of tables per GB (lesson 6), so about 4 MB here. Data pages are copied only on a write, and `exec` drops the child's whole address space before it writes much. Sharing the parent's page table is what `vfork`-style calls do; plain `fork` can't, because the child may write."
-  },
-  {
-   "q": "A parent and three forked workers each show RSS 900 MB in `ps`. `smaps_rollup` gives each one `Pss` 300 MB. About how much RAM do the four use together?",
-   "options": [
-    "3.6 GB: four times 900 MB",
-    "900 MB: they are all the same memory",
-    "About 1.2 GB: the sum of their PSS values",
-    "300 MB: the shared part only counts once"
-   ],
-   "answer": 2,
-   "why": "PSS charges each shared page to its sharers in equal parts, so summing PSS over all processes gives the frames really in use: 4 × 300 MB = 1.2 GB (for example 800 MB shared by all four plus 100 MB private each). Summing RSS counts every shared page four times, which is how dashboards end up showing more memory than the machine has."
-  },
-  {
-   "q": "A rates service maps a 1 GB reference-data file with `MapMode.PRIVATE` and patches a few entries in memory for a test run. What happens to the file on disk?",
-   "options": [
-    "Writeback copies the patched pages to the file within about 30 seconds",
-    "Nothing: each patched page became a private anonymous copy, and the file never changes",
-    "The changes reach the file when the buffer is garbage-collected",
-    "The JVM throws `ReadOnlyBufferException` on the first patch"
-   ],
-   "answer": 1,
-   "why": "A private mapping is copy-on-write against the file. The first write to a page faults, and the kernel gives the process its own anonymous copy of that page; other processes and the file keep seeing the original. Only `READ_WRITE` (a shared mapping) writes into the page cache, from where writeback reaches the disk."
-  },
-  {
-   "q": "A Docker container with `--memory 2g` runs a JVM with `-Xmx1800m`. It runs for hours, then disappears with exit code 137. The log ends mid-request with no exception. What happened?",
-   "options": [
-    "An `OutOfMemoryError` was thrown, but the log line was lost in the crash",
-    "A long GC pause made Docker's health check send `SIGTERM`",
-    "The JVM ran out of heap and called `System.exit(137)`",
-    "The heap's touched pages plus the JVM's non-heap memory crossed 2 GB, and the kernel's OOM killer sent `SIGKILL`"
-   ],
-   "answer": 3,
-   "why": "137 means `SIGKILL`, and the kernel's memory controller kills at `memory.max` without the JVM getting a say. The heap grew toward 1.8 GB as it was touched, and metaspace, thread stacks and native memory came on top. An `OutOfMemoryError` would have exited with 1 and printed a stack trace; `SIGTERM` would give 143."
-  },
-  {
-   "q": "In one container's cgroup, a JVM with 1.2 GB of RSS and a 50 MB shell script share a 1.5 GB limit. The script's next command allocates 300 MB and the group hits its limit. Both have `oom_score_adj` 0. Who gets killed?",
-   "options": [
-    "The JVM: it has by far the highest badness score",
-    "The script: it made the request that failed",
-    "Neither: the script's allocation returns `ENOMEM`",
-    "Both, because they share a cgroup"
-   ],
-   "answer": 0,
-   "why": "The OOM killer scores candidates by memory held (RSS plus swap plus page tables) plus `oom_score_adj`, not by who asked last. The JVM's 1.2 GB beats the script's 350 MB. The failing request is a page fault, not a call that can return `ENOMEM`. Killing the whole group needs `memory.oom.group` set to 1, and Docker leaves it at 0."
-  }
- ],
- "flashcards": [
-  {
-   "front": "What does `fork` copy on Linux?",
-   "back": "The page table (with every entry marked read-only) and the task's kernel records. Data pages are shared and copied one at a time on the first write: copy-on-write."
-  },
-  {
-   "front": "RSS or PSS: which one can you add up across processes?",
-   "back": "PSS. It splits each shared page among the processes that map it. RSS counts a shared page in full in each one."
-  },
-  {
-   "front": "`MAP_SHARED` vs `MAP_PRIVATE` for a file?",
-   "back": "Shared: writes go into the page cache and reach the file. Private: the first write to a page copies it; the file never changes."
-  },
-  {
-   "front": "Which pages can the kernel simply drop when memory is short?",
-   "back": "Clean file-backed pages, because it can read them again from the file. Anonymous pages need swap; dirty file pages must be written back first."
-  },
-  {
-   "front": "What do `vm.overcommit_memory` 0, 1 and 2 mean?",
-   "back": "0: heuristic, refuse obvious overcommits (default). 1: always say yes. 2: never let `Committed_AS` exceed `CommitLimit`."
-  },
-  {
-   "front": "How does the OOM killer choose its victim?",
-   "back": "Highest badness: RSS + swap + page tables, plus `oom_score_adj` thousandths of the allowed memory. -1000 is never chosen."
-  },
-  {
-   "front": "`OutOfMemoryError` or exit code 137?",
-   "back": "OOME: the Java heap hit `-Xmx`, an exception the JVM throws. 137: `SIGKILL`, usually the kernel's OOM killer at `memory.max`; nothing in the JVM runs."
-  }
- ],
- "terms": [
-  {
-   "term": "Copy-on-write",
-   "plain": "Sharing a page read-only between processes and copying it only when one of them first writes to it."
-  },
-  {
-   "term": "PSS",
-   "plain": "Proportional set size: a process's resident pages, with each shared page divided by the number of processes that map it."
-  },
-  {
-   "term": "Anonymous memory",
-   "plain": "Memory that belongs to no file and starts as zeros: heap, stacks, the Java heap."
-  },
-  {
-   "term": "File-backed mapping",
-   "plain": "A region whose pages come from a file through the page cache, set up by `mmap` of a file."
-  },
-  {
-   "term": "Overcommit",
-   "plain": "Promising processes more memory than RAM and swap hold, because most promises are never fully used."
-  },
-  {
-   "term": "OOM killer",
-   "plain": "The kernel code that, when no memory can be reclaimed, picks a process by its memory use and kills it with SIGKILL."
-  },
-  {
-   "term": "oom_score_adj",
-   "plain": "A per-process value from -1000 to 1000 added to its OOM badness score; -1000 means never kill it."
-  },
-  {
-   "term": "memory.max",
-   "plain": "A cgroup's hard memory limit. Crossing it makes the kernel reclaim and then OOM-kill inside the group."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate sees a parent process and four forked workers each showing 1 GB of RSS in `ps` on a machine that reports only 2 GB of RAM in use, and asks what's going on and what would happen if each worker rewrote all its data inside a 4 GB container. Explain.",
-  "answer": "`fork` doesn't copy memory. It gives each worker a page table pointing at the parent's frames, with every entry marked read-only, so all five processes map mostly the same RAM. RSS counts every page a process maps, shared or not, so each one shows the full 1 GB, but adding them up counts the shared frames five times. PSS divides each shared page among its sharers, and the five PSS values add up to roughly the 2 GB really in use: the shared data plus whatever each process has written since the fork. The copying happens later and lazily: the first write to a shared page faults, and the kernel copies that 4 KB page for the writer. If every worker rewrote all its data, each would end up with a private copy of the whole 1 GB, about 5 GB of frames in total. In a 4 GB container the charge would hit `memory.max` partway through, the kernel would reclaim what it could, and then the OOM killer would `SIGKILL` the process with the highest badness, by RSS plus `oom_score_adj`, and we'd see exit code 137 and `oom_kill` go up in `memory.events`."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "Swap changes how an OOM looks. With `--memory 256m` alone, Docker lets the container use as much swap again as its memory limit: inside, `memory.swap.max` reads 268435456 and the JVM's `-XshowSettings:system` reports `Memory & Swap Limit: 512.00M`. A hog then slows down as its oldest anonymous pages move to swap, and dies later. That's why the Try-its in this lesson pass `--memory-swap 256m`, which sets memory plus swap to 256 MB, so no swap at all. Many Kubernetes nodes run without swap, which behaves like the Try-its.\n\nThe cgroup has a softer limit too. `memory.high` makes the kernel reclaim and slow the group's allocations down once usage passes it, and it never calls the OOM killer. `memory.max` is the hard stop. A third file, `memory.oom.group`, set to 1, makes the OOM killer take every process in the group together instead of the single worst one. It was 0 in the lab box's containers.\n\nThe page-table cost of `fork` is real for very big processes: about 2 MB of tables per GB mapped with 4 KB pages (lesson 6). At the 1.7 ms per 512 MB measured above, a process with 30 GB touched spends about 100 ms in `fork` copying tables. That's one reason Java's `ProcessBuilder` on Linux starts children through `posix_spawn`, which glibc runs with `CLONE_VM` and `CLONE_VFORK`: the child borrows the parent's address space until it calls `exec`, and nothing is copied at all.\n\nFinally, `cow.c` asks for 4 KB pages with `madvise(MADV_NOHUGEPAGE)`, so that one write copies one 4 KB page. With transparent huge pages (lesson 6), a region can be mapped with 2 MB pages, and fault counts after `fork` stop being one per 4 KB, which is why the program turns them off to make the numbers readable."
- },
- "sources": [
-  {
-   "title": "OSTEP chapter 23: Complete Virtual Memory Systems (copy-on-write, demand zeroing)",
-   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/vm-complete.pdf"
-  },
-  {
-   "title": "fork(2), Linux manual page",
-   "url": "https://man7.org/linux/man-pages/man2/fork.2.html"
-  },
-  {
-   "title": "mmap(2), Linux manual page",
-   "url": "https://man7.org/linux/man-pages/man2/mmap.2.html"
-  },
-  {
-   "title": "Overcommit accounting (Linux kernel documentation)",
-   "url": "https://docs.kernel.org/mm/overcommit-accounting.html"
-  },
-  {
-   "title": "Control Group v2 (Linux kernel documentation)",
-   "url": "https://docs.kernel.org/admin-guide/cgroup-v2.html"
-  }
- ]
 }

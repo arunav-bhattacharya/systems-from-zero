@@ -1,406 +1,410 @@
 {
- "id": "sql-05",
- "title": "Subqueries and common table expressions",
- "minutes": 40,
- "goal": "By the end you can put a subquery where a value, a list or a table goes, tell a correlated subquery from an uncorrelated one in SQL and in EXPLAIN, rewrite a per-row subquery as a join, and predict whether PostgreSQL inlines or materializes a CTE.",
- "warmup": {
-  "q": "On a table of 1,000,000 payments with a primary key on payment_id, how does PostgreSQL 18 run `WITH p AS (SELECT * FROM payments) SELECT * FROM p WHERE payment_id = 42`?",
-  "options": [
-   "It copies all 1,000,000 rows into a temporary result, then searches the copy for id 42",
-   "It looks up id 42 in the primary key index, as if the CTE were not there",
-   "It raises an error: a CTE cannot be filtered from outside",
-   "It runs the CTE once per row of the outer query"
-  ],
-  "answer": 1,
-  "why": "Since PostgreSQL 12, a CTE that is referenced once, is not recursive and has no side effects is inlined: pasted into the main query and planned with it, so the filter reaches the index. The copy-everything behaviour is what older versions did, and what `MATERIALIZED` still asks for. It is the old \"optimization fence\" advice, which is out of date."
- },
- "sections": [
-  {
-   "h": "A subquery is a query in a place that wants a value",
-   "body": "\"Payments above the average payment\" is a two-step question: find the average, then compare each payment with it. From the application that is two round trips. You run `SELECT avg(amount_minor) ...`, read 24015.17 into a Kotlin variable, and send a second query with that number bound as a parameter. Between the two, another transaction can insert payments and move the average, and you have written glue code for something the database can do in one statement.\n\nPut the first query inside the second, in parentheses, where the number would go:\n\n```sql\nSELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\n  AND amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');\n```\n\nA query in parentheses inside another statement is a **subquery**. PostgreSQL computes it and uses its result in that spot, and this one returns the nine payments above 24,015.17. The picture for this lesson is simple: **a subquery is a query used as a value, and the shape of its result decides where it may go.** There are three shapes.\n\nOne column and at most one row is a **scalar subquery**. It can go anywhere a single value can: in WHERE, in the SELECT list, inside an expression. If it returns no row, its value is NULL. If it returns two rows, the statement fails with `more than one row returned by a subquery used as an expression`. PostgreSQL checks this while the query runs, on the rows that exist that day, so a scalar subquery that works on test data can fail in production the day a customer gets a second card.\n\nOne column and many rows is a list. It goes after `IN`, `= ANY` or `<> ALL`, or inside `EXISTS`, which lesson 3 used for semi and anti joins. `card_id IN (SELECT card_id FROM cards WHERE brand = 'amex')` keeps the payments made with any amex card. Write `=` instead of `IN` and the query fails, because two cards are amex.\n\nSeveral columns and many rows is a table. It goes in FROM, where it is called a **derived table**. Lesson 4 used one to fold refunds per payment before joining them. PostgreSQL required an alias on a derived table until version 16; give it one anyway, so the rest of the query can name its columns.\n\nNone of these subqueries mention the outer query. PostgreSQL notices that and runs each one once, before the outer query needs its value. EXPLAIN calls such a subquery an **InitPlan**: a plan that runs once, at initialization.",
-   "try": {
-    "title": "Three shapes of subquery",
-    "minutes": 4,
-    "steps": [
-     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-     "Run the first two queries: a scalar subquery and a list subquery.",
-     "Run the third, which uses `=` where the second used `IN`, and read the error. Then run the fourth, whose subquery finds no row.",
-     "Run the EXPLAIN and find the InitPlan: the average is computed once, before the scan."
+  "id": "sql-05",
+  "title": "Subqueries and common table expressions",
+  "minutes": 40,
+  "goal": "By the end, you can put a query inside another wherever a value, a list or a table goes, tell a subquery that runs once from one that runs again for every row, rewrite the slow kind as a join, and predict whether PostgreSQL pastes a WITH step into the query or works it out first and stores it.",
+  "opening": "Picture a team asked a simple question: which payments were bigger than their own shop's usual payment? A 5.50 bus ride is large for a bus company and tiny for an electronics shop. The team writes the query the way they'd say it, tests it on 37 payments, and it answers at once. On the full data, a million payments, it doesn't come back. At that pace it would need about 13 hours.\n\nIt's easy to believe that a query which reads like the question must be cheap. SQL describes the answer, and the database often finds a fast way to it. For this query, PostgreSQL does what the words say, once for every payment.\n\nIn \"Aggregation: GROUP BY, FILTER, ROLLUP and GROUPING SETS\", we folded rows into one line per shop and used a query in parentheses before a join. In this lesson, we'll put queries inside queries, watch one run again for every row, and rewrite it to run once. Then we'll name the steps with WITH. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "A query can name a step with WITH and then use it: `WITH p AS (SELECT * FROM payments) SELECT * FROM p WHERE payment_id = 42`. The first part calls every payment `p`, and the second asks `p` for payment 42. The table holds a million payments, and the database keeps an index on `payment_id`: a sorted list that finds one payment's row at once, like a library catalogue. How does PostgreSQL 18 run the query?",
+    "options": [
+      "It copies all 1,000,000 payments into a temporary list called p, then searches the copy for 42",
+      "It looks up 42 in the index, as if the WITH step weren't there",
+      "It fails: a named step can't be searched from outside",
+      "It runs the named step once for every row of the main query"
     ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "\\pset null '∅'\nSELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\n  AND amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded')\nORDER BY amount_minor DESC;\n\nSELECT payment_id, card_id, amount_minor\nFROM payments\nWHERE card_id IN (SELECT card_id FROM cards WHERE brand = 'amex')\nORDER BY payment_id;\n\nSELECT payment_id FROM payments WHERE card_id = (SELECT card_id FROM cards WHERE brand = 'amex');\n\nSELECT (SELECT card_id FROM cards WHERE pan_last4 = '0000') AS card;\n\nEXPLAIN (COSTS OFF)\nSELECT payment_id FROM payments\nWHERE amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');"
-    },
-    "expect": "The first query returns nine payments, from 3 (129900) down to 16 (31500): all of them at merchants 4 and 5. The IN query returns payments 4, 10, 19 and 30, made with amex cards 4 and 10. The `=` version fails with `ERROR:  more than one row returned by a subquery used as an expression`. The empty scalar subquery returns one row with `card` shown as ∅: no row means NULL. The plan:\n\n```postgresql\n                       QUERY PLAN\n---------------------------------------------------------\n Seq Scan on payments\n   Filter: ((amount_minor)::numeric > (InitPlan 1).col1)\n   InitPlan 1\n     ->  Aggregate\n           ->  Seq Scan on payments payments_1\n                 Filter: (status = 'succeeded'::text)\n(6 rows)\n```\n\n`(InitPlan 1).col1` is the one value the InitPlan computed, used by the filter on every row."
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18: Scalar subqueries (value expressions)",
-     "url": "https://www.postgresql.org/docs/18/sql-expressions.html",
-     "kind": "docs"
-    },
-    {
-     "title": "PostgreSQL 18: Subquery expressions (EXISTS, IN, ANY, ALL)",
-     "url": "https://www.postgresql.org/docs/18/functions-subquery.html",
-     "kind": "docs"
-    }
-   ]
+    "answer": 1,
+    "why": "Since PostgreSQL 12, a WITH step that's used once, doesn't refer to itself and changes no data is pasted into the main query and planned together with it. That's called inlining, and it lets the condition `payment_id = 42` reach the index. Copying everything first is what older versions did, and what the keyword `MATERIALIZED` still asks for. Advice you may read that a WITH step is an \"optimization fence\", a wall the database can't see through, is out of date. The fourth section measures both ways."
   },
-  {
-   "h": "A correlated subquery runs again for every outer row",
-   "body": "Risk does not want payments above the global average. A 550-cent payment is tiny for Volt Electronics and twice the usual fare at Metro Transit, whose rides cost 275. The question is \"larger than this merchant's average\", and now the subquery needs a value from the row being tested:\n\n```sql\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nWHERE p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor)\n                        FROM payments p2\n                        WHERE p2.status = 'succeeded'\n                          AND p2.merchant_id = p.merchant_id);   -- the outer row's merchant\n```\n\n`p.merchant_id` belongs to the outer query. A subquery that refers to the outer query is **correlated**: it is a function of the outer row. In lesson 3's loop picture it runs once for every outer row, with that row's values plugged in, as the stepper below shows. EXPLAIN gives it a different name: a correlated subquery appears as a **SubPlan**, run on demand for each row that needs it.\n\nAliases matter more here than anywhere else in SQL. A column name inside a subquery is looked up in the subquery's own FROM first, and in the outer query only if that fails. Write `WHERE merchant_id = merchant_id` and both names find the inner `payments`. The condition is then true for every row, the subquery is no longer correlated, and the query quietly compares every payment with the global average again. The lab starts with exactly this bug. Qualify every column in a correlated subquery.\n\nRunning once per outer row costs what it sounds like. On the large data set, each run of this subquery scans a million payments to find one merchant's rows, which takes about 51 ms. For the first 20 payments that adds up to 1.1 seconds. For all 930,826 succeeded payments it would be about 13 hours. The same question written as a join takes 282 ms: one pass computes the 2,500 merchant averages with GROUP BY, and a hash join (lesson 3) attaches each payment to its merchant's average.\n\n```sql\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nJOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor\n      FROM payments WHERE status = 'succeeded'\n      GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id\nWHERE p.status = 'succeeded' AND p.amount_minor > a.avg_minor;\n```\n\nCorrelated subqueries are not always slow. PostgreSQL rewrites some of them into joins on its own: `EXISTS`, `NOT EXISTS` and `IN (subquery)` become semi and anti joins, which is why lesson 3's NOT EXISTS plan showed a Hash Anti Join and no SubPlan. PostgreSQL 18 does not rewrite a subquery that computes an aggregate, like the average here. And a correlated subquery that finds its rows through an index (lesson 1's B-tree; the Storage track covers indexes properly) costs a few page reads per run, which is fine when the outer side is small. Read the plan: a SubPlan whose `loops` count matches a big table is the thing to rewrite.",
-   "stepper": {
-    "title": "A SubPlan per row, or a join once",
-    "intro": "Click Next to watch PostgreSQL answer \"larger than this merchant's average\" both ways.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><rect class=\"box-dim\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"460\" y=\"120\" text-anchor=\"middle\">needs a merchant_id from outside</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 0</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 0</text><text class=\"t-s t-m\" x=\"20\" y=\"305\" text-anchor=\"start\">The subquery mentions p, the outer row. It cannot run on its own.</text></svg>",
-      "say": "The subquery refers to `p.merchant_id`, a column of the outer row. It has no value until there is an outer row, so PostgreSQL cannot run it once in advance, the way it runs an InitPlan."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-a\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"84\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 1</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 7</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 4704.86</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">4250 &gt; 4704.86 ?  no: drop</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 1</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 37</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 1, merchant 1: run the subquery with 1 plugged in.</text></svg>",
-      "say": "PostgreSQL takes outer row 1 (merchant 1), plugs 1 into the subquery and runs it: a scan of all 37 payments that keeps merchant 1's seven succeeded ones and averages them. 4250 is below 4704.86, so row 1 is dropped."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-a\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"114\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 2</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 3</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 1935.00</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">1890 &gt; 1935.00 ?  no: drop</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 2</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 74</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 2, merchant 2: run it again from scratch.</text></svg>",
-      "say": "Outer row 2 belongs to merchant 2. The subquery runs again from the start: another 37 rows read. Nothing from the first run is reused."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-dim\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"144\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 4</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 7</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 48620.86</text><rect class=\"box-ok\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">129900 &gt; 48620.86 ?  yes: keep</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 3</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 111</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 3, merchant 4: and again. This one passes.</text></svg>",
-      "say": "Row 3 belongs to merchant 4: a third run, average 48620.86. 129900 is above it, so payment 3 is kept. Payment 17 later belongs to merchant 4 as well, and the subquery will compute the same average for it again."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-dim\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-ok\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box-dim\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box-dim\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><rect class=\"box\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"100\" text-anchor=\"middle\">large data set: 51 ms per run</text><text class=\"t-s t-bad\" x=\"460\" y=\"124\" text-anchor=\"middle\">930,826 runs: about 13 hours</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 30</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 1,110</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">30 outer rows, 30 runs, each reading the whole table.</text></svg>",
-      "say": "After all 30 succeeded payments: 30 runs and 1,110 rows read for 6 different answers. On the large data set each run takes about 51 ms, and there are 930,826 outer rows: about 13 hours. EXPLAIN shows this as a SubPlan with a huge `loops` count."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM payments p JOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">... GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">payments p</text><rect class=\"box\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">join: averages first, once</text><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"96\" text-anchor=\"middle\">GROUP BY merchant_id: hash table</text><text class=\"t-s t-code\" x=\"460\" y=\"118\" text-anchor=\"middle\">m1 4705   m2 1935   m3 344</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">m4 48621  m5 55917  m7 1498</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">averages computed: once</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 37</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">The join: one pass computes every merchant's average.</text></svg>",
-      "say": "The join version turns the work around. One pass over payments with `GROUP BY merchant_id` computes all the averages and keeps them in a hash table (lesson 3)."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM payments p JOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">... GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">payments p</text><rect class=\"box-a\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-a\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box-a\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">join: averages first, once</text><rect class=\"box\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"96\" text-anchor=\"middle\">GROUP BY merchant_id: hash table</text><text class=\"t-s t-code\" x=\"460\" y=\"118\" text-anchor=\"middle\">m1 4705   m2 1935   m3 344</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">m4 48621  m5 55917  m7 1498</text><line class=\"ln-a\" x1=\"202\" y1=\"84\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">each payment probes one bucket</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">averages computed: once</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 74 (37 + 37)</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">A second pass looks each payment up in that hash table.</text></svg>",
-      "say": "A second pass reads each payment once and looks up its merchant's average in one step. Total work: two passes, 74 rows here. On the large data set: 282 ms for all 930,826 payments."
-     }
+  "sections": [
+    {
+      "h": "A question inside a question: three shapes of subquery",
+      "body": "Let's start with a two-step question: which payments were bigger than the average payment? First you find the average, then you compare each payment with it.\n\nThe course database belongs to a small company whose app records card payments. Each payment is one row in a table called `payments`, like one line in a spreadsheet. `payment_id` is the payment's number and `card_id` is the card that paid. `merchant_id` is the shop that was paid (the database calls a shop a merchant). `amount_minor` is the amount in cents, so 4250 is 42.50, and `status` says whether the payment `succeeded`, `failed` or is still `pending`. Another table, `cards`, holds one row per card with its brand, such as visa or amex. The data is small on purpose: 37 payments at 8 shops.\n\nWe ask questions in SQL, the language the database understands, and each question is a query. The database program is PostgreSQL 18, a free database that many companies run.\n\nFrom your own program, the two-step question takes two trips. You ask for the average, `SELECT avg(amount_minor) ...`, and read 24015.17 back into a variable. Then you send a second query with that number in it. Between the two trips, another program can add payments and move the average. And you've written glue code for something the database can do in one go.\n\nPut the first query inside the second, in parentheses, right where the number would go:\n\n```sql\nSELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\n  AND amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');\n```\n\nSELECT lists what to show, FROM names the table, and WHERE keeps only the rows that pass a condition. A query in parentheses inside another one is a **subquery**. PostgreSQL works it out and uses its answer in that spot, and this query returns the nine payments above 240.15. The picture for this lesson is simple: **a subquery is a query used as a value, and the shape of its answer decides where it may go.** There are three shapes.\n\nOne column and at most one row is a **scalar subquery**: a single value. It can go anywhere a single value can, such as in WHERE, in the list of columns after SELECT, or inside a sum. If it finds no row, its value is NULL, the database's marker for a value that's missing or unknown. If it finds two rows, the query fails with `more than one row returned by a subquery used as an expression`. PostgreSQL checks this while the query runs, on the rows that exist that day. So a scalar subquery that works on test data can fail for real users the day one of them gets a second card.\n\nOne column and many rows is a list. It goes after `IN`, which means \"equal to one of these\". `= ANY` means the same, and `<> ALL` means \"different from all of these\". A list also fits inside `EXISTS`, which \"Joins, including semi and anti joins\" used to ask whether any match exists. `card_id IN (SELECT card_id FROM cards WHERE brand = 'amex')` keeps the payments made with any amex card. Write `=` instead of `IN` and the query fails, because two cards are amex.\n\nSeveral columns and many rows is a table. It goes in FROM, where it's called a **derived table**. \"Aggregation: GROUP BY, FILTER, ROLLUP and GROUPING SETS\" used one to add up refunds per payment before joining them. PostgreSQL required a short name (an alias) on a derived table until version 16. Give it one anyway, so the rest of the query can name its columns.\n\nNone of these subqueries mention the query around them, the outer query. PostgreSQL notices that, and works each one out once, before the outer query needs its value. EXPLAIN, the command that shows how PostgreSQL plans to run a query, calls such a subquery an **InitPlan**: a plan that runs once, at the start.\n\nComparing every payment with one average is easy. Next, we'll compare each payment with its own shop's average, and the subquery will have to run again and again.",
+      "try": {
+        "title": "Three shapes of subquery",
+        "minutes": 4,
+        "steps": [
+          "Start the database if it isn't running. From the `labs` folder, run `docker compose -f env/postgres.yml up -d --wait`. Docker is a program that runs other programs in sealed boxes called containers, and this command starts PostgreSQL in one. Then open psql, PostgreSQL's window for typing queries: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the first two queries: a subquery that gives one value, and one that gives a list. (The first line, `\\pset null '∅'`, makes psql show NULL as ∅ instead of a blank.)",
+          "Run the third, which uses `=` where the second used `IN`, and read the error. Then run the fourth, whose subquery finds no row.",
+          "Run the EXPLAIN and find the InitPlan: the average is worked out once, before the payments are read."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nSELECT payment_id, merchant_id, amount_minor\nFROM payments\nWHERE status = 'succeeded'\n  AND amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded')\nORDER BY amount_minor DESC;\n\nSELECT payment_id, card_id, amount_minor\nFROM payments\nWHERE card_id IN (SELECT card_id FROM cards WHERE brand = 'amex')\nORDER BY payment_id;\n\nSELECT payment_id FROM payments WHERE card_id = (SELECT card_id FROM cards WHERE brand = 'amex');\n\nSELECT (SELECT card_id FROM cards WHERE pan_last4 = '0000') AS card;\n\nEXPLAIN (COSTS OFF)\nSELECT payment_id FROM payments\nWHERE amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');"
+        },
+        "expect": "The first query returns nine payments, from 3 (129900) down to 16 (31500), all of them at shops 4 and 5. The IN query returns payments 4, 10, 19 and 30, made with amex cards 4 and 10. The `=` version fails with `ERROR:  more than one row returned by a subquery used as an expression`. The empty subquery returns one row with `card` shown as ∅: no row means NULL. The plan:\n\n```postgresql\n                       QUERY PLAN\n---------------------------------------------------------\n Seq Scan on payments\n   Filter: ((amount_minor)::numeric > (InitPlan 1).col1)\n   InitPlan 1\n     ->  Aggregate\n           ->  Seq Scan on payments payments_1\n                 Filter: (status = 'succeeded'::text)\n(6 rows)\n```\n\nRead a plan from the inside out. The InitPlan reads the payments once (`Seq Scan`, a read of every row in turn), keeps the succeeded ones and works out their average (`Aggregate`). `(InitPlan 1).col1` is that one value, and the outer scan's filter compares every row with it."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Scalar subqueries (value expressions)",
+          "url": "https://www.postgresql.org/docs/18/sql-expressions.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: Subquery expressions (EXISTS, IN, ANY, ALL)",
+          "url": "https://www.postgresql.org/docs/18/functions-subquery.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "A subquery that runs again for every row",
+      "body": "The fraud team doesn't want payments above the overall average. A 5.50 payment is tiny for Volt Electronics, which sells laptops, and twice the usual fare at Metro Transit, whose rides cost 2.75. The question is \"larger than this shop's average\", so now the subquery needs a value from the row being tested:\n\n```sql\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nWHERE p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor)\n                        FROM payments p2\n                        WHERE p2.status = 'succeeded'\n                          AND p2.merchant_id = p.merchant_id);   -- the outer row's merchant\n```\n\n`p` and `p2` are short names (aliases) for two separate readings of the same `payments` table: `p` for the outer query and `p2` for the subquery. `p.merchant_id` belongs to the outer query. A subquery that refers to the outer query is **correlated**: its answer depends on the outer row. So PostgreSQL runs it once for every outer row, with that row's values plugged in, as the stepper below shows. EXPLAIN calls a correlated subquery a **SubPlan**, run again for each row that needs it.\n\nA kitchen picture helps. An uncorrelated subquery is a cook who makes one pot of sauce before dinner starts. A correlated one is a cook told \"for each guest, go and taste the sauce\": one walk to the pot per guest, even when two guests ordered the same dish. The guest is the outer row, the pot is the payments table, and each walk is one run of the subquery.\n\nShort names matter more here than anywhere else in SQL. A column name inside a subquery is looked up in the subquery's own FROM first, and in the outer query only if that fails. Write `WHERE merchant_id = merchant_id` and both names find the inner `payments`. The condition is then true for every row, the subquery isn't correlated any more, and the query quietly compares every payment with the overall average again. No error appears. The lab starts with exactly this bug. In a correlated subquery, put a short name in front of every column.\n\nRunning once per outer row costs what it sounds like. On the large data set, a million made-up payments at 2,500 shops, each run of this subquery reads all million payments to find one shop's rows. That takes about 51 ms (thousandths of a second). For the first 20 payments, it adds up to 1.1 seconds. For all 930,826 succeeded payments, it would be about 13 hours.\n\nThe same question written as a join takes 282 ms. A join pairs each row of one table with the matching rows of another. Here one pass works out the 2,500 shop averages with GROUP BY, which sorts rows into one group per shop and folds each group into one row (the last lesson). Then a hash join attaches each payment to its shop's average:\n\n```sql\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nJOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor\n      FROM payments WHERE status = 'succeeded'\n      GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id\nWHERE p.status = 'succeeded' AND p.amount_minor > a.avg_minor;\n```\n\nA hash join, from \"Joins, including semi and anti joins\", first puts the 2,500 averages into a lookup table in memory. Then it reads each payment once and finds its shop's average in one step.\n\nCorrelated subqueries aren't always slow. PostgreSQL rewrites some of them into joins on its own: `EXISTS`, `NOT EXISTS` and `IN (subquery)` become joins that keep or drop each row once. That's why, in the joins lesson, the plan for NOT EXISTS (keep the rows with no match) showed a `Hash Anti Join` and no SubPlan. PostgreSQL 18 doesn't rewrite a subquery that computes an aggregate, a function such as avg or sum that folds many values into one.\n\nAnd a correlated subquery that finds its rows through an index costs only a few small reads per run, which is fine when the outer query has few rows. (An index is a sorted copy of one column that points to each row, like a library catalogue. The track \"Storage engines and query execution\" opens one up.) So read the plan. A SubPlan that loops as many times as a big table has rows is the thing to rewrite.\n\n**A subquery that depends on the outer row runs once per row. Work it out once for every key, and join.** Long queries built like this get hard to read, though. Next, we'll give each step a name.",
+      "stepper": {
+        "title": "A SubPlan per row, or a join once",
+        "intro": "Click Next to watch PostgreSQL answer \"larger than this shop's average\" both ways.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><rect class=\"box-dim\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"460\" y=\"120\" text-anchor=\"middle\">needs a merchant_id from outside</text><rect class=\"box\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 0</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 0</text><text class=\"t-s t-m\" x=\"20\" y=\"305\" text-anchor=\"start\">The subquery mentions p, the outer row. It cannot run on its own.</text></svg>",
+            "say": "The subquery refers to `p.merchant_id`, a column of the outer row. It has no value until there is an outer row, so PostgreSQL can't run it once in advance, the way it runs an InitPlan."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-a\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"84\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 1</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 7</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 4704.86</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">4250 &gt; 4704.86 ?  no: drop</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 1</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 37</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 1, merchant 1: run the subquery with 1 plugged in.</text></svg>",
+            "say": "PostgreSQL takes outer row 1 (shop 1), plugs 1 into the subquery and runs it: it reads all 37 payments, keeps shop 1's seven succeeded ones and averages them. 4250 is below 4704.86, so row 1 is dropped."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-a\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"114\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 2</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 3</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 1935.00</text><rect class=\"box-bad\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-bad\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">1890 &gt; 1935.00 ?  no: drop</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 2</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 74</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 2, merchant 2: run it again from scratch.</text></svg>",
+            "say": "Outer row 2 belongs to shop 2. The subquery runs again from the start: another 37 rows read. Nothing from the first run is reused."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-dim\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><line class=\"ln-a\" x1=\"202\" y1=\"144\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s t-code\" x=\"460\" y=\"96\" text-anchor=\"middle\">p2.merchant_id = 4</text><text class=\"t-s\" x=\"460\" y=\"118\" text-anchor=\"middle\">reads all 37 payments, keeps 7</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">avg = 48620.86</text><rect class=\"box-ok\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">129900 &gt; 48620.86 ?  yes: keep</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 3</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 111</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">Row 3, merchant 4: and again. This one passes.</text></svg>",
+            "say": "Row 3 belongs to shop 4: a third run, average 48620.86. 129900 is above it, so payment 3 is kept. Payment 17 also belongs to shop 4, and the subquery will work out the same average for it all over again."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">WHERE p.amount_minor &gt; (SELECT avg(p2.amount_minor) FROM payments p2</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">WHERE p2.merchant_id = p.merchant_id AND ...)</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">outer: payments p</text><rect class=\"box-dim\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-dim\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-ok\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box-dim\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box-dim\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">inner query, run for this row</text><rect class=\"box\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"100\" text-anchor=\"middle\">large data set: 51 ms per run</text><text class=\"t-s t-bad\" x=\"460\" y=\"124\" text-anchor=\"middle\">930,826 runs: about 13 hours</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">subquery runs: 30</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 1,110</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">30 outer rows, 30 runs, each reading the whole table.</text></svg>",
+            "say": "After all 30 succeeded payments: 30 runs and 1,110 rows read, for 6 different answers. On the large data set each run takes about 51 ms, and there are 930,826 outer rows: about 13 hours. EXPLAIN shows this as a SubPlan with a huge `loops` count, the number of times it ran."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM payments p JOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">... GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">payments p</text><rect class=\"box\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">join: averages first, once</text><rect class=\"box-a\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"96\" text-anchor=\"middle\">GROUP BY merchant_id: hash table</text><text class=\"t-s t-code\" x=\"460\" y=\"118\" text-anchor=\"middle\">m1 4705   m2 1935   m3 344</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">m4 48621  m5 55917  m7 1498</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">averages computed: once</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 37</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">The join: one pass computes every merchant's average.</text></svg>",
+            "say": "The join version turns the work around. One pass over the payments with `GROUP BY merchant_id` works out every shop's average and keeps them in a hash table, a lookup table that finds an entry by its key in one step."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 320\" role=\"img\" aria-label=\"A correlated subquery reruns for each outer row, while a join computes the averages once\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-code\" x=\"20\" y=\"22\" text-anchor=\"start\">FROM payments p JOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor</text><text class=\"t-s t-code\" x=\"20\" y=\"38\" text-anchor=\"start\">... GROUP BY merchant_id) a ON a.merchant_id = p.merchant_id</text><text class=\"t-s t-m\" x=\"110\" y=\"62\" text-anchor=\"middle\">payments p</text><rect class=\"box-a\" x=\"20\" y=\"72\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"88.5\" text-anchor=\"start\">1  m1  4250</text><rect class=\"box-a\" x=\"20\" y=\"102\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"118.5\" text-anchor=\"start\">2  m2  1890</text><rect class=\"box-a\" x=\"20\" y=\"132\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"148.5\" text-anchor=\"start\">3  m4  129900</text><rect class=\"box-a\" x=\"20\" y=\"162\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"178.5\" text-anchor=\"start\">4  m3  275</text><rect class=\"box-a\" x=\"20\" y=\"192\" width=\"180\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"30\" y=\"208.5\" text-anchor=\"start\">5  m5  48000</text><text class=\"t-s t-m\" x=\"110\" y=\"240\" text-anchor=\"middle\">... 30 succeeded rows</text><text class=\"t-s t-m\" x=\"460\" y=\"62\" text-anchor=\"middle\">join: averages first, once</text><rect class=\"box\" x=\"260\" y=\"72\" width=\"400\" height=\"86\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"96\" text-anchor=\"middle\">GROUP BY merchant_id: hash table</text><text class=\"t-s t-code\" x=\"460\" y=\"118\" text-anchor=\"middle\">m1 4705   m2 1935   m3 344</text><text class=\"t-s t-code\" x=\"460\" y=\"140\" text-anchor=\"middle\">m4 48621  m5 55917  m7 1498</text><line class=\"ln-a\" x1=\"202\" y1=\"84\" x2=\"258\" y2=\"110\" marker-end=\"url(#arr)\"/><rect class=\"box-ok\" x=\"260\" y=\"170\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-ok\" x=\"460.0\" y=\"189.5\" text-anchor=\"middle\">each payment probes one bucket</text><rect class=\"box-b\" x=\"260\" y=\"214\" width=\"400\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"460\" y=\"234\" text-anchor=\"middle\">averages computed: once</text><text class=\"t-s\" x=\"460\" y=\"254\" text-anchor=\"middle\">payment rows read: 74 (37 + 37)</text><text class=\"t-s t-a\" x=\"20\" y=\"305\" text-anchor=\"start\">A second pass looks each payment up in that hash table.</text></svg>",
+            "say": "A second pass reads each payment once and looks up its shop's average in one step. Total work: two passes, 74 rows here. On the large data set: 282 ms for all 930,826 payments."
+          }
+        ]
+      },
+      "try": {
+        "title": "Watch a SubPlan run once per row",
+        "minutes": 5,
+        "steps": [
+          "On the small data, run the first EXPLAIN. Compare it with the InitPlan from the last Try it: this one says SubPlan, and its filter mentions `p.merchant_id`.",
+          "This step uses the large data set. Load it once, from the `labs` folder in a second terminal window (it takes about a minute and adds about 650 MB): `docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`. It goes into a schema, a named folder of tables, called `big`. Then, in psql, type `SET search_path = big, public;` so that your queries read from it.",
+          "Run the correlated query on the first 20 payments only. `EXPLAIN (ANALYZE)` runs the query and prints the plan with real times. Predict the total from the 51 ms per run before you look.",
+          "Run the join version, which answers for all million payments. Compare its `Execution Time` with the first plan's."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "EXPLAIN (COSTS OFF)\nSELECT p.payment_id FROM payments p\nWHERE p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.merchant_id = p.merchant_id);\n\nSET search_path = big, public;\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nWHERE p.payment_id <= 20\n  AND p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.merchant_id = p.merchant_id);\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nJOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor\n      FROM payments WHERE status = 'succeeded' GROUP BY merchant_id) a\n  ON a.merchant_id = p.merchant_id\nWHERE p.status = 'succeeded' AND p.amount_minor > a.avg_minor;"
+        },
+        "expect": "The small plan has `SubPlan 1` under the filter, with `Filter: ((status = 'succeeded'::text) AND (merchant_id = p.merchant_id))` inside it. On the large data set, 20 payments take about a second:\n\n```postgresql\n Index Scan using payments_pkey on payments p (actual time=269.362..1088.071 rows=6.00 loops=1)\n   Index Cond: (payment_id <= 20)\n   Filter: ((status = 'succeeded'::text) AND ((amount_minor)::numeric > (SubPlan 1)))\n   Rows Removed by Filter: 14\n   Index Searches: 1\n   SubPlan 1\n     ->  Aggregate (actual time=51.155..51.155 rows=1.00 loops=19)\n           ->  Seq Scan on payments p2 (actual time=0.265..51.032 rows=1943.32 loops=19)\n                 Filter: ((status = 'succeeded'::text) AND (merchant_id = p.merchant_id))\n                 Rows Removed by Filter: 998535\n Planning Time: 0.583 ms\n Execution Time: 1101.959 ms\n```\n\n`loops=19`: 19 of the 20 payments succeeded, and each one ran the subquery, which read the whole table and threw away 998,535 rows. The join version returns 279,399 rows for all 930,826 succeeded payments with `Execution Time` about 280 ms. Its plan shows a `Hash Join` over a `Finalize GroupAggregate` of 2,500 rows, the shop averages. Times are from an Apple-silicon laptop under Docker Desktop. Yours will differ, but the ratio won't."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: Using EXPLAIN",
+          "url": "https://www.postgresql.org/docs/18/using-explain.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Naming the steps with WITH",
+      "body": "Subqueries nest, and nested queries read from the inside out. Here's each shop's share of all the succeeded money, written with a derived table and a scalar subquery:\n\n```sql\nSELECT v.merchant_id, v.volume,\n       round(100.0 * v.volume / (SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded'), 1) AS pct\nFROM (SELECT merchant_id, sum(amount_minor) AS volume\n      FROM payments WHERE status = 'succeeded'\n      GROUP BY merchant_id) AS v;\n```\n\nTo read it, you start in the middle at the derived table, jump to the subquery inside `round`, and come back out. The two inner queries also say the same thing twice: \"succeeded payments, added up\". When one of them changes, the other has to change with it, and one day somebody forgets.\n\nA recipe has the same problem, and the same fix. Nobody writes \"add the stock (bones simmered for two hours, then strained) to the soup\". The recipe says \"make the stock\" first and gives it a name. Later steps say \"add a cup of stock\".\n\nA **common table expression**, or CTE, names a subquery before the main query: `WITH name AS (query)`. Inside that one statement, the name works like a table:\n\n```sql\nWITH volume AS (                    -- succeeded volume per merchant\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments\n    WHERE status = 'succeeded'\n    GROUP BY merchant_id\n),\ntotal AS (                          -- a CTE may use the CTEs above it\n    SELECT sum(volume) AS total FROM volume\n)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v\nCROSS JOIN total t;                 -- total has one row: attach it to every merchant\n```\n\nIt reads top to bottom, like the steps of a recipe. Each step has a name, and a later step may use any earlier one. `total` is worked out from `volume`, so \"succeeded\" is written in one place only. The answer is the same six rows: Volt Electronics has 47.2% of the money and Harbor Hotel 46.6%.\n\nThe last line uses a cross join, from \"Joins, including semi and anti joins\", which pairs every row of one side with every row of the other. With a one-row table on one side, that attaches the total to each shop.\n\nSeveral CTEs go in one WITH, separated by commas, and the main query may use each one as often as it likes. For a plain query, a CTE doesn't let you ask anything a derived table can't. There are two exceptions. A CTE can refer to itself (`WITH RECURSIVE`, which the track \"Data models beyond tables\" uses to walk family trees and other chains). And a CTE can change data, as the end of the next section shows.\n\nWhat a CTE changes is how the query reads. It can also change how PostgreSQL runs it, and that's the next section.",
+      "try": {
+        "title": "Name the steps",
+        "minutes": 3,
+        "steps": [
+          "Run the nested version and the CTE version. Check that they return the same rows.",
+          "Add a third CTE after `total`: `big AS (SELECT merchant_id FROM volume v, total t WHERE v.volume > t.total / 10)`. Then change the main query to list only the shops in `big`. Predict how many rows come back."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT v.merchant_id, v.volume,\n       round(100.0 * v.volume / (SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded'), 1) AS pct\nFROM (SELECT merchant_id, sum(amount_minor) AS volume\n      FROM payments WHERE status = 'succeeded' GROUP BY merchant_id) AS v\nORDER BY v.volume DESC;\n\nWITH volume AS (\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments\n    WHERE status = 'succeeded'\n    GROUP BY merchant_id\n),\ntotal AS (\n    SELECT sum(volume) AS total FROM volume\n)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v\nCROSS JOIN total t\nORDER BY v.volume DESC;"
+        },
+        "expect": "Both return:\n\n```postgresql\n merchant_id | volume | pct\n-------------+--------+------\n           4 | 340346 | 47.2\n           5 | 335500 | 46.6\n           1 |  32934 |  4.6\n           2 |   5805 |  0.8\n           7 |   4495 |  0.6\n           3 |   1375 |  0.2\n(6 rows)\n```\n\nWith the `big` CTE, two shops are left: 4 and 5. Every other shop has less than a tenth of the money."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: WITH queries (common table expressions)",
+          "url": "https://www.postgresql.org/docs/18/queries-with.html",
+          "kind": "docs"
+        }
+      ],
+      "aside": {
+        "title": "Is a WITH step saved somewhere, like a table?",
+        "body": "No. A CTE exists only inside its own statement. The next query you send can't see it, and nothing is kept once the statement ends. A temporary table is different: you create it with `CREATE TEMP TABLE`, it holds its rows until you disconnect, and every later query you send can read it. A view is different again: a named query saved in the database for everyone, which runs each time someone reads from it. A CTE is closer to a note in the margin of one query."
+      }
+    },
+    {
+      "h": "Pasted in or worked out first: how PostgreSQL runs a WITH step",
+      "body": "You may read old advice that a CTE is an \"optimization fence\": a wall the planner can't see through. (The planner is the part of PostgreSQL that chooses how to run a query.) Until PostgreSQL 12 that was true. PostgreSQL worked out every CTE completely first, stored its rows, and ran the main query against the stored copy. A condition in the main query couldn't reach the table inside the CTE, and neither could that table's index. The keyword `MATERIALIZED` still asks for that behaviour, and on the large data set you can see what it costs:\n\n```sql\nWITH succeeded AS MATERIALIZED (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;\n```\n\nPostgreSQL reads all million payments and writes the 930,826 succeeded ones to a temporary store (30 MB, which spills from memory to disk). Then it searches the copy for one payment: 214 ms. Remove the keyword, and the plan becomes a single `Index Scan using payments_pkey`, one lookup in the index on the payment number. That takes 0.24 ms, almost a thousand times faster.\n\nBack in the kitchen, the stock is the CTE and the soup is the main query. A cook who pastes reads the whole recipe first and makes only the one cup of stock the soup needs. A cook who works it out first makes a full pot of stock, then ladles out one cup. The pot is worth it when three dishes use the stock, and wasteful when one does. The picture breaks at the end, though. Two cooks can make different soups, while PostgreSQL returns the same rows either way, so the choice is only about speed.\n\nSince version 12, PostgreSQL **inlines** a CTE when three things are true. It doesn't refer to itself. It has no side effects: it's a plain SELECT that changes nothing and calls no function like `random()`, whose answer differs each time. And the main query uses it once. Inlining means pasting the CTE's query into the main query, as if you'd written a derived table, and then planning the whole statement together. That's how the `payment_id = 424242` condition reached the index.\n\nA CTE used two or more times, by the main query or by other CTEs, is **materialized** by default: worked out once, stored, and read by every use. Often that's cheaper than working it out twice. In the share-of-money query from the last section, `volume` is used twice and materialized, while `total` is used once and inlined. The Try it shows both in one plan.\n\nMaterializing also hides the main query's conditions from the CTE, though. A query that joined `succeeded` to itself and looked for one payment took 318 ms on the large data set. With `NOT MATERIALIZED`, which forces inlining, it took 0.08 ms.\n\nSo the two keywords override the planner's default. `NOT MATERIALIZED` asks PostgreSQL to inline even when it wouldn't. `MATERIALIZED` asks it to work the CTE out once. That pays off when the CTE is costly and inlining would run it many times, or when it calls a function like `random()` that must run only once. **Write neither keyword by default. Reach for one when a plan shows you need it.** The signs are a `CTE Scan` that reads far more rows than the query returns, or the same costly work done twice.\n\nTwo kinds of CTE are never inlined. A recursive CTE is always worked out on its own. And a CTE that changes data runs exactly once and to the end, whether or not the main query reads its rows. The course database has a `jobs` table, a to-do list of tasks such as sending a receipt, and `WITH moved AS (DELETE FROM jobs WHERE status = 'done' RETURNING *)` removes the finished ones. `RETURNING *` hands back the rows it removed, and the deeper notes at the end of this lesson use them.\n\nThat's the reach of today's tools, and their limit. A subquery or a CTE can work out a value per shop, but to show it beside each payment, you still join it back. The next lesson does that in one step.",
+      "try": {
+        "title": "Inlined or materialized?",
+        "minutes": 4,
+        "steps": [
+          "On the small data (type `SET search_path = public;` if you changed it), EXPLAIN the share-of-money query. Find which CTE has its own `CTE volume` step in the plan, and which one disappeared into it.",
+          "On the large data set (`SET search_path = big, public;`), run the two EXPLAIN ANALYZE statements. They differ in one keyword.",
+          "When you're done with the large data set, `DROP SCHEMA big CASCADE;` frees the space. Or keep it: lessons 6 to 9 of this track use it again."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = public;\nEXPLAIN (COSTS OFF)\nWITH volume AS (\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments WHERE status = 'succeeded' GROUP BY merchant_id\n),\ntotal AS (SELECT sum(volume) AS total FROM volume)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v CROSS JOIN total t;\n\nSET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nWITH succeeded AS (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nWITH succeeded AS MATERIALIZED (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;"
+        },
+        "expect": "The small plan has a `CTE volume` step and two `CTE Scan on volume` steps, because `volume` is used twice. `total` has no step of its own: it was inlined into an `Aggregate` over one of those scans. On the large data set the inlined CTE is one index lookup:\n\n```postgresql\n Index Scan using payments_pkey on payments (actual time=0.211..0.214 rows=1.00 loops=1)\n   Index Cond: (payment_id = 424242)\n   Filter: (status = 'succeeded'::text)\n   Index Searches: 1\n Planning Time: 0.327 ms\n Execution Time: 0.243 ms\n```\n\nThe materialized one builds the whole copy first:\n\n```postgresql\n CTE Scan on succeeded (actual time=92.542..212.188 rows=1.00 loops=1)\n   Filter: (payment_id = 424242)\n   Rows Removed by Filter: 930825\n   Storage: Disk  Maximum Storage: 30904kB\n   CTE succeeded\n     ->  Seq Scan on payments (actual time=0.123..89.939 rows=930826.00 loops=1)\n           Filter: (status = 'succeeded'::text)\n           Rows Removed by Filter: 69652\n Planning Time: 0.061 ms\n Execution Time: 213.792 ms\n```\n\nThe answer is the same row. Only the work differs: `Rows Removed by Filter: 930825` is the copy being searched for one payment."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: WITH queries, CTE materialization",
+          "url": "https://www.postgresql.org/docs/18/queries-with.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 12 release notes (CTE inlining)",
+          "url": "https://www.postgresql.org/docs/12/release-12.html",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "compare": {
+    "title": "Moving rows in one statement: Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle",
+      "src": "-- WITH holds queries only: no DML inside it.\n-- Archive, then delete, as two statements:\nINSERT INTO jobs_archive\nSELECT * FROM jobs WHERE status = 'done';\n\nDELETE FROM jobs WHERE status = 'done';\nCOMMIT;\n-- each statement takes its own snapshot: a job\n-- that turns 'done' in between is deleted\n-- without being archived. Close the gap with a\n-- lock, or PL/SQL DELETE ... RETURNING BULK COLLECT."
+    },
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL 18",
+      "src": "-- a data-modifying CTE: the rows the DELETE\n-- returns are exactly the rows inserted\nWITH moved AS (\n    DELETE FROM jobs\n    WHERE status = 'done'\n    RETURNING *\n)\nINSERT INTO jobs_archive\nSELECT * FROM moved;\n-- INSERT 0 2 (jobs 1 and 4)\n-- runs exactly once, even if nothing reads moved"
+    },
+    "note": "Oracle is another database program, sold by the company of the same name and run by many large firms. The job here is to move the finished jobs into an archive table without losing any. PostgreSQL allows INSERT, UPDATE and DELETE with RETURNING inside WITH, and runs each of them exactly once and to the end. The rows a DELETE removes are the rows the INSERT receives, in one statement that sees one fixed picture of the data, so nothing can slip between them. Oracle's WITH clause holds queries only, so the move takes two statements, and a job that finishes between them is deleted without being archived. Oracle also has no keyword like `MATERIALIZED`. Its SQL reference says its planner treats each named query \"as either an inline view or as a temporary table\", and it chooses which. Plain WITH queries, scalar and correlated subqueries, and the rule for finding a column's table behave the same in both databases."
+  },
+  "worked": {
+    "title": "Rewrite a per-row subquery as a join, and prove nothing changed",
+    "steps": [
+      {
+        "say": "The fraud team flags payments whose risk score is more than 30 points above the average score of their card. The app stores a risk score with each payment, a number from 0 to 100 that says how suspicious it looked, in `metadata->'risk'->>'score'`. The first version is a correlated subquery. It's correct and easy to read, and on the small data it returns six payments.",
+        "code": "-- 1. the correlated version: the subquery depends on p.card_id\nSELECT p.payment_id, p.card_id, (p.metadata->'risk'->>'score')::int AS score\nFROM payments p\nWHERE (p.metadata->'risk'->>'score')::int >\n      (SELECT avg((p2.metadata->'risk'->>'score')::int) + 30\n       FROM payments p2\n       WHERE p2.card_id = p.card_id)\nORDER BY p.payment_id;\n-- payments 8, 15, 18, 23, 31 and 36",
+        "lang": "sql"
+      },
+      {
+        "say": "Before you change anything, read the plan. `SubPlan 1` with `p2.card_id = p.card_id` inside it means one full read of the payments for every outer row. With 100,000 cards and a million payments, that's a million full reads.",
+        "code": "-- 2. EXPLAIN (COSTS OFF) of step 1\n--  Seq Scan on payments p\n--    Filter: (((((metadata -> 'risk'::text) ->> 'score'::text))::integer)::numeric > (SubPlan 1))\n--    SubPlan 1\n--      ->  Aggregate\n--            ->  Seq Scan on payments p2\n--                  Filter: (card_id = p.card_id)",
+        "lang": "sql"
+      },
+      {
+        "say": "Work out what the subquery works out, for every card at once, in a CTE. Then join each payment to its card's row. The extra column shows the average each payment was compared with, which the correlated version couldn't show without a second subquery.",
+        "code": "-- 3. averages once, then a join\nWITH card_risk AS (\n    SELECT card_id, avg((metadata->'risk'->>'score')::int) AS avg_score\n    FROM payments\n    GROUP BY card_id\n)\nSELECT p.payment_id, p.card_id,\n       (p.metadata->'risk'->>'score')::int AS score,\n       round(c.avg_score, 1) AS card_avg\nFROM payments p\nJOIN card_risk c ON c.card_id = p.card_id\nWHERE (p.metadata->'risk'->>'score')::int > c.avg_score + 30\nORDER BY p.payment_id;\n-- 8 (67 vs 30.7), 15 (88 vs 52.0), 18 (79 vs 35.3),\n-- 23 (52 vs 16.4), 31 (72 vs 40.5), 36 (61 vs 17.0)",
+        "lang": "sql"
+      },
+      {
+        "say": "Prove that the rewrite returns the same rows, instead of checking six numbers by eye. `EXCEPT ALL` returns the rows of the first query that the second lacks, counting duplicates. Run it in both directions: zero rows means the two answers hold exactly the same rows. Keep this check for every rewrite of a report.",
+        "code": "-- 4. old minus new, plus new minus old: expect (0 rows)\nWITH old AS ( /* step 1 without ORDER BY, selecting payment_id */ ),\n     new AS ( /* step 3 without ORDER BY, selecting payment_id */ )\n(SELECT * FROM old EXCEPT ALL SELECT * FROM new)\nUNION ALL\n(SELECT * FROM new EXCEPT ALL SELECT * FROM old);",
+        "lang": "sql"
+      }
     ]
-   },
-   "try": {
-    "title": "Watch a SubPlan run once per row",
+  },
+  "lab": {
+    "title": "A subquery that only looks correlated, an average of the wrong thing, and a chain of CTEs",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l05/above_merchant_average.sql",
+      "labs/sql/src/main/resources/sfz/sql/l05/above_average_spenders.sql",
+      "labs/sql/src/main/resources/sfz/sql/l05/monthly_active_customers.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l05.*'",
+    "steps": [
+      "Start Docker, then run the tests from the `labs` folder with the command above (Gradle is the tool that builds and tests the labs). Each test runs your query against a fresh copy of the course database. All six fail at first, and each failure prints the expected rows next to yours.",
+      "`above_merchant_average.sql` compares every payment with the average over all shops, although it looks correlated. Find which table each `merchant_id` in the subquery names, then fix it with short names, or with a join to per-shop averages.",
+      "`above_average_spenders.sql` compares each customer's total spending with the average single payment, which is the wrong comparison. Work out the spending per customer in a CTE and use it twice: once per customer, and once for the average customer.",
+      "Write `monthly_active_customers.sql` as a chain of CTEs: first the (customer, month) pairs, then each customer's first month, then the counts. A payment leads to its customer through its card: `cards` names the account, and `accounts` names the customer.",
+      "Run the tests until all six pass. Each exercise has a second test that adds rows first, so an answer typed in by hand fails it."
+    ],
+    "hints": [
+      "Run the subquery from the file on its own in psql, with `merchant_id = merchant_id` left in. It returns one number, 24015.17. A correlated subquery couldn't run on its own, because it needs a value from outside.",
+      "The grain of a question is what one row stands for. \"Average customer spend\" needs one row per customer before `avg`.",
+      "`SELECT DISTINCT a.customer_id, to_char(p.created_at, 'YYYY-MM') AS month` gives one row per customer and month. Text like `'2026-03'` sorts in time order, so `min(month)` is the first month, and `count(*) FILTER (WHERE ac.month = f.month)` counts the new customers."
+    ],
+    "done_when": "All six tests in `SubqueriesTest` pass."
+  },
+  "drill": {
+    "title": "Three subqueries from memory",
     "minutes": 5,
-    "steps": [
-     "On the small data, run the first EXPLAIN. Compare it with the InitPlan from the last Try it: this one says SubPlan, and its filter mentions `p.merchant_id`.",
-     "This step uses the large data set. Load it once, from the `labs` folder in a second terminal (it takes about a minute and adds about 650 MB): `docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`. Then, in psql, `SET search_path = big, public;`.",
-     "Run the correlated query on the first 20 payments only. Predict its run time from the 51 ms per run before you look.",
-     "Run the join version, which answers for all million payments. Compare `Execution Time` with the first plan."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "EXPLAIN (COSTS OFF)\nSELECT p.payment_id FROM payments p\nWHERE p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.merchant_id = p.merchant_id);\n\nSET search_path = big, public;\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nWHERE p.payment_id <= 20\n  AND p.status = 'succeeded'\n  AND p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.merchant_id = p.merchant_id);\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nSELECT p.payment_id, p.merchant_id, p.amount_minor\nFROM payments p\nJOIN (SELECT merchant_id, avg(amount_minor) AS avg_minor\n      FROM payments WHERE status = 'succeeded' GROUP BY merchant_id) a\n  ON a.merchant_id = p.merchant_id\nWHERE p.status = 'succeeded' AND p.amount_minor > a.avg_minor;"
-    },
-    "expect": "The small plan has `SubPlan 1` under the filter, with `Filter: ((status = 'succeeded'::text) AND (merchant_id = p.merchant_id))` inside it. On the large data set, 20 payments take about a second:\n\n```postgresql\n Index Scan using payments_pkey on payments p (actual time=269.362..1088.071 rows=6.00 loops=1)\n   Index Cond: (payment_id <= 20)\n   Filter: ((status = 'succeeded'::text) AND ((amount_minor)::numeric > (SubPlan 1)))\n   Rows Removed by Filter: 14\n   Index Searches: 1\n   SubPlan 1\n     ->  Aggregate (actual time=51.155..51.155 rows=1.00 loops=19)\n           ->  Seq Scan on payments p2 (actual time=0.265..51.032 rows=1943.32 loops=19)\n                 Filter: ((status = 'succeeded'::text) AND (merchant_id = p.merchant_id))\n                 Rows Removed by Filter: 998535\n Planning Time: 0.583 ms\n Execution Time: 1101.959 ms\n```\n\n`loops=19`: 19 of the 20 payments succeeded, and each one ran the subquery, which read the whole table and threw away 998,535 rows. The join version returns 279,399 rows for all 930,826 succeeded payments with `Execution Time` about 280 ms, using a `Hash Join` over a `Finalize GroupAggregate` of 2,500 rows. Times are from an Apple-silicon laptop under Docker Desktop. Yours will differ, but the ratio will not."
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18: Using EXPLAIN",
-     "url": "https://www.postgresql.org/docs/18/using-explain.html",
-     "kind": "docs"
+    "prompt": "Without looking, write three queries: (1) the payments above the average succeeded amount, with a scalar subquery; (2) the same, but against each payment's own card, as a correlated subquery with a short name in front of every column; (3) version 2 rewritten with a CTE of per-card averages and a join. Then say what EXPLAIN calls the subquery in (1) and in (2).",
+    "answer": {
+      "lang": "sql",
+      "src": "-- 1. uncorrelated: EXPLAIN shows an InitPlan, run once\nSELECT payment_id, amount_minor FROM payments\nWHERE amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');\n\n-- 2. correlated: EXPLAIN shows a SubPlan, run per outer row\nSELECT p.payment_id, p.amount_minor FROM payments p\nWHERE p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.card_id = p.card_id);\n\n-- 3. the averages once, then a join\nWITH card_avg AS (\n    SELECT card_id, avg(amount_minor) AS avg_minor\n    FROM payments WHERE status = 'succeeded'\n    GROUP BY card_id\n)\nSELECT p.payment_id, p.amount_minor\nFROM payments p\nJOIN card_avg c ON c.card_id = p.card_id\nWHERE p.amount_minor > c.avg_minor;"
     }
-   ]
   },
-  {
-   "h": "WITH gives a subquery a name",
-   "body": "Subqueries nest, and nested queries read from the inside out. Here is each merchant's share of all succeeded volume, written with a derived table and a scalar subquery:\n\n```sql\nSELECT v.merchant_id, v.volume,\n       round(100.0 * v.volume / (SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded'), 1) AS pct\nFROM (SELECT merchant_id, sum(amount_minor) AS volume\n      FROM payments WHERE status = 'succeeded'\n      GROUP BY merchant_id) AS v;\n```\n\nTo read it you start in the middle at the derived table, jump to the scalar subquery, and come back out. The two inner queries also say the same thing twice, \"succeeded payments, summed\", and when one of them changes the other has to change with it.\n\nA **common table expression**, or CTE, names a subquery before the main query: `WITH name AS (query)`. Inside that one statement, the name works like a table:\n\n```sql\nWITH volume AS (                    -- succeeded volume per merchant\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments\n    WHERE status = 'succeeded'\n    GROUP BY merchant_id\n),\ntotal AS (                          -- a CTE may use the CTEs above it\n    SELECT sum(volume) AS total FROM volume\n)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v\nCROSS JOIN total t;                 -- total has one row: attach it to every merchant\n```\n\nIt reads top to bottom, like `val` declarations in a Kotlin function. Each step has a name, and a later step can use any earlier one. `total` is computed from `volume`, so \"succeeded\" is defined in one place. The answer is the same six rows: Volt Electronics has 47.2% of the volume and Harbor Hotel 46.6%. The last line uses lesson 3's cross join, every row paired with every row: with a one-row table on one side, that attaches the total to each merchant.\n\nA CTE exists only for its own statement. It is not a temporary table and not a view: the next statement cannot see it, and nothing is stored anywhere. Several CTEs go in one WITH, separated by commas, and they can be used by the main query as often as you like.\n\nFor a plain SELECT, a CTE does not let you ask anything a derived table cannot. The exceptions are recursion (`WITH RECURSIVE`, which the Data models track uses for trees and graphs) and CTEs that change data, at the end of the next section. What a CTE changes is how the query reads. It can also change how PostgreSQL runs it, which is the subject of the next section.",
-   "try": {
-    "title": "Name the steps",
-    "minutes": 3,
-    "steps": [
-     "Run the nested version and the CTE version. Check that they return the same rows.",
-     "Add a third CTE after `total`, `big AS (SELECT merchant_id FROM volume v, total t WHERE v.volume > t.total / 10)`, and change the main query to list only merchants in `big`. Predict how many rows come back."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "SELECT v.merchant_id, v.volume,\n       round(100.0 * v.volume / (SELECT sum(amount_minor) FROM payments WHERE status = 'succeeded'), 1) AS pct\nFROM (SELECT merchant_id, sum(amount_minor) AS volume\n      FROM payments WHERE status = 'succeeded' GROUP BY merchant_id) AS v\nORDER BY v.volume DESC;\n\nWITH volume AS (\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments\n    WHERE status = 'succeeded'\n    GROUP BY merchant_id\n),\ntotal AS (\n    SELECT sum(volume) AS total FROM volume\n)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v\nCROSS JOIN total t\nORDER BY v.volume DESC;"
-    },
-    "expect": "Both return:\n\n```postgresql\n merchant_id | volume | pct\n-------------+--------+------\n           4 | 340346 | 47.2\n           5 | 335500 | 46.6\n           1 |  32934 |  4.6\n           2 |   5805 |  0.8\n           7 |   4495 |  0.6\n           3 |   1375 |  0.2\n(6 rows)\n```\n\nWith the `big` CTE, two merchants are left: 4 and 5. Everyone else has less than a tenth of the volume."
-   },
-   "refs": [
+  "recap": [
+    "A subquery is a query used as a value. One value goes where a value goes, a list goes after IN, ANY or EXISTS, and a table goes in FROM as a derived table.",
+    "A scalar subquery that finds no row gives NULL. One that finds two rows fails while the query runs, on whatever data exists that day.",
+    "A subquery that ignores the outer query runs once (an InitPlan). A correlated one refers to the outer row and runs once per row (a SubPlan), unless PostgreSQL turns it into a join, as it does for EXISTS and IN.",
+    "Inside a subquery, a column name finds the nearest table that has it. Put a short name in front of every column, or a correlated subquery quietly stops being correlated.",
+    "WITH names subqueries so a query reads top to bottom. Since PostgreSQL 12, a CTE used once is pasted in (inlined), and one used twice is worked out once and stored (materialized). MATERIALIZED and NOT MATERIALIZED override that.",
+    "The limit: to show a shop's total or average beside each payment, these tools still work it out on the side and join it back."
+  ],
+  "closing": "We started with a query that read like its question and would have run for 13 hours. It ran its subquery again for every payment, and each run read the whole table. Working out the 2,500 shop averages once and joining took about a quarter of a second.\n\nOn the small data, put `EXPLAIN` in front of any query you wrote in this lesson and look for the words InitPlan and SubPlan. For each SubPlan, ask how many rows will feed it on the day the table holds a million.\n\nNext, we'll give every payment its shop's total, its place in a ranking and the payment just before it, without folding a single row away.",
+  "quiz": [
     {
-     "title": "PostgreSQL 18: WITH queries (common table expressions)",
-     "url": "https://www.postgresql.org/docs/18/queries-with.html",
-     "kind": "docs"
+      "q": "A report shows each customer with the last four digits of their card: `(SELECT c.pan_last4 FROM cards c JOIN accounts a ON a.account_id = c.account_id WHERE a.customer_id = cu.customer_id)`. It passed every test, and fails for real customers with \"more than one row returned by a subquery used as an expression\". Why?",
+      "options": [
+        "Some customer has two cards, and a scalar subquery may return at most one row",
+        "PostgreSQL forbids scalar subqueries in the list after SELECT",
+        "The subquery needs DISTINCT",
+        "Some real customers have no card, and a subquery that finds nothing is an error"
+      ],
+      "answer": 0,
+      "why": "The one-row limit is checked when the query runs, against the data that exists. The test data had one card per customer. A subquery that finds no row isn't an error, it gives NULL, so the last option is wrong. DISTINCT wouldn't help either, because two cards have different digits. Decide which card you want (the main one, the newest) and say so in the WHERE."
+    },
+    {
+      "q": "`SELECT p.payment_id FROM payments p WHERE p.amount_minor > (SELECT avg(amount_minor) FROM payments WHERE merchant_id = merchant_id)`. What is each payment compared with?",
+      "options": [
+        "Its own shop's average",
+        "The average over all payments",
+        "Nothing: the subquery returns NULL",
+        "Nothing: PostgreSQL stops with an error about an unclear column name"
+      ],
+      "answer": 1,
+      "why": "Both `merchant_id` names find the inner `payments`, the nearest table that has the column. So the condition is true for every row, and the subquery isn't correlated at all. PostgreSQL raises no error. Write `payments p2 ... WHERE p2.merchant_id = p.merchant_id`, with a short name in front of each column."
+    },
+    {
+      "q": "EXPLAIN ANALYZE shows `SubPlan 1` under a filter, with `loops=930826` on its Seq Scan (a read of the whole table). What's the best next step?",
+      "options": [
+        "Add MATERIALIZED to a CTE",
+        "Rewrite the subquery as a join to rows grouped once per key, or give it an index to use",
+        "Give each sort more memory by raising work_mem",
+        "Nothing: PostgreSQL remembers a SubPlan's answers from row to row"
+      ],
+      "answer": 1,
+      "why": "Each loop is one run of the subquery for one outer row, here a full read of the table each time. Working out the aggregate once per key and joining turns 930,826 reads into two passes. PostgreSQL doesn't remember a SubPlan's answer from one row to the next, and more memory doesn't change how many times it runs."
+    },
+    {
+      "q": "A CTE called `recent` is used twice in the main query and has no MATERIALIZED keyword. What does PostgreSQL 18 do?",
+      "options": [
+        "Pastes it in at both places",
+        "Raises an error",
+        "Works it out once, stores it, and reads the stored rows twice",
+        "Works it out once per row of the main query"
+      ],
+      "answer": 2,
+      "why": "A CTE that changes nothing is pasted in (inlined) only when it's used once. Used twice, it's worked out once and stored (materialized) by default. Write `AS NOT MATERIALIZED` if you want it pasted in at each use, for example so that a condition can reach an index."
+    },
+    {
+      "q": "\"Joins, including semi and anti joins\" found the customers with no account using `WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id)`. That subquery is correlated. How does PostgreSQL run it?",
+      "options": [
+        "As a Hash Anti Join, reading each table once",
+        "As a SubPlan, once per customer",
+        "As an InitPlan, once",
+        "By storing the accounts as a materialized CTE"
+      ],
+      "answer": 0,
+      "why": "PostgreSQL rewrites EXISTS, NOT EXISTS and IN subqueries into joins that keep or drop each row once, so that lesson's plan showed a Hash Anti Join. Correlated doesn't always mean once per row. The per-row SubPlan is what you get for a correlated subquery that works out a value, such as an average.",
+      "from": "sql-03"
     }
-   ]
-  },
-  {
-   "h": "PostgreSQL pastes a CTE into the query unless you ask it not to",
-   "body": "Older advice says a CTE is an \"optimization fence\". Until PostgreSQL 12 that was true. PostgreSQL computed every CTE completely, stored its rows, and ran the main query against the stored copy, so a filter in the main query could not reach the table inside the CTE, and neither could that table's indexes. The keyword `MATERIALIZED` still asks for that behaviour, and on the large data set you can see what it costs:\n\n```sql\nWITH succeeded AS MATERIALIZED (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;\n```\n\nPostgreSQL scans all million payments, writes the 930,826 succeeded ones to a temporary store (30 MB, spilled to disk), then searches the copy for one id: 214 ms. Remove the keyword, and the plan becomes a single `Index Scan using payments_pkey`: 0.24 ms, almost a thousand times faster.\n\nSince version 12, PostgreSQL **inlines** a CTE when three things are true: it is not recursive, it has no side effects (a plain SELECT with no volatile function such as `random()`), and the main query refers to it once. Inlining means pasting the CTE's query into the main query, as if you had written a derived table, and then planning the whole statement together. That is how the `payment_id = 424242` filter reached the primary key index.\n\nA CTE referenced two or more times, by the main query or by other CTEs, is **materialized** by default: computed once, stored, and read by every reference. Often that is cheaper than computing it twice. In the share-of-volume query from the last section, `volume` is used twice and materialized, while `total` is used once and inlined; the Try it shows both in one plan. Materializing also hides the main query's filters from the CTE, though. A query that joined `succeeded` to itself and filtered on one id took 318 ms on the large data set; with `NOT MATERIALIZED`, which forces inlining, it took 0.08 ms.\n\nSo the two keywords are overrides for the planner's default. `NOT MATERIALIZED` asks PostgreSQL to inline even when it would not. `MATERIALIZED` asks it to compute once, which pays off when the CTE is expensive and inlining would run it many times, or when it calls a volatile function that must run only once. Write neither by default. Reach for one when EXPLAIN shows a `CTE Scan` reading far more rows than the query returns, or the same expensive work done twice.\n\nTwo kinds of CTE are never inlined. A recursive CTE, the Data models track's tool for walking trees and graphs, is always computed on its own. And a CTE that changes data, such as `WITH moved AS (DELETE FROM jobs WHERE status = 'done' RETURNING *)`, runs exactly once and to completion, whether or not the main query reads its rows.",
-   "try": {
-    "title": "Inlined or materialized?",
-    "minutes": 4,
-    "steps": [
-     "On the small data (`SET search_path = public;` if you changed it), EXPLAIN the share-of-volume query. Find which CTE has its own `CTE volume` node and which one disappeared into the plan.",
-     "On the large data set (`SET search_path = big, public;`), run the two EXPLAIN ANALYZE statements. They differ in one keyword.",
-     "When you are done with the large data set, `DROP SCHEMA big CASCADE;` frees the space, or keep it: lessons 6 to 9 use it again."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "SET search_path = public;\nEXPLAIN (COSTS OFF)\nWITH volume AS (\n    SELECT merchant_id, sum(amount_minor) AS volume\n    FROM payments WHERE status = 'succeeded' GROUP BY merchant_id\n),\ntotal AS (SELECT sum(volume) AS total FROM volume)\nSELECT v.merchant_id, v.volume, round(100.0 * v.volume / t.total, 1) AS pct\nFROM volume v CROSS JOIN total t;\n\nSET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nWITH succeeded AS (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;\n\nEXPLAIN (ANALYZE, COSTS OFF, BUFFERS OFF)\nWITH succeeded AS MATERIALIZED (\n    SELECT payment_id, merchant_id, amount_minor FROM payments WHERE status = 'succeeded'\n)\nSELECT * FROM succeeded WHERE payment_id = 424242;"
-    },
-    "expect": "The small plan has a `CTE volume` node and two `CTE Scan on volume` nodes, because `volume` is referenced twice. `total` has no node of its own: it was inlined into an `Aggregate` over one of those scans. On the large data set the inlined CTE is just an index lookup:\n\n```postgresql\n Index Scan using payments_pkey on payments (actual time=0.211..0.214 rows=1.00 loops=1)\n   Index Cond: (payment_id = 424242)\n   Filter: (status = 'succeeded'::text)\n   Index Searches: 1\n Planning Time: 0.327 ms\n Execution Time: 0.243 ms\n```\n\nThe materialized one builds the whole copy first:\n\n```postgresql\n CTE Scan on succeeded (actual time=92.542..212.188 rows=1.00 loops=1)\n   Filter: (payment_id = 424242)\n   Rows Removed by Filter: 930825\n   Storage: Disk  Maximum Storage: 30904kB\n   CTE succeeded\n     ->  Seq Scan on payments (actual time=0.123..89.939 rows=930826.00 loops=1)\n           Filter: (status = 'succeeded'::text)\n           Rows Removed by Filter: 69652\n Planning Time: 0.061 ms\n Execution Time: 213.792 ms\n```\n\nThe answer is the same row. Only the work differs."
-   },
-   "refs": [
+  ],
+  "flashcards": [
     {
-     "title": "PostgreSQL 18: WITH queries, CTE materialization",
-     "url": "https://www.postgresql.org/docs/18/queries-with.html",
-     "kind": "docs"
+      "front": "What does a scalar subquery give when it finds no row? Two rows?",
+      "back": "No row: NULL. Two rows: the query fails with \"more than one row returned by a subquery used as an expression\"."
     },
     {
-     "title": "PostgreSQL 12 release notes (CTE inlining)",
-     "url": "https://www.postgresql.org/docs/12/release-12.html",
-     "kind": "docs"
+      "front": "What makes a subquery correlated?",
+      "back": "It refers to a column of the outer query, so its answer depends on the outer row."
+    },
+    {
+      "front": "InitPlan or SubPlan: which runs once?",
+      "back": "InitPlan, a subquery that ignores the outer query. A SubPlan runs again for each outer row that needs it."
+    },
+    {
+      "front": "Inside a subquery, which table does a column name without a short name in front belong to?",
+      "back": "The nearest one that has it: the subquery's own FROM first, then the outer query. No error either way."
+    },
+    {
+      "front": "When does PostgreSQL 12 or later paste a CTE into the main query?",
+      "back": "When it doesn't refer to itself, has no side effects, and is used once."
+    },
+    {
+      "front": "What do MATERIALIZED and NOT MATERIALIZED do?",
+      "back": "Force the CTE to be worked out once and stored, or force it to be pasted into the main query."
+    },
+    {
+      "front": "How do you check that a rewritten query returns the same rows?",
+      "back": "`(old EXCEPT ALL new) UNION ALL (new EXCEPT ALL old)` must return zero rows."
     }
-   ]
-  }
- ],
- "analogy": "A CTE is a named step in a recipe: \"make the stock\", then \"use one cup of stock in the soup\". A cook who inlines reads the whole recipe first and makes only the cup the soup needs. A cook who materializes makes a full pot of stock first and then ladles out one cup, which is worth it when three dishes use the stock and wasteful when one does. A correlated subquery is the instruction \"for each guest, taste the sauce at their table\": you walk back to the pot once per guest, even when two guests share a table. The analogy breaks at the result. Two cooks can make different soups, but PostgreSQL returns the same rows whether it inlines or materializes (volatile functions such as random() aside), so the choice is only about speed.",
- "in_your_world": "A lot of slow reporting SQL in payments services is a correlated aggregate written for clarity: \"each merchant with its last payment time\", \"each card with its average risk score\", as a scalar subquery in the SELECT list. It was fast on staging with 5,000 rows and turns into a SubPlan with a million loops in production. The same thing happens one level up when JPA lazy loading runs one query per entity (the N+1 problem of lesson 10). CTEs earn their keep in the long queries a settlement or reconciliation job runs: name each step, check each step on its own with `SELECT * FROM step`, then build on it. If your team still writes CTE-free SQL because of the \"optimization fence\" advice, that advice died with PostgreSQL 12. And a data-modifying CTE gives a Temporal activity or a Kafka consumer a way to move rows atomically in one statement: delete from the outbox and insert into the sent log, with no window between the two.",
- "mistake": "The most damaging subquery mistake is an unqualified column that resolves to the wrong table. Inside a subquery, a name is looked up in the subquery's own FROM first and then in the outer query, and PostgreSQL raises no error either way. `merchant_id = merchant_id` compares the inner table with itself and is always true. Worse, if the inner table has no such column, the name silently binds to the outer one: `SELECT count(*) FROM customers WHERE customer_id IN (SELECT customer_id FROM merchants)` returns 13, all customers, because `merchants` has no `customer_id` and the subquery returns the outer row's own id once per merchant. Put that pattern in a DELETE and it deletes every row. Always alias every table in a statement with a subquery and qualify every column: `SELECT m.customer_id FROM merchants m` fails with `column m.customer_id does not exist`, which is the error you wanted.",
- "compare": {
-  "title": "Moving rows in one statement: Oracle and PostgreSQL",
-  "a": {
-   "label": "Oracle",
-   "lang": "sql",
-   "title": "Oracle",
-   "src": "-- WITH holds queries only: no DML inside it.\n-- Archive, then delete, as two statements:\nINSERT INTO jobs_archive\nSELECT * FROM jobs WHERE status = 'done';\n\nDELETE FROM jobs WHERE status = 'done';\nCOMMIT;\n-- each statement takes its own snapshot: a job\n-- that turns 'done' in between is deleted\n-- without being archived. Close the gap with a\n-- lock, or PL/SQL DELETE ... RETURNING BULK COLLECT."
+  ],
+  "terms": [
+    {
+      "term": "Subquery",
+      "plain": "A SELECT in parentheses inside another query, used as a value, a list or a table."
+    },
+    {
+      "term": "Scalar subquery",
+      "plain": "A subquery that returns one column and at most one row, used where a single value goes."
+    },
+    {
+      "term": "Derived table",
+      "plain": "A subquery in FROM. It acts like a table for the rest of the query."
+    },
+    {
+      "term": "Correlated subquery",
+      "plain": "A subquery that refers to the outer query's row, so it's worked out again for each outer row."
+    },
+    {
+      "term": "InitPlan and SubPlan",
+      "plain": "EXPLAIN's names for a subquery that runs once (InitPlan) and one that runs once per outer row (SubPlan)."
+    },
+    {
+      "term": "Common table expression (CTE)",
+      "plain": "A named subquery written with WITH before the main query, visible only in that one statement."
+    },
+    {
+      "term": "Inlining",
+      "plain": "Pasting a CTE's query into the main query, so the planner plans them together."
+    },
+    {
+      "term": "Materialization",
+      "plain": "Working out a CTE once and storing its rows for the main query to read."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate writes \"each shop with its average payment\" as `SELECT m.*, (SELECT avg(p.amount_minor) FROM payments p WHERE p.merchant_id = m.merchant_id) FROM merchants m`. It's fast with 8 shops. Explain how PostgreSQL runs it, when it gets slow, and what you'd write instead.",
+    "answer": "The subquery refers to `m.merchant_id`, so it's correlated. PostgreSQL runs it as a SubPlan once for each shop, and with no index on `payments.merchant_id`, every run reads the whole payments table. The cost is shops times payments: fine for 8 shops and 37 payments, terrible for 2,500 shops and a million payments, which is about 2,500 full reads. PostgreSQL doesn't turn a subquery that works out an aggregate into a join by itself. Work the averages out once, `SELECT merchant_id, avg(amount_minor) FROM payments GROUP BY merchant_id`, in a CTE or a derived table, and LEFT JOIN the shops to it, so that shops without payments still get a row, with NULL. That's two passes over the data. An index on `payments (merchant_id)` would also make each SubPlan run cheap, but the join is simpler to reason about."
   },
-  "b": {
-   "label": "PostgreSQL 18",
-   "lang": "sql",
-   "title": "PostgreSQL 18",
-   "src": "-- a data-modifying CTE: the rows the DELETE\n-- returns are exactly the rows inserted\nWITH moved AS (\n    DELETE FROM jobs\n    WHERE status = 'done'\n    RETURNING *\n)\nINSERT INTO jobs_archive\nSELECT * FROM moved;\n-- INSERT 0 2 (jobs 1 and 4)\n-- runs exactly once, even if nothing reads moved"
+  "deeper": {
+    "minutes": 8,
+    "body": "A CTE that changes data is worth trying once, inside a transaction you then undo. A transaction groups statements so that they all take effect together or not at all: `BEGIN` starts one, and `ROLLBACK` throws all its changes away. This one moves the finished jobs to an archive table in one statement:\n\n```sql\nBEGIN;\nCREATE TEMP TABLE jobs_archive (LIKE jobs);\n\nWITH moved AS (\n    DELETE FROM jobs\n    WHERE status = 'done'\n    RETURNING *\n)\nINSERT INTO jobs_archive\nSELECT * FROM moved;\n\nSELECT job_id, kind, status FROM jobs_archive ORDER BY job_id;\nSELECT count(*) AS left_in_jobs FROM jobs;\nROLLBACK;\n```\n\nThe INSERT reports `INSERT 0 2`. The archive holds jobs 1 (`fraud_review`) and 4 (`send_receipt`), both `done`, and 6 jobs are left in `jobs`. ROLLBACK then puts everything back.\n\nAll parts of the statement see the same snapshot of the data: a fixed picture taken when the statement starts. That has a surprising result. The main query can't see the changes its own CTEs make to tables. `WITH d AS (DELETE FROM jobs WHERE status = 'done') SELECT count(*) FROM jobs` still counts 8, because the SELECT reads the picture from before the DELETE. Only the RETURNING rows carry the changes forward. The PostgreSQL documentation also warns against changing the same row twice in one statement: which change wins can't be predicted.\n\nSubqueries have one more shape worth knowing by name. A **row subquery** returns one row with several columns and compares them all at once. `WHERE (card_id, amount_minor) = (SELECT card_id, amount_minor FROM payments WHERE payment_id = 17)` finds payments with the same card and amount as payment 17: here, 17 and its duplicate 18. \"LATERAL joins, top-N per group and keyset pagination\" uses the same row comparison, with `<`, to page through results.\n\nFinally, `ANY` and `ALL` with an empty list. `x > ALL (empty)` is true, because there's no element it fails against. `x > (SELECT max(...) FROM empty)` compares with NULL, so it's never true. The two look interchangeable, and they part ways exactly when the subquery finds nothing."
   },
-  "note": "PostgreSQL allows INSERT, UPDATE and DELETE with RETURNING inside WITH, and runs each of them exactly once and to completion. The rows a DELETE removes are the rows the INSERT receives, in one statement and one snapshot, so nothing can slip between them. Oracle's WITH clause holds queries only. Oracle also has no keyword like `MATERIALIZED`: its SQL reference says the optimizer treats each query name \"as either an inline view or as a temporary table\", and it chooses. Plain query CTEs, scalar and correlated subqueries, and the name-resolution rule behave the same in both databases."
- },
- "worked": {
-  "title": "Rewrite a per-row subquery as a join, and prove nothing changed",
-  "steps": [
-   {
-    "say": "The fraud desk flags payments whose risk score is more than 30 points above the average score of their card. The first version is a correlated subquery. It is correct and easy to read, and on the small data it returns six payments.",
-    "code": "-- 1. the correlated version: the subquery depends on p.card_id\nSELECT p.payment_id, p.card_id, (p.metadata->'risk'->>'score')::int AS score\nFROM payments p\nWHERE (p.metadata->'risk'->>'score')::int >\n      (SELECT avg((p2.metadata->'risk'->>'score')::int) + 30\n       FROM payments p2\n       WHERE p2.card_id = p.card_id)\nORDER BY p.payment_id;\n-- payments 8, 15, 18, 23, 31 and 36",
-    "lang": "sql"
-   },
-   {
-    "say": "Before you change anything, read the plan. `SubPlan 1` with `p2.card_id = p.card_id` inside it means one full scan of payments per outer row. With 100,000 cards and a million payments that is a million scans.",
-    "code": "-- 2. EXPLAIN (COSTS OFF) of step 1\n--  Seq Scan on payments p\n--    Filter: (((((metadata -> 'risk'::text) ->> 'score'::text))::integer)::numeric > (SubPlan 1))\n--    SubPlan 1\n--      ->  Aggregate\n--            ->  Seq Scan on payments p2\n--                  Filter: (card_id = p.card_id)",
-    "lang": "sql"
-   },
-   {
-    "say": "Compute what the subquery computes, for every card at once, in a CTE. Then join each payment to its card's row. The extra column shows the average each payment was compared with, which the correlated version could not show without a second subquery.",
-    "code": "-- 3. averages once, then a join\nWITH card_risk AS (\n    SELECT card_id, avg((metadata->'risk'->>'score')::int) AS avg_score\n    FROM payments\n    GROUP BY card_id\n)\nSELECT p.payment_id, p.card_id,\n       (p.metadata->'risk'->>'score')::int AS score,\n       round(c.avg_score, 1) AS card_avg\nFROM payments p\nJOIN card_risk c ON c.card_id = p.card_id\nWHERE (p.metadata->'risk'->>'score')::int > c.avg_score + 30\nORDER BY p.payment_id;\n-- 8 (67 vs 30.7), 15 (88 vs 52.0), 18 (79 vs 35.3),\n-- 23 (52 vs 16.4), 31 (72 vs 40.5), 36 (61 vs 17.0)",
-    "lang": "sql"
-   },
-   {
-    "say": "Prove that the rewrite returns the same rows, instead of eyeballing six ids. `EXCEPT ALL` returns the rows of the first query that the second lacks, duplicates included. Run it in both directions: zero rows means the two results are equal as bags of rows. Keep this check for every refactoring of a report.",
-    "code": "-- 4. old minus new, plus new minus old: expect (0 rows)\nWITH old AS ( /* step 1 without ORDER BY, selecting payment_id */ ),\n     new AS ( /* step 3 without ORDER BY, selecting payment_id */ )\n(SELECT * FROM old EXCEPT ALL SELECT * FROM new)\nUNION ALL\n(SELECT * FROM new EXCEPT ALL SELECT * FROM old);",
-    "lang": "sql"
-   }
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: WITH queries (common table expressions)",
+      "url": "https://www.postgresql.org/docs/18/queries-with.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Subquery expressions",
+      "url": "https://www.postgresql.org/docs/18/functions-subquery.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Value expressions (scalar subqueries)",
+      "url": "https://www.postgresql.org/docs/18/sql-expressions.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: Using EXPLAIN",
+      "url": "https://www.postgresql.org/docs/18/using-explain.html"
+    },
+    {
+      "title": "Oracle AI Database SQL Language Reference: SELECT (subquery factoring clause)",
+      "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html"
+    }
   ]
- },
- "lab": {
-  "title": "A subquery that only looks correlated, an average at the wrong grain, and a CTE pipeline",
-  "minutes": 15,
-  "needs": [
-   "Docker"
-  ],
-  "files": [
-   "labs/sql/src/main/resources/sfz/sql/l05/above_merchant_average.sql",
-   "labs/sql/src/main/resources/sfz/sql/l05/above_average_spenders.sql",
-   "labs/sql/src/main/resources/sfz/sql/l05/monthly_active_customers.sql"
-  ],
-  "run": "./gradlew :sql:test --tests 'sfz.sql.l05.*'",
-  "steps": [
-   "With Docker running, run the tests from the `labs` folder. All six fail. Each failure prints the expected rows next to yours.",
-   "`above_merchant_average.sql` compares every payment with the average over all merchants, although it looks correlated. Find which table each `merchant_id` in the subquery names, then fix it with aliases or with a join to per-merchant averages.",
-   "`above_average_spenders.sql` compares customers' totals with the average payment. Compute spend per customer in a CTE and use it twice.",
-   "Write `monthly_active_customers.sql` as a pipeline of CTEs: (customer, month) pairs, then each customer's first month, then the counts.",
-   "Run the tests until all six pass. Each exercise has a second test that adds rows first, so a hard-coded answer fails it."
-  ],
-  "hints": [
-   "Run the placeholder's subquery on its own in psql, with `merchant_id = merchant_id` left in: it returns one number, 24015.17. A correlated subquery cannot run on its own.",
-   "The grain of a question is what one row stands for. \"Average customer spend\" needs one row per customer before `avg`.",
-   "`SELECT DISTINCT a.customer_id, to_char(p.created_at, 'YYYY-MM') AS month` gives one row per customer and month. `'YYYY-MM'` text sorts in time order, so `min(month)` is the first month, and `count(*) FILTER (WHERE ac.month = f.month)` counts the new ones."
-  ],
-  "done_when": "All six tests in `SubqueriesTest` pass."
- },
- "drill": {
-  "title": "Three subqueries from memory",
-  "minutes": 5,
-  "prompt": "Without looking, write: (1) payments whose amount is above the average succeeded amount, with a scalar subquery; (2) the same for each payment's own card instead, as a correlated subquery with every column qualified; (3) version 2 rewritten with a CTE of per-card averages and a join. Then say what EXPLAIN calls the subquery in (1) and in (2).",
-  "answer": {
-   "lang": "sql",
-   "src": "-- 1. uncorrelated: EXPLAIN shows an InitPlan, run once\nSELECT payment_id, amount_minor FROM payments\nWHERE amount_minor > (SELECT avg(amount_minor) FROM payments WHERE status = 'succeeded');\n\n-- 2. correlated: EXPLAIN shows a SubPlan, run per outer row\nSELECT p.payment_id, p.amount_minor FROM payments p\nWHERE p.amount_minor > (SELECT avg(p2.amount_minor) FROM payments p2\n                        WHERE p2.status = 'succeeded' AND p2.card_id = p.card_id);\n\n-- 3. the averages once, then a join\nWITH card_avg AS (\n    SELECT card_id, avg(amount_minor) AS avg_minor\n    FROM payments WHERE status = 'succeeded'\n    GROUP BY card_id\n)\nSELECT p.payment_id, p.amount_minor\nFROM payments p\nJOIN card_avg c ON c.card_id = p.card_id\nWHERE p.amount_minor > c.avg_minor;"
-  }
- },
- "recap": [
-  "A subquery is a query used as a value. Scalar (one row, one column) goes where a value goes; a column list goes after IN, ANY or EXISTS; a table goes in FROM as a derived table.",
-  "A scalar subquery with no row is NULL; with two rows it fails at run time, on whatever data exists that day.",
-  "An uncorrelated subquery runs once (InitPlan). A correlated one refers to the outer row and runs per row (SubPlan), unless PostgreSQL turns it into a join, as it does for EXISTS and IN.",
-  "Inside a subquery, a column name binds to the nearest table that has it. Qualify every column, or a correlated subquery silently stops being correlated.",
-  "WITH names subqueries so a query reads top to bottom. Since PostgreSQL 12 a CTE used once is inlined; one used twice is materialized. MATERIALIZED and NOT MATERIALIZED override."
- ],
- "quiz": [
-  {
-   "q": "A report shows each customer with `(SELECT c.pan_last4 FROM cards c JOIN accounts a ON a.account_id = c.account_id WHERE a.customer_id = cu.customer_id)`. It passed every test and fails in production with \"more than one row returned by a subquery used as an expression\". Why?",
-   "options": [
-    "Some customer has two cards, and a scalar subquery may return at most one row",
-    "PostgreSQL forbids scalar subqueries in the SELECT list",
-    "The subquery needs DISTINCT",
-    "Production has customers with no card, and an empty subquery is an error"
-   ],
-   "answer": 0,
-   "why": "The one-row limit is checked when the query runs, against the data that exists. The test data had one card per customer. An empty scalar subquery is not an error: it is NULL. DISTINCT would not help, because two cards have different last4 digits. Decide which card you want (the primary one, the newest) and say so in the WHERE."
-  },
-  {
-   "q": "`SELECT p.payment_id FROM payments p WHERE p.amount_minor > (SELECT avg(amount_minor) FROM payments WHERE merchant_id = merchant_id)`. What is each payment compared with?",
-   "options": [
-    "Its own merchant's average",
-    "The average over all payments",
-    "Nothing: the subquery returns NULL",
-    "An error is raised: ambiguous column"
-   ],
-   "answer": 1,
-   "why": "Both `merchant_id` names resolve to the inner `payments`, the nearest table that has the column, so the condition is true for every non-NULL row and the subquery is not correlated at all. PostgreSQL raises no error. Write `payments p2 ... WHERE p2.merchant_id = p.merchant_id`."
-  },
-  {
-   "q": "EXPLAIN ANALYZE shows `SubPlan 1` under a filter, with `loops=930826` on its Seq Scan. What is the best next step?",
-   "options": [
-    "Add MATERIALIZED to a CTE",
-    "Rewrite the subquery as a join to pre-aggregated rows, or give it an index to use",
-    "Increase work_mem",
-    "Nothing: SubPlans are cached between rows"
-   ],
-   "answer": 1,
-   "why": "Each loop is one run of the subquery for one outer row, here a full table scan each time. Computing the aggregate once per key and joining turns 930,826 scans into two passes. PostgreSQL does not cache a SubPlan's result between rows, and work_mem does not change the number of runs."
-  },
-  {
-   "q": "A CTE `recent` is referenced twice in the main query and has no MATERIALIZED keyword. What does PostgreSQL 18 do?",
-   "options": [
-    "Inlines it twice",
-    "Raises an error",
-    "Computes it once, stores it, and reads the stored rows twice",
-    "Computes it once per row of the main query"
-   ],
-   "answer": 2,
-   "why": "A side-effect-free CTE is inlined only when it is referenced once. With two references it is materialized by default. Write `AS NOT MATERIALIZED` if you want each reference inlined, for example so that a filter can use an index."
-  },
-  {
-   "q": "Lesson 3 wrote an anti join as `WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.customer_id = cu.customer_id)`. That subquery is correlated. How does PostgreSQL run it?",
-   "options": [
-    "As a Hash Anti Join, reading each table once",
-    "As a SubPlan, once per customer",
-    "As an InitPlan, once",
-    "It materializes accounts as a CTE"
-   ],
-   "answer": 0,
-   "why": "PostgreSQL rewrites EXISTS, NOT EXISTS and IN subqueries into semi and anti joins, so lesson 3's plan showed a Hash Anti Join. Correlated does not always mean per-row. The per-row SubPlan is what you get for a correlated subquery that computes a value, such as an average.",
-   "from": "sql-03"
-  }
- ],
- "flashcards": [
-  {
-   "front": "What does a scalar subquery return when it finds no row? Two rows?",
-   "back": "No row: NULL. Two rows: the statement fails with \"more than one row returned by a subquery used as an expression\"."
-  },
-  {
-   "front": "What makes a subquery correlated?",
-   "back": "It refers to a column of the outer query, so its value depends on the outer row."
-  },
-  {
-   "front": "InitPlan or SubPlan: which runs once?",
-   "back": "InitPlan: an uncorrelated subquery, run once. A SubPlan is run for each outer row that needs it."
-  },
-  {
-   "front": "In a subquery, which table does an unqualified column name bind to?",
-   "back": "The nearest one: the subquery's own FROM first, then the outer query. No error either way."
-  },
-  {
-   "front": "When does PostgreSQL 12 and later inline a CTE by default?",
-   "back": "When it is not recursive, has no side effects, and is referenced once."
-  },
-  {
-   "front": "What do MATERIALIZED and NOT MATERIALIZED do?",
-   "back": "Force the CTE to be computed once and stored, or force it to be pasted into the main query."
-  },
-  {
-   "front": "How do you check that a rewritten query returns the same rows?",
-   "back": "`(old EXCEPT ALL new) UNION ALL (new EXCEPT ALL old)` must return zero rows."
-  }
- ],
- "terms": [
-  {
-   "term": "Subquery",
-   "plain": "A SELECT in parentheses inside another statement, used as a value, a list or a table."
-  },
-  {
-   "term": "Scalar subquery",
-   "plain": "A subquery that returns one column and at most one row, used where a single value goes."
-  },
-  {
-   "term": "Derived table",
-   "plain": "A subquery in FROM. It acts like a table for the rest of the query."
-  },
-  {
-   "term": "Correlated subquery",
-   "plain": "A subquery that refers to the outer query's row, so it is evaluated per outer row."
-  },
-  {
-   "term": "InitPlan and SubPlan",
-   "plain": "EXPLAIN's names for a subquery run once (InitPlan) and one run per outer row (SubPlan)."
-  },
-  {
-   "term": "Common table expression (CTE)",
-   "plain": "A named subquery declared with WITH before the main query, visible only in that statement."
-  },
-  {
-   "term": "Inlining",
-   "plain": "Pasting a CTE's query into the main query so the planner optimizes them together."
-  },
-  {
-   "term": "Materialization",
-   "plain": "Computing a CTE once and storing its rows for the main query to read."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate writes \"each merchant with its average payment\" as `SELECT m.*, (SELECT avg(p.amount_minor) FROM payments p WHERE p.merchant_id = m.merchant_id) FROM merchants m`. It is fast with 8 merchants. Explain how PostgreSQL runs it, when it gets slow, and what you would write instead.",
-  "answer": "The subquery refers to `m.merchant_id`, so it is correlated: PostgreSQL runs it as a SubPlan once for each merchant, and with no index on `payments.merchant_id` every run scans the whole payments table. The cost is merchants times payments: fine for 8 merchants and 37 payments, terrible for 2,500 merchants and a million payments, about 2,500 full scans. PostgreSQL does not turn an aggregate subquery into a join by itself. Write the averages once, `SELECT merchant_id, avg(amount_minor) FROM payments GROUP BY merchant_id`, in a CTE or derived table, and LEFT JOIN merchants to it, so merchants without payments still get a row with NULL. That is two passes over the data. An index on `payments (merchant_id)` would also make each SubPlan run cheap, but the join is simpler to reason about."
- },
- "deeper": {
-  "minutes": 8,
-  "body": "A data-modifying CTE is worth trying once, inside a transaction you roll back. This one moves the finished jobs to an archive table in one statement:\n\n```sql\nBEGIN;\nCREATE TEMP TABLE jobs_archive (LIKE jobs);\n\nWITH moved AS (\n    DELETE FROM jobs\n    WHERE status = 'done'\n    RETURNING *\n)\nINSERT INTO jobs_archive\nSELECT * FROM moved;\n\nSELECT job_id, kind, status FROM jobs_archive ORDER BY job_id;\nSELECT count(*) AS left_in_jobs FROM jobs;\nROLLBACK;\n```\n\nThe INSERT reports `INSERT 0 2`. The archive holds jobs 1 (`fraud_review`) and 4 (`send_receipt`), both `done`, and 6 jobs are left in `jobs`. ROLLBACK puts everything back.\n\nAll parts of the statement see the same snapshot of the data, taken when the statement starts. That has a surprising consequence: the main query cannot see the changes its own CTEs make to tables. `WITH d AS (DELETE FROM jobs WHERE status = 'done') SELECT count(*) FROM jobs` still counts 8, because the SELECT reads the snapshot from before the DELETE. Only the RETURNING rows carry the changes forward. The PostgreSQL docs also warn against changing the same row twice in one statement: which change wins is not predictable.\n\nSubqueries have one more shape worth knowing by name: a **row subquery**, which returns one row with several columns and compares them all at once. `WHERE (card_id, amount_minor) = (SELECT card_id, amount_minor FROM payments WHERE payment_id = 17)` finds payments with the same card and amount as payment 17: here 17 and its duplicate 18. Lesson 8 uses the same row comparison, with `<`, for keyset pagination.\n\nFinally, `ANY` and `ALL` with an empty list. `x > ALL (empty)` is true, because there is no element it fails against, while `x > (SELECT max(...) FROM empty)` compares with NULL and is never true. The two look interchangeable and part ways exactly when the subquery finds nothing."
- },
- "sources": [
-  {
-   "title": "PostgreSQL 18 documentation: WITH queries (common table expressions)",
-   "url": "https://www.postgresql.org/docs/18/queries-with.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: Subquery expressions",
-   "url": "https://www.postgresql.org/docs/18/functions-subquery.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: Value expressions (scalar subqueries)",
-   "url": "https://www.postgresql.org/docs/18/sql-expressions.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: Using EXPLAIN",
-   "url": "https://www.postgresql.org/docs/18/using-explain.html"
-  },
-  {
-   "title": "Oracle AI Database SQL Language Reference: SELECT (subquery factoring clause)",
-   "url": "https://docs.oracle.com/en/database/oracle/oracle-database/23/sqlrf/SELECT.html"
-  }
- ]
 }

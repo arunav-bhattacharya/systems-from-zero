@@ -54,3 +54,6 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
   `videos/scripts/derived-data.md`) and shipped. Usage about 90%: stopped for the week.
   **Next (after the reset):** remake the other 4 Foundations videos and the 10 networking videos (they still
   tell the old story), then text for os, sql, model and onward in course order.
+- Weekly usage was refreshed to 0% (user: "Try now"). Wave 2 started: remakes of the 14 Foundations and networking
+  videos (4 makers) and the os and sql text (8 writers, task sheet `brief/WRITER_TASK.md`). Cost seen in wave 1:
+  roughly 0.7% of a week per lesson and 2% per remade video.

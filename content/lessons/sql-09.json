@@ -1,435 +1,439 @@
 {
- "id": "sql-09",
- "title": "JSONB, upserts and MERGE",
- "minutes": 40,
- "goal": "By the end you can store and query a JSON document in a jsonb column without the text-comparison trap, index it for containment with GIN, ingest a message that may arrive twice at the same moment with INSERT ... ON CONFLICT, and bring a summary table in line with its source in one MERGE.",
- "warmup": {
-  "q": "Two Kafka consumers receive the same payment message at the same moment. Each runs `SELECT ... WHERE payment_uid = ?` and, if it finds nothing, `INSERT`s the payment. payment_uid has a UNIQUE constraint. What happens?",
-  "options": [
-   "One consumer's SELECT waits for the other's INSERT, so the second consumer sees the row and skips it",
-   "Both checks find nothing; the second INSERT waits for the first transaction and then fails with a duplicate key error",
-   "Both inserts succeed, because each check passed",
-   "PostgreSQL merges the two inserts into one row"
+  "id": "sql-09",
+  "title": "JSONB, upserts and MERGE",
+  "minutes": 40,
+  "goal": "By the end, you can store a JSON document in a table and look inside it safely, find documents fast by what they contain, store a message that arrives twice exactly once, and bring a table of totals up to date in one statement.",
+  "opening": "Picture a café on a busy morning. You tap your card, and the card reader sends a message about the payment to the company that records it. The reader hears nothing back, so it sends the same message again. Both copies arrive a millisecond apart, and two copies of the company's program pick up one each. Each asks the database, \"do we have this payment yet?\" Each hears no, and each stores it. You've paid for one coffee twice.\n\nLooking before you write feels like the careful thing to do. It's what you'd do with a paper order book, and it passes every test, because a test sends one message at a time.\n\nThe last lesson, LATERAL joins, top-N per group and keyset pagination, only read rows; this one writes them. We'll store the loose notes that come with each payment as a JSON document and search inside it, store a message that arrives twice exactly once, and update a table of monthly totals in one statement. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "Two copies of the payments program receive the same payment message at the same moment. Each one asks the database whether it already has a payment with the message's code (`SELECT ... WHERE payment_uid = ?`), and if it finds nothing, adds the payment (`INSERT`). The code column is marked UNIQUE, a rule that no two rows may share a code. What happens?",
+    "options": [
+      "The second program's question waits for the first program's insert, so it sees the payment and skips it",
+      "Both questions find nothing. The second insert waits for the first program to finish, then fails with an error: that code already exists",
+      "Both inserts succeed, because each check passed",
+      "The database combines the two inserts into one row"
+    ],
+    "answer": 1,
+    "why": "A question (a `SELECT`) never waits for another program's unfinished insert. It sees only changes that have been saved for good, so both programs find nothing. The UNIQUE rule is what notices. The second insert finds the first one's new entry, not yet saved, and waits to see whether it will be. Once it is, the second insert fails with a duplicate key error, code 23505. So the data stays right, but one program got an error instead of an answer. Without the UNIQUE rule, the third option is what you'd get: one coffee stored twice. The third section plays this race frame by frame."
+  },
+  "sections": [
+    {
+      "h": "Storing a document whose shape keeps changing: jsonb",
+      "body": "Let's set up the app first. A small company runs the program that records card payments for cafés, bookshops and grocers. It keeps its data in PostgreSQL, a free database program. A database keeps data in tables, like the sheets of a spreadsheet: named columns, and one row per record. SQL is the language for asking tables questions and changing them: a `SELECT` statement asks a question and returns rows, and an `INSERT` adds a row.\n\nThe `payments` table has one row per payment. Its columns say which card paid (`card_id`), which shop was paid (`merchant_id`: the labs call a shop a merchant, and keep the shops in `merchants`), how much in cents (`amount_minor`), whether the money has moved (`status`) and when (`created_at`).\n\nEvery payment is also checked for fraud. A fraud check is a program that scores each payment from 0 to 100 for how suspicious it looks, and lists the rules that fired. The rule `velocity`, for example, fires when one card pays many times in a few minutes. The fraud team adds a field every month or so, and a column for each would mean changing the table every month. So the column `metadata` holds the fraud check's answer as it arrived, as JSON:\n\n```json\n{\"channel\": \"web\", \"risk\": {\"score\": 91, \"rules\": [\"velocity\"]}}\n```\n\nJSON is a common way to write structured data as text. Curly braces hold an object: named values, each written as a key and its value (`\"channel\"` is a key, `\"web\"` its value). Square brackets hold a list, called an array. So this payment was made on a website and scored 91, because the velocity rule fired.\n\nStored as plain `text`, the document means nothing to PostgreSQL. A document cut off halfway is stored without complaint. Every question becomes a search for letters: `metadata LIKE '%velocity%'` (`LIKE` matches a pattern, and `%` stands for any characters) also matches a rule called `velocity_hourly`, or a note that mentions the word.\n\nThe `jsonb` type parses the text when you store it: it reads the text once, works out its structure, and refuses anything that isn't valid JSON. It keeps the result as a tree of keys and values, so a query can go straight to `risk`, then to `score`. An older type, `json`, keeps the exact text, with its spaces, its key order and any key written twice. `jsonb` tidies it: keys come back in its own order, and of two equal keys only the last survives. Use `jsonb` unless you must hand back the exact text you were sent.\n\nOn paper, plain text is a handwritten note stapled to a line of the café's order book: to find the score, you read the whole note. `jsonb` is the same note on a printed form with a box labelled \"score\".\n\nTwo operators, symbols that act on values, take you inside a document. `->` takes a key, or a position in an array, and returns jsonb: still a piece of document. `->>` does the same and returns text. So `metadata -> 'risk' -> 'score'` is the JSON number 91, and `metadata -> 'risk' ->> 'score'` is the text `'91'`.\n\nThe difference bites when you compare. Text is compared letter by letter, the way a dictionary sorts words, so `'8' > '50'` is true: `'8'` comes after `'5'`. The lab database starts with a small seed data set, 37 payments you can check by hand, and 8 of them score above 50. `metadata -> 'risk' ->> 'score' > '50'` finds 14, because six of them score from 6 to 9. Turn the text into a number before you compare: `(metadata -> 'risk' ->> 'score')::int > 50`, where `::int` means \"read this as a whole number\", finds the right 8.\n\nThe operator to know best is containment, `@>`. `metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` asks whether the document contains that smaller document: a `risk` object whose `rules` array holds `\"velocity\"`, whatever else is around it. It finds payments 3, 15 and 18, and never a rule that merely starts with the same letters. Its cousin `?` asks whether a key, or a text item in an array, exists: `metadata -> 'risk' -> 'rules' ? 'velocity'`.\n\nOn a million payments, though, containment still reads every one. Next, we'll make it fast.",
+      "aside": {
+        "title": "Why not keep the whole payment in one JSON document?",
+        "body": "It's tempting: the table would never need to change. But a column gets a type and rules that PostgreSQL checks on every write. `amount_minor` must be a whole number above zero, `status` must be one of three words, and `card_id` must name a card that exists. Inside a document, nothing checks any of that, so a misspelled status goes in without a word. Keep the facts every payment has in real columns, and use jsonb for the part whose shape keeps changing. The Data models track asks this question properly, starting with what tables make hard."
+      },
+      "try": {
+        "title": "Inside a document, and the text trap",
+        "minutes": 4,
+        "steps": [
+          "Start the database if it isn't running. From the `labs` folder, run `docker compose -f env/postgres.yml up -d --wait`. Docker is a program that runs the database inside a small, separate Linux system on your laptop, called a container. Then open psql, PostgreSQL's command-line program, where you type SQL and read the answers: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the block. Compare the types the two arrows return, then the two counts. Why do they differ?",
+          "The last statement fails on purpose. Read the error."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SELECT payment_id, metadata FROM payments WHERE payment_id IN (3, 8, 18);\n\nSELECT metadata -> 'risk' -> 'score'  AS arrow,\n       metadata -> 'risk' ->> 'score' AS double_arrow,\n       pg_typeof(metadata -> 'risk' -> 'score')  AS arrow_type,\n       pg_typeof(metadata -> 'risk' ->> 'score') AS double_arrow_type\nFROM payments WHERE payment_id = 3;\n\nSELECT count(*) FILTER (WHERE metadata -> 'risk' ->> 'score' > '50')      AS compared_as_text,\n       count(*) FILTER (WHERE (metadata -> 'risk' ->> 'score')::int > 50) AS compared_as_int\nFROM payments;\n\nSELECT payment_id, metadata -> 'risk' ->> 'score' AS score\nFROM payments\nWHERE metadata -> 'risk' ->> 'score' > '50' AND (metadata -> 'risk' ->> 'score')::int <= 50\nORDER BY payment_id;\n\nSELECT payment_id FROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'\nORDER BY payment_id;\n\nSELECT '{\"b\": 1, \"a\": 2, \"a\": 3}'::json AS as_json, '{\"b\": 1, \"a\": 2, \"a\": 3}'::jsonb AS as_jsonb;\nSELECT '{\"channel\": \"web\", \"risk\": {\"score\": 91'::jsonb;"
+        },
+        "expect": "```postgresql\n arrow | double_arrow | arrow_type | double_arrow_type\n-------+--------------+------------+-------------------\n 91    | 91           | jsonb      | text\n\n compared_as_text | compared_as_int\n------------------+-----------------\n               14 |               8\n\n payment_id | score\n------------+-------\n          2 | 8\n         12 | 7\n         14 | 6\n         21 | 9\n         25 | 6\n         34 | 7\n(6 rows)\n```\n\nThe two arrows print the same characters but return different types. Compared as text, six single-digit scores count as more than 50. The containment query returns payments 3, 15 and 18. `json` gives back the text exactly as written, `{\"b\": 1, \"a\": 2, \"a\": 3}`, while `jsonb` returns `{\"a\": 3, \"b\": 1}`: reordered, with only the last `a` kept. The document that was cut off fails with `invalid input syntax for type json` and `The input string ended unexpectedly.`"
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: JSON types",
+          "url": "https://www.postgresql.org/docs/18/datatype-json.html",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: JSON functions and operators",
+          "url": "https://www.postgresql.org/docs/18/functions-json.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Finding 478 documents out of a million with a GIN index",
+      "body": "Let's try containment on a bigger table. The lab's large data set holds a million made-up payments in a schema called `big`, a named group of tables inside the database. Among them the lab planted 478 near-copies of other payments, each marked in its document with `\"injected_dup\": true`. Finding them with `metadata @> '{\"injected_dup\": true}'` takes from half a second to a few seconds, depending on how busy your laptop is.\n\nWhere does the time go? PostgreSQL stores a table on disk in blocks of 8 KB, called pages. With no better way to find the rows, it reads every page, first to last, and tests every row: a sequential scan. This table has 23,818 pages, 186 MB, and the query reads all of them to return 478 rows. `EXPLAIN (ANALYZE)` shows it: it runs the query and reports the plan, the steps PostgreSQL chose to answer it, with the time of each step and the pages it touched (the `Buffers` line).\n\nThe usual fix is an index, a separate structure that finds rows without reading the whole table. The kind the last lesson used for paging, called a B-tree, keeps values sorted like the names in a phone book, so it finds one value or a range quickly. It can't help here: \"contains this key somewhere inside\" isn't a value or a range in a sorted list of whole documents.\n\nWhat helps is the index at the back of a book: every word, with the pages it appears on. Look up two words, and read only the pages listed under both. A **GIN index** (generalized inverted index) is exactly that. For every key and every value that occurs in any document, it keeps a sorted list of the rows that contain it. For `@>`, PostgreSQL looks up each key and value of the smaller document, keeps the rows that appear in every list, and reads only those. The figure shows three documents and some of their entries.\n\n`CREATE INDEX payments_metadata_gin ON payments USING gin (metadata)` takes a few seconds to build, and the index is under 9 MB, against 186 MB for the table. Now the same query reads 17 pages: 3 of the index, and the 14 table pages where the 478 rows live. It takes under a millisecond. EXPLAIN calls this a Bitmap Index Scan: PostgreSQL first collects the matching rows from the index, then fetches them from the table.\n\nThe book picture also explains the plan's `Recheck Cond` line. A book's index says page 40 has both \"risk\" and \"velocity\", not whether they share a sentence. The default GIN index, too, records keys and values but not how they nest, so PostgreSQL checks each row it fetches against the full condition.\n\nThe index has two limits. First, it serves only the jsonb operators: `@>`, `?` and four relatives (`?|`, `?&`, `@?`, `@@`). `metadata ->> 'injected_dup' = 'true'` asks the same question as the containment query and still reads every page, because the index holds keys and values, not the text that `->>` makes from them. Write containment.\n\nSecond, an index helps only when it lets PostgreSQL read less. The velocity rule fired on 5% of the payments: 50,188 rows spread over 21,036 of the 23,818 pages. Counting them through the GIN index was slower than the sequential scan, because it visited almost every page anyway, after a trip through the index.\n\nNext, we'll start writing rows, and meet a bug that no index can find.",
+      "figure": {
+        "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A GIN index lists, for every key and value, the payments that contain it; containment intersects the lists for risk, rules and velocity\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">three documents (payments.metadata)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"55\" text-anchor=\"start\">payment 3</text><text class=\"t-s t-m\" x=\"34\" y=\"73\" text-anchor=\"start\">web, score 91, rules: velocity</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"117\" text-anchor=\"start\">payment 8</text><text class=\"t-s t-m\" x=\"34\" y=\"135\" text-anchor=\"start\">web, score 67, rules: geo_mismatch</text><rect class=\"box\" x=\"20\" y=\"158\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"179\" text-anchor=\"start\">payment 18</text><text class=\"t-s t-m\" x=\"34\" y=\"197\" text-anchor=\"start\">android, score 79, rules: velocity</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"start\">GIN entries: key or value, then the rows</text><rect class=\"box-a\" x=\"310\" y=\"32\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"48.5\" text-anchor=\"start\">key   risk</text><text class=\"t-s t-code\" x=\"646\" y=\"48.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"61\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"77.5\" text-anchor=\"start\">key   rules</text><text class=\"t-s t-code\" x=\"646\" y=\"77.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"90\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"106.5\" text-anchor=\"start\">value velocity</text><text class=\"t-s t-code\" x=\"646\" y=\"106.5\" text-anchor=\"end\">3, 18</text><rect class=\"box\" x=\"310\" y=\"119\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"135.5\" text-anchor=\"start\">value geo_mismatch</text><text class=\"t-s t-code\" x=\"646\" y=\"135.5\" text-anchor=\"end\">8</text><rect class=\"box\" x=\"310\" y=\"148\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"164.5\" text-anchor=\"start\">value web</text><text class=\"t-s t-code\" x=\"646\" y=\"164.5\" text-anchor=\"end\">3, 8</text><rect class=\"box\" x=\"310\" y=\"177\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"193.5\" text-anchor=\"start\">value android</text><text class=\"t-s t-code\" x=\"646\" y=\"193.5\" text-anchor=\"end\">18</text><line class=\"ln-d\" x1=\"270\" y1=\"80\" x2=\"306\" y2=\"80\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"20\" y=\"222\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"241.5\" text-anchor=\"start\">metadata @&gt; '{\"risk\": {\"rules\": [\"velocity\"]}}'</text><rect class=\"box-ok\" x=\"440\" y=\"222\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"241.5\" text-anchor=\"middle\">intersect: rows 3, 18</text><line class=\"ln-a\" x1=\"420\" y1=\"237\" x2=\"436\" y2=\"237\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">The default GIN index keeps keys and values, not how they nest, so PostgreSQL rechecks rows 3 and 18.</text></svg>",
+        "caption": "Three documents from the seed and some of their index entries. For the containment query, PostgreSQL looks up risk, rules and velocity, keeps the rows that appear in all three lists, then rechecks those rows."
+      },
+      "try": {
+        "title": "478 rows out of a million",
+        "minutes": 5,
+        "steps": [
+          "This Try it uses the large data set. If an earlier lesson didn't load it, load it now from the `labs` folder (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute). Then open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. The block's first line, `SET search_path = big, public`, points the queries at the big tables.",
+          "Run the block. Building the index takes a few seconds. Compare the `Buffers` lines of the three plans: each one counts the pages that query touched.",
+          "The third query asks the same question as the second. Why doesn't it use the index?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "SET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nCREATE INDEX payments_metadata_gin ON payments USING gin (metadata);\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata ->> 'injected_dup' = 'true';\n\nSELECT pg_size_pretty(pg_relation_size('payments_metadata_gin')) AS gin_index,\n       pg_size_pretty(pg_relation_size('payments')) AS payments_table;\nDROP INDEX payments_metadata_gin;\nRESET search_path;"
+        },
+        "expect": "Trimmed, from one run. The times depend on your machine and on how busy Docker is; the page counts don't:\n\n```postgresql\n Gather (actual time=2809.428..2860.989 rows=478.00 loops=1)\n   Buffers: shared hit=13166 read=10652\n   ->  Parallel Seq Scan on payments (actual time=2798.341..2806.396 rows=159.33 loops=3)\n         Filter: (metadata @> '{\"injected_dup\": true}'::jsonb)\n         Rows Removed by Filter: 333333\n\n Bitmap Heap Scan on payments (actual time=0.159..0.561 rows=478.00 loops=1)\n   Recheck Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n   Heap Blocks: exact=14\n   Buffers: shared hit=17\n   ->  Bitmap Index Scan on payments_metadata_gin (actual time=0.075..0.075 rows=478.00 loops=1)\n         Index Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n\n Gather (actual time=579.725..591.767 rows=478.00 loops=1)\n   Buffers: shared hit=13114 read=10704\n   ->  Parallel Seq Scan on payments (actual time=541.899..542.006 rows=159.33 loops=3)\n         Filter: ((metadata ->> 'injected_dup'::text) = 'true'::text)\n```\n\nAll 23,818 pages, then 17, then all 23,818 again for the `->>` version, though the index exists. `Parallel Seq Scan` with `loops=3` means three processes shared the sequential scan, and `Gather` joined their results. In each `Buffers` line, `hit` counts pages PostgreSQL found in its memory and `read` pages it had to fetch from disk. The sizes are `8856 kB` for the index and `186 MB` for the table. The block drops the index at the end."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: jsonb indexing",
+          "url": "https://www.postgresql.org/docs/18/datatype-json.html#JSON-INDEXING",
+          "kind": "docs"
+        },
+        {
+          "title": "PostgreSQL 18: GIN indexes",
+          "url": "https://www.postgresql.org/docs/18/gin.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Check first, then insert: how one message gets stored twice",
+      "body": "Back to the opening's café. Each payment reaches the company as a message, and a sender that hears no answer sends the message again. That rule is called at-least-once delivery: every message arrives, and some arrive twice. The company runs two copies of its program, called workers, so that one can carry on if the other crashes. A copy sent again can reach the second worker while the first is still storing the original.\n\nTo tell a repeat from a new payment, the card reader gives every payment a long unique code, `payment_uid`, and a copy sent again carries the same code. A code like that is an idempotency key: it lets the receiver spot a repeat. (Idempotent means that doing something twice has the same effect as doing it once.) The obvious code looks first:\n\n```kotlin\nif (payments.findByUid(msg.uid) == null) {     // both workers: not found\n    payments.insert(msg)                       // both workers: insert\n}\n```\n\nTwo workers can both run the check before either inserts. Both find nothing, and both insert. With nothing else in the way, one payment would be stored twice, and the shop paid twice.\n\nSomething does stop it here. The `payment_uid` column is marked `UNIQUE`, a rule that no two rows may share a value. PostgreSQL keeps that rule with a unique index: a sorted list of every code in the column, which every insert must pass through.\n\nA transaction is a group of changes that the database applies all together or not at all. `BEGIN` starts one, `COMMIT` saves its changes for good and shows them to everyone else, and `ROLLBACK` throws them away. Until a worker commits, no other worker can see its new row.\n\nNow replay the race. Worker A inserts, and its new code goes into the unique index at once, marked as belonging to A's unfinished transaction. Worker B's insert reaches the index and finds an entry for the same code. B can't know yet whether A will commit, so it waits. If A commits, B's insert fails with `duplicate key value violates unique constraint`. Every PostgreSQL error carries a five-character code called a SQLSTATE, and this one's is 23505. If A rolls back, B's insert goes through. Either way, one row. The stepper below plays it frame by frame.\n\nCatching that error is clumsy. An error spoils the whole transaction it happens in, until it's rolled back. A worker that stores 500 messages in one transaction loses all 500 to a single repeat.\n\n`INSERT ... ON CONFLICT (payment_uid) DO NOTHING` moves the decision into the statement itself. The insert asks the unique index in the same step as the write. If the code is already there, or is being inserted by a transaction that hasn't finished (it waits for that one first), the insert skips the row instead of failing. Add `RETURNING payment_id`, which hands back columns of the rows the statement wrote, and you learn which happened: one row back means the payment was new, none means it was a repeat. The stepper shows it holding up in every order of events.\n\nOn paper, two waiters who each check the order book, find nothing and then write make our workers' mistake. A unique index is a book where checking and writing are one movement of one pen. The picture breaks on speed: a pen serves one writer at a time, while PostgreSQL lets thousands of inserts with different codes through at once.\n\n**A check in a separate statement can be out of date before you act on it. Let the unique index decide.**\n\nBut some second messages carry news, and should change the row. Next, we'll handle those.",
+      "stepper": {
+        "title": "The same message on two workers",
+        "intro": "Click Next. The middle column is the unique index on payment_uid; each side is one worker's transaction.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The same payment message reaches two workers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">the message arrives twice</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">message ...a001</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">message ...a001 again</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">A copy sent again reached B while A is still storing the first.</text></svg>",
+            "say": "The card reader sent one payment message, code `...a001`, and then sent it again. The copy reached worker B while worker A was still storing the first. Both are about to store it. The unique index on payment_uid has no entry for that code yet."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"Both workers check first and find nothing\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">Both checks run before either insert: both find nothing.</text></svg>",
+            "say": "Check, then insert. Each worker runs `SELECT count(*) ... WHERE payment_uid = ...` in its own transaction. Neither has inserted yet, so both see 0 and both decide to insert. Whatever happens next, the check has already given its answer."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A inserts; B's insert waits on the unique index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-a\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"482\" y=\"134\" text-anchor=\"start\">INSERT: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">B's INSERT finds A's uncommitted entry for the same key and waits.</text></svg>",
+            "say": "A inserts. The new entry is in the unique index already, marked as belonging to A's unfinished transaction. B's INSERT reaches the index, finds an entry for the same code from a transaction that hasn't finished, and waits: PostgreSQL can't know yet whether A will commit."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits, B fails with a duplicate key error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s t-ok\" x=\"32\" y=\"160\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-bad\" x=\"478\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"134.5\" text-anchor=\"middle\">INSERT: ERROR 23505</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-bad\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits and B fails: duplicate key. Without the unique index</text><text class=\"t-s t-bad\" x=\"20\" y=\"274\" text-anchor=\"start\">B would have committed too: one payment stored twice.</text></svg>",
+            "say": "A commits, and B's INSERT fails with `duplicate key value violates unique constraint`, SQLSTATE 23505. The unique index kept the data right, but B's transaction is now spoiled, along with everything else it did. Without the index, both inserts would have committed, and the shop would be paid twice."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"With ON CONFLICT, both workers insert directly; B waits on the index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-a\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><text class=\"t-s t-m\" x=\"482\" y=\"108\" text-anchor=\"start\">DO NOTHING: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">No separate check. Each INSERT asks the unique index itself.</text></svg>",
+            "say": "Now each worker sends one statement: `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id`. A's goes in and returns payment 40. B's reaches the same unsaved entry and waits for A, exactly as before. The difference is what happens after the wait."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits and B's insert does nothing, without an error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-ok\" x=\"32\" y=\"134\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 0 rows</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits. B's INSERT sees the committed key and skips the row:</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">INSERT 0 0, no error, and RETURNING says it was a repeat.</text></svg>",
+            "say": "A commits. B's INSERT sees that the code now exists and skips the row: `INSERT 0 0`, no error, no spoiled transaction. RETURNING gave B zero rows, which is how its code knows the message was a repeat. One payment."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"If A rolls back instead, B's insert succeeds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One payment message, uid ...a001, sent to two workers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Worker A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-bad\" x=\"32\" y=\"134\" text-anchor=\"start\">ROLLBACK</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Worker B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: B's</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">Had A rolled back, B's INSERT would have gone ahead.</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">Either way, exactly one payment: the unique index is the referee.</text></svg>",
+            "say": "Had A crashed or rolled back instead, its entry would vanish and B's INSERT would store the payment itself. Every order of events ends with exactly one row, because the unique index decides at the moment of the write, not a check that ran earlier."
+          }
+        ]
+      },
+      "try": {
+        "title": "Race two inserts",
+        "minutes": 5,
+        "steps": [
+          "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Each is one session, an open connection to the database, like one of our two workers. Start the database first if it isn't running (`docker compose -f env/postgres.yml up -d --wait`).",
+          "Run part 1, switching terminals at each comment (`-- A` or `-- B`). B's INSERT hangs until A commits. What does it print then?",
+          "Run part 2 the same way. What does B's INSERT return after A's COMMIT?"
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, two sessions on database course",
+          "src": "-- part 1: check, then insert\n-- A\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- B\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- A\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- A\nCOMMIT;\n-- B\n\\echo :SQLSTATE\nROLLBACK;\n-- A: remove it again\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n\n-- part 2: let the unique index decide\n-- A\nBEGIN;\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- A\nCOMMIT;\nSELECT payment_id, status FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';"
+        },
+        "expect": "In part 1 both counts are 0, and B's INSERT prints nothing until A commits. Then:\n\n```postgresql\n-- B\nERROR:  duplicate key value violates unique constraint \"payments_payment_uid_key\"\nDETAIL:  Key (payment_uid)=(019f1d1f-0500-7000-8000-0000000a0001) already exists.\n23505\n```\n\nIn part 2, A's INSERT returns one row, and B's waits again. When A commits, B's finishes without an error:\n\n```postgresql\n-- B\n payment_id\n------------\n(0 rows)\n\nINSERT 0 0\n```\n\nThe final SELECT shows a single pending payment. Its payment_id was 40 on a fresh database: part 1 used up 38 and 39, though only one of those inserts survived, and B's skipped insert in part 2 took 41 (the next section explains why skipped inserts use up numbers). Each part deletes the payment again, so the seed data stays as it was."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: INSERT, the ON CONFLICT clause",
+          "url": "https://www.postgresql.org/docs/18/sql-insert.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "When the second message should change the row: ON CONFLICT DO UPDATE",
+      "body": "Not every repeat is a copy. A card payment happens in two steps. First the card's bank says yes and sets the money aside, and the payment is stored as `pending`. Later the money really moves, and a second message arrives with the same code and the status `succeeded`, or `failed` if it never moved. Payment 20 in the seed is still pending. When its second message arrives, the conflict should update the row, not skip it:\n\n```sql\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n```\n\n`AS p` gives the table a short name. `EXCLUDED` is the row the INSERT proposed and couldn't insert, so `SET status = EXCLUDED.status` copies the new message's status onto the stored row. The `WHERE` decides whether the stored row changes at all. An insert that turns into an update when the row already exists is called an upsert.\n\nWhy the `WHERE`? Messages can arrive late and out of order. Without it, a late `pending` message, one that arrives after the `succeeded` one, would set a finished payment back to pending. With it, only a pending payment moves (`p.status = 'pending'`), and only to a final status (`<>` means \"is not\"). Any other repeat leaves the row alone and returns nothing.\n\n`RETURNING old.status, new.status` is new in PostgreSQL 18: `old` is the row before the statement and `new` the row after. For a fresh insert, `old` is all NULL, the value SQL uses for \"nothing here\". For an update, both are filled. So one statement tells the worker what it did: inserted, updated, or nothing. The PostgreSQL manual promises an insert or an update here \"even under high concurrency\", with many writers at once.\n\nThree rules decide whether the statement works at all:\n\n- The conflict target, `(payment_uid)`, must name a column with a unique index or a UNIQUE rule. A clash on any other unique index, such as the one on `payment_id`, still raises an error.\n- One statement may not change the same row twice. A batch that carries one code twice fails with `ON CONFLICT DO UPDATE command cannot affect row a second time`, so remove the repeats from the batch first.\n- `payment_id` comes from a sequence, a counter inside the database that hands out the next number. Every insert that is tried takes a number, including the ones that end in a conflict. So the ids get gaps, and you can't use them as a count.\n\n`DO UPDATE` has one more cost. PostgreSQL never changes a row in place: an UPDATE writes a new copy of the row and marks the old one dead, even when the values are the same. The `WHERE` saves those writes too. (The Transactions track's lesson MVCC: versions, snapshots and VACUUM explains why.)\n\nON CONFLICT handles messages as they arrive. A nightly job that corrects a whole table needs one more tool. Next, we'll meet it.",
+      "try": {
+        "title": "Capture, repeat, late message, new payment",
+        "minutes": 4,
+        "steps": [
+          "Start the database if it isn't running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. The block's first line, `\\pset null '∅'`, makes psql print NULL as ∅, so you can see it.",
+          "Run the block one statement at a time, and predict each result before you run it. The comments call the second message the capture: the one that says the money has moved.",
+          "Statement 5 fails on purpose. The ROLLBACK at the end undoes everything, so the seed data stays as it was."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nBEGIN;\n-- 1. the capture for payment 20, which is pending\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 2. the same capture again\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 3. a late 'pending' for the same payment, without the WHERE guard\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'pending', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 4. a payment nobody has seen\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 5. one batch that carries payment 20 twice\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00'),\n       ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'failed',    '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status;\nROLLBACK;"
+        },
+        "expect": "```postgresql\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | pending    | succeeded\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n(0 rows)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | succeeded  | pending\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         45 | ∅          | pending\n(1 row)\n\nERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time\nHINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.\n```\n\nStatement 2 changed nothing, so it returned nothing. Statement 3, without the guard, moved a succeeded payment back to pending: that's the bug the WHERE prevents. The new payment got id 45 on a fresh database after the previous Try it, because statements 1 to 3 each used up a number from the sequence though none of them inserted a row. The ROLLBACK undoes all of it."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18 release notes: OLD and NEW in RETURNING",
+          "url": "https://www.postgresql.org/docs/18/release-18.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Bringing a table of totals up to date in one statement: MERGE",
+      "body": "Shop owners want to see what they've taken each month. Adding up every payment on every visit would be slow, so the app keeps a summary table, `merchant_month_totals`, with one row per shop per month: the shop, the month, the total of its succeeded payments in cents (`gross_minor`) and how many there were (`payment_count`). Every night, a job works the totals out again from the payments and brings the table up to date.\n\nSince the last run, three things can have happened to a month. A shop's first payment came in: a row to insert. A late payment arrived: a row to correct. A payment turned out to have failed, and the shop has no sales left that month: a row to delete. ON CONFLICT can insert and update, but it can't delete. `MERGE` does all three in one statement:\n\n```sql\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded' AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action(), t.merchant_id, old.gross_minor, new.gross_minor;\n```\n\nThe part after `USING` is the source: a query that works out February's totals from the payments. `GROUP BY merchant_id` makes one row per shop, and `sum` and `count` add up that shop's payments. MERGE lines up the target table with the source on the `ON` condition, here the same shop and month, and puts every row into one of three classes. MATCHED rows are on both sides. NOT MATCHED rows are only in the source. NOT MATCHED BY SOURCE rows are only in the target; that class came in PostgreSQL 17.\n\nFor each row, the first WHEN clause whose class and extra condition fit decides what happens. The extra condition on MATCHED uses `IS DISTINCT FROM`, which means \"differs\", with NULL treated as an ordinary value. So a matched row whose numbers already agree fits no clause and is left alone. On paper, this is someone at closing time with the totals page and the day's receipts: write in the shop that's missing, correct the wrong total, cross out the month with no sales left.\n\nMind the condition on the DELETE. The source holds February only, so every January row is \"not matched by source\" too. Leave out `AND t.month = ...` and the MERGE deletes all of January, which nobody asked for, as the Try it shows. `RETURNING` on MERGE, with `merge_action()` to say which branch produced each row, came in PostgreSQL 17, and PostgreSQL 18 added `old` and `new`. If two source rows match the same target row, MERGE fails with `MERGE command cannot affect row a second time`.\n\nMERGE has one weakness, and it's the opening's problem again. It sorts rows into MATCHED and NOT MATCHED from the data it sees when it starts, and nothing makes it wait for another session's unfinished insert of the same key. When two sessions (open connections to the database, like our two workers) merge the same new shop and month at once, both choose INSERT, and the second fails with 23505. The PostgreSQL manual points to ON CONFLICT for that case.\n\n**MERGE syncs a table from a source, one job at a time. Messages that can arrive twice at once go through ON CONFLICT.**\n\nThat's the limit of today's tools: each is safe only for the writer it was built for. And we typed every statement into psql by hand. A real program sends its own SQL, and that has costs of its own.",
+      "try": {
+        "title": "Sync February's totals",
+        "minutes": 5,
+        "steps": [
+          "Start the database if it isn't running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
+          "Run the block. Inside a transaction, it creates a totals table, fills it with last night's numbers for January and February, and merges February's payments into it. The comments in the INSERT say what has changed since last night.",
+          "Before the second MERGE, predict which rows it will delete."
+        ],
+        "code": {
+          "lang": "postgresql",
+          "title": "psql, database course",
+          "src": "\\pset null '∅'\nBEGIN;\nCREATE TABLE merchant_month_totals (\n    merchant_id    bigint NOT NULL REFERENCES merchants,\n    month          date   NOT NULL,\n    gross_minor    bigint NOT NULL,\n    payment_count  int    NOT NULL,\n    PRIMARY KEY (merchant_id, month)\n);\nINSERT INTO merchant_month_totals VALUES\n    (1, '2026-01-01',   4250, 1), (4, '2026-01-01', 129900, 1),\n    (1, '2026-02-01',   6120, 1),     -- payment 11 arrived after last night's run\n    (2, '2026-02-01',   3400, 1),     -- payment 10 was later reported failed\n    (4, '2026-02-01',  54999, 1),\n    (7, '2026-02-01',   1450, 1);     -- merchant 3 has no February row yet\n\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT (merchant_id, month, gross_minor, payment_count)\n    VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month,\n          old.gross_minor AS old_gross, new.gross_minor AS new_gross;\n\nSELECT * FROM merchant_month_totals ORDER BY month, merchant_id;\n\n-- the same MERGE without \"AND t.month = ...\" on the DELETE branch\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN NOT MATCHED BY SOURCE THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month;\nROLLBACK;"
+        },
+        "expect": "```postgresql\n action | merchant_id |   month    | old_gross | new_gross\n--------+-------------+------------+-----------+-----------\n UPDATE |           1 | 2026-02-01 |      6120 |      8620\n DELETE |           2 | 2026-02-01 |      3400 |         ∅\n INSERT |           3 | 2026-02-01 |         ∅ |       275\n(3 rows)\n\nMERGE 3\n```\n\nShops 4 and 7 were already right, so they aren't in the output: the `IS DISTINCT FROM` test left them alone. The SELECT shows the two January rows untouched and four February rows. The second MERGE, without the month test, returns `DELETE | 1 | 2026-01-01` and `DELETE | 4 | 2026-01-01`: it deleted January, because January isn't in February's source. The ROLLBACK removes the table again."
+      },
+      "refs": [
+        {
+          "title": "PostgreSQL 18: MERGE",
+          "url": "https://www.postgresql.org/docs/18/sql-merge.html",
+          "kind": "docs"
+        }
+      ]
+    }
   ],
-  "answer": 1,
-  "why": "A SELECT never waits for an uncommitted INSERT: it reads committed data and finds nothing in both sessions. The unique index is what notices: the second INSERT finds the first one's uncommitted entry, waits for that transaction, and fails with 23505 once it commits. Without the unique constraint, the third option is what you would get: the same payment stored twice."
- },
- "sections": [
-  {
-   "h": "A jsonb column stores a parsed document, so SQL can look inside it",
-   "body": "Every payment carries what the risk engine said about it, and the shape of that keeps changing. A web payment gets a score and a list of rules that fired. Next month the fraud team adds a device fingerprint for mobile, then a 3-D Secure result. A column per field would mean a migration for every new rule, so `payments.metadata` holds the engine's JSON as it arrived:\n\n```json\n{\"channel\": \"web\", \"risk\": {\"score\": 91, \"rules\": [\"velocity\"]}}\n```\n\nThe simplest version stores it as `text`, and then PostgreSQL knows nothing about it. A truncated document is stored without complaint, and every question becomes string matching: `metadata LIKE '%velocity%'` also matches a rule called `velocity_hourly`, or a note that mentions the word.\n\nThe `jsonb` type parses the text once, when you write it, and rejects anything that is not valid JSON. It stores the result as a binary tree of keys and values, so a query can walk straight to `risk`, then to `score`, without parsing the document again. The older `json` type keeps the original text, with its whitespace, key order and duplicate keys. `jsonb` normalizes it: keys come back in its own order, and of two equal keys only the last one survives. Use `jsonb` unless you must return the exact bytes you were sent.\n\nTwo operators walk into a document. `->` takes a key, or an array position, and returns jsonb: still a document. `->>` does the same and returns text. So `metadata -> 'risk' -> 'score'` is the jsonb number 91, and `metadata -> 'risk' ->> 'score'` is the string `'91'`. In Kotlin terms, `->` is Jackson's `node.get(\"score\")`, still a `JsonNode`, and `->>` is `node.get(\"score\").asText()`.\n\nThe difference bites in comparisons. `metadata -> 'risk' ->> 'score' > '50'` compares strings, character by character, and `'8' > '50'` because `'8'` sorts after `'5'`. On the 37 seeded payments it finds 14 high-risk payments, and six of them score 6 to 9. Cast before you compare: `(metadata -> 'risk' ->> 'score')::int > 50` finds the right 8.\n\nThe operator to know best is containment, `@>`. `metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` asks whether the document contains that smaller document: a `risk` object whose `rules` array has the element `\"velocity\"`, whatever else is around it. It finds payments 3, 15 and 18, and never a rule that only starts with the same letters. Its cousin `?` asks whether a key, or a string element of an array, exists: `metadata -> 'risk' -> 'rules' ? 'velocity'`.",
-   "try": {
-    "title": "Inside a document, and the text trap",
-    "minutes": 4,
-    "steps": [
-     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-     "Run the block. Compare the two arrows' types, then the two counts: why do they differ?",
-     "The last statement fails on purpose: read the error."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "SELECT payment_id, metadata FROM payments WHERE payment_id IN (3, 8, 18);\n\nSELECT metadata -> 'risk' -> 'score'  AS arrow,\n       metadata -> 'risk' ->> 'score' AS double_arrow,\n       pg_typeof(metadata -> 'risk' -> 'score')  AS arrow_type,\n       pg_typeof(metadata -> 'risk' ->> 'score') AS double_arrow_type\nFROM payments WHERE payment_id = 3;\n\nSELECT count(*) FILTER (WHERE metadata -> 'risk' ->> 'score' > '50')      AS compared_as_text,\n       count(*) FILTER (WHERE (metadata -> 'risk' ->> 'score')::int > 50) AS compared_as_int\nFROM payments;\n\nSELECT payment_id, metadata -> 'risk' ->> 'score' AS score\nFROM payments\nWHERE metadata -> 'risk' ->> 'score' > '50' AND (metadata -> 'risk' ->> 'score')::int <= 50\nORDER BY payment_id;\n\nSELECT payment_id FROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'\nORDER BY payment_id;\n\nSELECT '{\"b\": 1, \"a\": 2, \"a\": 3}'::json AS as_json, '{\"b\": 1, \"a\": 2, \"a\": 3}'::jsonb AS as_jsonb;\nSELECT '{\"channel\": \"web\", \"risk\": {\"score\": 91'::jsonb;"
+  "compare": {
+    "title": "Storing one payment message safely: Oracle and PostgreSQL",
+    "a": {
+      "label": "Oracle",
+      "lang": "sql",
+      "title": "Oracle: MERGE is the upsert",
+      "src": "MERGE INTO payments p\nUSING (SELECT :uid AS payment_uid, :card AS card_id,\n              :merchant AS merchant_id, :amount AS amount_minor,\n              :status AS status, :created AS created_at\n       FROM dual) m\nON (p.payment_uid = m.payment_uid)\nWHEN MATCHED THEN\n    UPDATE SET p.status = m.status\n    WHERE p.status = 'pending' AND m.status <> 'pending'\nWHEN NOT MATCHED THEN\n    INSERT (payment_uid, card_id, merchant_id,\n            amount_minor, status, created_at)\n    VALUES (m.payment_uid, m.card_id, m.merchant_id,\n            m.amount_minor, m.status, m.created_at);\n-- two sessions inserting the same new uid at once:\n-- the second can fail with ORA-00001; catch and retry"
     },
-    "expect": "```postgresql\n arrow | double_arrow | arrow_type | double_arrow_type\n-------+--------------+------------+-------------------\n 91    | 91           | jsonb      | text\n\n compared_as_text | compared_as_int\n------------------+-----------------\n               14 |               8\n\n payment_id | score\n------------+-------\n          2 | 8\n         12 | 7\n         14 | 6\n         21 | 9\n         25 | 6\n         34 | 7\n(6 rows)\n```\n\nThe two arrows print the same characters but return different types. Compared as text, six single-digit scores count as more than 50. The containment query returns 3, 15 and 18. `json` gives back the text exactly as written, `{\"b\": 1, \"a\": 2, \"a\": 3}`, while `jsonb` returns `{\"a\": 3, \"b\": 1}`: reordered, and only the last `a` kept. The truncated document fails with `invalid input syntax for type json` and `The input string ended unexpectedly.`"
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18: JSON types",
-     "url": "https://www.postgresql.org/docs/18/datatype-json.html",
-     "kind": "docs"
+    "b": {
+      "label": "PostgreSQL 18",
+      "lang": "sql",
+      "title": "PostgreSQL: INSERT ... ON CONFLICT",
+      "src": "INSERT INTO payments AS p\n       (payment_uid, card_id, merchant_id,\n        amount_minor, status, created_at)\nVALUES (:uid, :card, :merchant,\n        :amount, :status, :created)\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending'\n  AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id,\n          old.status, new.status;\n-- a concurrent insert of the same uid makes this\n-- one wait, then take the DO UPDATE branch:\n-- no error to catch"
     },
-    {
-     "title": "PostgreSQL 18: JSON functions and operators",
-     "url": "https://www.postgresql.org/docs/18/functions-json.html",
-     "kind": "docs"
-    }
-   ]
+    "note": "Oracle Database is a commercial database program that many banks run. It has no ON CONFLICT clause, so Oracle code writes the upsert as a MERGE whose source is a single row, often taken from `dual`, Oracle's built-in table of one row. PostgreSQL has MERGE too, since version 15, and with the same race: MERGE decides MATCHED or NOT MATCHED before it writes, so two MERGEs of the same new key at once can both choose INSERT, and the unique index rejects the second (ORA-00001 is Oracle's duplicate key error). INSERT ... ON CONFLICT is different, because the unique index decides inside the write: the second session waits for the first, then takes the DO UPDATE or DO NOTHING branch, with no error to catch. The WHERE on the update branch exists in both and does the same job: a late message never moves a payment backward. PostgreSQL 18 adds RETURNING old and new to both statements, and Oracle 23ai added them for UPDATE and MERGE."
   },
-  {
-   "h": "A GIN index answers containment by looking up every key and value",
-   "body": "The large data set has 478 near-duplicate payments, flagged in their metadata with `\"injected_dup\": true`. Finding them with `metadata @> '{\"injected_dup\": true}'` reads all 23,818 pages of payments, which takes between half a second and a few seconds depending on how busy Docker is.\n\nA B-tree index (lesson 8 used one, and the Storage track builds them up properly) cannot help. It sorts whole values, and \"contains this key somewhere inside\" is not a range of sorted documents. What helps is the kind of index at the back of a book: every word, with the pages it appears on. A **GIN index** (generalized inverted index) is exactly that. For every key and every value that occurs in any document, it keeps a sorted list of the rows that contain it. For `@>`, PostgreSQL looks up each key and value of the query document, intersects their row lists, and reads only those rows.\n\n`CREATE INDEX payments_metadata_gin ON payments USING gin (metadata)` takes a few seconds and is under 9 MB, against 186 MB for the table. The same query becomes a Bitmap Index Scan on the GIN index and reads 17 pages: 3 of the index and the 14 table pages where the 478 rows live. It takes under a millisecond. The plan shows a `Recheck Cond` because the default GIN index stores keys and values without how they nest, so PostgreSQL checks each candidate row against the full condition.\n\nTwo limits. A GIN index on `metadata` serves only the jsonb operators `@>`, `?`, `?|`, `?&`, `@?` and `@@`. `metadata ->> 'injected_dup' = 'true'` means the same as the containment query and still reads every page, because `->>` produces text that the index does not hold. Write containment. And an index helps only when it lets PostgreSQL read less: the velocity rule fired on 5% of payments, 50,188 rows spread over 21,036 of the 23,818 pages, and counting them through the GIN index was slower than the sequential scan, since it visited almost every page anyway.\n\nIf you only ever query with `@>`, `USING gin (metadata jsonb_path_ops)` builds a smaller index, 4.5 MB here. It supports `@>`, `@?` and `@@`, and not the key-exists operators.",
-   "figure": {
-    "svg": "<svg viewBox=\"0 0 680 300\" role=\"img\" aria-label=\"A GIN index lists, for every key and value, the payments that contain it; containment intersects the lists for risk, rules and velocity\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">three documents (payments.metadata)</text><rect class=\"box\" x=\"20\" y=\"34\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"55\" text-anchor=\"start\">payment 3</text><text class=\"t-s t-m\" x=\"34\" y=\"73\" text-anchor=\"start\">web, score 91, rules: velocity</text><rect class=\"box\" x=\"20\" y=\"96\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"117\" text-anchor=\"start\">payment 8</text><text class=\"t-s t-m\" x=\"34\" y=\"135\" text-anchor=\"start\">web, score 67, rules: geo_mismatch</text><rect class=\"box\" x=\"20\" y=\"158\" width=\"250\" height=\"50\" rx=\"8\"/><text class=\"t-s\" x=\"34\" y=\"179\" text-anchor=\"start\">payment 18</text><text class=\"t-s t-m\" x=\"34\" y=\"197\" text-anchor=\"start\">android, score 79, rules: velocity</text><text class=\"t-s t-m\" x=\"310\" y=\"22\" text-anchor=\"start\">GIN entries: key or value, then the rows</text><rect class=\"box-a\" x=\"310\" y=\"32\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"48.5\" text-anchor=\"start\">key   risk</text><text class=\"t-s t-code\" x=\"646\" y=\"48.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"61\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"77.5\" text-anchor=\"start\">key   rules</text><text class=\"t-s t-code\" x=\"646\" y=\"77.5\" text-anchor=\"end\">3, 8, 18</text><rect class=\"box-a\" x=\"310\" y=\"90\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"106.5\" text-anchor=\"start\">value velocity</text><text class=\"t-s t-code\" x=\"646\" y=\"106.5\" text-anchor=\"end\">3, 18</text><rect class=\"box\" x=\"310\" y=\"119\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"135.5\" text-anchor=\"start\">value geo_mismatch</text><text class=\"t-s t-code\" x=\"646\" y=\"135.5\" text-anchor=\"end\">8</text><rect class=\"box\" x=\"310\" y=\"148\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"164.5\" text-anchor=\"start\">value web</text><text class=\"t-s t-code\" x=\"646\" y=\"164.5\" text-anchor=\"end\">3, 8</text><rect class=\"box\" x=\"310\" y=\"177\" width=\"350\" height=\"24\" rx=\"8\"/><text class=\"t-s t-code\" x=\"324\" y=\"193.5\" text-anchor=\"start\">value android</text><text class=\"t-s t-code\" x=\"646\" y=\"193.5\" text-anchor=\"end\">18</text><line class=\"ln-d\" x1=\"270\" y1=\"80\" x2=\"306\" y2=\"80\" marker-end=\"url(#arr)\"/><rect class=\"box-b\" x=\"20\" y=\"222\" width=\"400\" height=\"30\" rx=\"8\"/><text class=\"t-s t-code\" x=\"32\" y=\"241.5\" text-anchor=\"start\">metadata @&gt; '{\"risk\": {\"rules\": [\"velocity\"]}}'</text><rect class=\"box-ok\" x=\"440\" y=\"222\" width=\"220\" height=\"30\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"241.5\" text-anchor=\"middle\">intersect: rows 3, 18</text><line class=\"ln-a\" x1=\"420\" y1=\"237\" x2=\"436\" y2=\"237\" marker-end=\"url(#arr)\"/><text class=\"t-s t-a\" x=\"20\" y=\"284\" text-anchor=\"start\">The default GIN index keeps keys and values, not how they nest, so PostgreSQL rechecks rows 3 and 18.</text></svg>",
-    "caption": "Three seeded documents and some of their GIN entries: containment looks up risk, rules and velocity, intersects the row lists, and rechecks the rows it finds."
-   },
-   "try": {
-    "title": "478 rows out of a million",
-    "minutes": 5,
+  "worked": {
+    "title": "Storing a batch of 500 messages in one statement",
     "steps": [
-     "This Try it uses the large data set. If an earlier lesson did not load it, load it now from the `labs` folder (`docker compose -f env/postgres.yml exec db psql -U sfz -d course -f /seed/load-big.sql`, about a minute). Then open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-     "Run the block. The `CREATE INDEX` takes a few seconds. Compare the Buffers of the three plans.",
-     "Why does the third query, which asks the same question, not use the index?"
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "SET search_path = big, public;\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nCREATE INDEX payments_metadata_gin ON payments USING gin (metadata);\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata @> '{\"injected_dup\": true}';\n\nEXPLAIN (ANALYZE, COSTS OFF)\nSELECT payment_id, card_id, amount_minor FROM payments\nWHERE metadata ->> 'injected_dup' = 'true';\n\nSELECT pg_size_pretty(pg_relation_size('payments_metadata_gin')) AS gin_index,\n       pg_size_pretty(pg_relation_size('payments')) AS payments_table;\nDROP INDEX payments_metadata_gin;\nRESET search_path;"
-    },
-    "expect": "Trimmed, from one run (the times depend on your machine and on how busy Docker is; the buffer counts do not):\n\n```postgresql\n Gather (actual time=2809.428..2860.989 rows=478.00 loops=1)\n   Buffers: shared hit=13166 read=10652\n   ->  Parallel Seq Scan on payments (actual time=2798.341..2806.396 rows=159.33 loops=3)\n         Filter: (metadata @> '{\"injected_dup\": true}'::jsonb)\n         Rows Removed by Filter: 333333\n\n Bitmap Heap Scan on payments (actual time=0.159..0.561 rows=478.00 loops=1)\n   Recheck Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n   Heap Blocks: exact=14\n   Buffers: shared hit=17\n   ->  Bitmap Index Scan on payments_metadata_gin (actual time=0.075..0.075 rows=478.00 loops=1)\n         Index Cond: (metadata @> '{\"injected_dup\": true}'::jsonb)\n\n Gather (actual time=579.725..591.767 rows=478.00 loops=1)\n   Buffers: shared hit=13114 read=10704\n   ->  Parallel Seq Scan on payments (actual time=541.899..542.006 rows=159.33 loops=3)\n         Filter: ((metadata ->> 'injected_dup'::text) = 'true'::text)\n```\n\nAll 23,818 pages, then 17, then all 23,818 again for the `->>` version, though the index exists. The sizes are `8856 kB` for the index and `186 MB` for the table. The block drops the index at the end."
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18: jsonb indexing",
-     "url": "https://www.postgresql.org/docs/18/datatype-json.html#JSON-INDEXING",
-     "kind": "docs"
-    },
-    {
-     "title": "PostgreSQL 18: GIN indexes",
-     "url": "https://www.postgresql.org/docs/18/gin.html",
-     "kind": "docs"
-    }
-   ]
-  },
-  {
-   "h": "Check, then insert, lets one message in twice",
-   "body": "The card network delivers each payment message at least once. A Kafka consumer that crashes before it commits its offset gets the same message again after the rebalance, sometimes while the first consumer is still working on it. `payment_uid` is the network's idempotency key, so the ingest must store each uid once. The obvious code checks first:\n\n```kotlin\nif (payments.findByUid(msg.uid) == null) {     // both consumers: not found\n    payments.insert(msg)                       // both consumers: insert\n}\n```\n\nTwo consumers can both run the check before either inserts. Both find nothing, and both insert. Without a unique constraint on payment_uid, that stores one payment twice, and settlement pays the merchant twice. The course schema has the constraint (`payment_uid uuid NOT NULL UNIQUE`), and it saves you. The second `INSERT` finds the first consumer's uncommitted entry in the unique index and waits for that transaction to end. If it commits, the second fails with `duplicate key value violates unique constraint`, SQLSTATE 23505. If it rolls back, the second goes through. Either way, one row.\n\nCatching that error is clumsy. An error aborts the transaction it happens in, so a consumer that stores a batch of 500 messages in one transaction loses all 500 to one duplicate, unless it wraps each insert in a savepoint.\n\n`INSERT ... ON CONFLICT (payment_uid) DO NOTHING` moves the decision into the statement. The insert consults the unique index itself, in the same step as the write. When the key is already there, or is being inserted by a transaction still in progress (it waits for that one first), it skips the row instead of failing. Add `RETURNING payment_id` and you learn which happened: one row back means inserted, none means a repeat. For the DO UPDATE form, the PostgreSQL docs guarantee an insert or an update \"even under high concurrency\", and the stepper shows DO NOTHING holding up the same way.\n\nThat is the picture for this lesson: **the unique index is the referee**. A check in a separate statement answers a question that can be out of date before you act on it. Only a write that consults the index as it happens is safe against a twin arriving in the same millisecond. In Kotlin terms, check-then-insert is `if (!map.containsKey(k)) map[k] = v`, and `ON CONFLICT DO NOTHING` is `ConcurrentHashMap.putIfAbsent(k, v)`.",
-   "stepper": {
-    "title": "The same message on two consumers",
-    "intro": "Click Next. The middle column is the unique index on payment_uid; each side is one consumer's transaction.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"The same payment message reaches two consumers\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">the message arrives twice</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">message ...a001</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">message ...a001 again</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">After a rebalance, B was handed the message A is still working on.</text></svg>",
-      "say": "The network sent one payment message, uid `...a001`. A Kafka rebalance handed it to consumer B while consumer A was still processing it. Both are about to store it. The unique index on payment_uid has no entry for that uid yet."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"Both consumers check first and find nothing\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s t-a\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s t-a\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">no entry for ...a001</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">Both checks run before either insert: both find nothing.</text></svg>",
-      "say": "Check, then insert. Each consumer runs `SELECT count(*) ... WHERE payment_uid = ...` in its own transaction. Neither has inserted yet, so both see 0 and both decide to insert. Whatever happens next, the check has already given its answer."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A inserts; B's insert waits on the unique index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-a\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><text class=\"t-s t-m\" x=\"482\" y=\"134\" text-anchor=\"start\">INSERT: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">B's INSERT finds A's uncommitted entry for the same key and waits.</text></svg>",
-      "say": "A inserts. The new entry is in the unique index already, marked as belonging to A's open transaction. B's INSERT reaches the index, finds an entry for the same key from a transaction that has not finished, and waits: PostgreSQL cannot know yet whether A will commit."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits, B fails with a duplicate key error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">check, then insert</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"32\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box\" x=\"28\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"134.5\" text-anchor=\"middle\">INSERT: 1 row</text><text class=\"t-s t-ok\" x=\"32\" y=\"160\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">SELECT count(*): 0</text><text class=\"t-s\" x=\"482\" y=\"108\" text-anchor=\"start\">not found: insert it</text><rect class=\"box-bad\" x=\"478\" y=\"119\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"134.5\" text-anchor=\"middle\">INSERT: ERROR 23505</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-bad\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits and B fails: duplicate key. Without the unique index</text><text class=\"t-s t-bad\" x=\"20\" y=\"274\" text-anchor=\"start\">B would have committed too: one payment stored twice.</text></svg>",
-      "say": "A commits, and B's INSERT fails with `duplicate key value violates unique constraint`, SQLSTATE 23505. The unique index kept the data right, and B's transaction is now aborted, along with anything else it held. Without the index, both inserts would have committed: the merchant gets paid twice."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"With ON CONFLICT, both consumers insert directly; B waits on the index\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-a\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><text class=\"t-s t-m\" x=\"482\" y=\"108\" text-anchor=\"start\">DO NOTHING: waits for A</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: A's, not committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">0</text><text class=\"t-s t-a\" x=\"20\" y=\"252\" text-anchor=\"start\">No separate check. Each INSERT asks the unique index itself.</text></svg>",
-      "say": "Now each consumer sends one statement: `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id`. A's goes in and returns payment 40. B's reaches the same uncommitted entry and waits for A, exactly as before. The difference is what happens after the wait."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"A commits and B's insert does nothing, without an error\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-ok\" x=\"32\" y=\"134\" text-anchor=\"start\">COMMIT: ok</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 0 rows</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-ok\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: committed</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">A commits. B's INSERT sees the committed key and skips the row:</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">INSERT 0 0, no error, and RETURNING says it was a repeat.</text></svg>",
-      "say": "A commits. B's INSERT sees that the key now exists and skips the row: `INSERT 0 0`, no error, no aborted transaction. RETURNING gave B zero rows, which is how its code knows the message was a repeat. One payment."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 680 330\" role=\"img\" aria-label=\"If A rolls back instead, B's insert succeeds\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><text class=\"t-s t-m\" x=\"20\" y=\"22\" text-anchor=\"start\">One network message, uid ...a001, delivered to two consumers</text><rect class=\"box-b\" x=\"440\" y=\"8\" width=\"220\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"550\" y=\"23.5\" text-anchor=\"middle\">ON CONFLICT DO NOTHING</text><text class=\"t-s\" x=\"115\" y=\"54\" text-anchor=\"middle\">Consumer A</text><rect class=\"box\" x=\"20\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"32\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box\" x=\"28\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"115\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row (40)</text><text class=\"t-s t-bad\" x=\"32\" y=\"134\" text-anchor=\"start\">ROLLBACK</text><text class=\"t-s\" x=\"565\" y=\"54\" text-anchor=\"middle\">Consumer B</text><rect class=\"box\" x=\"470\" y=\"62\" width=\"190\" height=\"156\" rx=\"8\"/><text class=\"t-s\" x=\"482\" y=\"82\" text-anchor=\"start\">INSERT ... ON CONFLICT</text><rect class=\"box-ok\" x=\"478\" y=\"93\" width=\"174\" height=\"22\" rx=\"8\"/><text class=\"t-s\" x=\"565\" y=\"108.5\" text-anchor=\"middle\">DO NOTHING: 1 row</text><text class=\"t-s t-m\" x=\"340\" y=\"54\" text-anchor=\"middle\">unique index on payment_uid</text><rect class=\"box-a\" x=\"230\" y=\"66\" width=\"220\" height=\"34\" rx=\"8\"/><text class=\"t-s\" x=\"340\" y=\"87.5\" text-anchor=\"middle\">...a001: B's</text><text class=\"t-s t-m\" x=\"340\" y=\"140\" text-anchor=\"middle\">payments with this uid</text><rect class=\"box-ok\" x=\"290\" y=\"150\" width=\"100\" height=\"34\" rx=\"8\"/><text class=\"t\" x=\"340\" y=\"171.5\" text-anchor=\"middle\">1</text><text class=\"t-s t-ok\" x=\"20\" y=\"252\" text-anchor=\"start\">Had A rolled back, B's INSERT would have gone ahead.</text><text class=\"t-s t-ok\" x=\"20\" y=\"274\" text-anchor=\"start\">Either way, exactly one payment: the unique index is the referee.</text></svg>",
-      "say": "Had A crashed or rolled back instead, its entry would vanish and B's INSERT would insert the payment itself. Every interleaving ends with exactly one row, because the decision is taken by the unique index at the moment of the write, not by a check that ran earlier."
-     }
+      {
+        "say": "Real workers don't take messages one at a time. Say the messages come from Kafka, a program that keeps a long list of messages and lets other programs read them in order, and our worker reads 500 at a time (`records`). Some may repeat each other, because the card reader sent them again. Some may repeat payments already stored, and some bring the final status of a pending payment. First, keep one message per code, preferring a final status over `pending`, because one statement may not touch the same row twice:",
+        "code": "// 1. one message per uid; a final status beats 'pending'\nval batch = records.map { it.value() }                        // List<PaymentMessage>\n    .sortedByDescending { it.status != \"pending\" }             // final statuses first\n    .distinctBy { it.uid }                                     // keeps the first of each uid",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Send the whole batch as six arrays, one per column, and let `unnest` turn them back into rows inside the database. An array here is a list of values sent as one parameter, one `?`. That's one statement and one trip across the network for 500 messages, instead of 500. The ON CONFLICT clause is the one from this lesson.",
+        "code": "-- 2. the statement: unnest turns six arrays into rows\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nSELECT * FROM unnest(?::uuid[], ?::bigint[], ?::bigint[], ?::bigint[], ?::text[], ?::timestamptz[])\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status, new.status",
+        "lang": "sql"
+      },
+      {
+        "say": "Bind each column as an array through JDBC, the standard library that Java and Kotlin programs use to talk to a database (the next lesson opens it up). The rows that come back are exactly the changes: an insert has a NULL old status, a payment that moved on has `pending`, and repeats return nothing.",
+        "code": "// 3. bind the arrays and read what changed\nval changes = conn.prepareStatement(UPSERT_BATCH).use { ps ->\n    ps.setArray(1, conn.createArrayOf(\"uuid\", batch.map { it.uid }.toTypedArray()))\n    ps.setArray(2, conn.createArrayOf(\"bigint\", batch.map { it.cardId }.toTypedArray()))\n    ps.setArray(3, conn.createArrayOf(\"bigint\", batch.map { it.merchantId }.toTypedArray()))\n    ps.setArray(4, conn.createArrayOf(\"bigint\", batch.map { it.amountMinor }.toTypedArray()))\n    ps.setArray(5, conn.createArrayOf(\"text\", batch.map { it.status }.toTypedArray()))\n    ps.setArray(6, conn.createArrayOf(\"timestamptz\", batch.map { Timestamp.from(it.createdAt) }.toTypedArray()))\n    ps.executeQuery().use { rs ->\n        buildList { while (rs.next()) add(Change(rs.getLong(1), rs.getString(2), rs.getString(3))) }\n    }\n}",
+        "lang": "kotlin"
+      },
+      {
+        "say": "Save the payments first, and tell Kafka the batch is done second (`consumer` is the worker's link to Kafka). If the worker dies between the two lines, Kafka hands it the same batch again, and the upsert turns every message in it into a no-op, a statement that changes nothing. Messages that arrive at least once, plus a write that's safe to repeat, store each payment exactly once.",
+        "code": "// 4. order of the two commits\nconn.commit()                      // the payments are durable\nconsumer.commitSync()              // only now tell Kafka the batch is done\n// a crash between the two lines: the batch comes back, and every row in it\n// hits ON CONFLICT and changes nothing",
+        "lang": "kotlin"
+      }
     ]
-   },
-   "try": {
-    "title": "Race two inserts",
-    "minutes": 5,
-    "steps": [
-     "Open two terminals in the `labs` folder and run psql in both: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Call them A and B. Start the database first if it is not running (`docker compose -f env/postgres.yml up -d --wait`).",
-     "Run part 1, switching terminals at each comment. B's INSERT hangs until A commits: what does it print then?",
-     "Run part 2 the same way. What does B's INSERT return after A's COMMIT?"
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, two sessions on database course",
-     "src": "-- part 1: check, then insert\n-- A\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- B\nBEGIN;\nSELECT count(*) FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n-- A\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00');\n-- A\nCOMMIT;\n-- B\n\\echo :SQLSTATE\nROLLBACK;\n-- A: remove it again\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\n\n-- part 2: let the unique index decide\n-- A\nBEGIN;\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- B (waits)\nINSERT INTO payments (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO NOTHING\nRETURNING payment_id;\n-- A\nCOMMIT;\nSELECT payment_id, status FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';\nDELETE FROM payments WHERE payment_uid = '019f1d1f-0500-7000-8000-0000000a0001';"
-    },
-    "expect": "In part 1 both counts are 0, and B's INSERT prints nothing until A commits. Then:\n\n```postgresql\n-- B\nERROR:  duplicate key value violates unique constraint \"payments_payment_uid_key\"\nDETAIL:  Key (payment_uid)=(019f1d1f-0500-7000-8000-0000000a0001) already exists.\n23505\n```\n\nIn part 2, A's INSERT returns one row, and B's waits again. When A commits, B's finishes without an error:\n\n```postgresql\n-- B\n payment_id\n------------\n(0 rows)\n\nINSERT 0 0\n```\n\nThe final SELECT shows a single pending payment. Its payment_id was 40 on a fresh database: part 1 used up 38 and 39, although only one of those inserts survived, and B's skipped insert in part 2 took 41. Each part deletes the payment again, so the seed stays as it was."
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18: INSERT, the ON CONFLICT clause",
-     "url": "https://www.postgresql.org/docs/18/sql-insert.html",
-     "kind": "docs"
-    }
-   ]
   },
-  {
-   "h": "ON CONFLICT DO UPDATE turns the second message into an update",
-   "body": "Not every repeat is a duplicate. Payment 20 is `pending`: the network authorized it and will send the capture later, a second message with the same uid and the status `succeeded`. This time the conflict should update the row:\n\n```sql\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n```\n\n`EXCLUDED` is the row the INSERT proposed and could not insert. The `WHERE` decides whether the existing row changes at all. Without it, a late `pending`, an authorization message that arrives after its capture, would set a succeeded payment back to pending. With it, only a pending payment moves, and only to a final status. Any other repeat leaves the row alone and returns nothing.\n\n`RETURNING old.status, new.status` is new in PostgreSQL 18: `old` is the row before the statement and `new` the row after. For an insert, `old` is all NULL; for an update, both are filled. One statement now tells the consumer what it did: inserted, updated, or nothing.\n\nThree rules decide whether the statement works at all:\n\n- The conflict target names a unique index or constraint. `ON CONFLICT (payment_uid)` works because payment_uid is UNIQUE; a clash on any other unique index, the primary key for example, still raises an error.\n- One statement may not change the same row twice. A batch that carries one uid twice fails with `ON CONFLICT DO UPDATE command cannot affect row a second time`, so deduplicate the batch first.\n- Every attempted insert takes a value from the payment_id sequence, including the ones that end in a conflict. Ids get gaps, so never use them as a count.\n\n`DO UPDATE` writes a new version of the row, as every UPDATE does (lesson 1), even when the new values equal the old ones. The `WHERE` saves those writes too.",
-   "try": {
-    "title": "Capture, repeat, late message, new payment",
+  "lab": {
+    "title": "The fraud list, a safe ingest and the monthly MERGE",
+    "minutes": 15,
+    "needs": [
+      "Docker"
+    ],
+    "files": [
+      "labs/sql/src/main/resources/sfz/sql/l09/risky_payments.sql",
+      "labs/sql/src/main/resources/sfz/sql/l09/ingest_payment.sql",
+      "labs/sql/src/main/resources/sfz/sql/l09/settle_month.sql"
+    ],
+    "run": "./gradlew :sql:test --tests 'sfz.sql.l09.*'",
+    "steps": [
+      "With Docker running, run the tests from the `labs` folder with the command above. Tests are small programs that check your answers against a real PostgreSQL loaded with the seed data. Seven of the eight fail for now. The one that passes inserts a new message twice, one delivery after the other, which the placeholder query handles. Its trouble starts when two deliveries overlap.",
+      "`risky_payments.sql` compares the score as text and searches the document for letters. Make it return the payments with a score of 50 or more, or with the velocity rule, comparing numbers and using containment.",
+      "`ingest_payment.sql` reads messages from a temporary table, `inbound`, and checks before it inserts. Make it one INSERT ... ON CONFLICT statement that inserts new payments, moves a pending payment to its final status, ignores everything else, and returns one row per change. One test runs it in two sessions at the same moment.",
+      "`settle_month.sql` is a MERGE that rewrites every March row, even the correct ones, and deletes every month that March's source doesn't mention. Make it change only the March rows that are wrong, missing or gone.",
+      "Run the tests until all eight pass. The second test of each exercise adds rows first: a high score of 100 and a rule named `velocity_hourly`; a batch mixing new, repeated, late and final messages; and new March payments next to a February one."
+    ],
+    "hints": [
+      "`WHERE (metadata -> 'risk' ->> 'score')::int >= 50 OR metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'`. A document without a score gives NULL for the cast, which is neither >= 50 nor an error.",
+      "`INSERT INTO payments AS p (...) SELECT ... FROM inbound ON CONFLICT (payment_uid) DO UPDATE SET status = EXCLUDED.status WHERE p.status = 'pending' AND EXCLUDED.status <> 'pending' RETURNING p.payment_id, old.status AS old_status, new.status AS new_status`.",
+      "Add `AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count)` to WHEN MATCHED, and `AND t.month = date '2026-03-01'` to WHEN NOT MATCHED BY SOURCE."
+    ],
+    "done_when": "All eight tests in `JsonbUpsertMergeTest` pass."
+  },
+  "drill": {
+    "title": "The ingest statement, from memory",
     "minutes": 4,
-    "steps": [
-     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`. Type `\\pset null '∅'` if you have not.",
-     "Run the block one statement at a time and predict each result before you run it.",
-     "Statement 5 fails on purpose. The ROLLBACK at the end undoes everything."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "\\pset null '∅'\nBEGIN;\n-- 1. the capture for payment 20, which is pending\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 2. the same capture again\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 3. a late 'pending' for the same payment, without the WHERE guard\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'pending', '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 4. a payment nobody has seen\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019f1d1f-0500-7000-8000-0000000a0001', 1, 1, 4200, 'pending', '2026-07-01 10:00+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status AS old_status, new.status AS new_status;\n\n-- 5. one batch that carries payment 20 twice\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'succeeded', '2026-03-20 10:10+00'),\n       ('019d0ab9-28c0-7014-8000-000000000014', 3, 1, 7425, 'failed',    '2026-03-20 10:10+00')\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status;\nROLLBACK;"
-    },
-    "expect": "```postgresql\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | pending    | succeeded\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n(0 rows)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         20 | succeeded  | pending\n(1 row)\n\n payment_id | old_status | new_status\n------------+------------+------------\n         45 | ∅          | pending\n(1 row)\n\nERROR:  ON CONFLICT DO UPDATE command cannot affect row a second time\nHINT:  Ensure that no rows proposed for insertion within the same command have duplicate constrained values.\n```\n\nStatement 2 changed nothing, so it returned nothing. Statement 3, without the guard, moved a succeeded payment back to pending: that is the bug the WHERE prevents. The new payment got id 45 on a fresh database after the previous Try it: statements 1 to 3 each used up a sequence value though none inserted a row. The ROLLBACK undoes all of it."
-   },
-   "refs": [
-    {
-     "title": "PostgreSQL 18 release notes: OLD and NEW in RETURNING",
-     "url": "https://www.postgresql.org/docs/18/release-18.html",
-     "kind": "docs"
+    "prompt": "Without looking, write the statement that stores one payment message (code, card, shop, amount, status, created_at) so that a repeat changes nothing, a final status moves a pending payment, a late 'pending' never moves a payment backward, and the statement reports whether it inserted, updated or did nothing. Then write the query for the payments whose fraud rules include \"geo_mismatch\" (a card used far from where it usually is), in a form a GIN index on metadata can serve.",
+    "answer": {
+      "lang": "sql",
+      "src": "INSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (payment_uid) DO UPDATE          -- the unique index decides, even mid-race\nSET status = EXCLUDED.status                 -- EXCLUDED: the row the INSERT proposed\nWHERE p.status = 'pending'                   -- only pending payments move,\n  AND EXCLUDED.status <> 'pending'           -- and only forward\nRETURNING p.payment_id,\n          old.status AS old_status,          -- NULL: inserted\n          new.status AS new_status;          -- no row at all: a repeat\n\nSELECT payment_id\nFROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"geo_mismatch\"]}}';   -- containment: GIN can answer it\n-- payments 8 and 31 on the seed"
     }
-   ]
   },
-  {
-   "h": "MERGE brings a table in line with its source in one statement",
-   "body": "Every night a job recomputes each merchant's monthly gross from the succeeded payments into `merchant_month_totals (merchant_id, month, gross_minor, payment_count)`. Since the last run, three things can have happened to a month. A merchant's first payment came in: a row to insert. A late payment arrived: a row to correct. A payment was reversed and the merchant has no sales left that month: a row to delete. `ON CONFLICT` can insert and update, but it cannot delete. `MERGE` does all three in one statement:\n\n```sql\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded' AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action(), t.merchant_id, old.gross_minor, new.gross_minor;\n```\n\nMERGE joins the target to the source on the `ON` condition and puts every row into one of three classes. MATCHED rows are on both sides. NOT MATCHED rows are only in the source. NOT MATCHED BY SOURCE rows are only in the target; that clause came in PostgreSQL 17. For each row, the first WHEN clause whose class and extra condition fit decides what happens. A matched row whose numbers already agree fits no clause and is left alone.\n\nMind the condition on the DELETE. The source holds February only, so every January row is \"not matched by source\" too. Leave out `AND t.month = ...` and the MERGE deletes all of January, as the Try it shows. `RETURNING` on MERGE, with `merge_action()` to say which branch produced each row, came in PostgreSQL 17, and PostgreSQL 18 added `old` and `new`. If two source rows match the same target row, MERGE fails with `MERGE command cannot affect row a second time`.\n\nMERGE has one weakness. It sorts rows into MATCHED and NOT MATCHED from its snapshot, and it has no arbiter index that makes a concurrent insert of the same key wait. When two sessions merge the same new (merchant, month) at once, the second fails with 23505, and the PostgreSQL docs point to `INSERT ... ON CONFLICT` for concurrent upserts. Use MERGE for a batch sync that one job runs at a time, and ON CONFLICT for messages that can arrive twice at once.",
-   "try": {
-    "title": "Sync February's totals",
-    "minutes": 5,
-    "steps": [
-     "Start the database if it is not running (`docker compose -f env/postgres.yml up -d --wait`, from the `labs` folder) and open psql: `docker compose -f env/postgres.yml exec db psql -U sfz -d course`.",
-     "Run the block. It creates a totals table inside a transaction, fills it with last night's numbers for January and February, and merges February's payments into it.",
-     "Before the second MERGE, predict which rows it will delete."
-    ],
-    "code": {
-     "lang": "postgresql",
-     "title": "psql, database course",
-     "src": "\\pset null '∅'\nBEGIN;\nCREATE TABLE merchant_month_totals (\n    merchant_id    bigint NOT NULL REFERENCES merchants,\n    month          date   NOT NULL,\n    gross_minor    bigint NOT NULL,\n    payment_count  int    NOT NULL,\n    PRIMARY KEY (merchant_id, month)\n);\nINSERT INTO merchant_month_totals VALUES\n    (1, '2026-01-01',   4250, 1), (4, '2026-01-01', 129900, 1),\n    (1, '2026-02-01',   6120, 1),     -- payment 11 arrived after last night's run\n    (2, '2026-02-01',   3400, 1),     -- payment 10 was later reported failed\n    (4, '2026-02-01',  54999, 1),\n    (7, '2026-02-01',   1450, 1);     -- merchant 3 has no February row yet\n\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN MATCHED AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count) THEN\n    UPDATE SET gross_minor = s.gross_minor, payment_count = s.payment_count\nWHEN NOT MATCHED THEN\n    INSERT (merchant_id, month, gross_minor, payment_count)\n    VALUES (s.merchant_id, s.month, s.gross_minor, s.payment_count)\nWHEN NOT MATCHED BY SOURCE AND t.month = date '2026-02-01' THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month,\n          old.gross_minor AS old_gross, new.gross_minor AS new_gross;\n\nSELECT * FROM merchant_month_totals ORDER BY month, merchant_id;\n\n-- the same MERGE without \"AND t.month = ...\" on the DELETE branch\nMERGE INTO merchant_month_totals AS t\nUSING (SELECT merchant_id, date '2026-02-01' AS month,\n              sum(amount_minor) AS gross_minor, count(*) AS payment_count\n       FROM payments\n       WHERE status = 'succeeded'\n         AND created_at >= '2026-02-01' AND created_at < '2026-03-01'\n       GROUP BY merchant_id) AS s\nON t.merchant_id = s.merchant_id AND t.month = s.month\nWHEN NOT MATCHED BY SOURCE THEN\n    DELETE\nRETURNING merge_action() AS action, t.merchant_id, t.month;\nROLLBACK;"
-    },
-    "expect": "```postgresql\n action | merchant_id |   month    | old_gross | new_gross\n--------+-------------+------------+-----------+-----------\n UPDATE |           1 | 2026-02-01 |      6120 |      8620\n DELETE |           2 | 2026-02-01 |      3400 |         ∅\n INSERT |           3 | 2026-02-01 |         ∅ |       275\n(3 rows)\n\nMERGE 3\n```\n\nMerchants 4 and 7 were already right and are not in the output: the `IS DISTINCT FROM` test left them alone. The SELECT shows the two January rows untouched and four February rows. The second MERGE, without the month test, returns `DELETE | 1 | 2026-01-01` and `DELETE | 4 | 2026-01-01`: it deleted January because January is not in February's source. The ROLLBACK removes the table again."
-   },
-   "refs": [
+  "recap": [
+    "A `jsonb` column parses a JSON document once, when it's stored, refuses broken ones, and lets SQL look inside: `->` returns jsonb, `->>` returns text. Text compares letter by letter, so turn a number back into a number (`::int`) before you compare it.",
+    "`@>` asks whether a document contains a smaller one. A GIN index lists every key and value with the rows that hold it, like the index at the back of a book, so containment reads only the matching rows. Conditions written with `->>` can't use it.",
+    "Check, then insert, is a race: two workers can both find nothing and both insert. The unique index is the referee, and `INSERT ... ON CONFLICT` asks it in the same step as the write, so a repeat waits, then does nothing instead of failing.",
+    "`ON CONFLICT DO UPDATE SET status = EXCLUDED.status WHERE ...` turns a second message with news into an update, and the WHERE stops a late message from moving a payment backward. PostgreSQL 18's `RETURNING old` and `new` says what happened. One statement can't touch the same row twice.",
+    "`MERGE` inserts, updates and deletes against a source in one statement. Guard its DELETE, or it removes every row the source doesn't mention.",
+    "The limit: MERGE isn't safe when two sessions write the same new key at once, and ON CONFLICT can't delete. Use ON CONFLICT for messages that may arrive twice, and MERGE for one nightly job."
+  ],
+  "closing": "We started with a café customer charged twice for one coffee, because two workers each looked before they wrote. Looking first can't work when the answer changes between the look and the write. The unique index decides at the moment of the write, so with `ON CONFLICT` the repeat is stored as nothing.\n\nNext time a checkout page warns you not to press Pay twice, you've found a system without that referee. A careful one would let you press it ten times and charge you once.\n\nNext, we'll leave psql and send SQL from a program, and find out why storing 2,000 payments one at a time is slow while the database sits idle.",
+  "quiz": [
     {
-     "title": "PostgreSQL 18: MERGE",
-     "url": "https://www.postgresql.org/docs/18/sql-merge.html",
-     "kind": "docs"
+      "q": "A fraud report uses `WHERE metadata -> 'risk' ->> 'score' >= '70'`. Which scores does it let through?",
+      "options": [
+        "Only scores of 70 and above",
+        "70 to 99, and also 8 and 9, but not 100",
+        "Every score, because text sorts after numbers",
+        "None: comparing text with a number raises an error"
+      ],
+      "answer": 1,
+      "why": "`->>` returns text, and `'70'` is text too, so PostgreSQL compares letter by letter, like words in a dictionary. `'8'` and `'9'` sort after `'7'`, and `'100'` sorts before it, because `'1'` comes before `'7'`. Turn the text into a number first, `(metadata -> 'risk' ->> 'score')::int >= 70`, or compare jsonb with jsonb, `metadata -> 'risk' -> 'score' >= '70'`, which compares the numbers. There's no error either, which is what makes the bug easy to miss."
+    },
+    {
+      "q": "The payments table has a GIN index on its documents (`CREATE INDEX ... USING gin (metadata)`). Which condition can the index serve?",
+      "options": [
+        "`metadata ->> 'channel' = 'pos'`",
+        "`(metadata -> 'risk' ->> 'score')::int > 90`",
+        "`metadata::text LIKE '%pos%'`",
+        "`metadata @> '{\"channel\": \"pos\"}'`"
+      ],
+      "answer": 3,
+      "why": "A GIN index on a jsonb column serves the jsonb operators, such as `@>`, `?` and `@?`. The other three first turn the column into something else, text or a number, and the index holds no entries for those, so PostgreSQL reads the whole table. The first option is the tempting one. It asks the same question as the containment query, but only the containment form can use the index."
+    },
+    {
+      "q": "Session A runs `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id` for a new code and hasn't committed yet. Session B runs the same statement for the same code. What does B see?",
+      "options": [
+        "B waits; when A commits, B's statement returns no rows and no error",
+        "B returns no rows at once, because A's row is already in the index",
+        "B inserts a second row, because A hasn't committed",
+        "B fails with a duplicate key error when A commits"
+      ],
+      "answer": 0,
+      "why": "B finds A's unsaved entry in the unique index. It can't know yet whether A will commit, so it waits. When A commits, B takes the DO NOTHING branch: no rows, no error. Had A rolled back, B would have stored the payment itself. The duplicate key error is what a plain INSERT, without ON CONFLICT, gets in the same race."
+    },
+    {
+      "q": "A nightly MERGE brings March's totals up to date with `WHEN NOT MATCHED BY SOURCE THEN DELETE` and no extra condition. The target table holds rows for January, February and March. What does it delete?",
+      "options": [
+        "Only March rows whose shop had no March payments",
+        "Nothing, because NOT MATCHED BY SOURCE needs a condition to run",
+        "Every January and February row, plus the March rows with no March payments",
+        "Only the rows of shops with no payments at all"
+      ],
+      "answer": 2,
+      "why": "The source holds only March, so every January and February row has no partner in the source and falls into NOT MATCHED BY SOURCE. Without a condition such as `AND t.month = date '2026-03-01'`, the DELETE applies to all of them. The clause needs no condition to run, and that's exactly the danger."
+    },
+    {
+      "q": "A batch of messages carries some payment codes more than once, because the card reader sent them again, and the upsert fails with \"cannot affect row a second time\". Which query keeps one row per code, the one received last?",
+      "options": [
+        "`SELECT DISTINCT payment_uid, status, received_at FROM batch`",
+        "`SELECT DISTINCT ON (payment_uid) * FROM batch ORDER BY payment_uid, received_at DESC`",
+        "`SELECT payment_uid, max(status), max(received_at) FROM batch GROUP BY payment_uid`",
+        "`SELECT * FROM batch ORDER BY received_at DESC LIMIT 1`"
+      ],
+      "answer": 1,
+      "why": "`DISTINCT ON (payment_uid)` keeps the first row of each code in the ORDER BY order, here the latest, the way LATERAL joins, top-N per group and keyset pagination used it for the latest row per group. Plain DISTINCT over all columns keeps all three rows, because their statuses differ. `max()` of each column mixes values from different rows, the trap of that lesson's latest-login exercise. And `LIMIT 1` keeps one row for the whole batch.",
+      "from": "sql-08"
     }
-   ]
-  }
- ],
- "analogy": "The unique index is the doorman with the guest list. Check-then-insert is two friends each phoning the venue to ask whether a name is on the list, both hearing no, and both turning up to write it in. ON CONFLICT is walking up to the doorman, who checks and writes in one movement; if someone ahead of you is writing the same name, you wait, and then he tells you the name is already in. MERGE is the manager going through the whole list against the booking system at the end of the night: add the missing names, correct the misspelled ones, cross out the cancellations. jsonb is the guest's form filled in on the venue's own template, so anyone can find the dietary field without reading the whole letter. The analogy breaks on timing: a real doorman serves one person at a time, while PostgreSQL lets thousands of inserts with different keys go through the same index at once and only makes the ones with the same key wait.",
- "in_your_world": "Every Kafka consumer that writes to a database is at-least-once, so its write must be idempotent: an upsert keyed on the message's idempotency key, inside the same transaction as the business change, and the offset committed after the database commit. A Temporal activity that stores a payment needs the same thing, because Temporal retries an activity after a timeout even when the first attempt reached the database. On Oracle there is no ON CONFLICT, so the upsert is a MERGE, and two sessions merging the same new key can still collide with ORA-00001; catch it and retry, or insert first and treat the duplicate key error as \"already done\". Beware of JPA's EntityManager.merge(): it loads the entity and then inserts or updates, which is check-then-insert with the same race. For the risk engine's payloads, a jsonb column with a GIN index lets the fraud team query new fields the day they appear, and it is no excuse to keep the amount, the status or the merchant inside JSON: those stay real columns with real constraints.",
- "mistake": "Making an ingest idempotent with a lookup before the insert: findByUid, then insert if absent, or a NOT EXISTS subquery in the INSERT. It works in every test, because tests deliver one message at a time, and it fails in production when a rebalance or a retry delivers the same message to two workers at once: both checks pass, and either the unique constraint throws a duplicate key error that aborts the whole batch, or, without the constraint, the payment is stored twice. The fix is to let the write itself consult the unique index: INSERT ... ON CONFLICT (payment_uid) DO NOTHING, or DO UPDATE with a WHERE that only moves a row forward, and RETURNING to learn what happened.",
- "compare": {
-  "title": "An idempotent upsert of one payment message: Oracle and PostgreSQL",
-  "a": {
-   "label": "Oracle",
-   "lang": "sql",
-   "title": "Oracle: MERGE is the upsert",
-   "src": "MERGE INTO payments p\nUSING (SELECT :uid AS payment_uid, :card AS card_id,\n              :merchant AS merchant_id, :amount AS amount_minor,\n              :status AS status, :created AS created_at\n       FROM dual) m\nON (p.payment_uid = m.payment_uid)\nWHEN MATCHED THEN\n    UPDATE SET p.status = m.status\n    WHERE p.status = 'pending' AND m.status <> 'pending'\nWHEN NOT MATCHED THEN\n    INSERT (payment_uid, card_id, merchant_id,\n            amount_minor, status, created_at)\n    VALUES (m.payment_uid, m.card_id, m.merchant_id,\n            m.amount_minor, m.status, m.created_at);\n-- two sessions inserting the same new uid at once:\n-- the second can fail with ORA-00001; catch and retry"
+  ],
+  "flashcards": [
+    {
+      "front": "json or jsonb: which should a column use?",
+      "back": "jsonb: parsed once when stored, checked, kept as a tree, and indexable. json keeps the exact text, including keys written twice."
+    },
+    {
+      "front": "What do `->` and `->>` return?",
+      "back": "`->` returns jsonb, still a piece of document. `->>` returns text. Turn `->>` results into numbers before comparing numbers."
+    },
+    {
+      "front": "What does `doc @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` ask?",
+      "back": "Whether doc contains that smaller document: a risk object whose rules array includes \"velocity\"."
+    },
+    {
+      "front": "Which conditions can a GIN index on a jsonb column serve?",
+      "back": "The jsonb operators: `@>`, `?`, `?|`, `?&`, and the path ones `@?` and `@@`. Not comparisons on `->>` results."
+    },
+    {
+      "front": "Why is check-then-insert unsafe, and what replaces it?",
+      "back": "Two workers can both find nothing before either inserts. INSERT ... ON CONFLICT lets the unique index decide inside the write."
+    },
+    {
+      "front": "In ON CONFLICT DO UPDATE, what is EXCLUDED?",
+      "back": "The row the INSERT proposed and couldn't insert, so `SET status = EXCLUDED.status` takes the new message's value."
+    },
+    {
+      "front": "Why use ON CONFLICT instead of MERGE when two sessions may insert the same new key at once?",
+      "back": "MERGE doesn't wait for the other session's insert, so both can choose INSERT and one fails with 23505. ON CONFLICT waits, then takes its conflict branch."
+    }
+  ],
+  "terms": [
+    {
+      "term": "jsonb",
+      "plain": "PostgreSQL's type for JSON documents: parsed and checked when stored, and kept as a tree of keys and values."
+    },
+    {
+      "term": "Containment (@>)",
+      "plain": "The test of whether one JSON document holds another, nesting included."
+    },
+    {
+      "term": "GIN index",
+      "plain": "Generalized inverted index: for every key and value, the sorted list of rows that contain it, like the index at the back of a book."
+    },
+    {
+      "term": "Transaction",
+      "plain": "A group of changes the database applies all together or not at all; COMMIT saves them for good, ROLLBACK throws them away."
+    },
+    {
+      "term": "Idempotency key",
+      "plain": "A unique code the sender attaches to a request, so the receiver can tell a repeat from a new one."
+    },
+    {
+      "term": "Upsert",
+      "plain": "Insert a row, or update it if a row with the same key already exists, in one step."
+    },
+    {
+      "term": "EXCLUDED",
+      "plain": "In ON CONFLICT DO UPDATE, the row that was proposed for insertion."
+    },
+    {
+      "term": "MERGE",
+      "plain": "A statement that lines up a table with a source and inserts, updates or deletes rows by class: matched, not matched, or not matched by source."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A teammate's worker stores payments with `if (repo.findByUid(uid) == null) repo.insert(msg)`, inside one transaction per batch of messages. It passes every test, but about once a week a batch fails with a duplicate key error and has to be run again. Explain what's happening and what you'd change.",
+    "answer": "The weekly failure is two deliveries of the same message overlapping. The card reader or the network sent a message again, and the copy reached a second worker while the first was still storing it. Each worker's transaction runs its findByUid before the other has committed, so both see nothing and both insert. The UNIQUE rule on payment_uid catches it: the second insert waits for the first transaction, then fails with 23505. The error spoils that worker's whole transaction, so it loses the whole batch and has to run it again. Without the UNIQUE rule, the payment would quietly be stored twice. Tests never show this, because they send one message at a time. I'd remove the check and let the insert ask the unique index itself: INSERT ... ON CONFLICT (payment_uid) DO NOTHING, or DO UPDATE SET status = EXCLUDED.status WHERE the stored payment is still pending and the message carries a final status, with RETURNING to learn whether it inserted, updated or did nothing. The second worker then waits and takes the conflict branch instead of failing. I'd also remove repeated codes from each batch before sending it, since one statement may not touch the same row twice, and mark the batch as done only after the database commit, so a crash in between means the batch is harmlessly sent again."
   },
-  "b": {
-   "label": "PostgreSQL 18",
-   "lang": "sql",
-   "title": "PostgreSQL: INSERT ... ON CONFLICT",
-   "src": "INSERT INTO payments AS p\n       (payment_uid, card_id, merchant_id,\n        amount_minor, status, created_at)\nVALUES (:uid, :card, :merchant,\n        :amount, :status, :created)\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending'\n  AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id,\n          old.status, new.status;\n-- a concurrent insert of the same uid makes this\n-- one wait, then take the DO UPDATE branch:\n-- no error to catch"
+  "deeper": {
+    "minutes": 10,
+    "body": "`DO NOTHING` doesn't return the existing row, so a caller that needs the id of a repeat has to ask again: `SELECT payment_id FROM payments WHERE payment_uid = $1`. A common workaround is `DO UPDATE SET status = p.status`, an update that changes nothing so that RETURNING has a row, but it writes a new copy of the row on every repeat. PostgreSQL 19, at release candidate as this lesson is written, is set to add `ON CONFLICT DO SELECT`, which hands the existing row to RETURNING without writing a new copy. Check the final release notes before you rely on it.\n\n`ON CONFLICT DO UPDATE` locks the conflicting row while it updates it, so upserts of one key from many sessions queue up one behind the other. That's what you want for a final status racing its own repeat. It also means that a very busy key, such as a single counter row that every request upserts, becomes a queue. The Transactions track's lesson Lost updates: row locks, SKIP LOCKED and job queues covers those waits.\n\nBefore PostgreSQL 18 there was no `old` in RETURNING, and people told inserts from updates with `RETURNING (xmax = 0) AS inserted`. `xmax` is a hidden column on every row that records the transaction that deleted or replaced it, so a freshly inserted row has none. It works, but it leans on an internal detail. Use `old` on 18.\n\nPostgreSQL 17 brought the SQL standard's JSON functions. `JSON_TABLE` turns a document into rows and typed columns inside FROM, the standard spelling of what the last lesson did with `jsonb_array_elements_text`:\n\n```sql\nSELECT p.payment_id, r.rule\nFROM payments p,\n     JSON_TABLE(p.metadata, '$.risk.rules[*]' COLUMNS (rule text PATH '$')) AS r\nORDER BY p.payment_id;\n-- 3 velocity, 8 geo_mismatch, 15 velocity, 18 velocity, 31 geo_mismatch\n```\n\njsonpath, the small query language inside that `'$.risk.rules[*]'`, also works with the `@?` operator: `metadata @? '$.risk.score ? (@ > 50)'` finds the same 8 payments as the cast, and a GIN index can serve it.\n\nA GIN index comes in a second, smaller flavour. If you only ever ask with `@>`, `USING gin (metadata jsonb_path_ops)` builds an index of 4.5 MB on the big table, about half the default. It serves `@>`, `@?` and `@@`, but not the operators that ask whether a key exists.\n\nA unique index on an expression works as a conflict target too. For email addresses compared without regard to capital letters, `CREATE UNIQUE INDEX ON customers (lower(email))` and then `ON CONFLICT ((lower(email))) DO NOTHING`."
   },
-  "note": "Oracle has no ON CONFLICT clause, so Oracle code spells the upsert as a MERGE against a one-row source, often from DUAL. PostgreSQL has MERGE too, since version 15, and the same race: MERGE decides MATCHED or NOT MATCHED before it writes, so two concurrent MERGEs of the same new key can both choose INSERT, and the unique index rejects the second. INSERT ... ON CONFLICT is different because the unique index arbitrates inside the write: the second session waits for the first and then takes the DO UPDATE or DO NOTHING branch. The WHERE clause on the update branch exists in both, and does the same job: a late message never moves a payment backward. PostgreSQL 18 adds RETURNING old and new on both statements, which Oracle 23ai also added for UPDATE and MERGE."
- },
- "worked": {
-  "title": "An idempotent Kafka batch: one statement, one round trip",
-  "steps": [
-   {
-    "say": "The consumer polls 500 messages. They may repeat each other (the producer retried), repeat payments already stored (a rebalance redelivered them), or bring the capture of a pending payment. First collapse repeats inside the batch, keeping a final status over `pending`, because one statement may not touch the same row twice:",
-    "code": "// 1. one message per uid; a final status beats 'pending'\nval batch = records.map { it.value() }                        // List<PaymentMessage>\n    .sortedByDescending { it.status != \"pending\" }             // final statuses first\n    .distinctBy { it.uid }                                     // keeps the first of each uid",
-    "lang": "kotlin"
-   },
-   {
-    "say": "Send the whole batch as arrays and unnest them into rows on the server: one statement and one network round trip for 500 messages, instead of 500. The ON CONFLICT clause is the one from this lesson.",
-    "code": "-- 2. the statement: unnest turns six arrays into rows\nINSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nSELECT * FROM unnest(?::uuid[], ?::bigint[], ?::bigint[], ?::bigint[], ?::text[], ?::timestamptz[])\nON CONFLICT (payment_uid) DO UPDATE\nSET status = EXCLUDED.status\nWHERE p.status = 'pending' AND EXCLUDED.status <> 'pending'\nRETURNING p.payment_id, old.status, new.status",
-    "lang": "sql"
-   },
-   {
-    "say": "Bind each column as a JDBC array. The rows that come back are exactly the changes: an insert has a NULL old status, a capture has `pending`, and repeats return nothing.",
-    "code": "// 3. bind the arrays and read what changed\nval changes = conn.prepareStatement(UPSERT_BATCH).use { ps ->\n    ps.setArray(1, conn.createArrayOf(\"uuid\", batch.map { it.uid }.toTypedArray()))\n    ps.setArray(2, conn.createArrayOf(\"bigint\", batch.map { it.cardId }.toTypedArray()))\n    ps.setArray(3, conn.createArrayOf(\"bigint\", batch.map { it.merchantId }.toTypedArray()))\n    ps.setArray(4, conn.createArrayOf(\"bigint\", batch.map { it.amountMinor }.toTypedArray()))\n    ps.setArray(5, conn.createArrayOf(\"text\", batch.map { it.status }.toTypedArray()))\n    ps.setArray(6, conn.createArrayOf(\"timestamptz\", batch.map { Timestamp.from(it.createdAt) }.toTypedArray()))\n    ps.executeQuery().use { rs ->\n        buildList { while (rs.next()) add(Change(rs.getLong(1), rs.getString(2), rs.getString(3))) }\n    }\n}",
-    "lang": "kotlin"
-   },
-   {
-    "say": "Commit the database first and the Kafka offset second. If the consumer dies between the two, Kafka redelivers the batch, and the upsert turns every message in it into a no-op. At-least-once delivery plus an idempotent write is how you get each payment stored exactly once.",
-    "code": "// 4. order of the two commits\nconn.commit()                      // the payments are durable\nconsumer.commitSync()              // only now tell Kafka the batch is done\n// a crash between the two lines: the batch comes back, and every row in it\n// hits ON CONFLICT and changes nothing",
-    "lang": "kotlin"
-   }
+  "sources": [
+    {
+      "title": "PostgreSQL 18 documentation: INSERT (ON CONFLICT)",
+      "url": "https://www.postgresql.org/docs/18/sql-insert.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: MERGE",
+      "url": "https://www.postgresql.org/docs/18/sql-merge.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: JSON types and jsonb indexing",
+      "url": "https://www.postgresql.org/docs/18/datatype-json.html"
+    },
+    {
+      "title": "PostgreSQL 18 documentation: GIN indexes",
+      "url": "https://www.postgresql.org/docs/18/gin.html"
+    },
+    {
+      "title": "PostgreSQL 18 release notes",
+      "url": "https://www.postgresql.org/docs/18/release-18.html"
+    }
   ]
- },
- "lab": {
-  "title": "The fraud queue, an idempotent ingest and the monthly MERGE",
-  "minutes": 15,
-  "needs": [
-   "Docker"
-  ],
-  "files": [
-   "labs/sql/src/main/resources/sfz/sql/l09/risky_payments.sql",
-   "labs/sql/src/main/resources/sfz/sql/l09/ingest_payment.sql",
-   "labs/sql/src/main/resources/sfz/sql/l09/settle_month.sql"
-  ],
-  "run": "./gradlew :sql:test --tests 'sfz.sql.l09.*'",
-  "steps": [
-   "With Docker running, run the tests from the `labs` folder. Seven of the eight fail. The one that passes inserts a new message twice, one delivery after the other, which the placeholder handles; its trouble starts when two deliveries overlap.",
-   "`risky_payments.sql` compares the score as text and searches the document as a string. Return the payments with a score of 50 or more, or with the velocity rule, comparing numbers and using containment.",
-   "`ingest_payment.sql` reads messages from a temporary table `inbound` and checks before it inserts. Make it one INSERT ... ON CONFLICT statement that inserts new payments, moves a pending payment to its final status, ignores everything else, and returns one row per change. One test runs it in two sessions at the same moment.",
-   "`settle_month.sql` is a MERGE that rewrites every March row, even correct ones, and deletes every month that March's source lacks. Make it change only the March rows that are wrong, missing or gone.",
-   "Run the tests until all eight pass. The second test of each exercise adds rows first: a high score of 100 and a rule named velocity_hourly, a batch mixing new, repeated, late and final messages, and new March payments next to a February one."
-  ],
-  "hints": [
-   "`WHERE (metadata -> 'risk' ->> 'score')::int >= 50 OR metadata @> '{\"risk\": {\"rules\": [\"velocity\"]}}'`. A document without a score gives NULL for the cast, which is neither >= 50 nor an error.",
-   "`INSERT INTO payments AS p (...) SELECT ... FROM inbound ON CONFLICT (payment_uid) DO UPDATE SET status = EXCLUDED.status WHERE p.status = 'pending' AND EXCLUDED.status <> 'pending' RETURNING p.payment_id, old.status AS old_status, new.status AS new_status`.",
-   "Add `AND (t.gross_minor, t.payment_count) IS DISTINCT FROM (s.gross_minor, s.payment_count)` to WHEN MATCHED, and `AND t.month = date '2026-03-01'` to WHEN NOT MATCHED BY SOURCE."
-  ],
-  "done_when": "All eight tests in `JsonbUpsertMergeTest` pass."
- },
- "drill": {
-  "title": "The ingest statement, from memory",
-  "minutes": 4,
-  "prompt": "Without looking, write the statement that stores one payment message (uid, card, merchant, amount, status, created_at) so that a repeat changes nothing, a capture moves a pending payment to its final status, a late 'pending' never moves a payment backward, and the statement reports whether it inserted, updated or did nothing. Then write the query for the payments whose risk rules include \"geo_mismatch\", in a form a GIN index on metadata can serve.",
-  "answer": {
-   "lang": "sql",
-   "src": "INSERT INTO payments AS p (payment_uid, card_id, merchant_id, amount_minor, status, created_at)\nVALUES ($1, $2, $3, $4, $5, $6)\nON CONFLICT (payment_uid) DO UPDATE          -- the unique index decides, even mid-race\nSET status = EXCLUDED.status                 -- EXCLUDED: the row the INSERT proposed\nWHERE p.status = 'pending'                   -- only pending payments move,\n  AND EXCLUDED.status <> 'pending'           -- and only forward\nRETURNING p.payment_id,\n          old.status AS old_status,          -- NULL: inserted\n          new.status AS new_status;          -- no row at all: a repeat\n\nSELECT payment_id\nFROM payments\nWHERE metadata @> '{\"risk\": {\"rules\": [\"geo_mismatch\"]}}';   -- containment: GIN can answer it\n-- payments 8 and 31 on the seed"
-  }
- },
- "recap": [
-  "jsonb parses JSON once on write, rejects invalid documents and lets SQL walk inside: -> returns jsonb, ->> returns text. Compare ->> results as text only when you mean text; cast numbers first.",
-  "@> asks whether a document contains a smaller one. A GIN index lists every key and value with the rows that hold it, so containment reads only matching rows; ->> conditions cannot use it.",
-  "Check-then-insert is a race: two sessions both find nothing. The unique index is the referee, and INSERT ... ON CONFLICT asks it in the same step as the write.",
-  "ON CONFLICT DO UPDATE SET ... = EXCLUDED.col WHERE ... updates only when the row should move; PostgreSQL 18's RETURNING old and new says what happened. One statement cannot touch the same row twice.",
-  "MERGE inserts, updates and deletes against a source in one statement (NOT MATCHED BY SOURCE since 17, RETURNING since 17, old and new since 18). Guard its DELETE, and use ON CONFLICT when two sessions may write the same new key at once."
- ],
- "quiz": [
-  {
-   "q": "Which scores does `WHERE metadata -> 'risk' ->> 'score' >= '70'` let through?",
-   "options": [
-    "Only scores of 70 and above",
-    "70 to 99, and also 8 and 9, but not 100",
-    "Every score, because text sorts after numbers",
-    "None: comparing text with a number raises an error"
-   ],
-   "answer": 1,
-   "why": "->> returns text, and '70' is a text literal, so PostgreSQL compares strings character by character: '8' and '9' sort after '7', and '100' sorts before it because '1' < '7'. Cast first, `(metadata -> 'risk' ->> 'score')::int >= 70`, or compare jsonb with jsonb, `metadata -> 'risk' -> 'score' >= '70'`, which compares numbers."
-  },
-  {
-   "q": "payments has `CREATE INDEX ... USING gin (metadata)`. Which condition can the index serve?",
-   "options": [
-    "`metadata ->> 'channel' = 'pos'`",
-    "`(metadata -> 'risk' ->> 'score')::int > 90`",
-    "`metadata::text LIKE '%pos%'`",
-    "`metadata @> '{\"channel\": \"pos\"}'`"
-   ],
-   "answer": 3,
-   "why": "A GIN index on a jsonb column serves the jsonb operators such as @>, ? and @?. The other three apply a function or a cast to the column first, so they produce values the index does not contain, and the plan is a sequential scan. The first one asks the same question as the containment query; only the containment form can use the index."
-  },
-  {
-   "q": "Session A runs `INSERT ... ON CONFLICT (payment_uid) DO NOTHING RETURNING payment_id` for a new uid and has not committed. Session B runs the same statement for the same uid. What does B see?",
-   "options": [
-    "B waits; when A commits, B's statement returns no rows and no error",
-    "B returns no rows at once, because A's row is already in the index",
-    "B inserts a second row, because A has not committed",
-    "B fails with a duplicate key error when A commits"
-   ],
-   "answer": 0,
-   "why": "B finds A's uncommitted entry in the unique index and cannot know yet whether A will commit, so it waits. When A commits, B takes the DO NOTHING branch: no rows, no error. Had A rolled back, B would have inserted. The duplicate key error is what a plain INSERT, without ON CONFLICT, gets in the same situation."
-  },
-  {
-   "q": "A nightly MERGE syncs March's totals with `WHEN NOT MATCHED BY SOURCE THEN DELETE` and no further condition. The target holds rows for January, February and March. What does it delete?",
-   "options": [
-    "Only March rows whose merchant had no March payments",
-    "Nothing, because NOT MATCHED BY SOURCE needs a condition to run",
-    "Every January and February row, plus the March rows with no March payments",
-    "Only rows of merchants with no payments at all"
-   ],
-   "answer": 2,
-   "why": "The source holds only March, so every January and February row has no source match and falls in NOT MATCHED BY SOURCE. Without a condition such as `AND t.month = date '2026-03-01'`, the DELETE applies to all of them. The clause runs without a condition; that is exactly the danger."
-  },
-  {
-   "q": "A Kafka batch carries some payment_uids more than once, because the producer retried, and the upsert fails with \"cannot affect row a second time\". Which source query keeps one row per uid, the most recently received?",
-   "options": [
-    "`SELECT DISTINCT payment_uid, status, received_at FROM batch`",
-    "`SELECT DISTINCT ON (payment_uid) * FROM batch ORDER BY payment_uid, received_at DESC`",
-    "`SELECT payment_uid, max(status), max(received_at) FROM batch GROUP BY payment_uid`",
-    "`SELECT * FROM batch ORDER BY received_at DESC LIMIT 1`"
-   ],
-   "answer": 1,
-   "why": "DISTINCT ON keeps the first row of each uid in the ORDER BY, here the latest, as lesson 8 did for the latest login. DISTINCT over all columns keeps all three rows, because their statuses differ. max() of each column mixes values from different rows, the trap of lesson 8's latest_login exercise. LIMIT 1 keeps one row for the whole batch.",
-   "from": "sql-08"
-  }
- ],
- "flashcards": [
-  {
-   "front": "json or jsonb?",
-   "back": "jsonb: parsed once on write, validated, stored as a tree, indexable. json keeps the exact text, including duplicate keys."
-  },
-  {
-   "front": "What do -> and ->> return?",
-   "back": "-> returns jsonb (still a document), ->> returns text. Cast ->> results before comparing numbers."
-  },
-  {
-   "front": "What does `doc @> '{\"risk\": {\"rules\": [\"velocity\"]}}'` ask?",
-   "back": "Whether doc contains that smaller document: a risk object whose rules array includes \"velocity\"."
-  },
-  {
-   "front": "Which conditions can a GIN index on a jsonb column serve?",
-   "back": "The jsonb operators: @>, ?, ?|, ?& and the jsonpath ones @? and @@. Not ->> comparisons."
-  },
-  {
-   "front": "Why is check-then-insert unsafe, and what replaces it?",
-   "back": "Two sessions can both find nothing before either inserts. INSERT ... ON CONFLICT lets the unique index decide inside the write."
-  },
-  {
-   "front": "In ON CONFLICT DO UPDATE, what is EXCLUDED?",
-   "back": "The row the INSERT proposed and could not insert, so SET status = EXCLUDED.status takes the new message's value."
-  },
-  {
-   "front": "Why prefer ON CONFLICT over MERGE for concurrent upserts in PostgreSQL?",
-   "back": "MERGE has no arbiter index: two sessions merging the same new key can both choose INSERT, and one fails with 23505."
-  }
- ],
- "terms": [
-  {
-   "term": "jsonb",
-   "plain": "PostgreSQL's binary JSON type: parsed and validated on write, stored as a tree of keys and values."
-  },
-  {
-   "term": "Containment (@>)",
-   "plain": "The test of whether one JSON document contains another, nesting included."
-  },
-  {
-   "term": "GIN index",
-   "plain": "Generalized inverted index: for every key and value, the sorted list of rows that contain it."
-  },
-  {
-   "term": "Idempotency key",
-   "plain": "A unique id that the sender attaches to a message so the receiver can tell a repeat from a new request."
-  },
-  {
-   "term": "Upsert",
-   "plain": "Insert a row, or update it if a row with the same key already exists, as one atomic operation."
-  },
-  {
-   "term": "EXCLUDED",
-   "plain": "In ON CONFLICT DO UPDATE, the row that was proposed for insertion."
-  },
-  {
-   "term": "MERGE",
-   "plain": "A statement that joins a target to a source and inserts, updates or deletes target rows by class: matched, not matched, not matched by source."
-  },
-  {
-   "term": "merge_action()",
-   "plain": "A function in MERGE ... RETURNING that says which action produced the row: INSERT, UPDATE or DELETE."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate's Kafka consumer stores payments with `if (repo.findByUid(uid) == null) repo.insert(msg)` inside a transaction per batch. It passes every test, but once a week a batch fails with a duplicate key error and is retried. Explain what is happening and what you would change.",
-  "answer": "The weekly failure is two deliveries of the same message overlapping, usually after a rebalance or a producer retry. Each transaction runs its findByUid before the other has committed, so both see nothing and both insert. The unique constraint on payment_uid catches it: the second insert waits for the first transaction and then fails with 23505. Because the error aborts the whole transaction, the consumer loses the entire batch and retries it, and if the constraint were missing, the payment would simply be stored twice. Tests never show this because they deliver one message at a time. I would remove the check and let the insert consult the unique index itself: INSERT ... ON CONFLICT (payment_uid) DO NOTHING, or DO UPDATE SET status = EXCLUDED.status WHERE the stored payment is still pending and the message carries a final status, with RETURNING to know whether it inserted, updated or did nothing. The second session then waits and takes the conflict branch instead of failing. I would also deduplicate the batch by uid before sending it, since one statement may not touch the same row twice, and commit the Kafka offset only after the database commit, so a crash in between means a harmless redelivery."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "`DO NOTHING` does not return the existing row, so a caller that needs the id of a repeat has to run a second query: `SELECT payment_id FROM payments WHERE payment_uid = $1`. A common workaround is `DO UPDATE SET status = p.status`, an update that changes nothing so that RETURNING has a row, but it writes a new row version on every repeat. PostgreSQL 19, at release candidate as this lesson is written, is set to add `ON CONFLICT DO SELECT`, which hands the existing row to RETURNING without writing a new version of it. Check the final release notes before you rely on it.\n\n`ON CONFLICT DO UPDATE` locks the conflicting row while it updates it, so concurrent upserts of one key queue up one behind the other. That is what you want for a capture racing its own repeat. It also means a very hot key, such as a single counter row upserted by every request, becomes a queue. The Transactions track's lesson on row locks covers those waits.\n\nBefore PostgreSQL 18 there was no `old` in RETURNING, and people told inserts from updates with `RETURNING (xmax = 0) AS inserted`: a freshly inserted row version has no deleting transaction recorded. It works, but it reads a system column whose meaning is an implementation detail. Use `old` on 18.\n\nPostgreSQL 17 brought the SQL/JSON standard functions. `JSON_TABLE` turns a document into rows and typed columns inside FROM, the standard spelling of what lesson 8 did with `jsonb_array_elements_text`:\n\n```sql\nSELECT p.payment_id, r.rule\nFROM payments p,\n     JSON_TABLE(p.metadata, '$.risk.rules[*]' COLUMNS (rule text PATH '$')) AS r\nORDER BY p.payment_id;\n-- 3 velocity, 8 geo_mismatch, 15 velocity, 18 velocity, 31 geo_mismatch\n```\n\njsonpath, the small query language inside that `'$.risk.rules[*]'`, also works with the `@?` operator: `metadata @? '$.risk.score ? (@ > 50)'` finds the same 8 payments as the cast, and a GIN index can serve it.\n\nA unique index on an expression works as a conflict target too. For case-insensitive emails, `CREATE UNIQUE INDEX ON customers (lower(email))` and then `ON CONFLICT ((lower(email))) DO NOTHING`."
- },
- "sources": [
-  {
-   "title": "PostgreSQL 18 documentation: INSERT (ON CONFLICT)",
-   "url": "https://www.postgresql.org/docs/18/sql-insert.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: MERGE",
-   "url": "https://www.postgresql.org/docs/18/sql-merge.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: JSON types and jsonb indexing",
-   "url": "https://www.postgresql.org/docs/18/datatype-json.html"
-  },
-  {
-   "title": "PostgreSQL 18 documentation: GIN indexes",
-   "url": "https://www.postgresql.org/docs/18/gin.html"
-  },
-  {
-   "title": "PostgreSQL 18 release notes",
-   "url": "https://www.postgresql.org/docs/18/release-18.html"
-  }
- ]
 }

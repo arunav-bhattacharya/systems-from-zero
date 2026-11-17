@@ -1,409 +1,409 @@
 {
- "id": "os-02",
- "title": "Processes: fork, exec, wait and signals",
- "minutes": 40,
- "goal": "By the end you can trace how a process is created, replaced, ended and reaped, explain zombies and orphans, and tell from an exit code like 137 what happened to your JVM.",
- "warmup": {
-  "q": "A Kubernetes pod restarted. Its last state says `Terminated, exit code 137`. What does 137 tell you?",
-  "options": [
-   "The JVM threw an `OutOfMemoryError`",
-   "The process was killed by signal 9, `SIGKILL`, because 137 = 128 + 9",
-   "The application called `System.exit(137)`",
-   "The image failed to start"
-  ],
-  "answer": 1,
-  "why": "When a signal kills a process, shells and container runtimes report 128 plus the signal number. 137 is `SIGKILL`, which no program can catch: the grace period ran out, or the kernel's OOM killer stepped in. An uncaught `OutOfMemoryError` in `main` ends the JVM with status 1, and nobody writes `System.exit(137)` on purpose."
- },
- "sections": [
-  {
-   "h": "A process is a running program with a record in the kernel",
-   "body": "Lesson 1 of this track put the kernel in charge of every program on the machine. To be in charge, it has to keep notes. For each running program it must know which memory is that program's, which files it has open, who started it, whether it is running or waiting, and in the end how it finished. Without those notes the kernel couldn't stop one program from reading another's files, and it couldn't tell a shell whether `ls` worked.\n\nA running program plus the kernel's notes about it is a **process**. Linux keeps the notes in a structure called `task_struct`. Each process gets a number, its **PID** (process ID), and records the PID of the process that created it, its parent, as its **PPID**. Every process except the very first was created by another one, so processes form a tree with PID 1 at the root.\n\nYou don't need a debugger to read the notes. Linux shows them as files under `/proc/<pid>/`. Here is `head` reading its own `status` file in the lab box:\n\n```text\nName:\thead\nState:\tR (running)\nTgid:\t12\nPid:\t12\nPPid:\t1\n```\n\n`PPid: 1` means the box's shell, PID 1, started `head`. (`Tgid`, the thread group ID, gets explained in lesson 3 of this track.)\n\nThe **state** says what the process is doing at this moment. `ps` shows it as one letter in its `STAT` column:\n\n- `R`: running, or ready to run as soon as a CPU is free\n- `S`: asleep until something happens, such as a timer, data on a socket or a child exiting\n- `D`: asleep in a way that can't be interrupted, usually waiting for a disk\n- `T`: stopped\n- `Z`: a zombie, dead and waiting for its parent (section 3 explains)\n\nEvery process takes the same path through its life, and this lesson walks it in order. A parent creates it (`fork`). It loads the program it should run (`exec`). It ends (`exit`). Its parent collects how it ended (`wait`). While it lives, other processes can send it signals. Keep that picture of a tree of rows in the kernel's table, each row moving through create, run, end and collect. The stepper in the next section shows one row make the whole trip, and the lab has you build the table.",
-   "try": {
-    "title": "Read a process's record",
-    "minutes": 3,
-    "steps": [
-     "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
-     "Run the commands below. `$!` holds the PID of the last command you started in the background with `&`.",
-     "Before the `grep`, predict the state of a process that is running `sleep 100`."
+  "id": "os-02",
+  "title": "Processes: fork, exec, wait and signals",
+  "minutes": 40,
+  "goal": "By the end, you can follow a process from the moment it's created to the moment its parent learns how it ended, explain zombies and orphans, and tell from an exit status like 137 what happened to a program.",
+  "opening": "Picture a café's payments program, which records every card payment, late at night. A new version is ready, so the old one must stop. It still holds three payments in memory that it hasn't saved. Stop it one way, and it saves them, says goodbye and ends with the number 143. Stop it another way, and it vanishes on the spot, with the three payments. All that's left is the number 137.\n\nIt's easy to think of stopping a program as one act, like switching off a lamp. Your laptop offers Quit and Force Quit, and from outside both look the same: the window goes away. Only one asks the program first.\n\nIn What a kernel does: system calls and user mode, we watched programs ask the kernel for everything, and the kernel kept a record of each. In this lesson, we'll follow a process from birth until its parent learns how it ended, build a tiny shell, leave a zombie behind and stop a Java program both ways. Before we start, make a guess, and keep it in mind.",
+  "warmup": {
+    "q": "A program running in a terminal window stops, and the terminal prints `Killed`. Asked how the program ended, the shell (the program that reads your commands) answers 137. What does 137 tell you?",
+    "options": [
+      "The program found a problem and chose to end with the code 137",
+      "Something ended the program with signal 9, the stop no program can refuse, and 137 is 128 + 9",
+      "The program ran out of memory for its objects and gave up",
+      "The program never started"
     ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "head -9 /proc/self/status\nps -o pid,ppid,stat,cmd\nsleep 100 &\ngrep -E '^(State|PPid)' /proc/$!/status\nkill $!"
-    },
-    "expect": "PIDs will differ:\n\n```text\nName:\thead\nUmask:\t0022\nState:\tR (running)\nTgid:\t12\nNgid:\t0\nPid:\t12\nPPid:\t1\nTracerPid:\t0\nUid:\t0\t0\t0\t0\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   13     1 R    ps -o pid,ppid,stat,cmd\nState:\tS (sleeping)\nPPid:\t1\n```\n\n`head` and `ps` are `R` because they were running when they looked at themselves. `sleep` is `S`: it's waiting for a timer and uses no CPU. In the `Ss` of the shell, the small `s` marks a session leader. The Mac has no `/proc`, though `ps -o pid,ppid,stat,command` works there too."
-   },
-   "refs": [
-    {
-     "title": "proc(5): /proc/pid/status fields",
-     "url": "https://man7.org/linux/man-pages/man5/proc.5.html",
-     "kind": "docs"
-    }
-   ]
+    "answer": 1,
+    "why": "When a signal ends a program, the shell reports 128 plus the signal's number. A signal is a short numbered notice the kernel delivers to a process, and number 9, `SIGKILL`, is the one no program can catch: the kernel ends the program without asking it. So 137 means somebody sent `SIGKILL`. Often the time allowed for a polite stop ran out, or the kernel itself ended a program that used too much memory. That last case makes the third option tempting. But a Java program that runs out of room for its objects throws an `OutOfMemoryError`, and if nothing catches it, the program ends with status 1. Nobody chooses 137 on purpose."
   },
-  {
-   "h": "fork copies a process, exec replaces its program",
-   "body": "A shell has to run `ls -l > files.txt`: start `ls`, and send its output to a file instead of the terminal. The simplest design is one system call, say `spawn(\"/usr/bin/ls\", args)`, that creates a process already running `ls`. It works for plain `ls`. It breaks for `> files.txt`, because `ls` should write to a file, so `spawn` needs a parameter for where output goes. Then one for input, one for a pipe between two programs, one for the working directory, the environment variables, the user, the resource limits. Every new kind of setup becomes another parameter.\n\nUnix took a different route in the 1970s, and Linux kept it. Creating a process is split into two calls, with your own code running in between.\n\n`fork()` makes a copy of the calling process. The child gets a new PID. Everything else starts as a copy of the parent: the code, the memory, the open files and the signal handlers (section 4 explains signals). Both processes return from the same `fork()` call. The parent gets the child's PID and the child gets 0, and that is how each one knows which it is. Copying all the memory sounds slow for a big process, but the kernel shares the memory and copies a page only when one side writes to it. Lesson 7 of this track covers that copy-on-write trick.\n\n`execve()` replaces the program running in a process. The kernel throws away the old code and memory and loads a new program from disk. The PID stays, and so do the parent and the open files. A successful `execve` never returns, because the code that called it is gone.\n\nThe gap between the two is the point. After `fork`, the child still runs the shell's code, so it can change things about itself before it becomes `ls`. Open files are named by file descriptors, small numbers where 1 is standard output (lesson 1 of this track). To redirect, the child opens the file and makes descriptor 1 refer to it with `dup2`. Here is the heart of `tinysh.c`, a 50-line shell in the labs folder:\n\n```c\npid_t pid = fork();                     // 1. copy this process\nif (pid == 0) {                         // child: still tinysh's code\n    int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0644);\n    dup2(fd, 1);                        // make fd 1 the file\n    close(fd);\n    execvp(argv[0], argv);              // 2. replace the program\n    _exit(127);                         // only reached if exec failed\n}\nwaitpid(pid, &status, 0);               // 3. wait, collect the status\n```\n\n`ls` knows nothing about files: it writes to descriptor 1, as always. The shell pointed descriptor 1 at the file before `ls` started. Pipes, environment variables and limits use the same gap, and `spawn` never needs a parameter for them.\n\nThe third call closes the loop. `wait()` (on Linux the system call is `wait4`) lets the parent sleep until a child ends and then hands it the child's exit status, the number the child passed to `exit()` (0 means success). That's where `$?` in bash and `Process.waitFor()` in Java get their number.\n\nYou won't find a `fork` system call in an arm64 trace. glibc's `fork()` calls `clone` with the flag `SIGCHLD` and without `CLONE_THREAD`, which means \"a new process, and tell the parent when it dies\". Java's `ProcessBuilder.start()` takes yet another road on Linux, through `posix_spawn` and a small helper program, `jspawnhelper`, and ends in the same `execve` and the same `wait4`.",
-   "stepper": {
-    "title": "fork, exec, exit, wait",
-    "intro": "Follow tinysh as it runs `ls os > /tmp/listing.txt`. The PIDs come from a real trace in the lab box.",
-    "frames": [
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"tinysh pid 43 has read a command; there is no child yet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">read: ls os &gt; /tmp/listing.txt</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"90.0\" text-anchor=\"middle\">no child yet</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text></svg>",
-      "say": "tinysh, PID 43, has read the line `ls os > /tmp/listing.txt`. To run `ls` it needs a second process, and on Linux the way to get one is to copy an existing process."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"fork creates child 45, a copy of tinysh\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-a\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">fork() returned 45</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: tinysh</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">fork() returned 0</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln-a\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-a\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  tinysh</text></svg>",
-      "say": "`fork()` (a `clone` with `SIGCHLD` and no `CLONE_THREAD`) creates PID 45, a copy of tinysh: same code, same memory contents, same open files. Both return from the same call. The parent gets 45 and the child gets 0, which is how each knows which one it is."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"the child points fd 1 at the file while the parent waits\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): asleep</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: tinysh</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">fd 1 is now /tmp/listing.txt</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  tinysh</text></svg>",
-      "say": "The child still runs tinysh's code, so it can prepare. It opens `/tmp/listing.txt` and `dup2`s it onto fd 1, standard output. The parent is already in `wait4(45)`, asleep in the kernel until the child is done."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"execve replaces tinysh with ls in pid 45\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): asleep</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: ls</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">same pid, new program</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-a\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  ls</text></svg>",
-      "say": "`execve(\"/usr/bin/ls\", ...)` throws away tinysh's code and memory inside PID 45 and loads `ls`. The PID, the parent and the open files stay. `ls` writes its listing to fd 1 without knowing that fd 1 is a file."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"ls exits and becomes a zombie; the kernel sends SIGCHLD\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): waking up</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: ls &lt;defunct&gt;</text><text class=\"t-s t-bad\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">zombie: only status 0 left</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><line class=\"ln-bad\" x1=\"370\" y1=\"110\" x2=\"272\" y2=\"110\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"320\" y=\"128\" text-anchor=\"middle\">SIGCHLD</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-bad\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  Z  ls &lt;defunct&gt;</text></svg>",
-      "say": "`ls` calls `exit_group(0)`. The kernel frees its memory and closes its files, but keeps a small record with the exit status. PID 45 is now a zombie (state `Z`), and the kernel sends `SIGCHLD` to the parent and wakes its `wait4`."
-     },
-     {
-      "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"wait4 returns the status and the kernel deletes pid 45\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-a\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4 returned 45, status 0</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: reaped</text><text class=\"t-s t-m\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">record deleted</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text></svg>",
-      "say": "`wait4` returns 45 and status 0. Only now does the kernel delete PID 45's record, and the number can be reused. tinysh prints `[pid 45 exited with status 0]` and reads its next line."
-     }
+  "sections": [
+    {
+      "h": "The kernel's record of a running program: what a process is",
+      "body": "Every program on a computer starts the same way: something else starts it. You type `ls` into a shell, the program that reads your commands, and a moment later `ls` is running and listing files. While it runs, the kernel, the core of the operating system that runs every program, has to keep notes about it. Which memory is its own? Which files has it open? Who started it? Is it running right now, or waiting? And when it ends, how did it end? Without those notes, the kernel couldn't stop one program from reading another's memory, and it couldn't tell the shell whether `ls` worked.\n\nA running program plus the kernel's notes about it is a **process**. Linux keeps the notes in a structure called `task_struct`, a bundle of fields much like a Java object, one per process. Each process gets a number, its **PID** (process ID). It also records the PID of the process that started it, its parent, as its **PPID** (parent process ID). Every process except the very first was started by another one, so processes form a tree with PID 1 at the root.\n\nUnix, the operating system from the 1970s whose design Linux follows, chose family words for all of this, and they fit better than you'd expect. A process has a parent and children. A child whose parent dies is an orphan, and gets adopted. One word is grimmer than the rest, and we'll meet it in the third section.\n\nYou can read the notes without special tools. Linux shows them as files in a folder, `/proc/<pid>/`, one folder per process. Here is `head`, a program that prints the first lines of a file, reading its own `status` file in the lab box. (The lab box is the small Linux computer, run by Docker on your laptop, that this track's Try its use.)\n\n```text\nName:\thead\nState:\tR (running)\nTgid:\t12\nPid:\t12\nPPid:\t1\n```\n\n`PPid: 1` means the box's shell, PID 1, started `head`. (`Tgid`, the thread group ID, is about threads, separate lines of work inside one program. The next lesson, Threads, and how the JVM maps them to the OS, explains it.)\n\nThe **state** says what the process is doing at this moment. `ps`, the program that lists processes, shows it as one letter in its `STAT` column:\n\n- `R`: running, or ready to run as soon as a processor is free\n- `S`: asleep until something happens, such as a timer, data from the network or a child ending\n- `D`: asleep in a way that can't be interrupted, usually waiting for a disk\n- `T`: stopped, paused by someone\n- `Z`: a zombie, dead and waiting for its parent (the third section explains)\n\nEvery process takes the same path through its life, and this lesson walks it in order. A parent creates it (`fork`). It loads the program it should run (`exec`). It ends (`exit`). Its parent collects how it ended (`wait`). While it lives, other processes can send it signals, short numbered notices such as \"please stop\". Picture a table in the kernel with one row per process, each row moving through create, run, end and collect. Next, we'll watch one row make the whole trip.",
+      "try": {
+        "title": "Read a process's record",
+        "minutes": 3,
+        "steps": [
+          "From the `labs` folder, start the lab box: `docker compose -f env/labbox.yml run --rm box`.",
+          "Run the commands below. The `&` starts `sleep 100`, a program that waits for 100 seconds, in the background, so the shell gives you the prompt back at once. `$!` holds the PID of that background program.",
+          "Before the `grep` line, predict the state of a process that is running `sleep 100`."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "head -9 /proc/self/status\nps -o pid,ppid,stat,cmd\nsleep 100 &\ngrep -E '^(State|PPid)' /proc/$!/status\nkill $!"
+        },
+        "expect": "PIDs will differ:\n\n```text\nName:\thead\nUmask:\t0022\nState:\tR (running)\nTgid:\t12\nNgid:\t0\nPid:\t12\nPPid:\t1\nTracerPid:\t0\nUid:\t0\t0\t0\t0\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   13     1 R    ps -o pid,ppid,stat,cmd\nState:\tS (sleeping)\nPPid:\t1\n```\n\n`head` and `ps` show `R` because they were running when they looked at themselves. `sleep` is `S`: it's waiting for a timer and uses no processor time. In the shell's `Ss`, the small `s` marks a session leader, the first process of a terminal's session. The Mac has no `/proc` folder, though `ps -o pid,ppid,stat,command` works there too."
+      },
+      "refs": [
+        {
+          "title": "proc(5): /proc/pid/status fields",
+          "url": "https://man7.org/linux/man-pages/man5/proc.5.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Starting a program: fork makes a copy, exec swaps the program",
+      "body": "A shell has to run `ls -l > files.txt`: start `ls`, and send what it prints to a file instead of the screen. The simplest design is one system call (a request to the kernel), say `spawn(\"/usr/bin/ls\", args)`, that creates a process already running `ls`. It works for plain `ls`. It breaks for `> files.txt`, because now `ls` should write to a file, so `spawn` needs a setting for where output goes. Then it needs one for input, one for a pipe that feeds one program's output into another, and one for the folder to start in. More follow for the environment variables (named settings a program inherits), the user and the limits. Every new kind of setup becomes one more setting.\n\nUnix took a different route in the 1970s, and Linux kept it. Creating a process is split into two calls, with your own code running in between.\n\n`fork()` makes a copy of the process that calls it. The child gets a new PID. Everything else starts as a copy of the parent: the code, the memory, the open files and the signal handlers (the fourth section explains signals). Here the family picture breaks, since no child is born with its parent's memories. Both processes come back from the same `fork()` call. The parent gets the child's PID and the child gets 0, and that's how each one knows which it is. Copying all the memory sounds slow for a big process. In fact the kernel shares the memory, and copies a page, a 4 KB piece of it, only when one side writes to it. Lesson 7, Copy-on-write, mmap and the OOM killer, covers that trick.\n\n`execve()` replaces the program running in a process. The kernel throws away the old code and memory and loads a new program from disk. The PID stays, and so do the parent and the open files. A successful `execve` never returns, because the code that called it is gone.\n\nThe gap between the two is the point. After `fork`, the child still runs the shell's code, so it can change things about itself before it becomes `ls`. A program names its open files with file descriptors, small numbers in which 1 is standard output, where a program's normal output goes. To send output to a file, the child opens the file, then points descriptor 1 at it with `dup2`. Here is the heart of `tinysh.c`, a 50-line shell in the labs folder:\n\n```c\npid_t pid = fork();                     // 1. copy this process\nif (pid == 0) {                         // child: still tinysh's code\n    int fd = open(file, O_WRONLY | O_CREAT | O_TRUNC, 0644);\n    dup2(fd, 1);                        // make fd 1 the file\n    close(fd);\n    execvp(argv[0], argv);              // 2. replace the program\n    _exit(127);                         // only reached if exec failed\n}\nwaitpid(pid, &status, 0);               // 3. wait, collect the status\n```\n\n`ls` knows nothing about files. It writes to descriptor 1, as always, and the shell pointed descriptor 1 at the file before `ls` started. Pipes, environment variables and limits use the same gap, and no call ever needs a setting for them.\n\nThe third call closes the loop. `wait()` lets the parent sleep until a child ends, then hands it the child's **exit status**: the number the child passed to `exit()`, where 0 means success. (On Linux the system call behind it is `wait4`.) That's where the shell's `$?` and Java's `Process.waitFor()` get their number.\n\nYou won't find a `fork` system call in an strace trace on arm64 Linux. (strace, from the last lesson, prints every system call a program makes.) glibc, the C library almost every Linux program uses to talk to the kernel, makes `fork()` out of `clone`. It passes the flag `SIGCHLD` and leaves out `CLONE_THREAD`, which means \"a new process, and tell the parent when it dies\". Java's `ProcessBuilder`, its way of starting other programs, takes another road on Linux, through a small helper program called `jspawnhelper`. It ends in the same `execve` and the same `wait4`. The stepper below follows one command through all three calls. Then we'll look at the moment between the child's end and the parent's wait.",
+      "stepper": {
+        "title": "fork, exec, exit, wait",
+        "intro": "Follow tinysh as it runs `ls os > /tmp/listing.txt`. The PIDs come from a real trace in the lab box.",
+        "frames": [
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"tinysh pid 43 has read a command; there is no child yet\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">read: ls os &gt; /tmp/listing.txt</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"90.0\" text-anchor=\"middle\">no child yet</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text></svg>",
+            "say": "tinysh, PID 43, has read the line `ls os > /tmp/listing.txt`. To run `ls` it needs a second process, and on Linux the way to get one is to copy a process that already exists."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"fork creates child 45, a copy of tinysh\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-a\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">fork() returned 45</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: tinysh</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">fork() returned 0</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln-a\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-a\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  tinysh</text></svg>",
+            "say": "`fork()` (a `clone` with `SIGCHLD` and no `CLONE_THREAD`) creates PID 45, a copy of tinysh: same code, same memory, same open files. Both come back from the same call. The parent gets 45 and the child gets 0, which is how each knows which one it is."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"the child points fd 1 at the file while the parent waits\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): asleep</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: tinysh</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">fd 1 is now /tmp/listing.txt</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  tinysh</text></svg>",
+            "say": "The child still runs tinysh's code, so it can prepare. It opens `/tmp/listing.txt` and uses `dup2` to put it on file descriptor 1, standard output. The parent is already in `wait4(45)`, asleep in the kernel until the child is done."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"execve replaces tinysh with ls in pid 45\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): asleep</text><rect class=\"box-a\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: ls</text><text class=\"t-s t-a\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">same pid, new program</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-a\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  R  ls</text></svg>",
+            "say": "`execve(\"/usr/bin/ls\", ...)` throws away tinysh's code and memory inside PID 45 and loads `ls`. The PID, the parent and the open files stay. `ls` writes its listing to descriptor 1 without knowing that descriptor 1 is a file."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"ls exits and becomes a zombie; the kernel sends SIGCHLD\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-m\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4(45): waking up</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: ls &lt;defunct&gt;</text><text class=\"t-s t-bad\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">zombie: only status 0 left</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><line class=\"ln\" x1=\"270\" y1=\"75\" x2=\"368\" y2=\"75\" marker-end=\"url(#arr)\"/><text class=\"t-s t-m\" x=\"320\" y=\"64\" text-anchor=\"middle\">fork()</text><line class=\"ln-bad\" x1=\"370\" y1=\"110\" x2=\"272\" y2=\"110\" marker-end=\"url(#arr)\"/><text class=\"t-s t-bad\" x=\"320\" y=\"128\" text-anchor=\"middle\">SIGCHLD</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text><text class=\"t-s t-code t-bad\" x=\"46\" y=\"231\" text-anchor=\"start\">PID 45  PPID 43  Z  ls &lt;defunct&gt;</text></svg>",
+            "say": "`ls` calls `exit_group(0)`. The kernel frees its memory and closes its files, but keeps a small record with the exit status. PID 45 is now a zombie (state `Z`). The kernel sends the signal `SIGCHLD` to the parent and wakes its `wait4`."
+          },
+          {
+            "svg": "<svg viewBox=\"0 0 640 260\" role=\"img\" aria-label=\"wait4 returns the status and the kernel deletes pid 45\"><defs><marker id=\"arr\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0 0L10 5L0 10z\" class=\"ln\"/></marker></defs><rect class=\"box-a\" x=\"30\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"150.0\" y=\"80.0\" text-anchor=\"middle\">pid 43: tinysh</text><text class=\"t-s t-a\" x=\"150.0\" y=\"100.0\" text-anchor=\"middle\">wait4 returned 45, status 0</text><rect class=\"box-dim\" x=\"370\" y=\"40\" width=\"240\" height=\"90\" rx=\"8\"/><text class=\"t\" x=\"490.0\" y=\"80.0\" text-anchor=\"middle\">pid 45: reaped</text><text class=\"t-s t-m\" x=\"490.0\" y=\"100.0\" text-anchor=\"middle\">record deleted</text><text class=\"t-s t-m\" x=\"150\" y=\"28\" text-anchor=\"middle\">parent</text><text class=\"t-s t-m\" x=\"490\" y=\"28\" text-anchor=\"middle\">child</text><rect class=\"box\" x=\"30\" y=\"160\" width=\"580\" height=\"86\" rx=\"8\"/><text class=\"t-s t-m\" x=\"46\" y=\"182\" text-anchor=\"start\">kernel process table</text><text class=\"t-s t-code\" x=\"46\" y=\"207\" text-anchor=\"start\">PID 43  PPID 1   R  tinysh</text></svg>",
+            "say": "`wait4` returns 45 and status 0. Only now does the kernel delete PID 45's record, and the number can be used again. tinysh prints `[pid 45 exited with status 0]` and reads its next line."
+          }
+        ]
+      },
+      "try": {
+        "title": "Run tinysh, then trace it",
+        "minutes": 5,
+        "steps": [
+          "In the box, build the shell: `gcc -O2 -o /tmp/tinysh os/c/l02/tinysh.c`. (`gcc` turns C code into a program you can run.) Read `os/c/l02/tinysh.c` on your Mac while it builds. It's 50 lines.",
+          "Run `/tmp/tinysh` and type these lines one by one: `echo hello from a child`, `ls /nope`, `nosuchcmd`, `ls os > /tmp/listing.txt`, `cat /tmp/listing.txt`, `exit`.",
+          "Now trace it. Run the first command below, type `ls os > /tmp/listing.txt` and then `exit`, and print the trace with the second command."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "strace -f -o /tmp/sh.txt -e trace=clone,openat,dup3,execve,wait4 /tmp/tinysh\ngrep -v -e ENOENT -e '\\.so' /tmp/sh.txt"
+        },
+        "expect": "The session (PIDs will differ):\n\n```text\ntinysh$ echo hello from a child\nhello from a child\n[pid 27 exited with status 0]\ntinysh$ ls /nope\nls: cannot access '/nope': No such file or directory\n[pid 29 exited with status 2]\ntinysh$ nosuchcmd\nnosuchcmd: No such file or directory\n[pid 31 exited with status 127]\ntinysh$ ls os > /tmp/listing.txt\n[pid 33 exited with status 0]\ntinysh$ cat /tmp/listing.txt\nbuild\nbuild.gradle.kts\nc\nsrc\n[pid 35 exited with status 0]\ntinysh$ exit\n```\n\n`nosuchcmd` got 127 from the `_exit(127)` after the failed `execvp`. Real shells use the same number for \"command not found\". The trace (trimmed) shows the steps in order:\n\n```text\n43    clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xffffa9a67fb0) = 45\n43    wait4(45,  <unfinished ...>\n45    openat(AT_FDCWD, \"/tmp/listing.txt\", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3\n45    dup3(3, 1, 0)                     = 1\n45    execve(\"/usr/bin/ls\", [\"ls\", \"os\"], 0xffffe33247a8 /* 14 vars */) = 0\n45    +++ exited with 0 +++\n43    <... wait4 resumed>[{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 45\n43    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=45, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---\n```\n\n`fork` shows up as `clone` with `SIGCHLD`. The file is opened in the child, after the `clone` and before the `execve`. arm64 has no `dup2` system call, so glibc uses `dup3`. `execvp` tried a few folders on `PATH`, the list of folders where a shell looks for programs, before it found `/usr/bin/ls`. Those failed calls are the `ENOENT` lines the `grep` removed."
+      },
+      "refs": [
+        {
+          "title": "OSTEP chapter 5: Interlude: Process API",
+          "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf",
+          "kind": "read"
+        },
+        {
+          "title": "fork(2) manual page",
+          "url": "https://man7.org/linux/man-pages/man2/fork.2.html",
+          "kind": "docs"
+        },
+        {
+          "title": "execve(2) manual page",
+          "url": "https://man7.org/linux/man-pages/man2/execve.2.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Collecting how it ended: zombies, orphans and wait",
+      "body": "A parent often needs to know how its child ended. The shell needs it for `$?`. A build tool, a program that compiles code in steps, needs it to stop at the first step that failed. But the child may finish long before the parent asks. Where does the answer wait in the meantime?\n\nThe simplest design deletes everything when a process ends. Then the exit status is gone before the parent asks. The next simplest keeps the whole process until the parent asks, which wastes its memory and open files, maybe for hours. Linux does something in between. At exit it frees the memory and closes the files at once, and keeps only the small record with the PID and the exit status.\n\nThat's the grim word from the first section. A process in that state is a **zombie**: dead, and still in the table. `ps` shows it as `Z` and `<defunct>`. It uses no processor time and almost no memory. You can't kill it either, because it's already dead. When the parent calls `wait`, the kernel hands over the status and deletes the record. That last step is called **reaping**.\n\nThe kernel tells the parent about the death with the signal `SIGCHLD` (the next section explains signals). A shell or a JVM reacts by calling `wait`. A parent that never waits collects zombies, and each zombie keeps holding a PID.\n\nNow flip the order. If the parent dies first, the child is an **orphan**. It keeps running, but nobody is left to wait for it. So the kernel gives it a new parent: PID 1, or the nearest ancestor that asked to adopt orphans. (Such an ancestor is called a subreaper, and it asks with the system call `prctl`.) When the orphan ends, PID 1 has to reap it. On most Linux computers, PID 1 is systemd, the program that starts everything else, and it reaps every orphan it gets.\n\nIn a container, PID 1 is whatever program the container starts. (A container is a group of programs that Docker keeps in a box of their own, and the lab box is one.) If that program is a JVM, the program that runs Java code, nobody reaps orphans. The JVM waits for the children it started itself and ignores every other process that ends up under it. Here is a JVM running as PID 1 that started `sh -c 'sleep 1 & exit 0'`. The small shell started `sleep` in the background and exited, so `sleep` became the JVM's orphan. A few seconds later, `ps` showed:\n\n```text\n  PID  PPID STAT CMD\n    1     0 Ssl  java /exp/Orphaner.java\n   30     1 Z    [sleep] <defunct>\n```\n\nOne zombie is harmless. Now picture the café's payments program making a PDF receipt for every payment, by running a small script that leaves a helper running in the background. Each receipt leaves one zombie, and each zombie holds a PID. A container also has a limit on how many PIDs it may use at once. That limit counts threads too, the lines of work inside each program, as the next lesson shows. So in the end, the JVM can't even start a thread. `docker run --init`, or a tiny program called `tini` started first, puts a small init program in front of yours. Its only job is to be a good PID 1: it reaps orphans and passes signals on. Next, we'll see what those signals are.",
+      "try": {
+        "title": "Make a zombie and an orphan",
+        "minutes": 4,
+        "steps": [
+          "In the box, build the two programs in `os/c/l02/`. `zombie.c` lets its child end at once, and waits 10 seconds before reaping it. `orphan.c` ends the parent while its child still runs.",
+          "Run the commands below. The second `ps` comes 10 seconds after the first.",
+          "Predict the `PPID` the orphan reports after its parent ends."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "gcc -O2 -o /tmp/zombie os/c/l02/zombie.c\ngcc -O2 -o /tmp/orphan os/c/l02/orphan.c\n/tmp/zombie 10 &\nsleep 1; ps -o pid,ppid,stat,cmd\nsleep 10; ps -o pid,ppid,stat,cmd\n/tmp/orphan"
+        },
+        "expect": "```text\nparent 57 forked child 59; reaping it in 10 s\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   57     1 S    /tmp/zombie 10\n   59    57 Z    [zombie] <defunct>\n   60     1 R    ps -o pid,ppid,stat,cmd\nparent reaped 59, exit status 7\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   62     1 R    ps -o pid,ppid,stat,cmd\nchild 64: my parent is 63\nparent 63: exiting without waiting\nchild 64: my parent is now 1\n```\n\nFor 10 seconds PID 59 is a `Z`, with its parent's PID next to it. Once the parent calls `waitpid`, it gets status 7 and the zombie is gone. The orphan's parent changes from 63 to 1, the box's bash shell. bash calls `wait` for any child it has, so the orphan is reaped when it ends."
+      },
+      "refs": [
+        {
+          "title": "wait(2) manual page",
+          "url": "https://man7.org/linux/man-pages/man2/wait.2.html",
+          "kind": "docs"
+        }
+      ]
+    },
+    {
+      "h": "Stopping a program: SIGTERM asks, SIGKILL doesn't",
+      "body": "Back to the opening. Something has to tell the café's payments program to stop: a new version going out, a computer being switched off, a person at a keyboard. How?\n\nThe bluntest way is for the kernel to remove the process on request. It always works, and it's a disaster for a program in the middle of its work: half-written files, payments held in memory and never saved, requests cut off halfway. A better way is to send the process a message and let its own code decide what to do. It can finish the work in hand, save what needs saving, then exit. That message is a **signal**, a small numbered notice the kernel delivers to a process. Some signals come from the kernel itself, such as `SIGSEGV` for a program that touched memory it doesn't own, or `SIGCHLD` when a child dies. Others come from another process through the `kill` system call, which sends any signal, despite its name.\n\nFor each signal, a process can choose: do the default action, ignore it, or run a **handler**, a function the program set up for that signal. For most signals, the default action is to end the process.\n\nHandlers bring their own failure. A buggy or stuck program could catch the stop request and never stop. So Linux keeps two signals that no program can catch, block (hold back for later) or ignore: `SIGKILL` (9) and `SIGSTOP` (19). The kernel acts on them without asking the program. That gives you the same two choices as Quit and Force Quit. `SIGTERM` (15) asks politely, and `SIGKILL` is the blunt removal for when asking fails.\n\nThe JVM sets up handlers for `SIGTERM`, `SIGINT` (2, what Ctrl-C sends) and `SIGHUP` (1). When one arrives, it runs your **shutdown hooks**, small pieces of code a Java program registers to run on the way out. That's where the payments program would save its three payments, and a logger, the code that notes what a program did, would write out its last lines. Then the JVM exits with status 143. `SIGKILL` gets none of that:\n\n```text\n$ kill -TERM $!; wait $!; echo \"exit status: $?\"\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143\n$ kill -KILL $!; wait $!; echo \"exit status: $?\"\nexit status: 137\n```\n\nWhere do 143 and 137 come from? An exit status is one byte, a number from 0 to 255. When a signal kills a process, `wait` reports \"killed by signal N\" instead of an exit status. bash folds that into one number for `$?`: 128 + N. So 137 is 128 + 9, and 143 is 128 + 15. Java's `Process.exitValue()` follows the same rule. The JVM's 143 after `SIGTERM` is a real exit status, though. Its handler caught the signal, ran the hooks, and then exited with the number a shell would have shown anyway.\n\n**A polite stop gives a program the chance to finish its work. Ask first.**\n\n`docker stop` uses both tools in order. It sends `SIGTERM` to the container's PID 1, waits 10 seconds by default, then sends `SIGKILL`. Kubernetes, a program that big companies use to run many containers across many computers, does the same with a default wait of 30 seconds. So a container that ends with 137 was killed. Either the wait ran out, or the kernel's out-of-memory killer (the OOM killer) ended it for using too much memory, which lesson 7 explains. Even `SIGKILL` has limits. It does nothing to a zombie, which is already dead, and a process stuck in state `D` may not die until its disk wait ends.",
+      "try": {
+        "title": "SIGTERM against SIGKILL on a JVM",
+        "minutes": 4,
+        "steps": [
+          "Read `os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java`. It plays the café's nightly payout job, which pays each shop what it took that day, and which its output calls a settlement batch. It sets up a shutdown hook, then sleeps for a minute as if it were working. The hook only prints a line saying it saved three ledger entries (records of money moved), because it's a stand-in.",
+          "In the box, start it in the background, send `SIGTERM`, and print the exit status. Then do the same with `SIGKILL`. The `sleep 2` gives the JVM time to compile and start the file.",
+          "Predict both exit statuses, and whether the hook's line prints each time."
+        ],
+        "code": {
+          "lang": "bash",
+          "title": "in the lab box",
+          "src": "java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\nsleep 2; kill -TERM $!; wait $!; echo \"exit status: $?\"\njava os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\nsleep 2; kill -KILL $!; wait $!; echo \"exit status: $?\""
+        },
+        "expect": "```text\npid 66: settlement batch running\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143\npid 92: settlement batch running\nexit status: 137\nbash: line 25:    92 Killed                  java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\n```\n\n`SIGTERM` reached the JVM's handler, the hook ran, and the JVM exited with 143. `SIGKILL` never reached the program. The kernel ended it, the hook never ran, and bash reported `Killed` and 137. (Your bash's line number will differ.)"
+      },
+      "refs": [
+        {
+          "title": "signal(7) manual page",
+          "url": "https://man7.org/linux/man-pages/man7/signal.7.html",
+          "kind": "docs"
+        },
+        {
+          "title": "docker container stop",
+          "url": "https://docs.docker.com/reference/cli/docker/container/stop/",
+          "kind": "docs"
+        }
+      ]
+    }
+  ],
+  "compare": {
+    "title": "The same JVM, stopped with SIGTERM and with SIGKILL",
+    "a": {
+      "label": "kill -TERM",
+      "lang": "text",
+      "title": "lab box",
+      "src": "$ java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\npid 66: settlement batch running\n$ kill -TERM $!; wait $!; echo \"exit status: $?\"\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143"
+    },
+    "b": {
+      "label": "kill -KILL",
+      "lang": "text",
+      "title": "lab box",
+      "src": "$ java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\npid 92: settlement batch running\n$ kill -KILL $!; wait $!; echo \"exit status: $?\"\nexit status: 137\nbash: line 25:    92 Killed                  java os/src/demo/..."
+    },
+    "note": "`SIGTERM` is a request. The JVM has a handler for it, runs the shutdown hooks and then exits with 143 (128 + 15) by its own choice. `SIGKILL` never reaches the program: the kernel ends the process, and `wait` reports \"killed by signal 9\", which bash shows as 137. From outside, the two numbers look alike. Only the first one gave your code a chance to finish its work."
+  },
+  "worked": {
+    "title": "Why didn't the shutdown hook run on docker stop?",
+    "steps": [
+      {
+        "say": "A Dockerfile is the recipe Docker uses to build a container: the files to put in it and the command that starts it. Say the payments program's Dockerfile ends with `ENTRYPOINT java -jar ledger.jar`, where `ledger.jar` is the packaged Java program. Written this way, called the shell form, Docker runs the command through a shell, `/bin/sh -c \"...\"`. Reproduce that with the demo and a shell that runs two commands, then look at the processes inside: `sh` is PID 1, and the JVM is its child.",
+        "code": "docker run -d --name sfz-os02-stop -v \"$PWD\":/labs sfz-labbox:1 \\\n  sh -c \"echo starting; java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\"\ndocker exec sfz-os02-stop ps -o pid,ppid,cmd\n#   PID  PPID CMD\n#     1     0 sh -c echo starting; java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\n#     7     1 java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java",
+        "lang": "bash"
+      },
+      {
+        "say": "Stop it, and give it 3 seconds to finish. The stop takes the full 3 seconds, the hook's line is missing from the log, and the exit status is 137.",
+        "code": "time docker stop -t 3 sfz-os02-stop      # 3.11 s total\ndocker logs sfz-os02-stop\n# starting\n# pid 7: settlement batch running\ndocker inspect -f '{{.State.ExitCode}}' sfz-os02-stop\n# 137\ndocker rm sfz-os02-stop",
+        "lang": "bash"
+      },
+      {
+        "say": "Why? Docker sent `SIGTERM` to PID 1, which is `sh`. The kernel protects a container's PID 1: it delivers a signal from outside only if PID 1 set up a handler for it, and `sh` has none for `SIGTERM`. So the signal was dropped, and `sh` doesn't pass signals on to its children anyway. After 3 seconds Docker sent `SIGKILL`, which the kernel always delivers. When a container's PID 1 dies, the kernel kills every other process in it, so the JVM died without running its hooks.",
+        "code": "",
+        "lang": ""
+      },
+      {
+        "say": "The fix: make the JVM itself PID 1. Write the command as a list, called the exec form, `ENTRYPOINT [\"java\", \"-jar\", \"ledger.jar\"]`. Or end a wrapper script with `exec java ...`, so the shell replaces itself with the JVM. The JVM has a `SIGTERM` handler, so the signal arrives. Here's the same test with `exec`:",
+        "code": "docker run -d --name sfz-os02-stop -v \"$PWD\":/labs sfz-labbox:1 \\\n  sh -c \"echo starting; exec java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\"\ntime docker stop -t 3 sfz-os02-stop      # 0.11 s total\ndocker logs sfz-os02-stop\n# starting\n# pid 1: settlement batch running\n# shutdown hook: flushed 3 pending ledger entries\ndocker inspect -f '{{.State.ExitCode}}' sfz-os02-stop\n# 143\ndocker rm sfz-os02-stop",
+        "lang": "bash"
+      },
+      {
+        "say": "If the JVM starts other programs, add `--init` too, or put `tini` first in the entrypoint. The tiny init becomes PID 1, passes `SIGTERM` on to the JVM and reaps any orphans. You get a clean stop and no zombies.",
+        "code": "ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"java\", \"-jar\", \"ledger.jar\"]",
+        "lang": "docker"
+      }
     ]
-   },
-   "try": {
-    "title": "Run tinysh, then trace it",
+  },
+  "lab": {
+    "title": "Model the kernel's process table",
+    "minutes": 15,
+    "files": [
+      "labs/os/src/main/kotlin/sfz/os/l02/ProcessTable.kt"
+    ],
+    "run": "./gradlew :os:test --tests 'sfz.os.l02.*'",
+    "steps": [
+      "Open `ProcessTable.kt`. It's a small model of the kernel's table of processes. `fork`, `exec` and `handle` are written for you. Read them first, and note what `fork` copies and what `exec` resets.",
+      "Run the tests from the `labs` folder. All ten fail.",
+      "Write `shellCode`, the number a shell would show: one `when` over the two kinds of `ExitStatus`.",
+      "Write `exit` through a private helper, `terminate(p, status)`. It marks the process a zombie, gives its children PID 1 as their new parent and, if `initReaps` is true, removes every zombie whose parent is now PID 1.",
+      "Write `kill`. Handle the cases in the order the KDoc (the comment above the function) gives: a missing PID, a zombie, `SIGKILL`, a signal with a handler, `SIGCHLD`, and everything else. The cases that end the process call `terminate`.",
+      "Write `waitpid`. Find the children of `parent` (only `child`, if it isn't -1). No children at all is the error `ECHILD`. If one is a zombie, remove it and return its PID and status. Otherwise return null.",
+      "Run the tests until all ten pass. The last test is this lesson's story of a JVM as PID 1."
+    ],
+    "hints": [
+      "`check(condition) { \"ECHILD: ...\" }` throws an `IllegalStateException` with your message, which is what the tests look for.",
+      "Re-parent before you reap. A child that was already a zombie becomes init's zombie, and an init that reaps removes it in the same step.",
+      "Collect the PIDs to remove into a list first, then remove them. Removing entries from `table` while you loop over `table.values` throws `ConcurrentModificationException`.",
+      "Test for `SIGKILL` before you look at the handlers. A program can't set up a handler for it, so `kill` shouldn't even look."
+    ],
+    "done_when": "All ten tests in `ProcessTableTest` pass."
+  },
+  "drill": {
+    "title": "fork, exec and wait in C, from memory",
     "minutes": 5,
-    "steps": [
-     "In the box, build the shell: `gcc -O2 -o /tmp/tinysh os/c/l02/tinysh.c`. Read `os/c/l02/tinysh.c` on your Mac while it compiles. It is 50 lines.",
-     "Run `/tmp/tinysh` and type these lines one by one: `echo hello from a child`, `ls /nope`, `nosuchcmd`, `ls os > /tmp/listing.txt`, `cat /tmp/listing.txt`, `exit`.",
-     "Now trace it. Run the first command below, type `ls os > /tmp/listing.txt` and then `exit`, and print the trace with the second command."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "strace -f -o /tmp/sh.txt -e trace=clone,openat,dup3,execve,wait4 /tmp/tinysh\ngrep -v -e ENOENT -e '\\.so' /tmp/sh.txt"
-    },
-    "expect": "The session (PIDs will differ):\n\n```text\ntinysh$ echo hello from a child\nhello from a child\n[pid 27 exited with status 0]\ntinysh$ ls /nope\nls: cannot access '/nope': No such file or directory\n[pid 29 exited with status 2]\ntinysh$ nosuchcmd\nnosuchcmd: No such file or directory\n[pid 31 exited with status 127]\ntinysh$ ls os > /tmp/listing.txt\n[pid 33 exited with status 0]\ntinysh$ cat /tmp/listing.txt\nbuild\nbuild.gradle.kts\nc\nsrc\n[pid 35 exited with status 0]\ntinysh$ exit\n```\n\n`nosuchcmd` got 127 from the `_exit(127)` after the failed `execvp`. Shells use the same code for \"command not found\". The trace (trimmed) shows the steps in order:\n\n```text\n43    clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, child_tidptr=0xffffa9a67fb0) = 45\n43    wait4(45,  <unfinished ...>\n45    openat(AT_FDCWD, \"/tmp/listing.txt\", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3\n45    dup3(3, 1, 0)                     = 1\n45    execve(\"/usr/bin/ls\", [\"ls\", \"os\"], 0xffffe33247a8 /* 14 vars */) = 0\n45    +++ exited with 0 +++\n43    <... wait4 resumed>[{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 45\n43    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=45, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---\n```\n\n`fork` shows up as `clone` with `SIGCHLD`, the file is opened in the child after the `clone` and before the `execve`, and arm64 has no `dup2` system call, so glibc uses `dup3`. `execvp` tried a few folders on `PATH` before `/usr/bin/ls`; those failed calls are the `ENOENT` lines the `grep` removed."
-   },
-   "refs": [
-    {
-     "title": "OSTEP chapter 5: Interlude: Process API",
-     "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf",
-     "kind": "read"
-    },
-    {
-     "title": "fork(2) manual page",
-     "url": "https://man7.org/linux/man-pages/man2/fork.2.html",
-     "kind": "docs"
-    },
-    {
-     "title": "execve(2) manual page",
-     "url": "https://man7.org/linux/man-pages/man2/execve.2.html",
-     "kind": "docs"
+    "prompt": "Without looking, write C that runs `ls -l` in a child process and waits for it. Print either its exit status, or the signal that killed it along with the number bash would show. Then say why the child calls `_exit` and not `exit` when `exec` fails.",
+    "answer": {
+      "lang": "c",
+      "src": "pid_t pid = fork();\nif (pid < 0) { perror(\"fork\"); exit(1); }\nif (pid == 0) {                              // child\n    execlp(\"ls\", \"ls\", \"-l\", (char *)NULL);\n    perror(\"exec\");                          // only runs if exec failed\n    _exit(127);                              // skip the stdio buffers and atexit\n}                                            // handlers copied from the parent\nint status;\nwaitpid(pid, &status, 0);                    // parent: sleep until the child ends\nif (WIFEXITED(status))\n    printf(\"exit code %d\\n\", WEXITSTATUS(status));\nelse if (WIFSIGNALED(status))\n    printf(\"signal %d, bash shows %d\\n\", WTERMSIG(status), 128 + WTERMSIG(status));"
     }
-   ]
   },
-  {
-   "h": "A dead child stays a zombie until its parent waits",
-   "body": "A parent often needs to know how its child ended. bash needs it for `$?`, a build tool needs it to stop on the first failed step, and `ProcessBuilder` needs it for `waitFor()`. But the child may finish long before the parent asks. Where does the answer wait in the meantime?\n\nThe simplest design deletes everything when a process exits. Then the exit status is gone before the parent asks. The next simplest keeps the whole process around until the parent asks. That wastes its memory and open files, possibly for hours. Linux does something in between. At exit it frees the memory and closes the files at once, and keeps only the small record with the PID and the exit status. A process in that state is a **zombie**. `ps` shows it as `Z` and `<defunct>`. It uses no CPU and almost no memory, and you can't kill it, because it is already dead. When the parent calls `wait`, the kernel hands over the status and deletes the record. That last step is called **reaping**.\n\nThe kernel tells the parent about the death with `SIGCHLD`, a signal (section 4). A shell or a JVM reacts by calling `wait`. A parent that never waits collects zombies, and each zombie keeps holding a PID.\n\nNow flip the order. If the parent dies first, the child is an **orphan**. It keeps running, but nobody is left to wait for it. So the kernel gives it a new parent: PID 1, or the nearest ancestor that registered as a \"subreaper\" (a process that asked the kernel, through `prctl`, to adopt the orphans below it). When the orphan exits, PID 1 has to reap it. On most Linux servers PID 1 is systemd, which reaps every orphan it gets.\n\nIn a container, PID 1 is whatever program the image starts. If that is your JVM, nobody reaps orphans. The JVM waits for the children it started with `ProcessBuilder` and ignores every other process that ends up under it. I ran a JVM as PID 1 that started `sh -c 'sleep 1 & exit 0'`. The shell exited, its `sleep` became the JVM's orphan, and a few seconds later:\n\n```text\n  PID  PPID STAT CMD\n    1     0 Ssl  java /exp/Orphaner.java\n   30     1 Z    [sleep] <defunct>\n```\n\nOne zombie is harmless. A service that shells out to a PDF converter through a wrapper script that backgrounds things leaks one PID per call. The container's limit on PIDs counts threads too (lesson 3 of this track), so eventually the JVM can't even start a thread. `docker run --init`, or `tini` as the entrypoint, puts a tiny init program in front of yours. It reaps orphans and passes signals on.",
-   "try": {
-    "title": "Make a zombie and an orphan",
-    "minutes": 4,
-    "steps": [
-     "In the box, build the two programs in `os/c/l02/`: `zombie.c` exits its child at once and waits 10 seconds before reaping it, and `orphan.c` exits the parent while its child still runs.",
-     "Run the commands below. The second `ps` comes 10 seconds after the first.",
-     "Predict the `PPID` the orphan reports after its parent exits."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "gcc -O2 -o /tmp/zombie os/c/l02/zombie.c\ngcc -O2 -o /tmp/orphan os/c/l02/orphan.c\n/tmp/zombie 10 &\nsleep 1; ps -o pid,ppid,stat,cmd\nsleep 10; ps -o pid,ppid,stat,cmd\n/tmp/orphan"
-    },
-    "expect": "```text\nparent 57 forked child 59; reaping it in 10 s\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   57     1 S    /tmp/zombie 10\n   59    57 Z    [zombie] <defunct>\n   60     1 R    ps -o pid,ppid,stat,cmd\nparent reaped 59, exit status 7\n  PID  PPID STAT CMD\n    1     0 Ss   bash -l\n   62     1 R    ps -o pid,ppid,stat,cmd\nchild 64: my parent is 63\nparent 63: exiting without waiting\nchild 64: my parent is now 1\n```\n\nFor 10 seconds PID 59 is a `Z` with its parent's PID next to it. Once the parent calls `waitpid` it gets status 7 and the zombie is gone. The orphan's parent changes from 63 to 1, the box's bash. bash calls `wait` for any child it has, so the orphan is reaped when it exits."
-   },
-   "refs": [
+  "recap": [
+    "A process is a running program plus the kernel's record of it: PID, parent, state, memory, open files and signal settings. `/proc/<pid>/status` shows the record.",
+    "`fork` copies the caller, `execve` replaces the program but keeps the PID and the open files, and `wait` collects the exit status. The gap between `fork` and `exec` is where a shell sends output to a file.",
+    "A dead process stays a zombie (`Z`) until its parent waits. An orphan gets PID 1 as its new parent, and PID 1 must reap it.",
+    "`SIGTERM` can be caught, so the JVM runs its shutdown hooks and exits with 143. `SIGKILL` can't, so nothing runs and the shell shows 137, which is 128 + 9.",
+    "In a container your program may be PID 1. A JVM there doesn't reap orphans, and a shell there drops `SIGTERM`. Start the JVM with the exec form, and add `--init` when it starts other programs.",
+    "The limit: every process in this lesson does one thing at a time. A program that must wait on many things at once needs several lines of work inside it, and that's the next lesson."
+  ],
+  "closing": "We started with the café's payments program on the night of an update, ending with 143 or with 137. 143 means it was asked to stop and saved its work. 137 means the kernel removed it, and nothing it held in memory survived.\n\nIn the lab box, run `sleep 300 &`, then `kill -TERM $!; wait $!; echo $?`. Do it again with `-KILL` in place of `-TERM`, and explain both numbers. On a Mac, the stop button in Activity Monitor offers the same choice, between Quit and Force Quit.\n\nNext, we'll put many lines of work inside one process, and find out what a thread is to the kernel.",
+  "quiz": [
     {
-     "title": "wait(2) manual page",
-     "url": "https://man7.org/linux/man-pages/man2/wait.2.html",
-     "kind": "docs"
+      "q": "A program in a container stops with exit status 137, and its log ends in the middle of a line, with no goodbye messages. What's the most likely story?",
+      "options": [
+        "The Java program ran out of room for its objects and threw an `OutOfMemoryError`",
+        "Something sent `SIGKILL`: the wait for a polite stop ran out, or the kernel's OOM killer ended the process",
+        "The program called `System.exit(137)` from a shutdown hook",
+        "The program got `SIGTERM` and ran its hooks"
+      ],
+      "answer": 1,
+      "why": "137 is 128 + 9, death by `SIGKILL`, which skips shutdown hooks. That's why there are no goodbye lines. A `SIGTERM` stop would log the hooks and end with 143. An `OutOfMemoryError` that nothing catches ends the JVM with status 1, not 137, even though the OOM killer's 137 sounds like the same thing."
+    },
+    {
+      "q": "`ps` in a container shows 300 lines like `[curl] <defunct>`, all with PPID 1, and PID 1 is `java -jar app.jar`. (curl is a small program that fetches web pages.) What fixes it?",
+      "options": [
+        "`kill -9` each defunct PID",
+        "Wake the zombies with `kill -CONT`",
+        "Run the container with `--init` (or tini), so a real init reaps orphans",
+        "Give the container more memory"
+      ],
+      "answer": 2,
+      "why": "Those are orphans that died under a PID 1 that never calls `wait` for processes it didn't start itself. They're already dead, so no `kill` of any kind does anything. A tiny init as PID 1 reaps them as they die. Memory has nothing to do with it: each zombie holds a PID, not memory."
+    },
+    {
+      "q": "A shell runs `java -jar ledger.jar > ledger.log`. Which process opens `ledger.log`, and when?",
+      "options": [
+        "The JVM, when the program first prints something",
+        "The kernel, during `execve`",
+        "The shell, before `fork`, passing the file's name to java",
+        "The shell's child, after `fork` and before `execve`, pointing descriptor 1 at the file"
+      ],
+      "answer": 3,
+      "why": "Sending output to a file happens in the gap between `fork` and `exec`. The child still runs the shell's code, opens the file and uses `dup2` to put it on descriptor 1, then `exec`s java. The JVM writes to descriptor 1 and never learns that a file is behind it."
+    },
+    {
+      "q": "A Java program has a shutdown hook that saves the payments it holds in memory. Which way of stopping it skips the hook?",
+      "options": [
+        "`kill <pid>`",
+        "Ctrl-C in the terminal it runs in",
+        "`kill -9 <pid>`",
+        "`docker stop` on a container whose PID 1 is the JVM, when the JVM exits within 10 seconds"
+      ],
+      "answer": 2,
+      "why": "`kill -9` sends `SIGKILL`, which no process can catch, so the JVM never runs its hooks. Plain `kill` sends `SIGTERM` and Ctrl-C sends `SIGINT`, and the JVM handles both by running the hooks. `docker stop` sends `SIGTERM` first, and a JVM that is PID 1 has a handler for it."
+    },
+    {
+      "q": "From What a kernel does: strace on a shell shows `clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, ...) = 45`. What did the shell just do?",
+      "options": [
+        "Called `fork`: there's no `CLONE_THREAD`, so 45 is a new process",
+        "Started a thread, because `clone` always starts threads",
+        "Ran `execve` in process 45",
+        "Sent `SIGCHLD` to process 45"
+      ],
+      "answer": 0,
+      "from": "os-01",
+      "why": "`clone` makes both threads and processes, depending on its flags. With `CLONE_THREAD` (and `CLONE_VM`), the new one joins the caller's process as a thread. Here neither is set, and `SIGCHLD` names the signal to send the parent when the child dies, so this is glibc's `fork()`, and 45 is the child's PID. The second option is the trap: in that lesson every `clone` started a thread, because the JVM asked for threads."
     }
-   ]
-  },
-  {
-   "h": "SIGTERM asks a process to stop, SIGKILL doesn't ask",
-   "body": "Sooner or later something has to tell your service to stop: a deploy, a scale-down, a person at a terminal. How?\n\nThe bluntest way is for the kernel to remove the process on request. It always works, and it is a disaster for a payment service in the middle of a settlement batch: half-written files, uncommitted Kafka offsets, requests cut off mid-flight. A better way is to send the process a message and let its own code decide what to do: finish the work in hand, flush, then exit. That message is a **signal**, a small numbered notice the kernel delivers to a process. Some signals come from the kernel itself, such as `SIGSEGV` for a bad memory access or `SIGCHLD` when a child dies. Others come from another process through the `kill` system call, which sends any signal, despite its name.\n\nFor each signal, a process has a disposition: do the default action, ignore it, or run a **handler**, a function the program registered for that signal. For most signals the default action is to end the process.\n\nHandlers bring their own failure: a buggy or stuck program could catch the stop request and never stop. So Linux keeps two signals that no program can catch, block or ignore: `SIGKILL` (9) and `SIGSTOP` (19). The kernel acts on them without asking the program. That gives you both tools. `SIGTERM` (15) asks politely, and `SIGKILL` is the blunt removal for when asking fails.\n\nThe JVM registers handlers for `SIGTERM`, `SIGINT` (2, what Ctrl-C sends) and `SIGHUP` (1). When one arrives, it runs your shutdown hooks, so Quarkus can stop taking requests, a Kafka consumer can commit its offsets and a logger can flush. Then it exits with status 143. `SIGKILL` gets none of that:\n\n```text\n$ kill -TERM $!; wait $!; echo \"exit status: $?\"\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143\n$ kill -KILL $!; wait $!; echo \"exit status: $?\"\nexit status: 137\n```\n\nWhere do 143 and 137 come from? An exit code is one byte. When a signal kills a process, `wait` reports \"killed by signal N\" instead of an exit code, and bash folds that into one number for `$?`: 128 + N. So 137 is 128 + 9 and 143 is 128 + 15. Java's `Process.exitValue()` follows the same rule. The JVM's 143 after `SIGTERM` is a real exit code: its handler caught the signal, ran the hooks, and then exited with the number a shell would have shown anyway.\n\n`docker stop` uses both tools in order. It sends `SIGTERM` to the container's PID 1, waits 10 seconds by default, then sends `SIGKILL`. Kubernetes does the same with a default grace period of 30 seconds. So exit code 137 on a pod means something used `SIGKILL`: either the grace period ran out, or the kernel's out-of-memory (OOM) killer ended the process for using too much memory (lesson 7 of this track).",
-   "try": {
-    "title": "SIGTERM against SIGKILL on a JVM",
-    "minutes": 4,
-    "steps": [
-     "Read `os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java`. It installs a shutdown hook and sleeps for a minute, like a settlement batch.",
-     "In the box, start it in the background, send `SIGTERM`, and print the exit status. Then do the same with `SIGKILL`. The `sleep 2` gives the JVM time to compile and start the file.",
-     "Predict both exit statuses and whether the hook's line prints each time."
-    ],
-    "code": {
-     "lang": "bash",
-     "title": "in the lab box",
-     "src": "java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\nsleep 2; kill -TERM $!; wait $!; echo \"exit status: $?\"\njava os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\nsleep 2; kill -KILL $!; wait $!; echo \"exit status: $?\""
-    },
-    "expect": "```text\npid 66: settlement batch running\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143\npid 92: settlement batch running\nexit status: 137\nbash: line 25:    92 Killed                  java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\n```\n\n`SIGTERM` reached the JVM's handler, the hook ran, and the JVM exited with 143. `SIGKILL` never reached the program. The kernel ended it, the hook never ran, and bash reported \"Killed\" and 137. (Your bash's line number will differ.)"
-   },
-   "refs": [
+  ],
+  "flashcards": [
     {
-     "title": "signal(7) manual page",
-     "url": "https://man7.org/linux/man-pages/man7/signal.7.html",
-     "kind": "docs"
+      "front": "What do `fork`, `execve` and `wait` each do?",
+      "back": "`fork` copies the calling process. `execve` replaces the program in a process but keeps its PID and open files. `wait` sleeps until a child ends and collects its exit status."
     },
     {
-     "title": "docker container stop",
-     "url": "https://docs.docker.com/reference/cli/docker/container/stop/",
-     "kind": "docs"
+      "front": "Why are fork and exec two separate calls?",
+      "back": "The child runs the parent's code between them, so a shell can send output to a file, set up a pipe or set limits before the new program starts."
+    },
+    {
+      "front": "What is a zombie process?",
+      "back": "A process that has ended but whose parent hasn't called `wait`. Only its PID and exit status remain. `ps` shows `Z` and `<defunct>`."
+    },
+    {
+      "front": "How do you get rid of a zombie?",
+      "back": "Make its parent call `wait`, or end the parent so PID 1 adopts and reaps it. `kill` does nothing: it's already dead."
+    },
+    {
+      "front": "What happens to an orphan?",
+      "back": "The kernel makes PID 1 (or a subreaper) its new parent. PID 1 must reap it when it ends."
+    },
+    {
+      "front": "What do exit statuses 137 and 143 mean?",
+      "back": "128 + 9 (killed by `SIGKILL`) and 128 + 15 (ended by `SIGTERM`)."
+    },
+    {
+      "front": "Which signals can't be caught, blocked or ignored?",
+      "back": "`SIGKILL` (9) and `SIGSTOP` (19). The kernel acts on them without asking the program."
     }
-   ]
-  }
- ],
- "analogy": "Think of each child process as a `CompletableFuture` its parent started. `fork` plus `exec` is the `supplyAsync` call, the exit status is the result, and `wait` is `get()`. A zombie is a future that has completed but whose result nobody has read: the work is done and the slot is still taken. An orphan is a future whose owner went away, so a caretaker (PID 1) takes it over and promises to read it. A signal is `cancel()`, and `SIGKILL` is a `cancel()` the task can't intercept. The analogy breaks on cleanup. An unread future is garbage collected once nothing refers to it. A zombie never goes away on its own. The kernel keeps it until somebody calls `wait`, however long that takes.",
- "in_your_world": "Your services go through this lesson on every deploy. Kubernetes stops a pod by sending `SIGTERM` to PID 1 in each container, waiting `terminationGracePeriodSeconds` (30 by default), then sending `SIGKILL`. Quarkus uses the `SIGTERM` window for a graceful shutdown: stop taking HTTP requests, let in-flight card authorizations finish, commit Kafka offsets. Two things break it. If the image's entrypoint is a shell that doesn't `exec` the JVM, the `SIGTERM` lands on the shell and is dropped (the worked example shows it happen), so every deploy ends in `SIGKILL` and exit 137 and in-flight work is cut off. And if shutdown takes longer than the grace period, for example a Temporal worker waiting for a long activity to finish, you also get `SIGKILL`. When a pod shows 137 and its log has no shutdown lines, check the entrypoint first, then the grace period, then memory.",
- "mistake": "Using `kill -9` as the normal way to stop a service. People reach for it because it always works. `SIGKILL` skips every shutdown hook: buffered log lines are lost, a Kafka consumer doesn't commit its last offsets so the next consumer processes those messages again, open Oracle transactions are cut off and rolled back, and the load balancer keeps sending requests until health checks notice. Send `SIGTERM` (plain `kill <pid>`), wait for the process to exit, and use `kill -9` only on a process that ignored `SIGTERM` for longer than its grace period. Even then it has limits: it does nothing to a zombie, which is already dead, and a process stuck in `D` state may not die until its disk wait ends.",
- "compare": {
-  "title": "The same JVM, stopped with SIGTERM and with SIGKILL",
-  "a": {
-   "label": "kill -TERM",
-   "lang": "text",
-   "title": "lab box",
-   "src": "$ java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\npid 66: settlement batch running\n$ kill -TERM $!; wait $!; echo \"exit status: $?\"\nshutdown hook: flushed 3 pending ledger entries\nexit status: 143"
+  ],
+  "terms": [
+    {
+      "term": "Process",
+      "plain": "A running program plus the kernel's record of it: PID, parent, state, memory, open files and signal settings."
+    },
+    {
+      "term": "PID / PPID",
+      "plain": "The process's ID number and its parent's. Every process except PID 1 has a parent."
+    },
+    {
+      "term": "fork",
+      "plain": "The call that creates a new process as a copy of the caller. On arm64, glibc makes it out of `clone`."
+    },
+    {
+      "term": "execve",
+      "plain": "The call that replaces the program running in a process. The PID and the open files stay."
+    },
+    {
+      "term": "Zombie",
+      "plain": "A process that has ended but hasn't been waited for. Only its PID and exit status are left."
+    },
+    {
+      "term": "Orphan",
+      "plain": "A live process whose parent has died. The kernel gives it PID 1 (or a subreaper) as its new parent."
+    },
+    {
+      "term": "Signal",
+      "plain": "A small numbered notice the kernel delivers to a process, such as `SIGTERM` (15, please stop) or `SIGKILL` (9, stopped without asking)."
+    },
+    {
+      "term": "Shutdown hook",
+      "plain": "Code a Java program registers to run on the way out: on a normal exit, or on `SIGTERM`, `SIGINT` or `SIGHUP`. It never runs on `SIGKILL`."
+    }
+  ],
+  "explain_back": {
+    "prompt": "A friend runs the café's payments program in a container. On their laptop it stops cleanly with Ctrl-C, but on every update in the container it ends with exit status 137. Explain what's going on, and what you'd check.",
+    "answer": "137 means the process was killed by signal 9, `SIGKILL`, because shells and container tools report 128 plus the signal number. `SIGKILL` can't be caught, so the JVM's shutdown hooks never ran. On the laptop, Ctrl-C sends `SIGINT`, which the JVM catches, and it runs the hooks. On an update, the container tool first sends `SIGTERM` to PID 1, and sends `SIGKILL` only after a wait, 10 seconds for `docker stop`. So either `SIGTERM` never reached the JVM, or stopping took longer than the wait. I'd check how the container starts first. If PID 1 is a shell that doesn't `exec` java, the kernel drops `SIGTERM`, because the shell has no handler for it, and the JVM only ever sees `SIGKILL`. Then I'd check whether the hooks finish within the wait. If both are fine, I'd look for the kernel's OOM killer, which also leaves 137."
   },
-  "b": {
-   "label": "kill -KILL",
-   "lang": "text",
-   "title": "lab box",
-   "src": "$ java os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java &\npid 92: settlement batch running\n$ kill -KILL $!; wait $!; echo \"exit status: $?\"\nexit status: 137\nbash: line 25:    92 Killed                  java os/src/demo/..."
+  "deeper": {
+    "minutes": 10,
+    "body": "`ProcessBuilder.start()`, Java's way of starting another program, doesn't call `fork` on Linux. Copying a JVM with a big heap and dozens of threads, even with copy-on-write, is wasted work when the child is about to `exec` anyway. Since JDK 13 (JDK-8213192), the default on Linux is `posix_spawn`, a C library function that starts a program in one step. The JDK, the JVM plus its tools, runs a small helper, `jspawnhelper`, which then `exec`s your command. Here's a trace of `new ProcessBuilder(\"ls\", \"/labs\").start()` on JDK 25 in the lab box (trimmed):\n\n```text\n39    clone3({flags=CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND, exit_signal=SIGCHLD, ...}, 88) = -1 ENOSYS (Function not implemented)\n39    clone(child_stack=0xffffb85ed000, flags=CLONE_VM|CLONE_VFORK|SIGCHLD <unfinished ...>\n59    execve(\"/opt/java/openjdk/lib/jspawnhelper\", [\"/opt/java/openjdk/lib/jspawnhelp\"..., \"25.0.5+8-LTS\", \"10:11:13\"], ...) = 0\n59    execve(\"/usr/bin/ls\", [\"ls\", \"/labs\"], ...) = 0\n39    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=59, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---\n60    wait4(59, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 59\n```\n\n`CLONE_VM|CLONE_VFORK` is the `vfork` pattern. The child shares the parent's memory instead of copying it, and the parent's thread pauses until the child calls `execve`. Nothing is copied, so it costs the same for a 100 MB JVM as for a 30 GB one. (The `clone3` and `ENOSYS` pair is Docker's seccomp filter again, from What a kernel does.) The `wait4` comes from thread 60, the JDK's \"process reaper\" thread. It waits for each child the JVM started, and completes `Process.onExit()`, an object that holds the result once the child ends. That thread is the reason a JVM reaps its own children and nobody else's.\n\nTwo more details are worth knowing. `/proc/<pid>/status` has bit masks, one bit per signal, for the signals a process blocks, ignores and catches (`SigBlk`, `SigIgn`, `SigCgt`). For the demo JVM, `SigCgt` decodes to `SIGHUP`, `SIGQUIT`, `SIGILL`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGUSR2`, `SIGPIPE`, `SIGTERM` and `SIGXFSZ`, plus two real-time signals. The JVM catches `SIGSEGV`, the bad-memory signal, on purpose: it's part of how it checks for null references and pauses its threads. `SIGQUIT` (`kill -3`) makes it print a thread dump, a list of what every thread is doing, which the next lesson uses. And `SIGINT` was missing from that mask. bash starts background jobs with `SIGINT` ignored, and the JVM leaves an ignored signal ignored. A `kill -INT` to that background JVM did nothing at all."
   },
-  "note": "`SIGTERM` is a request. The JVM has a handler for it, runs the shutdown hooks and then exits with 143 (128 + 15) by its own choice. `SIGKILL` is not delivered to the program at all: the kernel ends the process, and `wait` reports \"killed by signal 9\", which bash shows as 137. From the outside the two numbers look alike. Only the first one gave your code a chance to finish its work."
- },
- "worked": {
-  "title": "Why didn't the shutdown hook run on docker stop?",
-  "steps": [
-   {
-    "say": "A ledger service's Dockerfile uses the shell form, `ENTRYPOINT java -jar ledger.jar`, which Docker runs as `/bin/sh -c \"...\"`. Reproduce it with the demo and a shell that runs two commands. Then look at the process tree inside: `sh` is PID 1 and the JVM is its child.",
-    "code": "docker run -d --name sfz-os02-stop -v \"$PWD\":/labs sfz-labbox:1 \\\n  sh -c \"echo starting; java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\"\ndocker exec sfz-os02-stop ps -o pid,ppid,cmd\n#   PID  PPID CMD\n#     1     0 sh -c echo starting; java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\n#     7     1 java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java",
-    "lang": "bash"
-   },
-   {
-    "say": "Stop it with a 3 second grace period. The stop takes the full 3 seconds, the hook's line is missing from the log, and the exit code is 137.",
-    "code": "time docker stop -t 3 sfz-os02-stop      # 3.11 s total\ndocker logs sfz-os02-stop\n# starting\n# pid 7: settlement batch running\ndocker inspect -f '{{.State.ExitCode}}' sfz-os02-stop\n# 137\ndocker rm sfz-os02-stop",
-    "lang": "bash"
-   },
-   {
-    "say": "Why: Docker sent `SIGTERM` to PID 1, which is `sh`. The kernel protects a container's PID 1: it delivers a signal from outside only if PID 1 installed a handler for it, and `sh` has none for `SIGTERM`. So the signal was dropped. `sh` doesn't pass signals to its children anyway. After 3 seconds Docker sent `SIGKILL`, which the kernel always delivers. When a container's PID 1 dies, the kernel kills every other process in it, and the JVM died without running its hooks.",
-    "code": "",
-    "lang": ""
-   },
-   {
-    "say": "Fix: make the JVM itself PID 1. Use the exec form, `ENTRYPOINT [\"java\", \"-jar\", \"ledger.jar\"]`, or end a wrapper script with `exec java ...` so the shell replaces itself with the JVM. The JVM has a `SIGTERM` handler, so the signal arrives. Same test with `exec`:",
-    "code": "docker run -d --name sfz-os02-stop -v \"$PWD\":/labs sfz-labbox:1 \\\n  sh -c \"echo starting; exec java /labs/os/src/demo/java/sfz/os/l02/demo/GracefulShutdown.java\"\ntime docker stop -t 3 sfz-os02-stop      # 0.11 s total\ndocker logs sfz-os02-stop\n# starting\n# pid 1: settlement batch running\n# shutdown hook: flushed 3 pending ledger entries\ndocker inspect -f '{{.State.ExitCode}}' sfz-os02-stop\n# 143\ndocker rm sfz-os02-stop",
-    "lang": "bash"
-   },
-   {
-    "say": "If the JVM starts child processes, add `--init` too (in Kubernetes, put `tini` in the image as the entrypoint). The tiny init becomes PID 1, passes `SIGTERM` on to the JVM and reaps any orphans, so you get both a clean shutdown and no zombies.",
-    "code": "ENTRYPOINT [\"/usr/bin/tini\", \"--\", \"java\", \"-jar\", \"ledger.jar\"]",
-    "lang": "docker"
-   }
+  "sources": [
+    {
+      "title": "Arpaci-Dusseau, OSTEP chapter 5: Interlude: Process API",
+      "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf"
+    },
+    {
+      "title": "wait(2), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man2/wait.2.html"
+    },
+    {
+      "title": "signal(7), Linux manual page",
+      "url": "https://man7.org/linux/man-pages/man7/signal.7.html"
+    },
+    {
+      "title": "pid_namespaces(7): signals and the init process of a namespace",
+      "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html"
+    },
+    {
+      "title": "docker container stop",
+      "url": "https://docs.docker.com/reference/cli/docker/container/stop/"
+    }
   ]
- },
- "lab": {
-  "title": "Model the kernel's process table",
-  "minutes": 15,
-  "files": [
-   "labs/os/src/main/kotlin/sfz/os/l02/ProcessTable.kt"
-  ],
-  "run": "./gradlew :os:test --tests 'sfz.os.l02.*'",
-  "steps": [
-   "Open `ProcessTable.kt`. `fork`, `exec` and `handle` are written for you. Read them first, and note what `fork` copies and what `exec` resets.",
-   "Run the tests from the `labs` folder. All ten fail.",
-   "Write `shellCode`: one `when` over the two kinds of `ExitStatus`.",
-   "Write `exit` through a private helper, `terminate(p, status)`, that marks the process a zombie, re-parents its children to PID 1 and, if `initReaps` is true, removes every zombie whose parent is now PID 1.",
-   "Write `kill`. Handle the cases in the KDoc order: missing PID, zombie, `SIGKILL`, a handled signal, `SIGCHLD`, everything else. The death cases call `terminate`.",
-   "Write `waitpid`. Find the children of `parent` (only `child` if it isn't -1). None at all is `ECHILD`. If one is a zombie, remove it and return its PID and status. Otherwise return null.",
-   "Run the tests until all ten pass. The last test is the JVM-as-PID-1 story from this lesson."
-  ],
-  "hints": [
-   "`check(condition) { \"ECHILD: ...\" }` throws an `IllegalStateException` with your message, which is what the tests look for.",
-   "Re-parent before you reap. A child that was already a zombie becomes init's zombie, and a reaping init removes it in the same step.",
-   "Collect the PIDs to remove into a list first, then remove them. Removing entries from `table` while you loop over `table.values` throws `ConcurrentModificationException`.",
-   "Test `SIGKILL` before the handler set. A program can't install a handler for it, but `kill` should not even look."
-  ],
-  "done_when": "All ten tests in `ProcessTableTest` pass."
- },
- "drill": {
-  "title": "fork, exec and wait in C, from memory",
-  "minutes": 5,
-  "prompt": "Without looking, write C that runs `ls -l` in a child process, waits for it, and prints either its exit code or the signal that killed it along with the number bash would show. Then say why the child calls `_exit` and not `exit` when `exec` fails.",
-  "answer": {
-   "lang": "c",
-   "src": "pid_t pid = fork();\nif (pid < 0) { perror(\"fork\"); exit(1); }\nif (pid == 0) {                              // child\n    execlp(\"ls\", \"ls\", \"-l\", (char *)NULL);\n    perror(\"exec\");                          // only runs if exec failed\n    _exit(127);                              // skip the stdio buffers and atexit\n}                                            // handlers copied from the parent\nint status;\nwaitpid(pid, &status, 0);                    // parent: sleep until the child ends\nif (WIFEXITED(status))\n    printf(\"exit code %d\\n\", WEXITSTATUS(status));\nelse if (WIFSIGNALED(status))\n    printf(\"signal %d, bash shows %d\\n\", WTERMSIG(status), 128 + WTERMSIG(status));"
-  }
- },
- "recap": [
-  "A process is a running program plus the kernel's record of it: PID, parent, state, memory, open files and signal settings. `/proc/<pid>/status` shows the record.",
-  "`fork` copies the caller, `execve` replaces the program but keeps the PID and open files, and `wait` collects the exit status. The gap between `fork` and `exec` is where a shell sets up redirection.",
-  "A dead process stays a zombie (`Z`) until its parent waits. Orphans get PID 1 as their new parent, and PID 1 must reap them.",
-  "In a container your program may be PID 1. A JVM there doesn't reap orphans, and a shell there drops `SIGTERM`. Use the exec form, and `--init` when you start child processes.",
-  "`SIGTERM` can be caught, so the JVM runs its shutdown hooks and exits 143. `SIGKILL` can't, so nothing runs and the shell shows 137."
- ],
- "quiz": [
-  {
-   "q": "A pod's last state is `Terminated, exit code 137`, and the application log stops mid-line with no shutdown messages. What is the most likely story?",
-   "options": [
-    "The JVM threw an `OutOfMemoryError` and exited",
-    "Something sent `SIGKILL`: the grace period ran out, or the kernel's OOM killer ended the process",
-    "The app called `System.exit(137)` from a shutdown hook",
-    "The JVM got `SIGTERM` and ran its hooks"
-   ],
-   "answer": 1,
-   "why": "137 is 128 + 9, death by `SIGKILL`, which skips shutdown hooks, hence no shutdown lines. A `SIGTERM` path would log the hooks and end with 143. An uncaught `OutOfMemoryError` ends the JVM with status 1, not 137."
-  },
-  {
-   "q": "`ps` in a container shows 300 lines like `[curl] <defunct>` with PPID 1, and PID 1 is `java -jar app.jar`. What fixes it?",
-   "options": [
-    "`kill -9` each defunct PID",
-    "Restart the zombies with `kill -CONT`",
-    "Run the container with `--init` (or tini) so a real init reaps orphans",
-    "Give the container more memory"
-   ],
-   "answer": 2,
-   "why": "Those are orphans that died under a PID 1 that never calls `wait` for processes it didn't start. They're already dead, so `kill` of any kind does nothing. A tiny init as PID 1 reaps them as they die. Memory has nothing to do with it: each zombie holds a PID, not memory."
-  },
-  {
-   "q": "A shell runs `java -jar ledger.jar > ledger.log`. Which process opens `ledger.log`, and when?",
-   "options": [
-    "The JVM, when `System.out` is first used",
-    "The kernel, during `execve`",
-    "The shell, before `fork`, passing the file name to java",
-    "The shell's child, after `fork` and before `execve`, pointing fd 1 at it"
-   ],
-   "answer": 3,
-   "why": "Redirection happens in the gap between `fork` and `exec`. The child still runs the shell's code, opens the file and `dup2`s it onto fd 1, then `exec`s java. The JVM writes to fd 1 and never learns a file is behind it."
-  },
-  {
-   "q": "A Kotlin service has a shutdown hook that commits Kafka offsets. Which way of stopping it skips the hook?",
-   "options": [
-    "`kill <pid>`",
-    "Ctrl-C in the terminal it runs in",
-    "`kill -9 <pid>`",
-    "`docker stop` on a container whose PID 1 is the JVM, when the JVM exits within 10 seconds"
-   ],
-   "answer": 2,
-   "why": "`kill -9` sends `SIGKILL`, which no process can catch, so the JVM never runs its hooks. Plain `kill` sends `SIGTERM` and Ctrl-C sends `SIGINT`, and the JVM handles both by running hooks. `docker stop` sends `SIGTERM` first, and a JVM that is PID 1 has a handler for it."
-  },
-  {
-   "q": "From the last lesson's tool: strace on a shell shows `clone(child_stack=NULL, flags=CLONE_CHILD_CLEARTID|CLONE_CHILD_SETTID|SIGCHLD, ...) = 45`. What did the shell just do?",
-   "options": [
-    "Called `fork`: there is no `CLONE_THREAD`, so 45 is a new process",
-    "Started a thread, because `clone` always starts threads",
-    "Ran `execve` in process 45",
-    "Sent `SIGCHLD` to process 45"
-   ],
-   "answer": 0,
-   "from": "os-01",
-   "why": "`clone` makes both threads and processes, depending on its flags. With `CLONE_THREAD` (and `CLONE_VM`) the new task joins the caller's process as a thread. Here neither flag is set and `SIGCHLD` is the signal to send the parent when the child dies, so this is glibc's `fork()`. 45 is the child's PID."
-  }
- ],
- "flashcards": [
-  {
-   "front": "What do `fork`, `execve` and `wait` each do?",
-   "back": "`fork` copies the calling process. `execve` replaces the program in a process but keeps its PID and open files. `wait` sleeps until a child ends and collects its status."
-  },
-  {
-   "front": "Why are fork and exec two separate calls?",
-   "back": "The child runs the parent's code between them, so a shell can set up redirection, pipes or limits before the new program starts."
-  },
-  {
-   "front": "What is a zombie process?",
-   "back": "A process that has exited but whose parent hasn't called `wait`. Only its PID and exit status remain. `ps` shows `Z` and `<defunct>`."
-  },
-  {
-   "front": "How do you get rid of a zombie?",
-   "back": "Make its parent call `wait`, or end the parent so PID 1 adopts and reaps it. `kill` does nothing: it's already dead."
-  },
-  {
-   "front": "What happens to an orphan?",
-   "back": "The kernel makes PID 1 (or a subreaper) its parent. PID 1 must reap it when it exits."
-  },
-  {
-   "front": "What do exit statuses 137 and 143 mean?",
-   "back": "128 + 9 (`SIGKILL`) and 128 + 15 (`SIGTERM`)."
-  },
-  {
-   "front": "Which signals can't be caught, blocked or ignored?",
-   "back": "`SIGKILL` (9) and `SIGSTOP` (19)."
-  }
- ],
- "terms": [
-  {
-   "term": "Process",
-   "plain": "A running program plus the kernel's record of it: PID, parent, state, memory, open files and signal settings."
-  },
-  {
-   "term": "PID / PPID",
-   "plain": "The process's ID and its parent's ID. Every process except PID 1 has a parent."
-  },
-  {
-   "term": "fork",
-   "plain": "The call that creates a new process as a copy of the caller. On arm64 glibc implements it with `clone`."
-  },
-  {
-   "term": "execve",
-   "plain": "The call that replaces the program running in a process. The PID and open files stay."
-  },
-  {
-   "term": "Zombie",
-   "plain": "A process that has exited but not been waited for. Only its PID and exit status are left."
-  },
-  {
-   "term": "Orphan",
-   "plain": "A live process whose parent has died. The kernel gives it PID 1 (or a subreaper) as its new parent."
-  },
-  {
-   "term": "Signal",
-   "plain": "A small numbered message the kernel delivers to a process, such as `SIGTERM` (15) or `SIGKILL` (9)."
-  },
-  {
-   "term": "Shutdown hook",
-   "plain": "A Java thread the JVM runs when it exits normally or gets `SIGTERM`, `SIGINT` or `SIGHUP`. It never runs on `SIGKILL`."
-  }
- ],
- "explain_back": {
-  "prompt": "A teammate asks why our pods sometimes stop with exit code 137 on a normal deploy, while the same service stopped locally with Ctrl-C shuts down cleanly. Explain what is going on and what you would check.",
-  "answer": "137 means the process was killed by signal 9, `SIGKILL`, because shells and container runtimes report 128 plus the signal number. `SIGKILL` can't be caught, so the JVM's shutdown hooks never ran. Locally, Ctrl-C sends `SIGINT`, which the JVM catches and handles by running the hooks. On a deploy, Kubernetes first sends `SIGTERM` to PID 1 and only sends `SIGKILL` after the grace period. So either the `SIGTERM` never reached the JVM, or shutdown took too long. I'd check the entrypoint first: if PID 1 is a shell that doesn't `exec` java, the kernel drops `SIGTERM` because the shell has no handler for it, and the JVM only ever sees `SIGKILL`. Then I'd check whether shutdown fits in `terminationGracePeriodSeconds`. If both are fine, I'd look for an OOM kill, which also shows up as 137."
- },
- "deeper": {
-  "minutes": 10,
-  "body": "`ProcessBuilder.start()` on Linux doesn't call `fork`. Copying a JVM with a large heap and dozens of threads, even with copy-on-write, is wasteful when the child is about to `exec` anyway. Since JDK 13 (JDK-8213192) the default on Linux is `posix_spawn`, and the JDK runs a small helper, `jspawnhelper`, which then `exec`s your command. Here is a trace of `new ProcessBuilder(\"ls\", \"/labs\").start()` on JDK 25 in the lab box (trimmed):\n\n```text\n39    clone3({flags=CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND, exit_signal=SIGCHLD, ...}, 88) = -1 ENOSYS (Function not implemented)\n39    clone(child_stack=0xffffb85ed000, flags=CLONE_VM|CLONE_VFORK|SIGCHLD <unfinished ...>\n59    execve(\"/opt/java/openjdk/lib/jspawnhelper\", [\"/opt/java/openjdk/lib/jspawnhelp\"..., \"25.0.5+8-LTS\", \"10:11:13\"], ...) = 0\n59    execve(\"/usr/bin/ls\", [\"ls\", \"/labs\"], ...) = 0\n39    --- SIGCHLD {si_signo=SIGCHLD, si_code=CLD_EXITED, si_pid=59, si_uid=0, si_status=0, si_utime=0, si_stime=0} ---\n60    wait4(59, [{WIFEXITED(s) && WEXITSTATUS(s) == 0}], 0, NULL) = 59\n```\n\n`CLONE_VM|CLONE_VFORK` is the `vfork` pattern: the child shares the parent's memory instead of copying it, and the parent thread is paused until the child calls `execve`. Nothing is copied, so it costs the same for a 100 MB JVM as for a 30 GB one. (The `clone3` and `ENOSYS` pair is Docker's seccomp again, from lesson 1.) The `wait4` comes from thread 60, the JDK's \"process reaper\" thread, which waits for each child the JVM started and completes the `Process.onExit()` future. That thread is the reason a JVM reaps its own children and nobody else's.\n\nTwo more details are worth knowing. `/proc/<pid>/status` has bitmasks of the signals a process blocks, ignores and catches (`SigBlk`, `SigIgn`, `SigCgt`). For the demo JVM, `SigCgt` decodes to `SIGHUP`, `SIGQUIT`, `SIGILL`, `SIGBUS`, `SIGFPE`, `SIGSEGV`, `SIGUSR2`, `SIGPIPE`, `SIGTERM` and `SIGXFSZ`, plus two real-time signals. The JVM catches `SIGSEGV` on purpose, as part of how it handles null checks and safepoints, and `SIGQUIT` (`kill -3`) makes it print a thread dump, which lesson 3 of this track uses. And `SIGINT` was missing from that mask: bash starts background jobs with `SIGINT` ignored, and the JVM leaves an ignored signal ignored. A `kill -INT` to that background JVM did nothing at all."
- },
- "sources": [
-  {
-   "title": "Arpaci-Dusseau, OSTEP chapter 5: Interlude: Process API",
-   "url": "https://pages.cs.wisc.edu/~remzi/OSTEP/cpu-api.pdf"
-  },
-  {
-   "title": "wait(2), Linux manual page",
-   "url": "https://man7.org/linux/man-pages/man2/wait.2.html"
-  },
-  {
-   "title": "signal(7), Linux manual page",
-   "url": "https://man7.org/linux/man-pages/man7/signal.7.html"
-  },
-  {
-   "title": "pid_namespaces(7): signals and the init process of a namespace",
-   "url": "https://man7.org/linux/man-pages/man7/pid_namespaces.7.html"
-  },
-  {
-   "title": "docker container stop",
-   "url": "https://docs.docker.com/reference/cli/docker/container/stop/"
-  }
- ]
 }
