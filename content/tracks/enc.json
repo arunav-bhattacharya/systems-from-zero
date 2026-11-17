@@ -1,69 +1,69 @@
 {
   "id": "enc",
-  "intro": "By the end of this track you can follow one payment from an object on your heap to bytes on a wire, into a database that outlives the code that wrote it, across a call to another service, and through a multi-step process that survives a crash. You will be able to say what each encoding costs in bytes and in risk (lesson 1), change a Protobuf or Avro schema without breaking a reader (lesson 2), run two versions of a service against one database and migrate a live table in phases (lesson 3), call another service with deadlines and retries that can't charge a card twice (lesson 4), and write a Temporal workflow that resumes after a dead worker and a deploy (lesson 5).\n\nThe thread through all five lessons is that the writer and the reader of some bytes are never quite the same program: another language, another version, another machine, or the same service a year later. Every lesson starts from something that breaks when you forget that (a rounded ID, a lost field, a double charge, a stuck workflow) and builds up to the rule that prevents it.\n\nYou need to read Kotlin and have JDK 21 or newer. The labs live in one Gradle module, `flow`, run from the `labs` folder with `./gradlew :flow:test --tests 'sfz.enc.lNN.*'`, and need no code generation: Protobuf is encoded by hand or with `DynamicMessage`, gRPC method descriptors are written in Kotlin, and Temporal runs in its in-memory test server inside the JVM. Only lesson 3 needs Docker, for a PostgreSQL 18 container. The Networking track's lessons on HTTP and on load balancers, timeouts and retries, and the Caching track's lesson on idempotency keys, come up again in lessons 4 and 5.",
-  "cheatsheet": "## From objects to bytes (lesson 1)\n\nAn object holds addresses that mean nothing outside its process, so data that leaves it is encoded into self-contained bytes.\n\n| Encoding | The sample authorization | Field names in the bytes | Watch for |\n|---|---|---|---|\n| JSON | 116 bytes | yes | many readers keep numbers as doubles: integers above 2^53 round silently, so send 64-bit IDs as strings; binary data needs Base64 (+33%) |\n| MessagePack, CBOR | 84, 85 bytes | yes | smaller values, same names; 39 bytes as a bare array |\n| BSON | bigger than JSON | yes | lengths and type bytes, so a database can skip through it |\n| Java serialization | | class names | the bytes choose the classes and run their `readObject`: never on untrusted input; JEP 290 filter (`maxdepth=5;com.acme.Order;!*`) |\n| Protobuf | 42 bytes | field numbers | never change or reuse a number; `reserved` deleted ones |\n| Avro | 38 bytes | nothing | the reader needs the writer's exact schema |\n\n## Schemas that evolve (lessons 2 and 3)\n\n- **Backward** compatible: new code reads old data. **Forward** compatible: old code reads new data. A rolling upgrade needs both, because for a while both versions read and write the same data.\n- Protobuf key = `(fieldNumber shl 3) or wireType`. Varints: 7 bits per byte, low bits first; `-1` as `int64` is 10 bytes, as `sint64` 1. Unknown fields are skipped and kept; missing fields read as defaults.\n- Avro resolves the writer's schema against the reader's by field name. Add or remove only fields that have defaults.\n- Registry modes: BACKWARD (the default) = consumers upgrade first; FORWARD = producers first; FULL = both checks. Non-transitive modes compare only with the latest version: use `_TRANSITIVE` while old data is kept.\n- Old code that decodes into its own class and writes the class back deletes fields it doesn't know. Change only what you own, or keep unknown fields.\n- Never give an old identifier (a field number, a flag, a column) a new meaning: Knight Capital lost over $460 million in 45 minutes that way.\n- Expand and contract: add the new shape, dual-write, backfill, switch reads, switch writes, drop the old shape after the last old instance is gone. Set `lock_timeout` before DDL on a busy table.\n\n## Calling other services (lesson 4)\n\n| | REST | gRPC |\n|---|---|---|\n| Contract | OpenAPI 3.2 (YAML or JSON) | `.proto` file, generated stubs |\n| On the wire | resource URLs, HTTP methods, JSON | HTTP/2 POST to `/package.Service/Method`; 5-byte prefix + Protobuf per message |\n| Outcome | HTTP status | `grpc-status` in trailers (HTTP status is 200) |\n| Deadline | none standard; each side sets timeouts | `grpc-timeout`, sent as time remaining and passed to downstream calls (grpc-java, Go) |\n| Streaming | no (SSE or WebSocket aside) | unary, server, client, bidirectional |\n| Browsers | yes | via gRPC-Web or Connect |\n\n- A remote call can end with no answer, and the client can't tell a lost request from a lost reply. Set a deadline on every call: gRPC has none by default.\n- Retry `UNAVAILABLE` and, with a key, `DEADLINE_EXCEEDED`; never `INVALID_ARGUMENT` or `FAILED_PRECONDITION`. Full-jitter backoff, a cap, one layer. gRPC's own retry policy (service config) retries within the call's original deadline.\n- Idempotency key: one per operation, made before the first attempt, sent on every attempt, claimed atomically by the server before the work, passed on downstream. Stripe: up to 255 characters, result saved once execution begins (even a 500), pruned after 24 hours or more, different parameters with the same key are an error, POST only.\n- Compatibility: servers deploy first, so requests need backward and responses forward compatibility. Stripe pins each account to a dated version and converts responses back; since `2024-09-30.acacia`, monthly non-breaking releases and two breaking releases a year.\n- One gRPC channel = one HTTP/2 connection. An L4 balancer (kube-proxy) pins it to one backend. Fix: L7 per-stream balancing (Envoy, a mesh), client-side `round_robin` over a headless Service (`clusterIP: None`), or `maxConnectionAge` as a stopgap.\n\n## Durable execution (lesson 5)\n\n- Workflow = deterministic code that decides; activity = a step with side effects, at-least-once, retried (Temporal default: from 1 s, doubling to 100 s, no attempt limit).\n- The server keeps an append-only event history per run. After a crash, a worker replays the workflow code: recorded steps return their results, the first unrecorded step runs for real. `Workflow.sleep` is a durable timer.\n- \"Exactly once\" = progress recorded once. Pass every external call a key from the workflow ID and step: `\"$workflowId/charge\"`.\n- Saga: each step has a compensation; when a step fails for good, compensate finished steps newest first. No isolation. Put what can't be undone last.\n- In workflow code: no `Random`, `UUID.randomUUID()`, clock, `Thread.sleep`, threads or I/O. Use `Workflow.randomUUID()`, `Workflow.currentTimeMillis()`, `Workflow.sleep()` and activities.\n- Changing code with runs in flight: `Workflow.getVersion(changeId, Workflow.DEFAULT_VERSION, 1)` (old histories get -1), or Worker Versioning to pin runs to their deployment. Replay saved histories with `WorkflowReplayer` in CI. A mismatch raises `NonDeterministicException`, which fails the workflow task and is retried.\n- Kotlin 2.4 with Java SDK 1.40: don't pass method references (`activities::charge`) to `Async` or `Saga`; call activities directly or pass a lambda.\n- Limits: 51,200 events or 50 MB per history (warnings from 10,240 events or 10 MB); use continue-as-new for long loops.\n- Workflow ID as a dedupe key for starts; `REJECT_DUPLICATE` keeps it taken after the run closes.\n\n| Engine (Nov 2026) | Progress recorded in | Resumes by |\n|---|---|---|\n| Temporal (server 1.32, Java SDK 1.40) | event history in the Temporal cluster | replaying workflow code |\n| Restate 1.8 | journal per invocation in the Restate server | replaying the handler |\n| DBOS Transact Java 1.2 | checkpoint rows in your PostgreSQL | re-running the workflow with saved step outputs |\n| AWS Step Functions Standard | state machine execution history | moving to the next state (exactly-once unless `Retry`) |\n| AWS Lambda durable functions | SDK checkpoints | re-running the handler, skipping checkpointed steps |",
+  "intro": "This track follows one payment as it leaves a program: from the objects in the program's memory, to bytes on a disk or a network, into a database that outlives the code that wrote it, across a call to another program, and through an order of several steps that must survive a crash. Lessons start from scenes everyone knows, such as a bakery's refund that can't find its payment, a paper order form that gains a new box, a Pay button that asks you not to press it twice, and an online order stuck on Processing. Then they open up the machinery, one byte or one step at a time.\n\nBy the end, you can:\n\n- turn a record into bytes in several formats, say what each costs in size and in risk, and spot the one that runs a stranger's code;\n- change the shape of a record without breaking the programs that read it, and say which programs must be updated first;\n- run two versions of a program against one database, and change a live table in safe steps;\n- call another program with a deadline, and retry without charging a card twice;\n- write a workflow that carries an order on after a crash, and after a change to its code.\n\nThe five lessons:\n\n1. From objects to bytes: JSON, binary formats and serializers\n2. Schemas that evolve: Protobuf, Avro and compatibility\n3. Data outlives code: rolling upgrades and migrations\n4. Calling other services: REST, RPC and gRPC\n5. Durable execution: workflows that survive crashes\n\nYou need to read a little Kotlin, and to have JDK 21 or newer, the Java toolkit the labs run on. You don't need to know any of the formats or products first: every term is explained the first time it appears. The labs live in one Gradle project, `flow` (Gradle is the tool that builds the labs and runs their tests). From the `labs` folder, run `./gradlew :flow:test --tests 'sfz.enc.lNN.*'` until it passes; `./gradlew :flow:solutionTest` runs the same tests against the finished answers. No code generators are needed: Protobuf is written by hand, gRPC's methods are described in Kotlin, and Temporal runs in its test server inside the program. Only lesson 3 needs Docker, a free program that runs small, separate Linux systems on your laptop, for a PostgreSQL 18 database. The Networking track's lessons on HTTP and on production networking, and the Caching track's lesson on idempotency keys, come back in lessons 4 and 5.",
+  "cheatsheet": "## From objects to bytes (lesson 1)\n\nAn object in memory points at other objects by address, and an address means nothing outside the program that holds it. So data that is stored or sent is first encoded: turned into self-contained bytes.\n\n| Encoding | The sample payment | Field names in the bytes | Watch for |\n|---|---|---|---|\n| JSON (text) | 116 bytes | yes | many readers keep numbers as doubles, so whole numbers above 2^53 change without an error: send 64-bit IDs as strings; raw bytes need Base64 (+33%) |\n| MessagePack, CBOR (binary JSON) | 84, 85 bytes | yes | smaller values, the same names; 39 bytes as a bare list of values |\n| BSON | bigger than JSON | yes | adds lengths and type bytes, so a database can skip through it |\n| Java serialization | | class names | the bytes choose which classes are created, and run their `readObject`: never use it on bytes from outside; a JEP 290 filter (`maxdepth=5;com.acme.Order;!*`) lists what's allowed |\n| Protobuf | 42 bytes | field numbers | never change or reuse a number; mark deleted ones `reserved` |\n| Avro | 38 bytes | nothing | the reader needs the writer's exact schema |\n\n## Schemas that evolve (lessons 2 and 3)\n\n- A schema is the agreed shape of a record. **Backward** compatible: new code reads old data. **Forward** compatible: old code reads new data. A rolling upgrade, which replaces a program's copies one at a time, needs both, because for a while both versions read and write the same data.\n- Protobuf writes a key per field, `(fieldNumber shl 3) or wireType`, then the value. Varints use 7 bits per byte, lowest bits first; `-1` as `int64` takes 10 bytes, as `sint64` 1. Old code skips unknown fields and keeps them; missing fields read as defaults.\n- Avro matches the writer's schema to the reader's by field name. Add or remove only fields that have defaults.\n- A schema registry checks each new schema before you deploy. BACKWARD mode (the default) means consumers, the programs that read, upgrade first; FORWARD means producers, the programs that write, upgrade first; FULL checks both. Modes without `_TRANSITIVE` compare only with the latest version, so use the transitive ones while old data is kept.\n- Old code that decodes into its own class and writes the class back deletes fields it doesn't know. Change only what you own, or keep unknown fields.\n- Never give an old name or number (a field number, a flag, a column) a new meaning: Knight Capital lost over $460 million in 45 minutes that way.\n- Expand and contract: add the new shape, write both, copy old rows over (backfill), switch reads, switch writes, and drop the old shape after the last old copy of the program is gone. Set `lock_timeout` before changing a busy table's schema.\n\n## Calling other services (lesson 4)\n\n| | REST | gRPC |\n|---|---|---|\n| Contract | an OpenAPI 3.2 file (YAML or JSON) | a `.proto` file, with generated client and server code |\n| On the wire | resource URLs, HTTP methods, JSON bodies | HTTP/2 POST to `/package.Service/Method`; a 5-byte prefix and Protobuf bytes per message |\n| Outcome | HTTP status code | `grpc-status` in the trailers (the HTTP status is 200) |\n| Deadline | no standard; each side sets its own timeouts | `grpc-timeout`, sent as time remaining and passed on to later calls (grpc-java, Go) |\n| Streaming | no (apart from add-ons) | one request and one reply, or streams in either direction or both |\n| Browsers | yes | through gRPC-Web or Connect |\n\n- A remote call can end with no answer, and the client can't tell a lost request from a lost reply. Give every call a deadline: gRPC has none unless you set one.\n- Retry `UNAVAILABLE` and, with a key, `DEADLINE_EXCEEDED`; never `INVALID_ARGUMENT` or `FAILED_PRECONDITION`. Wait a random, growing time between attempts (full jitter), cap the attempts, and retry at one layer only. gRPC's own retry policy retries inside the call's original deadline.\n- Idempotency key: one per operation, made before the first attempt, sent with every attempt, claimed by the server in one atomic step before the work, and passed on to the next program down. Stripe: up to 255 characters; the first result is saved once the work begins (even a 500 error); keys may be deleted after 24 hours; the same key with different details is an error; POST only.\n- Servers update first, so requests need backward and replies forward compatibility. Stripe pins each account to a dated version and converts replies back; since `2024-09-30.acacia`, a release with no breaking changes every month, and two breaking releases a year.\n- One gRPC channel is one HTTP/2 connection. An L4 balancer, which picks a copy per connection, sends all of the channel's calls to one copy. Fix: an L7 proxy that balances each request (Envoy, a service mesh), the client's own `round_robin` over every copy's address, or `maxConnectionAge` as a quick patch.\n\n## Durable execution (lesson 5)\n\n- Workflow: the code that decides the steps; it must be deterministic. Activity: a step that touches the outside world, run at least once and retried (Temporal's default: from 1 s, doubling to 100 s, with no limit on attempts).\n- The server keeps an event history for every run, only ever added to. After a crash, a worker replays the workflow code: recorded steps return their saved results, and the first unrecorded step runs for real. `Workflow.sleep` is a timer kept by the server.\n- \"Exactly once\" means progress recorded once. Pass every outside call a key built from the workflow ID and the step: `\"$workflowId/charge\"`.\n- Saga: each step has a compensating step; when a step fails for good, compensate the finished steps, newest first. Others can see the state in between. Put what can't be undone last.\n- Never in workflow code: `Random`, `UUID.randomUUID()`, the clock, `Thread.sleep`, threads, files or network calls. Use `Workflow.randomUUID()`, `Workflow.currentTimeMillis()`, `Workflow.sleep()` and activities.\n- Changing code while runs are in progress: `Workflow.getVersion(changeId, Workflow.DEFAULT_VERSION, 1)` (old histories get -1), or Worker Versioning to keep each run on the version it started on. Replay saved histories with `WorkflowReplayer` before you deploy. A mismatch raises `NonDeterministicException`, which fails the workflow task, and Temporal retries it.\n- Kotlin 2.4 with Temporal's Java library 1.40: don't pass method references (`activities::charge`) to `Async` or `Saga`; call activities directly, or pass a lambda.\n- Limits: 51,200 events or 50 MB per history, with warnings from 10,240 events or 10 MB; long loops use continue-as-new.\n- The workflow ID doubles as a duplicate check for starts; `REJECT_DUPLICATE` keeps it taken after the run closes.\n\n| Engine (November 2026) | Progress is written to | Resumes by |\n|---|---|---|\n| Temporal (server 1.32, Java library 1.40) | an event history in the Temporal server | replaying the workflow code |\n| Restate 1.8 | a journal for each call, in the Restate server | replaying the function |\n| DBOS Transact Java 1.2 | rows of saved progress in your own PostgreSQL | running the workflow again with saved step results |\n| AWS Step Functions, Standard | the history of each run | moving to the next step (exactly once unless `Retry` is set) |\n| AWS Lambda durable functions | checkpoints written by its library | running the function again, skipping saved steps |",
   "recap": [
-    "Data that leaves a process must become self-contained bytes. Java serialization lets the bytes pick classes and run code, so never use it on untrusted input.",
-    "JSON is universal but rounds integers above 2^53 in many readers, has no binary type and no schema; binary JSON keeps the field names and saves little.",
-    "Protobuf tags each field with a number, so old readers skip unknown fields and missing ones read as defaults; never reuse a number. Avro writes bare values and resolves the writer's schema against the reader's by field name.",
-    "Backward compatibility lets new code read old data; forward compatibility lets old code read new data. Rolling upgrades need both, and registries check them before you deploy.",
-    "Data outlives code: change a live schema with expand and contract, and never let old code write back fields it doesn't understand.",
-    "A remote call can end with no answer. Set a deadline on every call, retry only what didn't get through or is unknown, and only with an idempotency key made once per operation.",
-    "REST with OpenAPI and gRPC with Protobuf are two ways to write the contract; gRPC's single long-lived connection needs per-stream or client-side load balancing.",
-    "Durable execution records each step's result and replays the code after a crash; activities still run at least once, so every external call carries a key built from the workflow ID.",
-    "Workflow code must replay identically: change it with `Workflow.getVersion` or pinned deployments, and test against real histories with `WorkflowReplayer`."
+    "Objects point at each other by memory address, which means nothing outside their program, so data that is stored or sent must become self-contained bytes. Java's built-in encoding lets the bytes choose which classes to create and runs their code, so never use it on bytes from outside.",
+    "JSON goes everywhere, but many readers turn whole numbers above 2^53 into a nearby value, it has no type for raw bytes, and it writes every field name in every record. Binary JSON shrinks the values and keeps the names.",
+    "Protobuf tags each field with a number, so old readers skip fields they don't know and missing ones read as defaults; never reuse a number. Avro writes only values, and matches the writer's schema to the reader's by field name.",
+    "Backward compatibility lets new code read old data, and forward compatibility lets old code read new data. A rolling upgrade needs both, and a schema registry checks them before you deploy.",
+    "Data outlives code: change a live schema in steps with expand and contract, and never let old code write back fields it doesn't understand.",
+    "A call to another program can end with no answer. Give every call a deadline, retry only what didn't get through or is unknown, and only with an idempotency key made once per operation.",
+    "REST with OpenAPI and gRPC with Protobuf are two ways to write the contract down. gRPC's one long-lived connection needs balancing per request, in an L7 proxy or in the client.",
+    "Durable execution writes down each step's result and replays the code after a crash. Activities still run at least once, so every outside call carries a key built from the workflow ID and the step.",
+    "Workflow code must replay the same way every time: change it with `Workflow.getVersion` or pinned versions, and test it against real histories with `WorkflowReplayer`."
   ],
   "quiz": [
     {
-      "q": "A JavaScript front end reads a payment ID, `1849204436731904017`, from your JSON API with `JSON.parse`. What does it get?",
+      "q": "A web page reads a payment number, `1849204436731904017`, from a JSON reply with JavaScript's `JSON.parse`. What does it get?",
       "options": [
-        "The exact ID, because JSON numbers are 64-bit",
-        "A parse error, because the number is too large",
-        "A rounded number that can match a different payment",
-        "The ID as a string, because the parser detects the overflow"
+        "The exact number, because JSON numbers are 64-bit",
+        "An error, because the number is too large",
+        "A nearby number, which can match a different payment",
+        "The number as a string, because the reader notices the overflow"
       ],
       "answer": 2,
-      "why": "`JSON.parse` keeps numbers as IEEE 754 doubles, which hold integers exactly only up to 2^53. Larger IDs round silently to a nearby value. The fix from lesson 1 is to send 64-bit IDs as strings."
+      "why": "`JSON.parse` keeps numbers as doubles, which hold whole numbers exactly only up to 2^53. Bigger ones change silently to a nearby value. The fix from lesson 1 is to send 64-bit numbers as strings."
     },
     {
-      "q": "Your service reads bytes from a queue with `ObjectInputStream.readObject()` and casts the result to `Order` on the next line. Why is that dangerous if the bytes come from outside?",
+      "q": "A program reads bytes from a queue with Java's `ObjectInputStream.readObject()` and casts the result to `Order` on the next line. Why is that dangerous if the bytes come from outside?",
       "options": [
         "The cast is slow for large objects",
-        "The bytes choose which classes are created, and their `readObject` methods run before your cast",
-        "Java serialization can't handle nested objects",
-        "The cast fails for every class that isn't `Order`, so the service crashes"
+        "The bytes choose which classes are created, and their `readObject` code runs before your cast",
+        "Java serialization can't handle objects inside objects",
+        "The cast fails for every class that isn't `Order`, so the program crashes"
       ],
       "answer": 1,
-      "why": "Deserialization creates whatever classes the bytes name and runs their code first; a gadget chain of ordinary classes on the classpath can end in remote code execution. The `ClassCastException` comes too late. A JEP 290 filter rejects classes before they exist."
+      "why": "Reading creates whatever classes the bytes name, and runs their code first. A chain of ordinary classes already in the program, called a gadget chain, can end with an attacker's command running. The `ClassCastException` comes too late. A JEP 290 filter rejects classes before they exist."
     },
     {
       "q": "A Protobuf field `int64 tip_cents = 7;` was deleted last year. A developer adds `int64 loyalty_points = 7;`. Old records still sit in the database. What happens when new code reads them?",
       "options": [
-        "Old tips are read as loyalty points, silently",
-        "The parser rejects the old records",
+        "Old tips are read as loyalty points, without any error",
+        "The reader rejects the old records",
         "Field 7 reads as 0, because the old field was deleted",
-        "Protobuf detects that the field name changed and skips it"
+        "Protobuf notices that the field's name changed and skips it"
       ],
       "answer": 0,
-      "why": "The bytes carry only the field number and wire type, and both match, so the old value lands in the new field. Nothing fails. That is why a deleted number goes into `reserved 7;`, so the compiler refuses to reuse it."
+      "why": "The bytes carry only the field number and the wire type, and both match, so the old value lands in the new field. Nothing fails. That's why a deleted number goes into `reserved 7;`, so the compiler refuses to reuse it."
     },
     {
-      "q": "A Kafka topic's Avro subject uses the registry's BACKWARD mode. You register a compatible new schema. In which order do you deploy?",
+      "q": "Kafka, a program that keeps logs of messages for other programs to read, stores Avro records in a topic whose schema a registry checks in BACKWARD mode. You register a compatible new schema. In which order do you deploy?",
       "options": [
-        "Producers first, then consumers",
+        "Producers (the writers) first, then consumers (the readers)",
         "All at once, in one release",
         "It doesn't matter, because the registry converts old data",
-        "Consumers first, then producers"
+        "Consumers (the readers) first, then producers (the writers)"
       ],
       "answer": 3,
-      "why": "BACKWARD means the new schema can read data written with the old one, so the readers (consumers) must have it before any producer starts writing with it. FORWARD is the producers-first mode. The registry checks schemas; it converts nothing."
+      "why": "BACKWARD means the new schema can read data written with the old one, so the readers must have it before any writer starts using it. FORWARD is the writers-first mode. The registry checks schemas; it converts nothing."
     },
     {
-      "q": "During a rolling upgrade, v1 and v2 of a service share a table. v2 adds a `loyaltyTier` property to a JSON column. A v1 instance reads such a row into its data class (ignoring unknown properties), changes the amount and writes the class back. What happens?",
+      "q": "During a rolling upgrade, v1 and v2 of a program share a table. v2 adds a `loyaltyTier` property to a JSON column. A v1 copy reads such a row into its data class (ignoring properties it doesn't know), changes the amount and writes the whole object back. What happens?",
       "options": [
         "The write fails, because the JSON no longer matches",
         "`loyaltyTier` is deleted from that row",
-        "`loyaltyTier` is kept, because JSON columns preserve unknown keys",
+        "`loyaltyTier` is kept, because JSON columns keep unknown keys",
         "v1 copies `loyaltyTier` but sets it to null"
       ],
       "answer": 1,
@@ -74,55 +74,55 @@
       "options": [
         "`ALTER TABLE ... RENAME COLUMN` during a quiet hour",
         "Deploy the new code first, then rename the column",
-        "Add `email_address`, write both, backfill, switch reads, switch writes, and drop `email` only after the last old instance is gone",
+        "Add `email_address`, write both, copy old rows over, switch reads, switch writes, and drop `email` only after the last old copy is gone",
         "Copy the table, rename the column in the copy and swap the tables"
       ],
       "answer": 2,
-      "why": "Expand and contract keeps every step compatible with the versions running on both sides of it. A rename breaks whichever version still uses the old name, at any hour. Copying and swapping loses writes made during the copy."
+      "why": "Expand and contract keeps every step compatible with the versions running on both sides of it. A rename breaks whichever version still uses the old name, at any hour. Copying and swapping loses the writes made during the copy."
     },
     {
-      "q": "A gRPC client sends 1,000 calls a second through one channel to a Kubernetes ClusterIP Service with 5 pods. Monitoring shows one busy pod and four idle ones. Why?",
+      "q": "A gRPC client sends 1,000 calls a second over one channel to a service with 5 copies behind an L4 load balancer. One copy is busy and four are idle. Why?",
       "options": [
-        "The channel's one HTTP/2 connection was balanced once, at L4, so every call goes to the same pod",
-        "gRPC always sends to the first pod in DNS order",
-        "The other four pods failed their health checks",
-        "Kubernetes balances gRPC per call, but the pods have different CPU limits"
+        "The channel's one HTTP/2 connection was balanced once, when it opened, so every call goes to the same copy",
+        "gRPC always sends to the first address that DNS returns",
+        "The other four copies failed their health checks",
+        "The balancer spreads calls one by one, but the copies have different CPU limits"
       ],
       "answer": 0,
-      "why": "kube-proxy picks a pod when a TCP connection opens, and a gRPC channel multiplexes all calls on one long-lived connection. Balance per stream with an L7 proxy or mesh, or in the client with `round_robin` over a headless Service."
+      "why": "An L4 balancer picks a copy when a TCP connection opens, and a gRPC channel sends all its calls over one long-lived connection. Balance each request with an L7 proxy, or in the client with `round_robin` over every copy's address."
     },
     {
       "q": "Which retry setup can't charge a card twice when replies are lost?",
       "options": [
-        "Retry `POST /charges` up to 3 times with exponential backoff",
+        "Retry `POST /charges` up to 3 times with growing waits",
         "Retry with a fresh UUID as the idempotency key on each attempt",
         "Turn on gRPC's retry policy for `UNAVAILABLE`",
-        "Make one key per payment before the first attempt, send it on every attempt, and have the server claim it before charging"
+        "Make one key per payment before the first attempt, send it with every attempt, and have the server claim it before charging"
       ],
       "answer": 3,
-      "why": "Only a key that stays the same across attempts lets the server recognize a retry, and claiming it before the work stops two concurrent attempts from both charging. The first three options all resend a request the server can't tell from a new payment."
+      "why": "Only a key that stays the same across attempts lets the server recognize a retry, and claiming it before the work stops two attempts running at once from both charging. The first three options all resend a request that the server can't tell apart from a new payment."
     },
     {
-      "q": "A Temporal worker dies after an order's `charge` and `reserve` activities completed. Another worker picks the order up. What happens at `charge`?",
+      "q": "A Temporal worker dies after an order's `charge` and `reserve` activities have finished. Another worker picks the order up. What happens at `charge`?",
       "options": [
-        "The SDK returns the charge id recorded in the event history; the bank is not called",
-        "The SDK calls the bank again, and the key makes it harmless",
+        "The library returns the charge ID recorded in the event history; the bank isn't called",
+        "The library calls the bank again, and the key makes it harmless",
         "The new worker skips the workflow code and starts at the next activity",
-        "The workflow restarts with a new run ID"
+        "The workflow starts over as a new run"
       ],
       "answer": 0,
-      "why": "Replay runs the workflow code from the top, and every activity call whose completion is in the history returns the recorded result at once. Keys matter for a different moment: an activity that did its side effect but never reported back is run again."
+      "why": "Replay runs the workflow code from the top, and every activity call whose result is in the history returns that result at once. Keys matter at a different moment: an activity that did its work but never reported back is run again."
     },
     {
-      "q": "A workflow with 40,000 runs asleep in a 24-hour wait needs a new activity before `charge`. Which deploy is safe for the sleeping runs?",
+      "q": "A workflow has 40,000 runs asleep in a 24-hour wait, and needs a new activity before `charge`. Which deploy is safe for the sleeping runs?",
       "options": [
-        "Insert the call and deploy; replay skips activities it doesn't recognize",
-        "Insert the call behind `Workflow.getVersion`, or pin the old runs to the old deployment with Worker Versioning",
-        "Insert the call and restart every sleeping run from the beginning",
+        "Add the call and deploy; replay skips activities it doesn't recognize",
+        "Add the call behind `Workflow.getVersion`, or keep the old runs on the old code with Worker Versioning",
+        "Add the call and start every sleeping run again from the beginning",
         "Rename the activity so the history doesn't match it"
       ],
       "answer": 1,
-      "why": "Replay must issue the same commands as the history. `getVersion` returns `DEFAULT_VERSION` for histories recorded before the change, so old runs take the old path; Worker Versioning avoids replaying old runs on new code at all. Deploying the change bare raises `NonDeterministicException` and leaves the runs stuck."
+      "why": "Replay must send the same commands as the history. `getVersion` returns `DEFAULT_VERSION` for histories recorded before the change, so old runs take the old path; Worker Versioning avoids replaying old runs on new code at all. Deploying the change bare raises `NonDeterministicException` and leaves the runs stuck."
     }
   ]
 }
