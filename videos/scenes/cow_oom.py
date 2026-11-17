@@ -1,34 +1,25 @@
 from sfz import *
 
-SAY.insert(0, (r"\bSIGKILL\b", "sig kill"))
-SAY.insert(0, (r"\bOOM\b", "O O M"))
+SAY.insert(0, (r"\bRSS\b", "R S S"))
+SAY.insert(0, (r"\bPSS\b", "P S S"))
+SAY.insert(0, (r"\b32,768\b", "thirty-two thousand, seven hundred and sixty-eight"))
+SAY.insert(0, (r"\b131,072\b", "a hundred and thirty-one thousand"))
+SAY.insert(0, (r"\b1\.8 microseconds\b", "one point eight microseconds"))
+SAY.insert(0, (r"\b1\.7 milliseconds\b", "one point seven milliseconds"))
 
-TX, TW, TH = 4.95, 3.0, 3.2            # page tables: centre x (±), width, height
-FX, FW, FH = 1.12, 2.0, 0.6            # RAM frames: sub-column x (±), width, height
-TOP, BOT = 1.65, -1.55                 # top and bottom of the tables and the RAM column
-ROWS = [0.7, -0.1, -0.9]               # page 0, 1, 2
-X0, U = -4.6, 1.15                     # the memory bars: left edge, units per GB
-PR_Y, RAM_Y, BH = 1.0, -0.6, 0.62      # promised row, in-RAM row, bar height
-CAP_X = X0 + 8 * U                     # 8 GB
-
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+FR = "ABCDE"
+FR_Y = [2.15, 1.2, 0.25, -0.7, -1.65]          # frames A..E, stacked in the middle; table rows share these heights
+FW, FHT = 2.4, 0.72
+TX = {0: (-6.5, -2.3), 1: (2.3, 6.5)}          # parent's table on the left, child's on the right
+T_TOP, T_BOT = 2.68, -1.18
+PCOL = {0: BLUE_M, 1: PURPLE_M}
+PNAME = {0: "parent: its page table", 1: "child: its page table"}
+MODE_X = {0: -3.15, 1: 5.65}
+K_C, K_W, K_H = np.array([0.0, -2.58, 0]), 5.0, 0.6     # the kernel
+CAP_Y, BAR_Y = -3.35, -3.0
+SEG, BX0 = 0.85, -4.0                           # the 512 MB bars: 8 blocks of 64 MB
+BY = {0: 1.45, 1: 0.25}
 
 
 class Base(VoiceScene):
@@ -58,7 +49,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.2):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -79,320 +70,468 @@ class Base(VoiceScene):
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
-        if t > dur + 0.1:
-            print(f"WARNING: steps {t:.1f}s longer than line {dur:.1f}s: {text[:50]}")
         if dur - t > 0.02:
             self.wait(dur - t)
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-def arr(a, b, color=GREY_B, sw=2.5):
+
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
+
+
+def dot_run(a, b, color=YELLOW_M, rt=0.6, frac=1.0, keep=False):
     a, b = np.array(a, dtype=float), np.array(b, dtype=float)
-    n = np.linalg.norm(b - a)
-    return Arrow(a, b, buff=0.04, stroke_width=sw, color=color, max_tip_length_to_length_ratio=0.2 / n,
-                 max_stroke_width_to_length_ratio=20)
+    d = Dot(radius=0.08, color=color).move_to(a).set_z_index(6)
+    seq = [FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, a + frac * (b - a)), rate_func=smooth, run_time=rt)]
+    if not keep:
+        seq.append(FadeOut(d, run_time=0.12))
+    return Succession(*seq)
 
 
-def table(x, title):
-    r = RoundedRectangle(corner_radius=0.14, width=TW, height=TH, stroke_color=WHITE, stroke_width=2.5).set_fill(BLACK, 1)
-    r.move_to([x, (TOP + BOT) / 2, 0])
-    return VGroup(r, T(title, 22, GREY_B).move_to([x, TOP - 0.33, 0]))
+def harrow(a, b, color=GREY_B, sw=2.5):
+    """Thin arrow with a small tip of the same size whatever its length."""
+    ln = np.linalg.norm(np.array(b, dtype=float) - np.array(a, dtype=float))
+    return Arrow(a, b, buff=0, stroke_width=sw, color=color, tip_length=0.17, max_tip_length_to_length_ratio=max(0.18, 0.17 / ln),
+                 max_stroke_width_to_length_ratio=8)
 
 
-def entry(x, k, perm="writable", pcolor=GREEN_M):
-    y = ROWS[k]
-    r = RoundedRectangle(corner_radius=0.08, width=TW - 0.4, height=0.5, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1)
-    r.move_to([x, y, 0])
-    return VGroup(r, left_at(M(f"page {k}", 18), x - TW / 2 + 0.38, y), perm_t(x, k, perm, pcolor))
+# ---- the pieces ----
+def frame_box(i):
+    r = RoundedRectangle(corner_radius=0.08, width=FW, height=FHT, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1).move_to([0, FR_Y[i], 0])
+    return VGroup(r, T(f"frame {FR[i]}", 20).move_to([-0.48, FR_Y[i], 0]))
 
 
-def perm_t(x, k, perm, pcolor):
-    return right_at(T(perm, 17, pcolor), x + TW / 2 - 0.38, ROWS[k])
+def refs_lab(i, n):
+    return T("free" if n == 0 else f"refs {n}", 18, GOLD_M if n > 1 else GREY_B).move_to([0.68, FR_Y[i], 0])
 
 
-def frame(side, k, name, count, color=WHITE):
-    x, y = side * FX, ROWS[k]
-    r = RoundedRectangle(corner_radius=0.08, width=FW, height=FH, stroke_color=color, stroke_width=2.5).set_fill(fillc(color), 1)
-    r.move_to([x, y, 0])
-    return VGroup(r, left_at(T(name, 18), x - FW / 2 + 0.16, y), cnt_t(side, k, count))
+def ptable(k):
+    x0, x1 = TX[k]
+    r = RoundedRectangle(corner_radius=0.12, width=x1 - x0, height=T_TOP - T_BOT, stroke_color=PCOL[k], stroke_width=3)
+    r.set_fill(fillc(PCOL[k]), 1).move_to([(x0 + x1) / 2, (T_TOP + T_BOT) / 2, 0])
+    return VGroup(r, T(PNAME[k], 22, PCOL[k]).move_to([(x0 + x1) / 2, T_TOP + 0.3, 0]))
 
 
-def cnt_t(side, k, count, color=GREY_B):
-    return right_at(T(count, 15, color), side * FX + FW / 2 - 0.13, ROWS[k])
+def prow(k, j, f, color=WHITE):
+    return left_at(M(f"page {j}: frame {FR[f]}", 18, color), TX[k][0] + 0.25, FR_Y[j])
 
 
-def p_arrow(k, color=GREY_B):
-    """Parent's entry k to frame k (left sub-column)."""
-    return arr([-TX + (TW - 0.4) / 2, ROWS[k], 0], [-FX - FW / 2, ROWS[k], 0], color)
+def mchip(k, j, rw):
+    c = chip("rw" if rw else "read-only", GREEN_M if rw else GOLD_M, 17)
+    return c.move_to([MODE_X[k], FR_Y[j], 0])
 
 
-def c_arrow(k, side, color=GREY_B):
-    """Child's entry k to the frame in row k, in the left (-1) or right (+1) sub-column."""
-    return arr([TX - (TW - 0.4) / 2, ROWS[k], 0], [side * FX + FW / 2, ROWS[k], 0], color)
+def parrow(k, j, f):
+    if k == 0:
+        a, b = [TX[0][1] + 0.08, FR_Y[j], 0], [-FW / 2 - 0.08, FR_Y[f], 0]
+    else:
+        a, b = [TX[1][0] - 0.08, FR_Y[j], 0], [FW / 2 + 0.08, FR_Y[f], 0]
+    return harrow(a, b, PCOL[k])
 
 
-def seg(a, b, y, color, label=None, size=17, op=0.32):
-    """A bar segment from a GB to b GB on row y."""
-    r = Rectangle(width=max((b - a) * U, 0.001), height=BH, stroke_color=color, stroke_width=2).set_fill(color, op)
-    r.move_to([X0 + (a + b) / 2 * U, y, 0])
-    g = VGroup(r)
-    if label:
-        g.add(T(label, size).move_to(r))
-    return g
+def kbox():
+    return RoundedRectangle(corner_radius=0.1, width=K_W, height=K_H, stroke_color=TEAL_M, stroke_width=2.5).set_fill(fillc(TEAL_M), 1).move_to(K_C)
+
+
+def seg(k, i, color):
+    r = Rectangle(width=SEG - 0.06, height=0.6, stroke_color=color, stroke_width=2).set_fill(fillc(color, 0.45), 1)
+    return r.move_to([BX0 + SEG * (i + 0.5), BY[k], 0])
 
 
 class CowOom(Base):
-    """os-07, section 0 (with sections 2 and 3): fork of a 512 MB process shares frames; copy-everything would need a second
-    512 MB. The kernel marks every entry read-only; the child's first write to page 1 faults and the kernel copies that one
-    page (about 2 µs). Honest bookkeeping refuses a 4 GB JVM's fork on an 8 GB machine, so Linux overcommits (100 GB returns
-    at once). A batch job touches its promise until RAM is full; reclaim drops the file cache; the OOM killer kills the
-    biggest process, the JVM, although the batch job asked for the last page."""
+    """os-07, section 0. cow.c fills 512 MB and forks; memcpy would take 33 ms and a second 512 MB, yet the child runs
+    1.7 ms after fork. Copying every page is slow where it hurts (Redis's 10 GB snapshot child; fork then exec).
+    Sharing frames breaks: a write by the parent shows up in the child. The kitchen: a second cook shares the recipe
+    binder, every page gets an ask-before-you-write sticker, and the manager photocopies one page when someone writes.
+    Walkthrough of the lesson's stepper (read, write fault, copy C to E, parent's write reuses C), copy-on-write,
+    the smaps numbers (Shared/Private, RSS 513 vs PSS 320 + 320 = 640), the cost (180 ms for every page), moral, check."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def drop_prefix(self, *prefixes):
+        return self.drop(*[k for k in list(self.lab) if k.startswith(prefixes)])
+
+    # one line of a page table: its text, its mode chip, its arrow
+    def line(self, k, j, f, rw, grow=True):
+        out = [*self.put(f"row{k}{j}", prow(k, j, f)), *self.put(f"mode{k}{j}", mchip(k, j, rw))]
+        a = parrow(k, j, f)
+        old = self.arr.get((k, j))
+        self.arr[(k, j)] = a
+        if old is None:
+            out.append(GrowArrow(a) if grow else FadeIn(a))
+        else:
+            out += [FadeOut(old), GrowArrow(a)]
+        return out
+
+    def mode(self, k, j, rw):
+        return self.put(f"mode{k}{j}", mchip(k, j, rw))
+
+    def refs(self, i, n):
+        return self.put(f"refs{i}", refs_lab(i, n))
+
+    def kern(self, s, color=WHITE):
+        return self.put("kst", left_at(T(s, 19, color), K_C[0] - K_W / 2 + 0.25, K_C[1]))
+
+    def copies(self, n):
+        return self.put("kcp", right_at(T(f"copies: {n}", 19, GOLD_M), K_C[0] + K_W / 2 - 0.25, K_C[1]))
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def row_pt(self, k, j):
+        """Where a dot leaves table k's line j (its arrow's start)."""
+        return self.arr[(k, j)].get_start()
 
     def construct(self):
-        self.title_card("Copy-on-write and the OOM killer", "fork shares pages, and the kernel promises more than it has")
+        self.capm = None
+        self.lab = {}
+        self.arr = {}
+        self.title_card("Copy 512 MB in 1.7 milliseconds", "fork and copy-on-write")
 
-        # ---- 1. the parent ---------------------------------------------------------------------------------------
-        pt = table(-TX, "parent's page table")
-        pe = [entry(-TX, k) for k in range(3)]
-        ram = RoundedRectangle(corner_radius=0.14, width=2 * FX + FW + 0.4, height=TH, stroke_color=GREY_B, stroke_width=2.5)
-        ram.set_fill(BLACK, 1).move_to([0, (TOP + BOT) / 2, 0])
-        ram_t = T("RAM", 22, GREY_B).move_to([0, TOP - 0.33, 0])
-        fr = [frame(-1, k, f"frame {'ABC'[k]}", "1 map") for k in range(3)]
-        pa = [p_arrow(k) for k in range(3)]
-        note = T("3 of its 131,072 pages", 20, GREY_B).move_to([-TX, 2.3, 0])
-        self.steps("A process holds 512 MB of memory, in pages of 4 KB. Its page table maps each page to a frame of RAM.", [
-            (lambda: [FadeIn(pt), *[FadeIn(e) for e in pe]], 0.8),
-            (lambda: [FadeIn(note, shift=0.1 * DOWN)], 0.5),
-            "Its page table",
-            (lambda: [FadeIn(ram), FadeIn(ram_t), *[FadeIn(f) for f in fr]], 0.8),
-            (lambda: [*[GrowArrow(a) for a in pa]], 0.7),
+        # ---------------- scene 1: the question ----------------
+        prog = VGroup(RoundedRectangle(corner_radius=0.12, width=3.4, height=1.3, stroke_color=BLUE_M, stroke_width=3).set_fill(fillc(BLUE_M), 1),
+                      T("a program", 26), T("512 MB of memory", 20, GREY_B)).move_to([-3.2, 0.9, 0])
+        prog[1].move_to(prog[0].get_center() + 0.22 * UP)
+        prog[2].move_to(prog[0].get_center() + 0.25 * DOWN)
+        kid = VGroup(RoundedRectangle(corner_radius=0.12, width=3.4, height=1.3, stroke_color=PURPLE_M, stroke_width=3).set_fill(fillc(PURPLE_M), 1),
+                     T("its copy", 26), T("running after 1.7 ms", 20, GREEN_M)).move_to([3.2, 0.9, 0])
+        kid[1].move_to(kid[0].get_center() + 0.22 * UP)
+        kid[2].move_to(kid[0].get_center() + 0.25 * DOWN)
+        fk = harrow(prog.get_right() + [0.1, 0, 0], kid.get_left() + [-0.1, 0, 0], GREY_B)
+        fk_l = M("fork()", 22).next_to(fk, UP, buff=0.12)
+        self.steps("A program fills 512 megabytes of memory. Then it calls fork, the system call that starts a second process "
+                   "as an exact copy of the first.", [
+            (lambda: [FadeIn(prog, shift=0.1 * RIGHT)], 0.7),
+            "Then it calls fork",
+            (lambda: [GrowArrow(fk), FadeIn(fk_l)], 0.6),
+            "an exact copy",
+            (lambda: [FadeIn(kid[0]), FadeIn(kid[1])], 0.6),
+        ])
+        c1 = left_at(T("copying 512 MB the plain way: 33 ms, and a second 512 MB of RAM", 22, RED_M), -5.0, -0.8)
+        self.steps("Copying 512 megabytes takes 33 milliseconds here, and needs another 512 megabytes of RAM. "
+                   "Yet the copy is running 1.7 milliseconds after fork.", [
+            (lambda: [FadeIn(c1, shift=0.1 * UP)], 0.6),
+            "Yet the copy",
+            (lambda: [FadeIn(kid[2], shift=0.1 * UP)], 0.6),
+            (lambda: [Indicate(kid[2], color=GREEN_M, scale_factor=1.15)], 0.8),
+        ])
+        qm = T("?", 60, YELLOW_M).move_to([0, -1.9, 0])
+        self.steps("How do you copy something faster than copying it?", [
+            (lambda: [FadeIn(qm, scale=0.6)], 0.6),
+        ], after=0.5)
+
+        # ---------------- scene 2: a reminder ----------------
+        frames = [frame_box(i) for i in range(5)]
+        ram_t = T("RAM", 22).move_to([0, T_TOP + 0.3, 0])
+        pt = ptable(0)
+        self.steps("A quick reminder. Memory comes in pages of 4 kilobytes. Each process has a page table: the kernel's list "
+                   "of which frame, which piece of real RAM, holds each of its pages.", [
+            (lambda: [FadeOut(VGroup(prog, kid, fk, fk_l, c1, qm))], 0.6),
+            "Each process",
+            (lambda: [FadeIn(pt)], 0.6),
+            "which frame",
+            (lambda: [FadeIn(ram_t), LaggedStart(*[FadeIn(f) for f in frames], lag_ratio=0.12)], 0.9),
+            (lambda: [*self.refs(0, 1), *self.refs(1, 1), *self.refs(2, 1), *self.refs(3, 1), *self.refs(4, 0)], 0.4),
+        ])
+        self.steps("Each line also says whether that page may be written. Here's a parent with four pages. "
+                   "The real program has 131,072.", [
+            (lambda: [*[x for j in range(4) for x in self.line(0, j, j, True)]], 1.0),
+            "may be written",
+            (lambda: [LaggedStart(*[Indicate(self.lab[f"mode0{j}"], color=GREEN_M) for j in range(4)], lag_ratio=0.15)], 0.9),
+            "The real program",
+            (lambda: self.cap("4 pages here; 512 MB is 131,072 pages", WHITE), 0.6),
         ])
 
-        # ---- 2. fork: the child is running in 1.7 ms -------------------------------------------------------------
-        ct = table(TX, "child's page table")
-        q = T("?", 60, GREY_C).move_to([TX, ROWS[1], 0])
-        cap1 = left_at(T("fork: the child runs 1.7 ms later", 21, TEAL_M), -6.4, -2.3)
-        cap2 = left_at(T("copying 512 MB: 33 ms", 21, GREY_B), -6.4, -2.85)
-        self.steps("It calls fork, and the child is running 1.7 milliseconds later. Copying 512 MB would take 33.", [
-            (lambda: [FadeIn(ct), FadeIn(q)], 0.8),
-            (lambda: [FadeIn(cap1, shift=0.1 * UP)], 0.6),
-            "Copying",
-            (lambda: [FadeIn(cap2, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 3: copy everything ----------------
+        self.steps("Now let's design fork ourselves. The simplest version copies every page into fresh frames. "
+                   "It's correct, and slow exactly where it hurts.", [
+            (lambda: self.cap("fork, version 1: copy every page", WHITE), 0.6),
+            "copies every page",
+            (lambda: [LaggedStart(*[dot_run([0, FR_Y[j], 0], [3.0, FR_Y[j], 0], YELLOW_M, 0.6) for j in range(4)], lag_ratio=0.25)], 1.3),
         ])
-
-        # ---- 3. the simplest fork copies everything --------------------------------------------------------------
-        cp = [frame(1, k, f"frame {'DEF'[k]}", "1 map", GREY_B) for k in range(3)]
-        ce = [entry(TX, k) for k in range(3)]
-        ca = [c_arrow(k, 1) for k in range(3)]
-        cap3 = left_at(T("copy everything: RAM used 1,024 MB", 21, RED_M), -6.4, -2.85)
-        self.steps("And copying every page would need a second 512 MB of RAM.", [
-            (lambda: [FadeOut(q), *[travel(Line(fr[k].get_center(), cp[k].get_center()), YELLOW_M, 0.7) for k in range(3)]], 0.8),
-            (lambda: [*[FadeIn(c, scale=0.9) for c in cp], *[FadeIn(e) for e in ce], *[GrowArrow(a) for a in ca]], 0.6),
-            "a second",
-            (lambda: [FadeOut(cap2), FadeIn(cap3, shift=0.1 * UP)], 0.6),
+        self.steps("Redis, a program that keeps data in memory, forks a child just to write a snapshot to disk. "
+                   "With 10 gigabytes of data, a child that only reads would need 20 gigabytes of RAM.", [
+            "Redis",
+            (lambda: self.cap("Redis, 10 GB of data: a snapshot child that only reads would need 20 GB", RED_M), 0.6),
         ])
+        self.steps("Or a program forks only to start another program, which throws the copy away at once. "
+                   "That's photocopying a whole cookbook to read one recipe, then throwing it in the bin.", [
+            (lambda: self.cap("fork, then start another program: the copy is thrown away at once", RED_M), 0.6),
+            "That's photocopying",
+            (lambda: self.cap("a whole cookbook photocopied, to read one recipe", GREY_B), 0.6),
+        ], after=0.4)
 
-        # ---- 4. share instead ------------------------------------------------------------------------------------
-        sa = [c_arrow(k, -1) for k in range(3)]
-        cap5 = left_at(T("share: about 1 MB of new page table", 21, GREEN_M), -6.4, -2.85)
-        self.steps("Instead, the child gets its own page table, pointing at the parent's frames. That's about 1 MB of table.", [
-            (lambda: [FadeOut(cap3), *[FadeOut(c) for c in cp]], 0.6),
+        # ---------------- scene 4: share, and break it ----------------
+        ct = ptable(1)
+        self.steps("Next try: share. The child gets its own page table, pointing at the parent's frames. "
+                   "That costs only the table, about 1 megabyte for 512 megabytes of pages.", [
+            (lambda: self.cap("fork, version 2: share the frames", WHITE), 0.6),
+            "its own page table",
+            (lambda: [FadeIn(ct)], 0.6),
             "pointing at",
-            (lambda: [*[ReplacementTransform(ca[k], sa[k]) for k in range(3)]], 0.9),
-            (lambda: [*[Transform(fr[k][2], cnt_t(-1, k, "2 maps", TEAL_M)) for k in range(3)]], 0.5),
-            "That's about",
-            (lambda: [FadeIn(cap5, shift=0.1 * UP)], 0.6),
+            (lambda: [*[x for j in range(4) for x in self.line(1, j, j, True)], *[x for i in range(4) for x in self.refs(i, 2)]], 1.0),
+            "costs only",
+            (lambda: self.cap("the only cost: the table, about 1 MB for 512 MB", GREEN_M), 0.6),
         ])
+        self.steps("But now, if the parent writes to page 2, the child sees the change. And the child was promised its own copy.", [
+            "the parent writes",
+            (lambda: [dot_run(self.row_pt(0, 2), self.arr[(0, 2)].get_end(), RED_M, 0.6)], 0.7),
+            (lambda: [glow(frames[2][0], RED_M, 1.05)], 0.6),
+            "the child sees",
+            (lambda: [Indicate(self.lab["row12"], color=RED_M, scale_factor=1.15), *self.cap("the child's page 2 changed too", RED_M)], 0.8),
+        ], after=0.4)
 
-        # ---- 5. but a write would leak into the child -------------------------------------------------------------
-        bad = tick(False, 0.2).move_to([TX, -1.3, 0])
-        self.steps("But then a write by the parent would show up in the child.", [
-            (lambda: [FadeOut(cap1), FadeOut(cap5), FadeOut(note)], 0.4),
-            (lambda: [travel(Line(pa[1].get_start(), pa[1].get_end()), RED_M, 0.6)], 0.6),
-            (lambda: [fr[1][0].animate.set_stroke(RED_M), sa[1].animate.set_color(RED_M)], 0.4),
-            "show up",
-            (lambda: [travel(Line(sa[1].get_end(), sa[1].get_start()), RED_M, 0.6), ce[1][0].animate.set_stroke(RED_M)], 0.6),
-            (lambda: [Create(bad)], 0.4),
+        # ---------------- scene 5: the kitchen ----------------
+        self.steps("A café kitchen has the same problem. A second cook joins, and is promised their own copy of the recipe binder. "
+                   "Photocopying all of it would take all morning, and they'll mostly just read it.", [
+            (lambda: self.cap("a second cook, promised their own copy of the recipe binder", WHITE), 0.6),
+            "Photocopying all",
+            (lambda: self.cap("photocopy it all? all morning, for pages they'll mostly just read", GREY_B), 0.6),
         ])
-
-        # ---- 6. read-only in both tables --------------------------------------------------------------------------
-        rule = T("at fork: every entry read-only", 22, GOLD_M).move_to([0, 2.3, 0])
-        self.steps("So the kernel marks every entry read-only, in both tables. Reads still work.", [
-            (lambda: [FadeOut(bad), fr[1][0].animate.set_stroke(WHITE), sa[1].animate.set_color(GREY_B),
-                      ce[1][0].animate.set_stroke(GREY_B)], 0.5),
-            (lambda: [FadeIn(rule, shift=0.1 * DOWN),
-                      *[Transform(e[2], perm_t(-TX, k, "read-only", GOLD_M)) for k, e in enumerate(pe)],
-                      *[Transform(e[2], perm_t(TX, k, "read-only", GOLD_M)) for k, e in enumerate(ce)]], 0.9),
-            "Reads still",
-            (lambda: [travel(Line(pa[0].get_start(), pa[0].get_end()), GREEN_M, 0.6),
-                      travel(Line(sa[2].get_start(), sa[2].get_end()), GREEN_M, 0.8)], 0.8),
+        self.steps("So the manager does something lazier. Both cooks share the binder, and every page gets a sticker: ask before you write.", [
+            (lambda: self.cap("share the binder; a sticker on every page: ask before you write", WHITE), 0.6),
+            "a sticker",
+            (lambda: [LaggedStart(*[x for k in (0, 1) for j in range(4) for x in self.mode(k, j, False)], lag_ratio=0.08)], 1.2),
         ])
-
-        # ---- 7. the child writes: page fault ----------------------------------------------------------------------
-        kern = RoundedRectangle(corner_radius=0.12, width=4.4, height=0.72, stroke_color=GOLD_M, stroke_width=2.5)
-        kern.set_fill(fillc(GOLD_M), 1).move_to([0, -2.5, 0])
-        kt = T("kernel: page fault on page 1", 20).move_to(kern)
-        fa = arr([TX - 0.6, BOT - 0.05, 0], [kern.get_right()[0] + 0.05, kern.get_y(), 0], RED_M, 3)
-        fl = T("page fault", 19, RED_M).move_to([TX + 0.4, -2.25, 0])
-        stop = Line(sa[1].get_start(), sa[1].get_start() + 0.8 * LEFT)
-
-        def halt():
-            d = Dot(radius=0.08, color=RED_M).move_to(stop.get_start())
-            return [Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, stop, run_time=0.5), FadeOut(d, run_time=0.25))]
-
-        self.steps("When the child writes page 1, the CPU refuses, and faults into the kernel.", [
-            (lambda: [glow(ce[1][0], YELLOW_M, 1.04)], 0.6),
-            "the CPU refuses",
-            (lambda: halt(), 0.8),
-            "and faults",
-            (lambda: [GrowArrow(fa), FadeIn(fl)], 0.5),
-            (lambda: [FadeIn(kern), FadeIn(kt)], 0.5),
+        self.steps("When a cook wants to change page 2, the manager photocopies just page 2, "
+                   "and that copy becomes their page 2, with no sticker.", [
+            "change page 2",
+            (lambda: [Indicate(self.lab["row12"], color=YELLOW_M, scale_factor=1.15)], 0.7),
+            "photocopies just",
+            (lambda: self.cap("only the page being written gets copied", YELLOW_M), 0.6),
         ])
+        self.steps("Let's map it. The cooks are the two processes. The sheets of paper are frames of RAM. "
+                   "The sticker is a read-only mark, on every line of both page tables. And the manager is the kernel.", [
+            (lambda: [glow(pt[0], BLUE_M, 1.02), glow(ct[0], PURPLE_M, 1.02), *self.cap("the cooks: the two processes", WHITE)], 0.7),
+            "The sheets",
+            (lambda: [LaggedStart(*[glow(f[0], WHITE, 1.05) for f in frames[:4]], lag_ratio=0.15), *self.cap("the sheets: frames of RAM", WHITE)], 0.9),
+            "The sticker",
+            (lambda: [LaggedStart(*[Indicate(self.lab[f"mode{k}{j}"], color=GOLD_M) for k in (0, 1) for j in range(4)], lag_ratio=0.08),
+                      *self.cap("the sticker: a read-only mark on each line", GOLD_M)], 1.0),
+            "the manager",
+            (lambda: [*self.put("kbox", kbox()), *self.kern("kernel: idle"), *self.copies(0), *self.cap("the manager: the kernel", TEAL_M)], 0.7),
+        ], after=0.4)
 
-        # ---- 8. copy one page --------------------------------------------------------------------------------------
-        fd = frame(1, 1, "frame D", "1 map", GREEN_M)
-        da = c_arrow(1, 1, GREEN_M)
-        self.steps("The kernel copies just that page to a free frame, points the child at the copy, and makes it writable. "
-                   "That takes about 2 microseconds.", [
-            (lambda: [glow(fr[1][0], GOLD_M, 1.05)], 0.6),
-            (lambda: [travel(Line(fr[1].get_center(), [FX, ROWS[1], 0]), YELLOW_M, 0.6)], 0.6),
-            (lambda: [FadeIn(fd, scale=0.9), Transform(kt, T("kernel: copied 1 page", 20).move_to(kern))], 0.5),
-            "points the child",
-            (lambda: [ReplacementTransform(sa[1], da)], 0.7),
-            "and makes it",
-            (lambda: [Transform(ce[1][2], perm_t(TX, 1, "writable", GREEN_M)),
-                      Transform(fr[1][2], cnt_t(-1, 1, "1 map", GREY_B))], 0.6),
-            "That takes",
-            (lambda: [FadeOut(fa), FadeOut(fl), travel(Line(da.get_start(), da.get_end()), GREEN_M, 0.5),
-                      Transform(kt, T("one page copied in about 2 µs", 20).move_to(kern))], 0.7),
+        # ---------------- scene 6: the walkthrough ----------------
+        self.steps("So here's what fork really does. It builds the child's table pointing at the same frames, and marks every line "
+                   "read-only, the parent's too. Each frame now has two lines pointing at it. No data moved.", [
+            (lambda: [*self.uncap(), *self.kern("kernel: fork()", TEAL_M)], 0.5),
+            "marks every line",
+            (lambda: [LaggedStart(*[glow(self.lab[f"mode{k}{j}"][0], GOLD_M, 1.05) for k in (0, 1) for j in range(4)], lag_ratio=0.06)], 1.0),
+            "two lines",
+            (lambda: [LaggedStart(*[Indicate(self.lab[f"refs{i}"], color=GOLD_M, scale_factor=1.2) for i in range(4)], lag_ratio=0.15)], 0.9),
+            "No data moved",
+            (lambda: [*self.kern("kernel: idle")], 0.4),
         ])
+        self.steps("The child reads page 1. Reading is allowed, so the CPU loads it straight from frame B, and the kernel never hears about it.", [
+            (lambda: [Indicate(self.lab["row11"], color=YELLOW_M, scale_factor=1.12)], 0.6),
+            "Reading is allowed",
+            (lambda: [dot_run(self.row_pt(1, 1), self.arr[(1, 1)].get_end(), YELLOW_M, 0.7)], 0.8),
+            "never hears",
+            (lambda: [Indicate(self.lab["kst"], color=WHITE)], 0.6),
+        ])
+        fault_c = harrow([3.8, T_BOT - 0.08, 0], [K_C[0] + K_W / 2 - 0.3, K_C[1] + K_H / 2 + 0.08, 0], RED_M)
+        self.steps("Now the child writes to page 2. The line says read-only, so the CPU stops the write, and hands control to the kernel. "
+                   "That's called a page fault.", [
+            "writes to page 2",
+            (lambda: [dot_run([TX[1][0] + 1.2, FR_Y[2], 0], [MODE_X[1] - 0.55, FR_Y[2], 0], RED_M, 0.5)], 0.6),
+            "The line says",
+            (lambda: [glow(self.lab["mode12"][0], RED_M, 1.1)], 0.6),
+            "hands control",
+            (lambda: [GrowArrow(fault_c)], 0.5),
+            (lambda: [*self.kern("kernel: page fault", RED_M)], 0.4),
+            "a page fault",
+            (lambda: self.cap("page fault: the CPU stops, and hands control to the kernel", RED_M), 0.6),
+        ])
+        self.steps("The kernel sees that the page may really be written, and that frame C is shared. "
+                   "So it copies frame C's 4 kilobytes into a free frame, E.", [
+            (lambda: [*self.uncap(), Indicate(self.lab["refs2"], color=GOLD_M, scale_factor=1.25)], 0.7),
+            "So it copies",
+            (lambda: [*self.kern("kernel: copy C to E", TEAL_M)], 0.4),
+            (lambda: [dot_run([0.95, FR_Y[2], 0], [0.95, FR_Y[4], 0], YELLOW_M, 0.8)], 0.9),
+            (lambda: [*self.refs(4, 1), glow(frames[4][0], PURPLE_M, 1.05), *self.copies(1)], 0.5),
+        ])
+        self.steps("It points the child's line at E, and makes it writable. Then the write runs again, and lands in E.", [
+            "points the child's",
+            (lambda: [*self.line(1, 2, 4, True), *self.refs(2, 1)], 0.8),
+            "the write runs",
+            (lambda: [FadeOut(fault_c), *self.kern("kernel: idle")], 0.3),
+            (lambda: [dot_run(self.row_pt(1, 2), self.arr[(1, 2)].get_end(), PURPLE_M, 0.7)], 0.8),
+        ])
+        fault_p = harrow([-3.8, T_BOT - 0.08, 0], [K_C[0] - K_W / 2 + 0.3, K_C[1] + K_H / 2 + 0.08, 0], RED_M)
+        self.steps("Now the parent writes to page 2. Its line is still read-only, so it faults too. "
+                   "Will the kernel copy frame C again? Pause and guess.", [
+            "the parent writes",
+            (lambda: [dot_run([TX[0][0] + 1.2, FR_Y[2], 0], [MODE_X[0] - 0.55, FR_Y[2], 0], RED_M, 0.5)], 0.6),
+            "it faults",
+            (lambda: [GrowArrow(fault_p), *self.kern("kernel: page fault", RED_M)], 0.5),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("No. Only one line points at C now, so nobody else can see it. The kernel just makes the line writable again, "
+                   "and copies nothing.", [
+            (lambda: [*self.uncap(), Indicate(self.lab["refs2"], color=WHITE, scale_factor=1.3)], 0.7),
+            "just makes",
+            (lambda: [*self.mode(0, 2, True), *self.kern("kernel: reuse C, no copy", GREEN_M)], 0.5),
+            "copies nothing",
+            (lambda: [Indicate(self.lab["kcp"], color=GOLD_M, scale_factor=1.15), FadeOut(fault_p)], 0.7),
+        ], after=0.3)
+        self.stamp("walk")
 
-        # ---- 9. last sharer just gets write access back ----------------------------------------------------------
-        cow = T("copy-on-write", 26, GREEN_M).move_to(rule)
-        self.steps("Frame B now has one map, so the parent's next write there just gets write access back. "
-                   "That's copy-on-write.", [
-            (lambda: [glow(fr[1][0], GREEN_M, 1.05)], 0.7),
-            "so the parent's",
-            (lambda: [glow(pe[1][0], YELLOW_M, 1.04)], 0.5),
-            "just gets",
-            (lambda: [Transform(pe[1][2], perm_t(-TX, 1, "writable", GREEN_M)),
-                      Transform(kt, T("no copy: frame B has 1 map", 20).move_to(kern))], 0.6),
-            (lambda: [travel(Line(pa[1].get_start(), pa[1].get_end()), GREEN_M, 0.5)], 0.5),
-            "That's copy-on-write",
-            (lambda: [Transform(rule, cow)], 0.7),
-        ])
+        # ---------------- scene 7: the name ----------------
+        self.steps("This is called copy-on-write: share every page, and copy one only when someone writes to it. "
+                   "The kernel counts the lines pointing at each frame, so it knows when to copy and when not to.", [
+            (lambda: [*self.kern("kernel: idle"), *self.cap("copy-on-write: share every page; copy one only when someone writes to it", YELLOW_M)], 0.6),
+            "The kernel counts",
+            (lambda: [LaggedStart(*[Indicate(self.lab[f"refs{i}"], color=GOLD_M, scale_factor=1.2) for i in range(5)], lag_ratio=0.12)], 1.0),
+        ], after=0.4)
 
-        # ---- 10. honest bookkeeping fails --------------------------------------------------------------------------
-        cap_ln = DashedLine([CAP_X, RAM_Y - 0.5, 0], [CAP_X, PR_Y + 0.45, 0], dash_length=0.1, stroke_width=2.5, color=GREY_B)
-        cap_l = left_at(T("8 GB of RAM", 19, GREY_B), CAP_X + 0.2, RAM_Y)
-        ram_bar = Rectangle(width=8 * U, height=BH, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1)
-        ram_bar.move_to([X0 + 4 * U, RAM_Y, 0])
-        lab_p = right_at(T("promised", 22, GREY_B), X0 - 0.2, PR_Y)
-        lab_r = right_at(T("in RAM", 22, GREY_B), X0 - 0.2, RAM_Y)
-        p_oth = seg(0, 1, PR_Y, GREY_B, "others", 16)
-        p_jvm = seg(1, 5, PR_Y, BLUE_M, "JVM, 4 GB")
-        r_oth = seg(0, 1, RAM_Y, GREY_B, "others", 16)
-        r_jvm = seg(1, 5, RAM_Y, BLUE_M, "JVM, 4 GB")
-        r_fc = seg(5, 6, RAM_Y, TEAL_M, "file cache", 15, 0.18)
-        p_kid = seg(5, 9, PR_Y, GOLD_M, "its child, 4 GB")
-        over = Rectangle(width=1 * U, height=BH, stroke_width=0).set_fill(RED_M, 0.45).move_to([CAP_X + U / 2, PR_Y, 0])
-        nofork = T("total 9 GB: fork refused", 20, RED_M).move_to([X0 + 6 * U, PR_Y + 0.7, 0])
-        phase1 = VGroup(pt, *pe, ct, *ce, *fr, fd, *pa, sa[0], sa[2], da, kern, kt, ram_t)
-        self.steps("But fork promised the child memory the kernel never set aside. An honest kernel would refuse: "
-                   "a 4 GB JVM on an 8 GB machine couldn't fork at all.", [
-            (lambda: [FadeOut(phase1), FadeOut(rule)], 0.7),
-            (lambda: [Transform(ram, ram_bar), FadeIn(lab_r)], 0.8),
-            (lambda: [Create(cap_ln), FadeIn(cap_l), FadeIn(r_oth), FadeIn(r_jvm), FadeIn(r_fc)], 0.7),
-            "An honest",
-            (lambda: [FadeIn(lab_p), FadeIn(p_oth), FadeIn(p_jvm)], 0.6),
-            "a 4 GB JVM",
-            (lambda: [FadeIn(p_kid, shift=0.3 * RIGHT)], 0.7),
-            (lambda: [FadeIn(over)], 0.4),
-            "couldn't fork",
-            (lambda: [FadeIn(nofork, shift=0.1 * UP)], 0.5),
+        # ---------------- scene 8: count it ----------------
+        ttl = T("cow.c: 512 MB, drawn as 8 blocks of 64 MB", 22, GREY_B).move_to([BX0 + 4 * SEG, 2.45, 0])
+        plab = {k: right_at(T("parent" if k == 0 else "child", 24, PCOL[k]), BX0 - 0.25, BY[k]) for k in (0, 1)}
+        segs = {k: [seg(k, i, TEAL_M) for i in range(8)] for k in (0, 1)}
+        shared = T("the same frames", 18, TEAL_M).move_to([BX0 + 4 * SEG, (BY[0] + BY[1]) / 2, 0])
+        self.steps("In the lab, the kernel reports each process's memory. Right after fork, the child shows 512 megabytes shared "
+                   "with the parent, and 0 of its own.", [
+            (lambda: [FadeOut(VGroup(pt, ct, *frames, ram_t, *self.arr.values())), *self.drop_prefix("row", "mode", "refs", "kst", "kcp", "kbox"),
+                      *self.uncap()], 0.8),
+            (lambda: [FadeIn(ttl), FadeIn(plab[0]), FadeIn(plab[1]), *[FadeIn(s) for k in (0, 1) for s in segs[k]]], 0.8),
+            "512 megabytes shared",
+            (lambda: [FadeIn(shared), *self.put("n1", left_at(T("Shared 512 MB, Private 0", 18), BX0 + 8 * SEG + 0.2, BY[1])),
+                      *self.put("n0", left_at(T("Shared 512 MB, Private 0", 18), BX0 + 8 * SEG + 0.2, BY[0]))], 0.7),
         ])
+        newk = {i: seg(1, i, PURPLE_M) for i in (1, 5)}
+        newp = {i: seg(0, i, BLUE_M) for i in (1, 5)}
+        self.steps("Then it writes one byte in every fourth page. The kernel makes 32,768 copies, 128 megabytes, "
+                   "at about 1.8 microseconds each. Now the child shows 384 shared, and 128 of its own.", [
+            "every fourth page",
+            (lambda: [*[Indicate(segs[1][i], color=RED_M) for i in (1, 5)]], 0.7),
+            "The kernel makes",
+            (lambda: [*[Transform(segs[1][i], newk[i]) for i in (1, 5)], *[Transform(segs[0][i], newp[i]) for i in (1, 5)],
+                      *self.cap("32,768 page faults, one 4 KB copy each, about 1.8 µs each", WHITE)], 0.9),
+            "Now the child",
+            (lambda: [*self.put("n1", left_at(T("Shared 384 MB, Private 128", 18), BX0 + 8 * SEG + 0.2, BY[1])),
+                      *self.put("n0", left_at(T("Shared 384 MB, Private 128", 18), BX0 + 8 * SEG + 0.2, BY[0]))], 0.7),
+        ])
+        l1 = left_at(T("RSS (every page it has in RAM): 513 + 513 = about 1 GB?", 22, RED_M), BX0, -0.75)
+        l2 = left_at(T("really used: 512 + 128 = 640 MB", 22, WHITE), BX0, -1.35)
+        l3 = left_at(T("PSS (shared pages split between sharers): 320 + 320 = 640 MB", 22, GREEN_M), BX0, -1.95)
+        self.steps("One trap. RSS, the usual memory number, counts every page a process has in RAM. It says 513 for each, "
+                   "so adding them claims a gigabyte. They really use 640.", [
+            (lambda: [*self.uncap(), FadeIn(l1, shift=0.1 * UP)], 0.6),
+            "They really use",
+            (lambda: [FadeIn(l2, shift=0.1 * UP)], 0.6),
+        ])
+        self.steps("PSS splits each shared page between its sharers, and the two PSS numbers add up to exactly 640. "
+                   "So to add up memory, add PSS.", [
+            (lambda: [FadeIn(l3, shift=0.1 * UP)], 0.6),
+            "So to add up",
+            (lambda: [*self.cap("to add up memory, add PSS", YELLOW_M, 30), Indicate(l3, color=GREEN_M, scale_factor=1.04)], 0.8),
+        ], after=0.4)
 
-        # ---- 11. overcommit -----------------------------------------------------------------------------------------
-        pv = ValueTracker(9)
-        ptot = always_redraw(lambda: left_at(T(f"promised in total: {int(round(pv.get_value()))} GB", 22, GOLD_M), -6.4, 2.75))
-        p_big = Rectangle(width=4.0, height=BH, stroke_color=PURPLE_M, stroke_width=2).set_fill(PURPLE_M, 0.32)
-        p_big.move_to([X0 + 9 * U + 2.0, PR_Y, 0])
-        big_l = right_at(T("a batch job asks for 100 GB  →", 19, PURPLE_M), 6.5, PR_Y + 0.75)
-        ok = T("returns at once", 20, GREEN_M).move_to([X0 + 2.5 * U, PR_Y + 0.75, 0])
-        self.steps("So Linux overcommits. It says yes, and bets that most promises are never collected. "
-                   "A request for 100 GB returns at once.", [
-            (lambda: [FadeOut(over), FadeOut(nofork), FadeIn(ptot)], 0.6),
-            "A request for",
-            (lambda: [FadeIn(big_l), GrowFromEdge(p_big, LEFT), pv.animate.set_value(109)], 1.3),
-            "returns at once",
-            (lambda: [FadeIn(ok, shift=0.1 * UP)], 0.5),
+        # ---------------- scene 9: the cost ----------------
+        allk = [seg(1, i, PURPLE_M) for i in range(8)]
+        allp = [seg(0, i, BLUE_M) for i in range(8)]
+        self.steps("Copy-on-write isn't free, though. When the child wrote to every page, the faults took 180 milliseconds, "
+                   "several times one big copy.", [
+            (lambda: [FadeOut(VGroup(l1, l2, l3, shared)), *self.uncap()], 0.5),
+            "every page",
+            (lambda: [*[Transform(segs[1][i], allk[i]) for i in range(8)], *[Transform(segs[0][i], allp[i]) for i in range(8)],
+                      *self.put("n1", left_at(T("Shared 0, Private 512", 18), BX0 + 8 * SEG + 0.2, BY[1])),
+                      *self.put("n0", left_at(T("Shared 0, Private 512", 18), BX0 + 8 * SEG + 0.2, BY[0]))], 0.9),
+            "the faults took",
+            (lambda: self.cap("131,072 faults: 180 ms     one big copy: 28 to 33 ms", RED_M), 0.6),
         ])
+        self.steps("The kitchen agrees: asking the manager 131,072 times takes longer than one trip to the copy shop. "
+                   "Copy-on-write wins because most children write a little, or start another program and write nothing.", [
+            "The kitchen agrees",
+            (lambda: self.cap("131,072 trips to the manager, or one trip to the copy shop", GREY_B), 0.6),
+            "Copy-on-write wins",
+            (lambda: self.cap("it wins because most children write a little, or nothing at all", WHITE), 0.6),
+        ], after=0.4)
 
-        # ---- 12. the job touches its pages until RAM is full -------------------------------------------------------
-        bv = ValueTracker(0.0)
-        r_job = always_redraw(lambda: seg(8 - bv.get_value(), 8, RAM_Y, PURPLE_M, "batch job" if bv.get_value() > 1.2 else None))
-        free_l = T("free", 17, GREY_C).move_to([X0 + 7 * U, RAM_Y, 0])
-        self.steps("Then the batch job touches its pages. Each first touch takes a real frame, until RAM is full.", [
-            (lambda: [FadeIn(free_l), VGroup(p_oth, p_jvm, p_kid, p_big, lab_p).animate.set_opacity(0.3), FadeOut(ok),
-                      big_l.animate.set_opacity(0.4)], 0.6),
-            (lambda: [FadeIn(r_job)], 0.1),
-            (lambda: [bv.animate(rate_func=linear).set_value(1.0), FadeOut(free_l)], 0.9),
-            "Each first touch",
-            (lambda: [bv.animate(rate_func=linear).set_value(2.0)], 1.2),
-            "until RAM is full",
-            (lambda: [glow(ram, RED_M, 1.0)], 0.6),
-        ])
+        # ---------------- scene 10: moral, and a check ----------------
+        self.arr = {}
+        frames = [frame_box(i) for i in range(5)]
+        pt, ct = ptable(0), ptable(1)
 
-        # ---- 13. a fault with nowhere to go; reclaim -----------------------------------------------------------------
-        kern2 = RoundedRectangle(corner_radius=0.12, width=5.6, height=0.72, stroke_color=GOLD_M, stroke_width=2.5)
-        kern2.set_fill(fillc(GOLD_M), 1).move_to([0, -2.6, 0])
-        k2 = T("kernel: page fault, no free frame", 20).move_to(kern2)
-        self.steps("The next touch faults, with no frame left and no error to return. "
-                   "The kernel drops cached file pages, and the job fills those too.", [
-            (lambda: [FadeIn(kern2), FadeIn(k2)], 0.6),
-            "no error",
-            (lambda: [glow(r_job[0], PURPLE_M, 1.0)], 0.7),
-            "The kernel drops",
-            (lambda: [Transform(k2, T("kernel: drop the file cache", 20).move_to(kern2)), FadeOut(r_fc)], 0.7),
-            "and the job",
-            (lambda: [bv.animate(rate_func=linear).set_value(3.0)], 0.9),
-            (lambda: [Transform(k2, T("kernel: still no free frame", 20, RED_M).move_to(kern2))], 0.4),
-        ])
-        r_job.clear_updaters()
+        def rebuild():
+            out = [FadeIn(pt), FadeIn(ct), FadeIn(ram_t), *[FadeIn(f) for f in frames], *self.put("kbox", kbox())]
+            for k in (0, 1):
+                for j in range(4):
+                    out += self.line(k, j, j, False, grow=False)
+            for i in range(4):
+                out += self.refs(i, 2)
+            out += self.refs(4, 0)
+            out += self.kern("kernel: idle") + self.copies(0)
+            return out
 
-        # ---- 14. the OOM killer scores, and kills ----------------------------------------------------------------------
-        sj = T("score: 4 GB", 18, BLUE_M).move_to([X0 + 3 * U, RAM_Y - 0.6, 0])
-        sb = T("score: 3 GB", 18, PURPLE_M).move_to([X0 + 6.5 * U, RAM_Y - 0.6, 0])
-        so = T("small", 18, GREY_B).move_to([X0 + 0.5 * U, RAM_Y - 0.6, 0])
-        self.steps("So the out-of-memory killer scores each process by the memory it holds. The JVM is the biggest.", [
-            (lambda: [Transform(k2, T("kernel: run the OOM killer", 20, RED_M).move_to(kern2))], 0.7),
-            "scores each",
-            (lambda: [FadeIn(so), FadeIn(sb), FadeIn(sj)], 0.7),
-            "The JVM",
-            (lambda: [glow(r_jvm[0], RED_M, 1.0), sj.animate.set_color(RED_M).scale(1.15)], 0.8),
+        self.steps("So the moral of the story: fork copies the list, not the memory. Everything is shared until someone writes, "
+                   "and then only that page is copied.", [
+            (lambda: [FadeOut(VGroup(ttl, plab[0], plab[1], *segs[0], *segs[1])), *self.drop("n0", "n1"),
+                      *self.cap("fork copies the list, not the memory", YELLOW_M, 30)], 0.7),
+            (lambda: rebuild(), 1.0),
+            "only that page",
+            (lambda: [Indicate(self.lab["row12"], color=YELLOW_M, scale_factor=1.12)], 0.7),
         ])
-
-        dead = seg(1, 5, RAM_Y, RED_M, "JVM: killed, exit code 137", 17, 0.12)
-        self.steps("It gets SIGKILL, with no chance to clean up. The batch job asked for the last page, but the JVM died.", [
-            (lambda: [Transform(k2, T("kernel: SIGKILL the JVM", 20, RED_M).move_to(kern2))], 0.5),
-            (lambda: [Transform(r_jvm, dead)], 0.8),
-            "The batch job",
-            (lambda: [glow(r_job[0], PURPLE_M, 1.0)], 0.7),
-            "but the JVM",
-            (lambda: [glow(dead[0], RED_M, 1.0)], 0.7),
-        ])
-
-        # ---- 15. the sentence to keep ------------------------------------------------------------------------------------
-        self.steps("fork copies only the pages that get written. The kernel promises more than it has, "
-                   "and when the bill comes, the biggest process pays.", [
-            (lambda: [FadeOut(so), FadeOut(sb), FadeOut(sj)], 0.5),
-            "The kernel promises",
-            (lambda: [Transform(p_oth, seg(0, 1, PR_Y, GREY_B, "others", 16)), Transform(p_jvm, seg(1, 5, PR_Y, BLUE_M, "JVM, 4 GB")),
-                      Transform(p_kid, seg(5, 9, PR_Y, GOLD_M, "its child, 4 GB")),
-                      p_big.animate.set_fill(PURPLE_M, 0.32).set_stroke(PURPLE_M, opacity=1),
-                      lab_p.animate.set_opacity(1), big_l.animate.set_opacity(1)], 0.7),
-            "the biggest",
-            (lambda: [glow(dead[0], RED_M, 1.0)], 0.8),
-        ])
-        self.wait(0.6)
+        self.steps("One quick check. A child only reads, like Redis writing its snapshot. How many pages does the kernel copy? "
+                   "Pause and think.", [
+            (lambda: self.uncap(), 0.3),
+            "only reads",
+            (lambda: [LaggedStart(*[dot_run(self.row_pt(1, j), self.arr[(1, j)].get_end(), YELLOW_M, 0.6) for j in range(4)], lag_ratio=0.25)], 1.3),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("None. Reads never fault, so the child can run for minutes without costing a single copy.", [
+            (lambda: [*self.uncap(), Indicate(self.lab["kcp"], color=GOLD_M, scale_factor=1.2)], 0.7),
+            "Reads never fault",
+            (lambda: [LaggedStart(*[dot_run(self.row_pt(1, j), self.arr[(1, j)].get_end(), YELLOW_M, 0.5) for j in range(4)], lag_ratio=0.2)], 1.1),
+        ], after=0.3)
+        self.play(*self.cap("fork copies the list, not the memory", YELLOW_M, 30), run_time=0.7)
+        self.wait(2.0)
