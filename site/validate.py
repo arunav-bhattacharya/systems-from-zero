@@ -257,8 +257,24 @@ def check_lesson(path):
         r.err(f"lab module '{lab}' is not one of labs/{{{','.join(sorted(MODULES))}}}")
     num = lid.split("-")[1]
     tid = track["id"]
-    need(L, ["minutes", "goal", "warmup", "sections", "analogy", "in_your_world", "mistake", "worked", "lab", "drill",
+    # Book-voice lessons (with an `opening`, see brief/VOICE.md) weave the analogy, the link to the
+    # reader's world and the common mistake into the prose, so those three callouts become optional.
+    callouts = [] if L.get("opening") else ["analogy", "in_your_world", "mistake"]
+    need(L, ["minutes", "goal", "warmup", "sections", *callouts, "worked", "lab", "drill",
              "recap", "quiz", "flashcards", "terms", "explain_back", "sources"], "lesson", r)
+    if L.get("opening"):
+        n_open = len(strip_code(L["opening"]).split())
+        if not (80 <= n_open <= 200):
+            r.warn(f"opening is {n_open} words; aim for 90-180")
+        if not L.get("closing"):
+            r.err("a lesson with an opening also needs a closing (the bridge to the next lesson)")
+        elif not (50 <= len(strip_code(L["closing"]).split()) <= 140):
+            r.warn(f"closing is {len(strip_code(L['closing']).split())} words; aim for 60-120")
+    for i, s in enumerate(L.get("sections", [])):
+        if s.get("aside"):
+            need(s["aside"], ["title", "body"], f"sections[{i}].aside", r)
+    if sum(1 for s in L.get("sections", []) if s.get("aside")) > 1:
+        r.warn("more than one aside; keep at most one per lesson")
     if not (25 <= L.get("minutes", 0) <= 45):
         r.warn("minutes should be 30-40")
     check_mcq(L.get("warmup", {}), "warmup", r)
@@ -327,8 +343,11 @@ def check_lesson(path):
             check_alt(s["try"].get("code"), f"sections[{i}].try.code", r, solos)
             for j, st in enumerate(s["try"].get("steps", [])):
                 check_pairs(st, f"sections[{i}].try.steps[{j}]", r, solos)
-    for k in ("mistake", "analogy", "in_your_world"):
+    for k in ("mistake", "analogy", "in_your_world", "opening", "closing"):
         check_pairs(L.get(k, ""), k, r, solos)
+    for i, s in enumerate(secs):
+        if s.get("aside"):
+            check_pairs(s["aside"].get("body", ""), f"sections[{i}].aside.body", r, solos)
     check_pairs((L.get("deeper") or {}).get("body", ""), "deeper.body", r, solos)
     for j, st in enumerate((L.get("worked") or {}).get("steps", [])):
         check_pairs(st.get("say", ""), f"worked.steps[{j}].say", r, solos)

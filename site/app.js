@@ -407,6 +407,10 @@
         <button class="btn ghost sm" data-act="timer">Start a 40-minute session</button></div>
       </header>`;
     if (l.videos && l.videos.length) h += l.videos.map(videoCard).join("");
+    if (l.opening) {
+      toc.push(["opening", "Introduction"]);
+      h += `<section class="block opening" id="opening"><div class="prose lede">${l.opening}</div></section>`;
+    }
     if (l.warmup) {
       toc.push(["warmup", "Before you read"]);
       h += `<section class="block" id="warmup"><span class="label">Before you read · guess, no score</span>${mcqCard(l.warmup, "w:" + l.id, 0, { warm: true })}</section>`;
@@ -416,6 +420,7 @@
       h += `<section class="lsec" id="s${si}"><div class="shead"><span class="sn">${pad(si + 1)}</span><h2>${s.h}</h2></div>
         ${s.video ? videoCard(s.video) : ""}
         <div class="prose">${s.html}</div>
+        ${s.aside ? callout("aside", s.aside.title || "You might be wondering", s.aside.html) : ""}
         ${s.figure ? `<figure class="fig"><div class="svg">${s.figure.svg}</div><figcaption><b>FIG ${pad(si + 1)}</b>${s.figure.caption}</figcaption></figure>` : ""}
         ${s.sim ? `<div class="sim" data-sim="${l.id}-${si}"></div>` : ""}
         ${s.stepper ? `<div class="stepper" data-stepper="${l.id}-${si}" tabindex="-1"></div>` : ""}
@@ -460,6 +465,7 @@
         <details class="reveal"><summary>Show the answer</summary><div class="reveal-body">${codePair(l.drill.answer, "Answer")}</div></details></section>`;
     }
     if (l.recap.length) h += `<section class="block"><div class="recap"><span class="label">Remember</span><ul class="prose">${l.recap.map((r) => `<li>${r}</li>`).join("")}</ul></div></section>`;
+    if (l.closing) { toc.push(["closing", "Where we go next"]); h += `<section class="block" id="closing"><aside class="call next"><span class="label">Where we go next</span><div class="prose">${l.closing}</div></aside></section>`; }
     toc.push(["quiz", "Quiz"]);
     h += `<section class="block" id="quiz"><span class="label">Exit quiz · ${l.quiz.length} questions · ${Math.ceil(l.quiz.length * 0.8)} right marks the lesson done</span><h2>Check what stuck</h2>${quizBlock(l.quiz, l.id, "lesson")}</section>`;
     if (l.explain) {

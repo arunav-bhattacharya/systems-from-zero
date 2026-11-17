@@ -21,6 +21,11 @@ memory disagree, trust the notes or check the primary source.
 
 ## Who the learner is
 
+> **Superseded.** The course is being rewritten for a complete newcomer in the book voice. Read
+> `brief/VOICE.md`: its reader, running examples and rules win over this section and over the
+> "Concrete, made-up examples from the learner's world" bullet under Voice.
+
+
 One person: a senior backend engineer. They write Kotlin and Java every day, on services built with
 Quarkus, Temporal, Oracle and Kafka, mostly in payments. They use databases, Kafka and Redis as a
 user of the client libraries. They do not yet have a deep, lasting model of what happens underneath:

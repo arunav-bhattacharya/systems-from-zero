@@ -129,6 +129,7 @@ def lesson(L, n, track):
                     "steps": [inline(x) for x in t.get("steps", [])], "code": code(t.get("code")),
                     "expect": md(t.get("expect", ""))} if t else None,
             "refs": [{"title": inline(r["title"]), "url": r["url"], "kind": r.get("kind", "read")} for r in s.get("refs", [])],
+            "aside": {"title": inline(s["aside"].get("title", "")), "html": md(s["aside"].get("body", ""))} if s.get("aside") else None,
         })
     cmp_ = L.get("compare")
     lab = L.get("lab") or {}
@@ -138,6 +139,7 @@ def lesson(L, n, track):
         "warmup": mcq(L["warmup"]) if L.get("warmup") else None,
         "sections": secs,
         "analogy": md(L.get("analogy", "")), "world": md(L.get("in_your_world", "")), "mistake": md(L.get("mistake", "")),
+        "opening": md(L.get("opening", "")), "closing": md(L.get("closing", "")),
         "compare": compare(cmp_) if cmp_ else None,
         "worked": {"title": inline(L["worked"].get("title", "")),
                    "steps": [{"say": md(s.get("say", "")), "code": hl(s.get("lang"), s["code"]) if s.get("code") else "",
