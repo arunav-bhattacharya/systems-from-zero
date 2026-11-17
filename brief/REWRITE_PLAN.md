@@ -82,3 +82,9 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
   Next in the queue: sql 6-9 (window-functions, gaps-islands, keyset-pagination, upsert-race), model (5),
   store (13), cache (10), enc (5), repl (8), shard (9), txn (8), dist (7), cons (6), msg (12), stream (7),
   batch (11), derive (4). Pause and ask the user at 60% weekly usage.
+- User rule (2026-11-16): when weekly usage reaches 60%, stop until the weekly reset (next: 2026-11-21 21:00 UTC).
+  Don't ask to continue. Ship what is complete; resume the video queue after the reset.
+- Videos live: 31 (found 5, net 10, os 11, sql 5). Cloudflare Workers refuses assets over 25 MiB; one 28.9 MiB
+  render failed a whole deploy silently, so the ship script now checks sizes and fails loudly. Running at 44%:
+  sql 6-9, model (5), store 1-4, store 5-8. Next after the reset: store 9-13, cache, enc, repl, shard, txn, dist,
+  cons, msg, stream, batch, derive.
