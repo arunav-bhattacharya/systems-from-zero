@@ -76,3 +76,9 @@ Track pages (`content/tracks/<id>.json`) get the same treatment with their track
 - Shipped videos so far: all 5 Foundations and all 10 networking videos.
 - Part III shipped: Replication, Partitioning, Transactions, Faults time and truth, Consistency and consensus
   (39 lessons and 5 track pages). Text is live for 13 of 17 tracks (117 lessons). All 14 Part IV writers running.
+- TEXT DONE: all 158 lessons and 17 track pages rewritten and live (usage 40%). A jargon review of the 89
+  remaining working-world terms in main prose (`brief/jargon_sweep.md`) is running.
+- Videos: 15 of 140 remade and live (found, net). In progress: os 1-4, os 5-8, os 10-12 + sql-01, sql 2-5.
+  Next in the queue: sql 6-9 (window-functions, gaps-islands, keyset-pagination, upsert-race), model (5),
+  store (13), cache (10), enc (5), repl (8), shard (9), txn (8), dist (7), cons (6), msg (12), stream (7),
+  batch (11), derive (4). Pause and ask the user at 60% weekly usage.
