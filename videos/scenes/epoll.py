@@ -1,24 +1,28 @@
 from sfz import *
 
 SAY.insert(0, (r"\bepoll_wait\b", "ee poll wait"))
-SAY.insert(0, (r"\bepoll wait\b", "ee poll wait"))
+SAY.insert(0, (r"\bepoll_ctl\b", "ee poll control"))
 SAY.insert(0, (r"\bepoll\b", "ee poll"))
+SAY.insert(0, (r"\bEAGAIN\b", "E again"))
+SAY.insert(0, (r"\bc([1-4])\b", r"C \1"))
+SAY.insert(0, (r"\b1,335,566\b", "one million three hundred thirty-five thousand five hundred sixty-six"))
+SAY.insert(0, (r"\b2,028\b", "two thousand and twenty-eight"))
+SAY.insert(0, (r"\b2,000\b", "two thousand"))
+SAY.insert(0, (r"\b7 a\.m\.", "seven A M"))
 
-GX, GY = -4.75, 0.55         # the sockets
-MX = -0.65                 # middle column: threads, later the kernel
-TX, TY = 4.6, 0.85          # the one thread
-READY = [17, 42, 88]
-
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+PX, PW = -5.3, 2.4                     # the program: threads, later one event-loop thread
+EX0, EX1 = -3.3, 0.1                   # the epoll instance, in the kernel
+ECX = (EX0 + EX1) / 2
+ROWS = [1.6, 0.7, -0.2, -1.1]          # connections c1 to c4
+BELL_X, LAB_X = 0.8, 1.35
+Q0, Q1 = 1.8, 6.45                     # each connection's receive queue
+CW, CG = 0.36, 0.06
+K0, K1, KB, KT = -3.55, 6.65, -2.35, 2.78  # the kernel's dashed outline
+LP_Y, LP_H = 0.25, 2.7                 # the one thread's box
+IL_Y, RL_Y = 1.0, -1.1                 # interest list and ready list centres
+TOP_Y, CAP_Y, BAR_Y = 3.32, -3.25, -2.8
+NAMES = ["c1", "c2", "c3", "c4"]
 
 
 class Base(VoiceScene):
@@ -48,7 +52,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.3):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -75,206 +79,459 @@ class Base(VoiceScene):
             self.wait(after)
 
 
-def left(m, x, y):
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
+def left_at(m, x, y):
     return m.move_to([x + m.width / 2, y, 0])
 
 
-def tstate(s, color=GREY_B):
-    return T(s, 22, color).move_to([TX, TY - 0.32, 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def harrow(a, b, color=GREY_B, sw=3):
+    return Arrow(a, b, buff=0, stroke_width=sw, color=color, max_tip_length_to_length_ratio=0.2, max_stroke_width_to_length_ratio=10)
+
+
+# ---- the pieces ----
+def bell():
+    pts = [(-0.17, -0.1), (0.17, -0.1), (0.12, 0.0), (0.1, 0.12), (0.05, 0.17), (-0.05, 0.17), (-0.1, 0.12), (-0.12, 0.0)]
+    body = Polygon(*[[x, y, 0] for x, y in pts], stroke_color=GREY_B, stroke_width=2.5).set_fill("#1a1a1a", 1)
+    clap = Dot([0, -0.16, 0], radius=0.045, color=GREY_B)
+    knob = Dot([0, 0.21, 0], radius=0.035, color=GREY_B)
+    return VGroup(body, clap, knob)
+
+
+def row(k):
+    y = ROWS[k]
+    q = RoundedRectangle(corner_radius=0.08, width=Q1 - Q0, height=0.56, stroke_color=GREY_C, stroke_width=2).set_fill("#0d0d0d", 1)
+    q.move_to([(Q0 + Q1) / 2, y, 0])
+    return VGroup(M(NAMES[k], 22).move_to([LAB_X, y, 0]), q)
+
+
+def cell_x(i):
+    return Q0 + 0.14 + CW / 2 + i * (CW + CG)
+
+
+def cell(k, i, color=GOLD_M):
+    return Square(CW, stroke_color=color, stroke_width=2).set_fill(fillc(color, 0.5), 1).move_to([cell_x(i), ROWS[k], 0])
+
+
+def chipm(s, color=WHITE, size=18):
+    t = M(s, size, color)
+    r = RoundedRectangle(corner_radius=0.07, width=t.width + 0.24, height=0.4, stroke_color=color, stroke_width=2).set_fill(BLACK, 1)
+    return VGroup(r, t.move_to(r))
+
+
+def slot_x(i):
+    return EX0 + 0.62 + i * 0.73
 
 
 class Epoll(Base):
-    """os-11, sections 0 and 1: 10,000 mostly idle connections. A thread per connection sleeps in read() and costs a
-    thread each (the lab: 2,000 idle clients, 2,028 threads, about 200 MB). Polling non-blocking sockets burns a CPU;
-    select and poll check every socket on every call. epoll registers sockets once, the kernel puts a socket on the
-    ready list when data arrives, and epoll_wait returns only those (the lab's Selector server: 19 threads, 51 MB)."""
+    """os-11, section 1. 2,000 quiet card readers cost 2,028 threads and about 200 MB: a waiter standing by every table.
+    One waiter asking "ready yet?" spins (the lesson's test: 1,335,566 failed reads and a full second of CPU for 8
+    bytes). select and poll check every connection on every call. epoll is a bell on every table: an interest list
+    filled once by epoll_ctl, a ready list the kernel fills, and epoll_wait returning only that. c3's 10 bytes; the
+    event loop. Level- versus edge-triggered on c4's 10 KB read 4 KB at a time: 6 KB stranded; read until EAGAIN.
+    Where the restaurant breaks, the moral, and a check (2,000 connections, 3 with data)."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = T(s, size, color).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def top(self, s, color=WHITE):
+        new = T(s, 24, color).move_to([0, TOP_Y, 0])
+        old, self.topm = self.topm, new
+        return [swap(old, new)]
+
+    def state(self, *lines):
+        """Rewrite the thread's state lines (each a (text, color) pair)."""
+        g = VGroup(*[T(s, 20, c) for s, c in lines]).arrange(DOWN, buff=0.16).move_to([PX, LP_Y - 0.25, 0])
+        fit(g, PW - 0.3)
+        old, self.stm = self.stm, g
+        return [swap(old, g)]
+
+    def countdown(self, secs=3.0, *extra):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar, rate_func=linear), *extra, run_time=secs)
+
+    def ring(self, k, on=True):
+        b = self.bells[k]
+        if on:
+            return [b[0].animate.set_stroke(YELLOW_M).set_fill(fillc(YELLOW_M, 0.6), 1), b[1].animate.set_color(YELLOW_M),
+                    b[2].animate.set_color(YELLOW_M)]
+        return [b[0].animate.set_stroke(GREY_B).set_fill("#1a1a1a", 1), b[1].animate.set_color(GREY_B), b[2].animate.set_color(GREY_B)]
+
+    def shake(self, k):
+        return Wiggle(self.bells[k], scale_value=1.15, rotation_angle=0.08 * TAU, n_wiggles=4)
+
+    def arrive(self, k, n, start=0):
+        """n cells slide in from the network on the right into connection k's queue."""
+        cs = [cell(k, start + i) for i in range(n)]
+        self.q[k] += cs
+        return [LaggedStart(*[FadeIn(c, shift=(7.6 - c.get_x()) * LEFT * 0.35) for c in cs], lag_ratio=0.12)]
+
+    def take(self, k, n):
+        """The thread reads the first n cells of connection k's queue; the rest slide forward."""
+        got, self.q[k] = self.q[k][:n], self.q[k][n:]
+        target = np.array([PX, LP_Y - 1.0, 0])
+        out = [LaggedStart(*[c.animate.move_to(target).scale(0.4).set_opacity(0) for c in got], lag_ratio=0.08)]
+        out += [c.animate.move_to([cell_x(i), ROWS[k], 0]) for i, c in enumerate(self.q[k])]
+        return out
+
+    def to_ready(self, k):
+        c = chipm(NAMES[k], YELLOW_M).move_to([BELL_X, ROWS[k], 0])
+        self.ready[k] = c
+        return [Succession(FadeIn(c, run_time=0.1), c.animate(run_time=0.6).move_to([slot_x(k), RL_Y - 0.25, 0]))]
+
+    def wait_returns(self, k, keep=False):
+        """epoll_wait hands back connection k: a copy flies to the thread (keep), or the chip itself leaves the list."""
+        c = self.ready[k]
+        if keep:
+            c2 = c.copy()
+            return [c2.animate.move_to([PX, LP_Y + 0.5, 0]).set_opacity(0)]
+        self.ready[k] = None
+        return [c.animate.move_to([PX, LP_Y + 0.5, 0]).set_opacity(0)]
 
     def construct(self):
-        self.title_card("Blocking reads and epoll", "ten thousand connections, a few of them talking")
+        self.capm = self.topm = self.stm = None
+        self.q = [[], [], [], []]
+        self.ready = [None] * 4
+        self.title_card("One waiter, a bell on every table", "how one thread waits on thousands of connections with epoll")
 
-        dots = VGroup(*[Dot(radius=0.09, color=GREY_C) for _ in range(100)]).arrange_in_grid(10, 10, buff=0.19)
-        dots.move_to([GX, GY, 0])
-        glab = T("10,000 open connections", 26).move_to([GX, 2.85, 0])
-        gsub = T("100 of them drawn", 18, GREY_B).move_to([GX, GY - 2.05, 0])
-        self.steps("A payment gateway holds 10,000 open connections from merchants. At any moment, only a few have sent "
-                   "anything. How many threads does it need?", [
-            (lambda: [FadeIn(glab), LaggedStart(*[FadeIn(d) for d in dots], lag_ratio=0.01), FadeIn(gsub)], 1.4),
-            "only a few",
-            (lambda: [*[dots[i].animate(rate_func=there_and_back).set_color(GOLD_M).scale(1.6) for i in READY]], 1.0),
+        # ---------------- scene 1: a quiet Sunday ----------------
+        kern = DashedVMobject(RoundedRectangle(corner_radius=0.2, width=K1 - K0, height=KT - KB, stroke_color=GREY_C, stroke_width=2),
+                              num_dashes=90).move_to([(K0 + K1) / 2, (KT + KB) / 2, 0])
+        kern_t = left_at(T("kernel", 22, GREY_B), K0 + 0.25, KT - 0.26)
+        prog_t = T("the program", 22, GREY_B).move_to([PX, KT - 0.26, 0])
+        rows = [row(k) for k in range(4)]
+        more = T("and 1,996 more connections", 20, GREY_B).move_to([(Q0 + Q1) / 2 - 0.3, -1.78, 0])
+        rq_t = T("receive queues", 18, GREY_B).move_to([(Q0 + Q1) / 2, ROWS[0] + 0.48, 0])
+        self.steps("A quiet Sunday morning. Card readers in 2,000 coffee shops stay connected to the payments program all day, "
+                   "ready to send a payment.", [
+            "Card readers",
+            (lambda: [Create(kern), FadeIn(kern_t), LaggedStart(*[FadeIn(r, shift=0.1 * LEFT) for r in rows], lag_ratio=0.15),
+                      FadeIn(more)], 1.2),
+            "stay connected",
+            (lambda: [FadeIn(rq_t), *self.top("2,000 card readers, connected all day")], 0.6),
         ])
+        self.steps("At 7 a.m., hardly anyone buys coffee. The program has almost nothing to do, yet it holds about 200 MB of memory. "
+                   "Why does waiting cost so much?", [
+            "The program has",
+            (lambda: [FadeIn(prog_t)], 0.5),
+            "yet it holds",
+            (lambda: self.top("2,000 card readers · about 200 MB of memory"), 0.6),
+            "Why does waiting",
+            (lambda: [Indicate(self.topm, color=YELLOW_M, scale_factor=1.06), *self.cap("why does waiting cost so much?", WHITE)], 0.8),
+        ], after=0.4)
 
-        caps = VGroup(*[RoundedRectangle(corner_radius=0.04, width=0.12, height=0.26, stroke_width=0).set_fill(GREY_D, 1)
-                        for _ in range(100)]).arrange_in_grid(10, 10, buff=(0.25, 0.09))
-        caps.move_to([MX, GY, 0])
-        clab = T("a thread for each, asleep in read()", 20, GREY_B).move_to([MX, GY - 2.05, 0])
-        self.steps("The simplest design gives each connection its own thread. "
-                   "The thread calls read, and the kernel puts it to sleep until bytes arrive.", [
-            (lambda: [TransformFromCopy(dots, caps)], 1.2),
-            "The thread calls read",
-            (lambda: [FadeIn(clab)], 0.6),
-            "puts it to sleep",
-            (lambda: [caps.animate.set_fill(GREY_D, 0.6)], 0.6),
+        # ---------------- scene 2: a waiter for every table ----------------
+        tb = []
+        for k in range(4):
+            r = RoundedRectangle(corner_radius=0.1, width=PW, height=0.56, stroke_color=BLUE_M, stroke_width=2.5).set_fill(fillc(BLUE_M), 1)
+            r.move_to([PX, ROWS[k], 0])
+            tb.append(VGroup(r, left_at(M(f"T{k + 1}", 20), PX - PW / 2 + 0.18, ROWS[k]),
+                             left_at(T("asleep in read()", 17, GREY_B), PX - PW / 2 + 0.62, ROWS[k])))
+        ties = [DashedLine([PX + PW / 2 + 0.06, ROWS[k], 0], [LAB_X - 0.35, ROWS[k], 0], dash_length=0.08, stroke_width=1.6, color=GREY_C)
+                for k in range(4)]
+        tmore = T("and 1,996 more threads", 20, GREY_B).move_to([PX, -1.78, 0])
+        self.steps("The simple way is a restaurant where every table has its own waiter, standing by until the guests decide.", [
+            (lambda: [*self.uncap()], 0.3),
+            "every table",
+            (lambda: [LaggedStart(*[AnimationGroup(FadeIn(tb[k]), Create(ties[k])) for k in range(4)], lag_ratio=0.2)], 1.2),
         ])
-
-        def wake(i):
-            return [(lambda: [dots[i].animate.set_color(GOLD_M).scale(1.5)], 0.4),
-                    (lambda: [caps[i].animate.set_fill(GOLD_M, 1).scale(1.6)], 0.4),
-                    (lambda: [caps[i].animate.set_fill(GREY_D, 0.6).scale(1 / 1.6), dots[i].animate.set_color(GREY_C).scale(1 / 1.5)], 0.5)]
-
-        self.steps("When a request comes in, the kernel wakes that one thread. It reads, answers, and calls read again.", [
-            *wake(READY[0]),
-            "It reads",
-            *wake(READY[1]),
+        self.steps("The waiter is a thread, one line of work the operating system runs. The table is a connection.", [
+            (lambda: [*self.cap("the waiter: a thread", BLUE_M), glow(tb[0][0], BLUE_M, 1.03)], 0.7),
+            "The table is",
+            (lambda: [*self.cap("the table: a connection", WHITE), Indicate(rows[0][0], color=YELLOW_M)], 0.7),
         ])
-
-        sx = 1.65
-        s1 = left(T("in the lab, 2,000 idle clients:", 22, GREY_B), sx, 1.95)
-        s2 = left(T("2,028 threads", 28, RED_M), sx, 1.4)
-        s3 = left(T("about 200 MB of memory", 28, RED_M), sx, 0.85)
-        s4 = left(T("almost all of them asleep", 22, GREY_B), sx, 0.35)
-        s5 = T("at 10,000: a stack for every thread, and a context switch for every wake-up", 22, GREY_B).move_to([0, -2.3, 0])
-        self.steps("It works, but in the lab, 2,000 idle clients took 2,028 threads and about 200 megabytes, "
-                   "almost all of it asleep. At 10,000, every thread's stack and every wake-up adds up.", [
-            "in the lab",
-            (lambda: [FadeIn(s1)], 0.5),
-            "2,028 threads",
-            (lambda: [FadeIn(s2, shift=0.1 * UP)], 0.5),
-            "and about 200",
-            (lambda: [FadeIn(s3, shift=0.1 * UP)], 0.5),
-            "almost all",
-            (lambda: [FadeIn(s4)], 0.5),
-            "At 10,000",
-            (lambda: [FadeIn(s5, shift=0.1 * UP)], 0.6),
+        self.steps("Standing there is a blocking read: the kernel, the core of the operating system, puts the thread to sleep "
+                   "until bytes arrive.", [
+            (lambda: self.cap("standing by: a blocking read, asleep until bytes arrive", WHITE), 0.6),
+            "puts the thread",
+            (lambda: [LaggedStart(*[t[2].animate(rate_func=there_and_back).set_color(BLUE_M) for t in tb], lag_ratio=0.2)], 1.2),
         ])
+        self.steps("Asleep, it uses no CPU, but each thread is a task with memory set aside. "
+                   "2,000 card readers meant 2,028 threads and about 200 MB.", [
+            (lambda: self.cap("asleep: no CPU.   but each thread has memory set aside", GREY_B), 0.6),
+            "2,000 card readers",
+            (lambda: [FadeIn(tmore), *self.top("2,000 connections · 2,028 threads · about 200 MB", GOLD_M)], 0.8),
+        ], after=0.4)
 
-        tb = RoundedRectangle(corner_radius=0.16, width=3.3, height=1.5, stroke_color=BLUE_M, stroke_width=3).set_fill(fillc(BLUE_M), 1)
-        tb.move_to([TX, TY, 0])
-        tt = T("one thread", 26).move_to([TX, TY + 0.3, 0])
-        ts = tstate("waits on all of them")
-        want = T("what we want: one thread, told which sockets have data", 22, BLUE_M).move_to([0, -2.3, 0])
-        self.steps("What we want is one thread that waits on all of them, and is told which ones have data.", [
-            (lambda: [FadeOut(VGroup(s1, s2, s3, s4, clab)), FadeOut(s5), FadeOut(caps)], 0.6),
-            (lambda: [FadeIn(tb)], 0.5),
-            (lambda: [FadeIn(tt), FadeIn(ts)], 0.5),
-            "and is told",
-            (lambda: [FadeIn(want, shift=0.1 * UP)], 0.6),
-        ])
+        # ---------------- scene 3: ready yet? ----------------
+        lp = RoundedRectangle(corner_radius=0.14, width=PW, height=LP_H, stroke_color=BLUE_M, stroke_width=3).set_fill(fillc(BLUE_M), 1)
+        lp.move_to([PX, LP_Y, 0])
+        lp_t = T("one thread", 24).move_to([PX, LP_Y + LP_H / 2 - 0.35, 0])
 
-        band = Rectangle(width=3.8, height=0.36, stroke_width=0).set_fill(RED_M, 0.35).move_to(dots[0:10].get_center())
-        rows = [dots[10 * r:10 * r + 10].get_center() for r in range(10)]
-        spin = T("read, read, read …: nearly every read fails", 22, RED_M).move_to([0, -2.3, 0])
-        self.steps("Asking each socket in turn doesn't work. A non-blocking read on a quiet socket fails at once, "
-                   "so the loop burns a whole CPU on failures.", [
-            (lambda: [FadeOut(want), FadeIn(band)], 0.3),
-            (lambda: [band.animate(rate_func=linear).move_to(rows[9])], 1.3),
-            (lambda: [band.animate.move_to(rows[0]), Transform(ts, tstate("CPU: 100%", RED_M))], 0.3),
+        def trip(k, rt=0.5, color=YELLOW_M):
+            a, b = np.array([PX + PW / 2, ROWS[k] if k is not None else LP_Y, 0]), np.array([LAB_X - 0.35, ROWS[k], 0])
+            a = np.array([PX + PW / 2, LP_Y + 0.3, 0])
+            d = Dot(a, radius=0.08, color=color)
+            return Succession(FadeIn(d, run_time=0.03), d.animate(run_time=rt / 2, rate_func=linear).move_to(b),
+                              d.animate(run_time=rt / 2, rate_func=linear).move_to(a).set_color(RED_M), FadeOut(d, run_time=0.03))
+
+        self.steps("So try one waiter for every table. A read can be told never to wait: on an empty connection it fails at once, "
+                   "with an error called EAGAIN, try again.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(*tb, *ties, tmore)), FadeIn(lp), FadeIn(lp_t),
+                      *self.top("one thread for all 2,000", WHITE)], 0.9),
             "fails at once",
-            (lambda: [FadeIn(spin, shift=0.1 * UP)], 0.5),
-            (lambda: [band.animate(rate_func=linear).move_to(rows[9])], 1.2),
+            (lambda: [trip(1, 0.8)], 0.86),
+            "with an error",
+            (lambda: [*self.state(("EAGAIN: try again", RED_M))], 0.5),
         ])
-
-        kb = RoundedRectangle(corner_radius=0.16, width=3.1, height=3.5, stroke_color=TEAL_M, stroke_width=3).set_fill(fillc(TEAL_M), 1)
-        kb.move_to([MX, GY, 0])
-        kt = T("kernel", 26, TEAL_M).move_to([MX, GY + 1.4, 0])
-        call = Arrow([TX - 1.75, TY + 0.3, 0], [MX + 1.65, TY + 0.3, 0], buff=0, stroke_width=3, color=GREY_B,
-                     max_tip_length_to_length_ratio=0.2)
-        clab2 = VGroup(T("the whole list,", 18, GREY_B), T("every call", 18, GREY_B)).arrange(DOWN, buff=0.08)
-        clab2.move_to([(TX - 1.75 + MX + 1.65) / 2, TY + 0.82, 0])
-        kchk = T("checks all 10,000", 24).move_to([MX, GY + 0.6, 0])
-        kfound = T("finds 3 ready", 24, GOLD_M).move_to([MX, GY + 0.05, 0])
-        tband = band.copy().set_fill(TEAL_M, 0.35).move_to(rows[0])
-        self.steps("The older calls, select and poll, hand the kernel the whole list every time. "
-                   "The kernel checks all 10,000 sockets to find the three that are ready.", [
-            (lambda: [FadeOut(band), FadeOut(spin), Transform(ts, tstate("calls select or poll")), FadeIn(kb), FadeIn(kt)], 0.7),
-            "hand the kernel",
-            (lambda: [GrowArrow(call), FadeIn(clab2)], 0.6),
-            "The kernel checks",
-            (lambda: [FadeIn(kchk), FadeIn(tband)], 0.4),
-            (lambda: [tband.animate(rate_func=linear).move_to(rows[9])], 1.4),
-            "to find the three",
-            (lambda: [FadeOut(tband), FadeIn(kfound), *[dots[i].animate.set_color(GOLD_M).scale(1.5) for i in READY]], 0.6),
+        self.steps("The waiter runs from table to table: ready yet? Ready yet?", [
+            (lambda: [LaggedStart(*[trip(k, 0.45) for k in (0, 1, 2, 3, 0, 1, 2, 3)], lag_ratio=0.5)], 2.6),
         ])
-
-        ilab = T("interest list", 24).move_to([MX, GY + 0.85, 0])
-        isub = T("all 10,000, added once", 19, GREY_B).move_to([MX, GY + 0.5, 0])
-        frame = SurroundingRectangle(dots, color=TEAL_M, buff=0.14, corner_radius=0.1, stroke_width=2)
-        self.steps("epoll splits that in two. The thread registers each socket once, and the kernel keeps the list.", [
-            (lambda: [FadeOut(VGroup(call, clab2, kchk, kfound)), *[dots[i].animate.set_color(GREY_C).scale(1 / 1.5) for i in READY],
-                      Transform(ts, tstate("epoll"))], 0.7),
-            "registers each socket",
-            (lambda: [Create(frame)], 0.8),
-            "and the kernel keeps",
-            (lambda: [FadeIn(ilab), FadeIn(isub)], 0.6),
+        vt = ValueTracker(0)
+        cnt = always_redraw(lambda: M(f"{int(vt.get_value()):,}", 22, RED_M).move_to([PX, LP_Y - 0.55, 0]))
+        cpu_lab = T("CPU", 18, GREY_B).move_to([PX - 0.7, LP_Y - 1.0, 0])
+        cpu_box = Rectangle(width=1.1, height=0.24, stroke_color=GREY_B, stroke_width=1.5).move_to([PX + 0.38, LP_Y - 1.0, 0])
+        cpu_fill = Rectangle(width=1.08, height=0.22, stroke_width=0).set_fill(RED_M, 0.85)
+        left_at(cpu_fill, PX + 0.38 - 0.54, LP_Y - 1.0)
+        self.steps("Here's a test with one connection that answers after one second. How much CPU does the waiter burn? Pause and guess.", [
+            (lambda: [*self.state(("failed reads:", GREY_B)), *[r.animate.set_opacity(0.25) for r in rows[1:]], more.animate.set_opacity(0.25),
+                      *self.top("a test: one connection, the answer after one second", WHITE)], 0.7),
+            (lambda: [FadeIn(cnt), FadeIn(cpu_lab), Create(cpu_box)], 0.4),
+            "How much CPU",
+            (lambda: [LaggedStart(*[trip(0, 0.4) for _ in range(5)], lag_ratio=0.6)], 1.6),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0, LaggedStart(*[trip(0, 0.4) for _ in range(6)], lag_ratio=0.75))
+        self.add(cnt)
+        c8 = cell(0, 0)
+        self.steps("All of it. A full second, and 1,335,566 failed reads, for 8 bytes the sleeping read got for free.", [
+            (lambda: [*self.uncap(), GrowFromEdge(cpu_fill, LEFT), vt.animate.set_value(1335566),
+                      LaggedStart(*[trip(0, 0.3) for _ in range(5)], lag_ratio=0.8)], 1.6),
+            "for 8 bytes",
+            (lambda: [FadeIn(c8, shift=0.6 * LEFT)], 0.5),
+            (lambda: [c8.animate.move_to([PX, LP_Y + 0.3, 0]).scale(0.4).set_opacity(0)], 0.6),
+            "the sleeping read",
+            (lambda: self.cap("the sleeping read: the same 8 bytes, 0.00 s of CPU", GREY_B), 0.5),
         ])
+        self.steps("Ready yet is a fine question once. Not a million times a second.", [
+            "Not a million",
+            (lambda: [Indicate(cnt, color=RED_M, scale_factor=1.15)], 0.8),
+        ], after=0.4)
 
-        rlab = T("ready list", 24, GOLD_M).move_to([MX, GY - 0.25, 0])
-        slots_x = [MX - 0.95, MX, MX + 0.95]
-        slots = VGroup(*[RoundedRectangle(corner_radius=0.06, width=0.85, height=0.42, stroke_color=GREY_D, stroke_width=1.5)
-                         .move_to([x, GY - 0.85, 0]) for x in slots_x])
-        fds = [chip(f"fd {i}", GOLD_M, 16, mono=True).move_to([x, GY - 0.85, 0]) for i, x in zip(READY, slots_x)]
-        self.steps("When bytes arrive, the kernel itself puts that socket on a ready list. Nobody had to check.", [
-            (lambda: [FadeIn(rlab), FadeIn(slots)], 0.6),
-            "When bytes arrive",
-            (lambda: [LaggedStart(*[dots[i].animate.set_color(GOLD_M).scale(1.6) for i in READY], lag_ratio=0.4)], 0.8),
-            "puts that socket",
-            (lambda: [LaggedStart(*[TransformFromCopy(dots[i], f) for i, f in zip(READY, fds)], lag_ratio=0.4)], 1.2),
-            "Nobody had",
-            (lambda: [glow(kb, GOLD_M, 1.02)], 0.8),
+        # ---------------- scene 4: asking from a chair ----------------
+        self.remove(c8)
+        lst = chipm("c1 c2 c3 c4 … all 2,000", WHITE, 18).move_to([PX, LP_Y + 0.4, 0])
+        sweep = SurroundingRectangle(rows[0], color=YELLOW_M, buff=0.08, corner_radius=0.08, stroke_width=3)
+        self.steps("We want a call that sleeps until any connection in a set has data. The first answers, select and poll, "
+                   "take the whole list every time, and the kernel checks every connection.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(cnt, cpu_lab, cpu_box, cpu_fill)), *self.state(),
+                      *[r.animate.set_opacity(1) for r in rows[1:]], more.animate.set_opacity(1),
+                      *self.top("wanted: sleep until any connection has data", WHITE)], 0.8),
+            "select and poll",
+            (lambda: [*self.state(("asleep in poll()", GREY_B)), FadeIn(lst)], 0.5),
+            "take the whole list",
+            (lambda: [lst.animate.move_to([ECX, 0.25, 0])], 0.8),
+            "checks every",
+            (lambda: [Create(sweep)], 0.3),
+            (lambda: [Succession(*[sweep.animate(run_time=0.3).move_to(rows[k]) for k in (1, 2, 3)],
+                                 sweep.animate(run_time=0.4).surround(more, buff=0.08))], 1.3),
         ])
+        self.steps("With 2,000 connections and 3 active, every wake-up checks 2,000. Still asking every table, just from a chair.", [
+            (lambda: [*self.cap("2,000 connections, 3 with data: every call checks 2,000", WHITE), FadeOut(sweep)], 0.6),
+            "Still asking",
+            (lambda: [glow(lst[0], YELLOW_M, 1.06)], 0.8),
+        ], after=0.4)
 
-        ret = Arrow([MX + 1.65, TY - 0.4, 0], [TX - 1.75, TY - 0.4, 0], buff=0, stroke_width=3, color=GOLD_M,
-                    max_tip_length_to_length_ratio=0.2)
-        got = VGroup(*[chip(f"fd {i}", GOLD_M, 16, mono=True) for i in READY]).arrange(RIGHT, buff=0.15).move_to([TX, TY - 1.25, 0])
-        self.steps("The thread calls epoll wait. It sleeps until the ready list has something, then gets back just those three.", [
-            (lambda: [Transform(ts, tstate("asleep in epoll_wait()", GREY_B))], 0.6),
-            "It sleeps",
-            (lambda: [tb.animate.set_fill(fillc(BLUE_M, 0.05), 1)], 0.6),
-            "then gets back",
-            (lambda: [GrowArrow(ret), tb.animate.set_fill(fillc(BLUE_M), 1), Transform(ts, tstate("woken: 3 ready", GOLD_M))], 0.6),
-            (lambda: [*[ReplacementTransform(f, g) for f, g in zip(fds, got)]], 0.9),
+        # ---------------- scene 5: a bell on every table ----------------
+        self.bells = [bell().move_to([BELL_X, ROWS[k], 0]) for k in range(4)]
+        ep = RoundedRectangle(corner_radius=0.14, width=EX1 - EX0, height=4.36, stroke_color=PURPLE_M, stroke_width=3).set_fill(fillc(PURPLE_M, 0.1), 1)
+        ep.move_to([ECX, 0.0, 0])
+        ep_t = T("epoll", 24, PURPLE_M).move_to([ECX, 1.95, 0])
+        il = RoundedRectangle(corner_radius=0.1, width=EX1 - EX0 - 0.3, height=1.4, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1)
+        il.move_to([ECX, IL_Y - 0.05, 0])
+        il_t = T("interest list", 20, GREY_B).move_to([ECX, IL_Y + 0.38, 0])
+        rl = RoundedRectangle(corner_radius=0.1, width=EX1 - EX0 - 0.3, height=1.25, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1)
+        rl.move_to([ECX, RL_Y, 0])
+        rl_t = T("ready list", 20, GREY_B).move_to([ECX, RL_Y + 0.38, 0])
+        ichips = [chipm(NAMES[k], WHITE).move_to([slot_x(k), IL_Y - 0.1, 0]) for k in range(4)]
+        imore = T("+ 1,996 more", 17, GREY_B).move_to([ECX, IL_Y - 0.55, 0])
+        self.steps("Now put a bell on every table. The waiter registers each bell once, sits down, and walks only to the tables that rang.", [
+            (lambda: [*self.uncap(), FadeOut(lst), *self.state(), *self.top("a bell on every table", WHITE)], 0.5),
+            "a bell on every",
+            (lambda: [LaggedStart(*[FadeIn(b, scale=0.5) for b in self.bells], lag_ratio=0.2)], 0.9),
+            "sits down",
+            (lambda: self.state(("sitting down", GREY_B)), 0.5),
+            "walks only",
+            (lambda: [*self.ring(2), self.shake(2)], 0.8),
+            (lambda: self.ring(2, False), 0.3),
         ])
-
-        def serve(k):
-            i = READY[k]
-            return (lambda: [Transform(ts, tstate(f"answers fd {i}", WHITE)), got[k].animate.set_opacity(0.15),
-                             dots[i].animate.set_color(GREY_C).scale(1 / 1.6)], 0.6)
-
-        quiet = T("the 9,997 quiet sockets cost nothing", 22, GREEN_M).move_to([0, -2.3, 0])
-        self.steps("It reads each one, answers, and asks again. Quiet connections cost nothing on each call.", [
-            serve(0), serve(1), serve(2),
-            "and asks again",
-            (lambda: [FadeOut(got), FadeOut(ret), Transform(ts, tstate("asleep in epoll_wait()", GREY_B))], 0.6),
-            "Quiet connections",
-            (lambda: [FadeIn(quiet, shift=0.1 * UP)], 0.6),
+        self.steps("That's epoll, on Linux. epoll_ctl registers each connection once, in the kernel's interest list.", [
+            (lambda: [FadeIn(ep), FadeIn(ep_t), *self.top("epoll: sign up once, then wait", WHITE)], 0.7),
+            "epoll_ctl",
+            (lambda: [FadeIn(il), FadeIn(il_t), *self.cap("epoll_ctl: sign each connection up, once", WHITE)], 0.5),
+            (lambda: [LaggedStart(*[Succession(FadeIn(c.copy().move_to([PX, LP_Y + 0.3, 0]).set_opacity(0), run_time=0.01),
+                                               FadeIn(c, shift=(c.get_x() - PX) * LEFT * 0.0 + 0.2 * RIGHT, run_time=0.5)) for c in ichips],
+                                  lag_ratio=0.3), FadeIn(imore)], 1.3),
         ])
+        self.steps("When bytes arrive, the kernel itself puts that connection on the ready list. "
+                   "And epoll_wait sleeps until the ready list has something, then returns only that.", [
+            "the ready list",
+            (lambda: [FadeIn(rl), FadeIn(rl_t)], 0.5),
+            "And epoll_wait",
+            (lambda: [*self.state(("asleep in", GREY_B), ("epoll_wait", WHITE)), *self.cap("epoll_wait: sleep until the ready list has something", WHITE)], 0.6),
+            "returns only that",
+            (lambda: [glow(rl, YELLOW_M, 1.03)], 0.8),
+        ], after=0.3)
+        lp_t2 = T("event loop", 24).move_to(lp_t)
 
-        hdr = T("in the lab, 2,000 idle clients", 20, GREY_B)
-        left(hdr, -6.3, -2.05)
-        r1 = VGroup(left(T("a thread per connection", 24, RED_M), -6.3, -2.5), left(T("2,028 threads", 24, RED_M), 0.2, -2.5),
-                    left(T("about 200 MB", 24, RED_M), 3.6, -2.5))
-        r2 = VGroup(left(T("one Selector thread, on epoll", 24, GREEN_M), -6.3, -3.05), left(T("19 threads", 24, GREEN_M), 0.2, -3.05),
-                    left(T("51 MB", 24, GREEN_M), 3.6, -3.05))
-        self.steps("In the lab, a Selector server, which is epoll underneath, served the same 2,000 clients "
-                   "with 19 threads and 51 megabytes.", [
-            (lambda: [FadeOut(quiet), FadeIn(hdr), FadeIn(r1)], 0.8),
-            "a Selector server",
-            (lambda: [FadeIn(r2[0], shift=0.1 * UP)], 0.6),
-            "with 19 threads",
-            (lambda: [FadeIn(r2[1], shift=0.1 * UP)], 0.5),
-            "and 51",
-            (lambda: [FadeIn(r2[2], shift=0.1 * UP)], 0.5),
+        # ---------------- scene 6: watch one request ----------------
+        self.steps("Watch. 10 bytes arrive for c3. The kernel puts c3 on the ready list and wakes the thread. epoll_wait returns c3.", [
+            (lambda: [*self.uncap(), *self.top("10 bytes arrive for c3", GOLD_M)], 0.4),
+            "10 bytes arrive",
+            (lambda: self.arrive(2, 1), 0.6),
+            "The kernel puts",
+            (lambda: [*self.ring(2), self.shake(2), *self.to_ready(2)], 0.8),
+            "wakes the thread",
+            (lambda: [glow(lp, YELLOW_M, 1.02), *self.state(("awake", YELLOW_M))], 0.6),
+            "epoll_wait returns",
+            (lambda: [*self.wait_returns(2), *self.state(("epoll_wait", GREY_B), ("returned: c3", YELLOW_M))], 0.7),
         ])
+        self.steps("The thread reads the 10 bytes, reads again, gets EAGAIN, and goes back to sleep. It never touched c1, c2 or c4.", [
+            (lambda: [*self.take(2, 1), *self.state(("read c3:", GREY_B), ("10 bytes", GREEN_M))], 0.7),
+            "reads again",
+            (lambda: [*self.state(("read c3 again:", GREY_B), ("EAGAIN", RED_M)), *self.ring(2, False)], 0.6),
+            "goes back",
+            (lambda: self.state(("asleep in", GREY_B), ("epoll_wait", WHITE)), 0.5),
+            "It never touched",
+            (lambda: [LaggedStart(*[Indicate(rows[k][0], color=GREY_B, scale_factor=1.2) for k in (0, 1, 3)], lag_ratio=0.3),
+                      *self.cap("c1, c2, c4: never touched", GREY_B)], 1.0),
+        ])
+        self.steps("A thread living in this wait-and-handle cycle is called an event loop.", [
+            (lambda: [swap(lp_t, lp_t2), *self.cap("an event loop: wait, handle what's ready, wait again", BLUE_M)], 0.7),
+            (lambda: [glow(lp, BLUE_M, 1.02)], 0.7),
+        ], after=0.4)
 
-        users = VGroup(*[chip(s, BLUE_M, 16) for s in ("Netty", "Kafka client", "virtual threads")]).arrange(RIGHT, buff=0.2)
-        users.move_to([TX - 0.3, -0.45, 0])
-        self.steps("Netty, the Kafka client and Java's virtual threads all run this loop for you.", [
-            (lambda: [LaggedStart(*[FadeIn(u, shift=0.1 * UP) for u in users], lag_ratio=0.4)], 1.2),
-            (lambda: [glow(tb, BLUE_M, 1.04)], 0.8),
+        # ---------------- scene 7: two ways to ring ----------------
+        self.steps("The bell can ring in two ways, and the difference bites. 10 KB arrive on c4, and the loop reads only 4 KB.", [
+            (lambda: [*self.uncap(), *self.top("10 KB arrive on c4", GOLD_M)], 0.4),
+            "10 KB arrive",
+            (lambda: [*self.arrive(3, 10)], 1.2),
+            (lambda: [*self.ring(3), self.shake(3), *self.to_ready(3)], 0.8),
+            "and the loop reads",
+            (lambda: [*self.wait_returns(3, keep=True), *self.state(("epoll_wait", GREY_B), ("returned: c4", YELLOW_M))], 0.6),
+            (lambda: [*self.take(3, 4), *self.state(("read c4:", GREY_B), ("4 KB, 6 KB left", GOLD_M))], 0.8),
         ])
+        self.steps("By default, epoll is level-triggered: the bell keeps ringing while the table has anything left to order.", [
+            (lambda: self.cap("level-triggered: rings while anything is left", WHITE), 0.6),
+            "keeps ringing",
+            (lambda: [self.shake(3), Indicate(self.ready[3], color=YELLOW_M)], 0.9),
+            (lambda: [self.shake(3)], 0.8),
+        ])
+        self.steps("So the next epoll_wait returns c4 again, and the loop reads the rest.", [
+            "returns c4 again",
+            (lambda: [*self.wait_returns(3), *self.state(("epoll_wait", GREY_B), ("returned: c4 again", YELLOW_M))], 0.7),
+            "reads the rest",
+            (lambda: [*self.take(3, 6), *self.state(("read c4:", GREY_B), ("the other 6 KB", GREEN_M)), *self.ring(3, False)], 0.9),
+        ], after=0.3)
+        self.steps("Edge-triggered rings once, each time new data arrives. Same 10 KB, same 4 KB read, and the loop waits again.", [
+            (lambda: [*self.cap("edge-triggered: rings once, when new data arrives", WHITE), *self.state(("asleep in", GREY_B), ("epoll_wait", WHITE))], 0.6),
+            "Same 10 KB",
+            (lambda: [*self.arrive(3, 10)], 1.0),
+            (lambda: [*self.ring(3), self.shake(3), *self.to_ready(3)], 0.7),
+            (lambda: [*self.wait_returns(3), *self.ring(3, False)], 0.6),
+            "same 4 KB",
+            (lambda: [*self.take(3, 4), *self.state(("read c4:", GREY_B), ("4 KB", GOLD_M))], 0.7),
+            "the loop waits",
+            (lambda: self.state(("asleep in", GREY_B), ("epoll_wait", WHITE)), 0.5),
+        ])
+        self.steps("What happens to the other 6 KB? Pause and guess.", [
+            (lambda: [*self.top("6 KB still in c4's queue", GOLD_M), *[Indicate(c, color=GOLD_M, scale_factor=1.15) for c in self.q[3]]], 0.8),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("They sit there. They aren't new, so epoll_wait sleeps.", [
+            (lambda: [*self.uncap(), *[c.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.5), 1) for c in self.q[3]]], 0.6),
+            "They aren't new",
+            (lambda: [*self.cap("not new, so no ring: the loop sleeps on", RED_M), Indicate(self.stm, color=GREY_B)], 0.7),
+        ])
+        self.steps("And the client sent its whole request and waits for an answer, so nothing new will come. "
+                   "The waiter took half the order and sat down.", [
+            (lambda: [*self.top("the client sent everything and waits for an answer", WHITE)], 0.6),
+            "nothing new",
+            (lambda: self.cap("nothing new will come: 6 KB stranded", RED_M), 0.5),
+            "half the order",
+            (lambda: [glow(lp, RED_M, 1.02)], 0.8),
+        ])
+        self.steps("Edge-triggered wakes the loop less often, which some servers want. The rule for that code: on every event, read until EAGAIN.", [
+            (lambda: self.cap("edge-triggered: fewer wake-ups", GREY_B), 0.5),
+            "The rule",
+            (lambda: [*self.cap("on every event, read until EAGAIN", YELLOW_M, 30),
+                      *[c.animate.set_stroke(GOLD_M).set_fill(fillc(GOLD_M, 0.5), 1) for c in self.q[3]]], 0.6),
+            (lambda: [*self.take(3, 4), *self.state(("read c4:", GREY_B), ("4 KB", GOLD_M))], 0.6),
+            (lambda: [*self.take(3, 2), *self.state(("read c4:", GREY_B), ("2 KB", GOLD_M))], 0.6),
+            (lambda: self.state(("read c4:", GREY_B), ("EAGAIN: done", GREEN_M)), 0.5),
+        ], after=0.5)
 
-        self.steps("A thread per connection pays for every connection. epoll pays only for the ones with data.", [
-            (lambda: [Indicate(r1, color=RED_M, scale_factor=1.04)], 1.0),
-            "epoll pays",
-            (lambda: [Indicate(r2, color=GREEN_M, scale_factor=1.04), glow(kb, GOLD_M, 1.02)], 1.0),
+        # ---------------- scene 8: where the restaurant breaks ----------------
+        self.steps("Here the restaurant picture breaks. A bell is free, but every connection in the interest list costs the kernel a little memory.", [
+            (lambda: [*self.top("where the restaurant picture breaks", WHITE), *self.cap("a bell: free", GREY_B),
+                      *self.state(("asleep in", GREY_B), ("epoll_wait", WHITE))], 0.6),
+            "but every connection",
+            (lambda: [*self.cap("each connection in the interest list: a little kernel memory", WHITE), glow(il, YELLOW_M, 1.03)], 0.8),
         ])
-        self.wait(0.6)
+        self.steps("And waiters are expensive, while threads are cheap until there are thousands. "
+                   "Ten card readers can have a thread each. Thousands of quiet ones want an event loop.", [
+            (lambda: self.cap("threads: cheap, until there are thousands", WHITE), 0.5),
+            "Ten card readers",
+            (lambda: self.cap("10 readers: a thread each is fine.   thousands: an event loop", WHITE), 0.6),
+            "Thousands of quiet",
+            (lambda: [glow(lp, BLUE_M, 1.02)], 0.8),
+        ], after=0.4)
+
+        # ---------------- scene 9: the moral, and a check ----------------
+        self.steps("So why did a quiet Sunday cost 200 MB? Every connection had its own sleeping waiter.", [
+            (lambda: [*self.uncap(), *self.top("why did a quiet Sunday cost 200 MB?", WHITE)], 0.5),
+            "Every connection",
+            (lambda: self.cap("2,000 connections, 2,028 sleeping threads", GOLD_M), 0.5),
+        ])
+        self.steps("epoll is one waiter and a bell on every table: sign up once, sleep, and walk only to the tables that rang.", [
+            (lambda: self.cap("epoll: sign up once, sleep, handle only what rang", WHITE), 0.6),
+            "sign up once",
+            (lambda: [glow(il, WHITE, 1.03)], 0.7),
+            "sleep",
+            (lambda: [glow(lp, BLUE_M, 1.02)], 0.6),
+            "walk only",
+            (lambda: [glow(rl, YELLOW_M, 1.03)], 0.7),
+        ], after=0.4)
+        self.steps("One quick check. 2,000 connections, and 3 have data. How many does poll check, and how many does epoll_wait return? "
+                   "Pause and think.", [
+            (lambda: [*self.uncap(), *self.top("2,000 connections, 3 with data", WHITE)], 0.5),
+            "3 have data",
+            (lambda: [*self.arrive(0, 1), *self.arrive(1, 1), *self.arrive(3, 1)], 0.7),
+            (lambda: [*self.ring(0), *self.ring(1), *self.ring(3), *self.to_ready(0), *self.to_ready(1), *self.to_ready(3)], 0.8),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        sweep2 = SurroundingRectangle(rows[0], color=YELLOW_M, buff=0.08, corner_radius=0.08, stroke_width=3)
+        self.steps("poll checks all 2,000. epoll_wait returns just the 3.", [
+            (lambda: [*self.uncap(), Create(sweep2)], 0.3),
+            (lambda: [Succession(*[sweep2.animate(run_time=0.25).move_to(rows[k]) for k in (1, 2, 3)],
+                                 sweep2.animate(run_time=0.3).surround(more, buff=0.08)), *self.cap("poll: checks all 2,000", WHITE)], 1.05),
+            "epoll_wait returns",
+            (lambda: [FadeOut(sweep2), *[glow(self.ready[k][0], YELLOW_M, 1.1) for k in (0, 1, 3)],
+                      *self.cap("poll: checks all 2,000.   epoll_wait: returns 3", YELLOW_M)], 0.8),
+        ], after=0.4)
+        self.wait(2.0)
