@@ -1,30 +1,50 @@
 from sfz import *
 
-# Kokoro says "Haddad" as "hadded"
-SAY.insert(0, (r"\bHaddad\b", "Hah-dahd"))
+# Category codes are said in pairs, the way people read them; captions keep the digits.
+SAY.insert(0, (r"\bmcc\b", "M C C"))
+SAY.insert(0, (r"\b5732\b", "fifty-seven thirty-two"))
+SAY.insert(0, (r"\b5814\b", "fifty-eight fourteen"))
+SAY.insert(0, (r"\b5812\b", "fifty-eight twelve"))
+SAY.insert(0, (r"\b7011\b", "seventy eleven"))
 
-F = 16                                       # table text size
-ROW_Y = [1.45 - 0.6 * i for i in range(6)]
-HDR_Y, RULE_Y, TTL_Y, Q_Y = 2.1, 1.83, 2.62, 3.22
-X_L = -6.52                                  # left edge of everything
-X_PID = -5.85                                # payment_id, centred
-X_AMT_R = -3.35                              # amount_minor, right edge
-X_EM_L = -2.95                               # customer_email, left edge
-X_NM_L = 0.65                                # customer_name in the wide table, left edge
-X_CEM_L, X_CNM_L = 0.95, 4.55                # the customers table's two columns, left edges
-NOTE_X = 4.6                                 # centre of the notes right of the wide table
-RES_Y, CHIP_Y = -2.4, -3.1
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+FS, HS = 18, 14                                   # cell and header text sizes
+ROW_Y = [2.05 - 0.42 * i for i in range(10)]
+TTL_Y, HDR_Y, RULE_Y = 2.95, 2.5, 2.3
+PF_X0, PF_X1, PF_X1_MID, PF_X1_SPLIT, PF_TOP, PF_BOT = -6.6, 5.45, 0.9, 0.0, 3.22, -1.98   # the file's table
+X_PID, X_NAME, X_MER, X_MCC, X_DESC = -5.8, -4.95, -2.7, 0.15, 1.1
+# the two tables of their own (the café's card box), drawn only once the cells have left
+MF_X0, MF_X1, MF_TOP, MF_BOT = 1.05, 5.0, 3.22, 0.55          # merchants: one row per shop
+XM_NAME, XM_MCC = 1.3, 4.15
+CF_X0, CF_X1, CF_TOP, CF_BOT = 1.05, 6.52, 0.02, -2.85          # mcc_codes: one row per category
+CTTL_Y, CHDR_Y, CRULE_Y = -0.22, -0.62, -0.8
+CROW_Y = [-1.04 - 0.38 * i for i in range(5)]
+XC_MCC, XC_DESC = 1.3, 2.2
+GHOST_Y = -2.42
+CAP_Y = -3.25
 
-# the six export rows for Ben, Jonas and Farid (payments_export in the course database, March 2026)
-ROWS = [(13, 64000, "ben.carter@example.com", "Ben Carter", "ben"),
-        (16, 31500, "jonas.weber@example.com", "Jonas Weber", "jonas"),
-        (17, 18999, "farid.haddad@example.com", "Farid Hadad", "farid"),
-        (18, 18999, "farid.haddad@example.com", "Farid Hadad", "farid"),
-        (20, 7425, "ben.carter@example.com", "Ben Carter", "ben"),
-        (22, 52000, "jonas.weber@example.com", "Jonas Weber", "jonas")]
-CC = {"ben": BLUE_M, "jonas": TEAL_M, "farid": GOLD_M}
-CUST = {"ben": (0, "ben.carter@example.com", "Ben Carter"), "jonas": (1, "jonas.weber@example.com", "Jonas Weber"),
-        "farid": (2, "farid.haddad@example.com", "Farid Haddad")}
+ROWS = [(13, "Ben Carter", "Harbor Hotel", "7011", "Hotels, motels, resorts"),
+        (14, "Asha Rao", "Northwind Grocers", "5411", "Grocery stores, supermarkets"),
+        (15, "Elena Petrova", "Volt Electronics", "5732", "Electronics stores"),
+        (16, "Jonas Weber", "Harbor Hotel", "7011", "Hotels, motels, resorts"),
+        (17, "Farid Hadad", "Volt Electronics", "5732", "Electronics stores"),
+        (18, "Farid Haddad", "Volt Electronics", "5732", "Electronic stores"),
+        (19, "Chloe Martin", "Volt Electronics", "5732", "Electronics stores"),
+        (20, "Ben Carter", "Northwind Grocers", "5411", "Grocery stores, supermarkets"),
+        (21, "Mateo Ruiz", "Quick Bite", "5812", "Eating places, restaurants"),
+        (22, "Jonas Weber", "Harbor Hotel", "7011", "Hotels, motels, resorts")]
+CODES = ["7011", "5411", "5732", "5812"]                       # first appearance in the file
+DESC = {"7011": "Hotels, motels, resorts", "5411": "Grocery stores, supermarkets", "5732": "Electronics stores",
+        "5812": "Eating places, restaurants"}
+SHOPS = ["Harbor Hotel", "Northwind Grocers", "Volt Electronics", "Quick Bite"]
+SHOP_MCC = {"Harbor Hotel": "7011", "Northwind Grocers": "5411", "Volt Electronics": "5732", "Quick Bite": "5812"}
+VOLT = [2, 4, 5, 6]
+
+# the café's order book (made up for the picture)
+BK_X0, BK_X1, BK_TOP, BK_BOT = -4.3, 4.3, 2.6, -1.75
+BK_Y = [1.15 - 0.6 * i for i in range(5)]
+BOOK = [("Ana", "555-0142", "latte", "3.50"), ("Tom", "555-0187", "tea", "2.80"), ("Ana", "555-0142", "flat white", "3.80"),
+        ("Ana", "555-0142", "latte", "3.50"), ("Ana", "555-0142", "mocha", "3.90")]
 
 
 class Base(VoiceScene):
@@ -75,10 +95,35 @@ class Base(VoiceScene):
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
+        if t > dur + 0.1:
+            print(f"WARNING: steps run {t - dur:.1f}s past the line: {text[:50]}")
         if dur - t > 0.02:
             self.wait(dur - t)
         if after:
             self.wait(after)
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 12.6).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def countdown(self, c=(0, -2.6), secs=3.0):
+        bar = Line([c[0] - 1.0, c[1], 0], [c[0] + 1.0, c[1], 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
 def left_at(m, x, y):
@@ -89,248 +134,471 @@ def right_at(m, x, y):
     return m.move_to([x - m.width / 2, y, 0])
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def pid(i):
-    return M(str(ROWS[i][0]), F).move_to([X_PID, ROW_Y[i], 0])
+def frame(x0, x1, top, bot, color):
+    return RoundedRectangle(corner_radius=0.14, width=x1 - x0, height=top - bot, stroke_color=color, stroke_width=3)\
+        .set_fill(fillc(color, 0.1), 1).move_to([(x0 + x1) / 2, (top + bot) / 2, 0]).set_z_index(-1)
 
 
-def amt(i):
-    return right_at(M(str(ROWS[i][1]), F), X_AMT_R, ROW_Y[i])
+def around(m, color, buff=0.07):
+    return SurroundingRectangle(m, buff=buff, corner_radius=0.05, stroke_color=color, stroke_width=3)
 
 
-def email(i, color=WHITE):
-    return left_at(M(ROWS[i][2], F, color), X_EM_L, ROW_Y[i])
+def row_box(x0, x1, y, color=YELLOW_M):
+    return RoundedRectangle(corner_radius=0.06, width=x1 - x0, height=0.38, stroke_color=color, stroke_width=3).move_to(
+        [(x0 + x1) / 2, y, 0])
 
 
-def name(i, s=None, color=WHITE):
-    return left_at(M(s or ROWS[i][3], F, color), X_NM_L, ROW_Y[i])
+# ---- the file's table ----
+def cell(col, s, y, color=WHITE):
+    m = M(s, FS, color)
+    if col == "pid":
+        return m.move_to([X_PID, y, 0])
+    return left_at(m, {"name": X_NAME, "mer": X_MER, "mcc": X_MCC, "desc": X_DESC}[col], y)
 
 
-def c_email(who, color=WHITE):
-    k, e, _ = CUST[who]
-    return left_at(M(e, F, color), X_CEM_L, ROW_Y[k])
+def hdr(s, x, y=HDR_Y, center=False, color=GREY_B):
+    m = M(s, HS, color)
+    return m.move_to([x, y, 0]) if center else left_at(m, x, y)
 
 
-def c_name(who, s=None, color=WHITE):
-    k, _, n = CUST[who]
-    return left_at(M(s or n, F, color), X_CNM_L, ROW_Y[k])
+def mer_cell(k, col, color=WHITE):
+    s = SHOPS[k] if col == "name" else SHOP_MCC[SHOPS[k]]
+    return left_at(M(s, FS, color), XM_NAME if col == "name" else XM_MCC, ROW_Y[k])
 
 
-def hdr(s, x, align="left", color=GREY_B):
-    m = M(s, F, color)
-    if align == "left":
-        return left_at(m, x, HDR_Y)
-    if align == "right":
-        return right_at(m, x, HDR_Y)
-    return m.move_to([x, HDR_Y, 0])
-
-
-def rule(x0, x1):
-    return Line([x0, RULE_Y, 0], [x1, RULE_Y, 0], stroke_width=1.5, color=GREY_D)
-
-
-def tint(x0, x1, y, color, a=0.16):
-    return Rectangle(width=x1 - x0, height=0.42, stroke_width=0).set_fill(color, a).move_to([(x0 + x1) / 2, y, 0]).set_z_index(-1)
-
-
-def outline(x0, x1, y, color):
-    return RoundedRectangle(corner_radius=0.06, width=x1 - x0, height=0.46, stroke_color=color, stroke_width=3)\
-        .move_to([(x0 + x1) / 2, y, 0])
+def cod_cell(k, col, code=None, color=WHITE):
+    code = code or CODES[k]
+    s = code if col == "mcc" else (DESC.get(code) or "Fast food restaurants")
+    return left_at(M(s, FS, color), XC_MCC if col == "mcc" else XC_DESC, CROW_Y[k])
 
 
 class Normalization(Base):
-    """sql-02, section 0 (with section 1's functional dependencies): payments_export repeats each customer's email and
-    name on every payment. A fix to payment 18 changes one of Farid's two copies, and the table now says one email has two
-    names (an update anomaly). customer_email -> customer_name is a dependency whose left side is not the key, so the email
-    and name move to customers, keyed by the email; loading it refuses Farid's second spelling, and from then on one row
-    holds his name for both payments."""
+    """sql-02, section 0. The café's order book repeats a regular's phone number on 200 lines, and a change reaches only
+    199. The partner bank's file, payments_export, does the same: Volt's category 5732 four times in ten rows, Farid's
+    surname spelled two ways (17, 18), 5732 called "Electronic stores" on 18. Being careful is steelmanned and broken:
+    the update anomaly, plus an insert anomaly (5814 has nowhere to go) and a delete anomaly (deleting 21 loses Quick
+    Bite's category). The café's card box is the fix: the categories and the shops move to tables of their own, keyed by
+    what decides them. The price is a join. Check: renaming 7011 touches three rows before, one after."""
 
     def construct(self):
-        self.title_card("Normalization", "store each fact once")
+        self.capm = None
+        self.title_card("One fact, many copies", "why a table should say things once")
 
-        ttl = left_at(T("payments_export", 22, GREY_B), X_L, TTL_Y)
-        h_pid, h_amt = hdr("payment_id", X_PID, "center"), hdr("amount_minor", X_AMT_R, "right")
-        h_em, h_nm = hdr("customer_email", X_EM_L), hdr("customer_name", X_NM_L)
-        r_wide = rule(X_L, X_NM_L + 1.75)
-        P = [pid(i) for i in range(6)]
-        A = [amt(i) for i in range(6)]
-        E = [email(i) for i in range(6)]
-        N = [name(i) for i in range(6)]
-        self.steps("A partner bank sends a file of payments every night. The quickest way to load it is one wide table, "
-                   "with every detail on every row.", [
-            (lambda: [FadeIn(ttl, shift=0.1 * DOWN), FadeIn(VGroup(h_pid, h_amt, h_em, h_nm)), Create(r_wide)], 0.9),
+        # ---------------- scene 1: the order book ----------------
+        bk = frame(BK_X0, BK_X1, BK_TOP, BK_BOT, BLUE_M)
+        rings = VGroup(*[Circle(radius=0.08, stroke_color=BLUE_M, stroke_width=2.5).set_fill(BLACK, 1).move_to([BK_X0, y, 0])
+                         for y in np.arange(BK_TOP - 0.45, BK_BOT + 0.3, -0.55)])
+        bk_t = left_at(T("order book", 26), BK_X0 + 0.45, BK_TOP - 0.38)
+        bx = [BK_X0 + 0.5, BK_X0 + 1.7, BK_X0 + 4.0, BK_X1 - 0.45]
+        bk_h = VGroup(left_at(T("name", 18, GREY_B), bx[0], 1.68), left_at(T("phone", 18, GREY_B), bx[1], 1.68),
+                      left_at(T("drink", 18, GREY_B), bx[2], 1.68), right_at(T("price", 18, GREY_B), bx[3], 1.68))
+        bk_r = Line([BK_X0 + 0.35, 1.45, 0], [BK_X1 - 0.3, 1.45, 0], stroke_width=1.5, color=GREY_C)
+
+        def bline(i, phone=None, pcolor=WHITE):
+            n, p, d, pr = BOOK[i]
+            y = BK_Y[i]
+            return VGroup(left_at(M(n, 26), bx[0], y), left_at(M(phone or p, 26, pcolor), bx[1], y),
+                          left_at(M(d, 26), bx[2], y), right_at(M(pr, 26), bx[3], y))
+
+        lines = [bline(i) for i in range(5)]
+        book = VGroup(bk, rings, bk_t, bk_h, bk_r)
+        self.steps("Picture a café's old order book. For every order, the barista writes the customer's name, phone number, "
+                   "drink and price on one line.", [
+            (lambda: [FadeIn(book, shift=0.15 * UP)], 1.0),
+            "For every order",
+            (lambda: [LaggedStart(*[FadeIn(l, shift=0.1 * DOWN) for l in lines], lag_ratio=0.3)], 2.0),
+        ])
+        self.steps("It's quick, and on the first day it works perfectly.", [
+            "it works perfectly",
+            (lambda: [glow(bk, BLUE_M, 1.01)], 0.9),
+        ])
+        ana = [0, 2, 3, 4]
+        her = T("her number is on 200 lines", 22, GREY_B).move_to([0, -2.3, 0])
+        cur = row_box(BK_X0 + 0.3, BK_X1 - 0.25, BK_Y[0])
+        miss = around(lines[3][1], RED_M)
+        new_p = {}
+
+        def change(i):
+            new_p[i] = bline(i, "555-0199", GREEN_M)[1]
+            return [Transform(lines[i][1], new_p[i])]
+
+        self.steps("Then a regular changes her phone number. Her number sits on 200 lines, and someone has to change all of them. "
+                   "They change 199.", [
+            "Then a regular",
+            (lambda: [*[Indicate(lines[i][1], color=YELLOW_M, scale_factor=1.08) for i in ana]], 0.9),
+            "Her number sits",
+            (lambda: [FadeIn(her, shift=0.1 * UP)], 0.5),
+            "someone has to",
+            (lambda: [Create(cur)], 0.3),
+            (lambda: change(0), 0.35),
+            (lambda: [cur.animate.move_to([cur.get_x(), BK_Y[2], 0])], 0.35),
+            (lambda: change(2), 0.35),
+            (lambda: [cur.animate.move_to([cur.get_x(), BK_Y[3], 0])], 0.35),
+            0.15,
+            (lambda: [cur.animate.move_to([cur.get_x(), BK_Y[4], 0])], 0.35),
+            (lambda: change(4), 0.35),
+            "They change",
+            (lambda: [FadeOut(cur), *self.cap("changed: 199 of 200", WHITE)], 0.5),
+            (lambda: [lines[3][1].animate.set_color(RED_M), Create(miss)], 0.6),
+        ])
+        self.steps("In an exam, 199 out of 200 is a great score. In a book of facts, it means the book now says two different things. "
+                   "Which number is right? Nobody can tell.", [
+            (lambda: self.cap("199 out of 200: a great exam score", GOLD_M), 0.5),
+            "In a book of facts",
+            (lambda: self.cap("one person, two phone numbers", RED_M), 0.5),
+            "Which number",
+            (lambda: [Indicate(lines[2][1], color=GREEN_M, scale_factor=1.1), Indicate(lines[3][1], color=RED_M, scale_factor=1.1)], 1.0),
+            "Nobody can tell",
+            (lambda: self.cap("which one is right? nobody can tell", RED_M), 0.5),
+        ], after=0.3)
+
+        # ---------------- scene 2: the same book, as a table ----------------
+        pf = frame(PF_X0, PF_X1, PF_TOP, PF_BOT, BLUE_M)
+        p_ttl = left_at(M("payments_export", 18, GREY_B), PF_X0 + 0.25, TTL_Y)
+        p_sub = right_at(T("the partner bank's file, as it arrived", 18, GREY_C), PF_X1 - 0.25, TTL_Y)
+        H = {"pid": hdr("payment_id", X_PID, center=True), "name": hdr("customer_name", X_NAME), "mer": hdr("merchant_name", X_MER),
+             "mcc": hdr("mcc", X_MCC), "desc": hdr("mcc_description", X_DESC)}
+        p_rule = Line([PF_X0 + 0.15, RULE_Y, 0], [PF_X1 - 0.15, RULE_Y, 0], stroke_width=1.5, color=GREY_D)
+        C = {c: [cell(c, str(r[k]), ROW_Y[i]) for i, r in enumerate(ROWS)] for k, c in enumerate(["pid", "name", "mer", "mcc", "desc"])}
+
+        def row(i):
+            return VGroup(*[C[c][i] for c in ("pid", "name", "mer", "mcc", "desc")])
+
+        self.steps("A database table can fall into the same trap. A table is like a spreadsheet: each row is one record, "
+                   "and each column one fact about it.", [
+            (lambda: [FadeOut(VGroup(book, *lines, her, miss)), *self.uncap()], 0.8),
+            "A table is like",
+            (lambda: [FadeIn(pf), FadeIn(VGroup(*H.values())), Create(p_rule)], 0.9),
+            "each row",
+            (lambda: [FadeIn(row(0), shift=0.1 * DOWN)], 0.6),
+            "each column",
+            (lambda: [*[Indicate(C[c][0], color=BLUE_M, scale_factor=1.1) for c in C]], 0.9),
+        ])
+        self.steps("A partner bank, another company that handles card payments for some of the same shops, sends a file of payments "
+                   "every night. The quickest way to load it is to keep it as it arrives, with every detail on every row.", [
+            (lambda: [FadeIn(p_ttl), FadeIn(p_sub)], 0.7),
             "The quickest",
-            (lambda: [LaggedStart(*[FadeIn(VGroup(P[i], A[i], E[i], N[i]), shift=0.1 * DOWN) for i in range(6)],
-                                  lag_ratio=0.18)], 1.8),
+            (lambda: [LaggedStart(*[FadeIn(row(i), shift=0.1 * DOWN) for i in range(1, 10)], lag_ratio=0.2)], 2.2),
+        ])
+        self.steps("The mcc is the merchant category code: four digits the card "
+                   "companies give each shop, to say what kind of business it is.", [
+            (lambda: [Transform(H["mcc"], hdr("mcc", X_MCC, color=GOLD_M)), *self.cap("mcc: merchant category code, four digits per shop")], 0.6),
+            "four digits",
+            (lambda: [*[Indicate(C["mcc"][i], color=GOLD_M, scale_factor=1.12) for i in range(10)]], 1.0),
+        ])
+        gold = [around(C["mcc"][i], GOLD_M, 0.05) for i in VOLT]
+        self.steps("Volt Electronics is in category 5732, electronics shops. This file says so four times in ten rows. "
+                   "A year of files would say it about 50,000 times.", [
+            (lambda: [*[C["mer"][i].animate.set_color(GOLD_M) for i in VOLT]], 0.6),
+            "This file says",
+            (lambda: [LaggedStart(*[Create(g) for g in gold], lag_ratio=0.3), *[C["mcc"][i].animate.set_color(GOLD_M) for i in VOLT]], 1.2),
+            "A year of files",
+            (lambda: self.cap("a year of files: about 50,000 copies of one fact", GOLD_M), 0.5),
+        ])
+        self.steps("So the table is the order book, a row is a line, and Volt's category is her phone number: "
+                   "one fact, copied onto many rows.", [
+            (lambda: [*self.cap("the table = the order book"), glow(pf, BLUE_M, 1.0)], 0.7),
+            "a row is a line",
+            (lambda: [*self.cap("a row = a line"), *[Indicate(m, color=WHITE, scale_factor=1.06) for m in row(1)]], 0.8),
+            "and Volt's",
+            (lambda: [*self.cap("Volt's category = her phone number", GOLD_M), *[glow(g, GOLD_M, 1.1) for g in gold]], 0.9),
         ])
 
-        tints = [tint(X_EM_L - 0.12, X_NM_L + 1.75, ROW_Y[i], CC[ROWS[i][4]]) for i in range(6)]
-        order = [0, 4, 1, 5, 2, 3]
-        self.steps("Ben, Jonas and Farid paid twice each. So every email and every name is stored twice, once per payment.", [
-            (lambda: [LaggedStart(*[FadeIn(tints[i]) for i in order], lag_ratio=0.25)], 1.6),
-            "So every email",
-            (lambda: [*[Indicate(E[i], color=CC[ROWS[i][4]], scale_factor=1.06) for i in range(6)]], 0.9),
-            "and every name",
-            (lambda: [*[Indicate(N[i], color=CC[ROWS[i][4]], scale_factor=1.06) for i in range(6)]], 0.9),
+        # ---------------- scene 3: spot the disagreements ----------------
+        self.steps("Every copy is a chance to disagree, and this small file already disagrees with itself twice. "
+                   "Can you spot where? Pause and look.", [
+            (lambda: [*self.uncap(), *[FadeOut(g) for g in gold], *[C["mer"][i].animate.set_color(WHITE) for i in VOLT],
+                      *[C["mcc"][i].animate.set_color(WHITE) for i in VOLT], Transform(H["mcc"], hdr("mcc", X_MCC))], 0.8),
+            "Pause and look",
+            (lambda: self.cap("pause and look", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown()
+        o17 = around(C["name"][4], RED_M)
+        o18 = around(C["name"][5], RED_M)
+        o18d = around(C["desc"][5], RED_M)
+        self.steps("Payment 17 spells Farid's surname with one d. Payment 18 spells it with two, and calls category 5732 "
+                   "Electronic stores, without the s.", [
+            (lambda: [*self.uncap(), Create(o17), C["name"][4].animate.set_color(RED_M)], 0.6),
+            "Payment 18",
+            (lambda: [Create(o18)], 0.5),
+            "and calls",
+            (lambda: [Create(o18d), C["desc"][5].animate.set_color(RED_M)], 0.6),
+            "without the s",
+            (lambda: [*[Indicate(C["desc"][i], color=WHITE, scale_factor=1.06) for i in (2, 4, 6)]], 0.8),
+        ])
+        self.steps("So which spelling is right? The table can't tell you, because nothing keeps the copies equal.", [
+            (lambda: self.cap("which spelling is right? the table can't tell you", RED_M), 0.5),
+            "because nothing",
+            (lambda: [*[glow(g, RED_M, 1.06) for g in (o17, o18, o18d)]], 0.9),
         ])
 
-        q1 = left_at(M("UPDATE payments_export SET customer_name = 'Farid Haddad' WHERE payment_id = 18;", F,
-                       t2c={"'Farid Haddad'": GREEN_M, "18": YELLOW_M}), X_L, Q_Y)
-        cur18 = outline(X_L - 0.1, X_NM_L + 1.85, ROW_Y[3], YELLOW_M)
-        res1 = left_at(M("UPDATE 1", F, GREEN_M), X_NM_L + 2.2, ROW_Y[3])
-        self.steps("Farid's surname has two d's, but the file spelled it with one. "
-                   "He calls support about payment 18, and the agent fixes that row.", [
-            (lambda: [Indicate(N[2], color=RED_M, scale_factor=1.06), Indicate(N[3], color=RED_M, scale_factor=1.06)], 1.0),
-            "He calls support",
-            (lambda: [FadeIn(q1, shift=0.1 * DOWN), Create(cur18)], 0.9),
-            "and the agent fixes",
-            (lambda: [Transform(N[3], name(3, "Farid Haddad", GREEN_M)), FadeIn(res1, shift=0.1 * LEFT)], 0.8),
+        # ---------------- scene 4: be careful? ----------------
+        self.steps("You might be thinking: so be careful. Fix the bad rows, and next time, change every copy. "
+                   "To be fair, that does fix today's mistake.", [
+            (lambda: self.cap("be careful: fix the bad rows, change every copy", PURPLE_M), 0.5),
+            "To be fair",
+            (lambda: [*[Indicate(m, color=PURPLE_M, scale_factor=1.06) for m in (C["name"][4], C["desc"][5])]], 0.9),
         ])
-
-        cur17 = outline(X_L - 0.1, X_NM_L + 1.85, ROW_Y[2], RED_M)
-        two = chip("one email, two names", RED_M, 20).move_to([NOTE_X + 0.2, (ROW_Y[2] + ROW_Y[3]) / 2, 0])
-        self.steps("Payment 17 still has the old spelling. Now one email has two names, "
-                   "and the table can't tell you which one is true.", [
-            (lambda: [FadeOut(res1), Transform(N[2], name(2, "Farid Hadad", RED_M)), Transform(cur18, cur17)], 0.8),
-            "Now one email",
-            (lambda: [Indicate(E[2], color=GOLD_M, scale_factor=1.06), Indicate(E[3], color=GOLD_M, scale_factor=1.06)], 0.8),
-            (lambda: [FadeIn(two, shift=0.1 * LEFT)], 0.6),
-        ])
-
-        anom = chip("update anomaly: some copies changed, others didn't", RED_M, 20).move_to([-2.0, CHIP_Y, 0])
-        self.steps("A fact stored on many rows has to change on every one of them. "
-                   "Miss one, and the table contradicts itself. That's called an update anomaly.", [
-            (lambda: [FadeOut(q1), *[glow(tints[i], CC["farid"], 1.03) for i in (2, 3)]], 1.0),
-            "Miss one",
-            (lambda: [glow(cur18, RED_M, 1.03)], 0.9),
+        self.steps("But careful is what the barista was, 199 times. A fact stored on many rows must be changed on all of them, "
+                   "and missing one leaves the table contradicting itself. That's called an update anomaly. "
+                   "An anomaly is something wrong that the design allows.", [
+            (lambda: self.cap("careful: 199 of 200", WHITE), 0.5),
+            "A fact stored",
+            (lambda: [*[Indicate(C["mcc"][i], color=GOLD_M, scale_factor=1.15) for i in VOLT]], 1.0),
+            "and missing one",
+            (lambda: [*[glow(g, RED_M, 1.06) for g in (o17, o18, o18d)]], 0.9),
             "That's called",
-            (lambda: [FadeIn(anom, shift=0.1 * UP)], 0.7),
+            (lambda: self.cap("update anomaly: copies that no longer agree", RED_M), 0.5),
+            "An anomaly is",
+            (lambda: self.cap("anomaly: something wrong that the design allows", RED_M), 0.5),
+        ])
+        gb = DashedVMobject(RoundedRectangle(corner_radius=0.06, width=PF_X1 - PF_X0 - 0.2, height=0.4, stroke_color=GREY_B,
+                                             stroke_width=2.5).move_to([(PF_X0 + PF_X1) / 2, GHOST_Y, 0]), num_dashes=70)
+        ghost = VGroup(cell("pid", "?", GHOST_Y, RED_M), cell("name", "?", GHOST_Y, RED_M), cell("mer", "?", GHOST_Y, RED_M),
+                       cell("mcc", "5814", GHOST_Y, GREY_A), cell("desc", "Fast food restaurants", GHOST_Y, GREY_A))
+        self.steps("And care can't help with the other two. Category 5814 means fast food restaurants. Where would you write that down? "
+                   "Every row is a payment, and no fast food payment has arrived yet. That's an insert anomaly.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(o17, o18, o18d))], 0.5),
+            "Category 5814",
+            (lambda: [Create(gb), FadeIn(ghost[3:], shift=0.1 * UP)], 0.8),
+            "Every row is a payment",
+            (lambda: [LaggedStart(*[FadeIn(m, scale=1.4) for m in ghost[:3]], lag_ratio=0.3)], 0.9),
+            "That's an insert",
+            (lambda: self.cap("insert anomaly: a fact with nowhere to live", RED_M), 0.5),
+        ])
+        strike = Line([PF_X0 + 0.25, ROW_Y[8], 0], [PF_X1 - 0.25, ROW_Y[8], 0], stroke_width=3, color=RED_M)
+        qb = row_box(PF_X0 + 0.15, PF_X1 - 0.15, ROW_Y[8], GOLD_M)
+        self.steps("Now payment 21, the only Quick Bite row. Say it turns out to be fraud, and you delete it. "
+                   "The fact that Quick Bite is a restaurant goes with it.", [
+            (lambda: [FadeOut(VGroup(gb, ghost)), *self.uncap(), Create(qb)], 0.6),
+            "Say it turns out",
+            (lambda: [Create(strike)], 0.5),
+            "you delete it",
+            (lambda: [row(8).animate.set_opacity(0.12), strike.animate.set_opacity(0.4)], 0.6),
+            "The fact that",
+            (lambda: self.cap("deleted with it: Quick Bite is a restaurant (5812)", RED_M), 0.5),
+        ])
+        self.steps("You came to remove one bad payment, and lost a restaurant. That's a delete anomaly.", [
+            "That's a delete",
+            (lambda: self.cap("delete anomaly: one fact deleted with another", RED_M), 0.5),
+        ], after=0.3)
+        self.steps("Three kinds of damage, and one cause: the same fact, stored on many rows.", [
+            (lambda: [FadeOut(strike), FadeOut(qb), row(8).animate.set_opacity(1)], 0.6),
+            "one cause",
+            (lambda: [*self.cap("one cause: the same fact, stored on many rows", GOLD_M),
+                      *[C["mcc"][i].animate.set_color(GOLD_M) for i in VOLT], *[C["desc"][i].animate.set_color(GOLD_M) for i in VOLT]], 0.8),
+        ], after=0.3)
+
+        # ---------------- scene 5: one home per fact ----------------
+        self.steps("So what would the café do? Wouldn't it be nice to write her number down only once?", [
+            (lambda: [*[C["mcc"][i].animate.set_color(WHITE) for i in VOLT],
+                      *[C["desc"][i].animate.set_color(RED_M if i == 5 else WHITE) for i in VOLT],
+                      C["name"][4].animate.set_color(WHITE), *self.cap("write her number down only once?", WHITE)], 0.7),
+        ])
+        sy = -2.6
+        bl_t = M("customer 17 · latte · 3.50", FS)
+        bl = VGroup(RoundedRectangle(corner_radius=0.1, width=bl_t.width + 0.4, height=0.5, stroke_color=BLUE_M, stroke_width=2.5)
+                    .set_fill(fillc(BLUE_M), 1), bl_t).move_to([-3.6, sy, 0])
+        cd_t = M("customer 17 · Ana · 555-0142", FS)
+        cd_r = RoundedRectangle(corner_radius=0.1, width=cd_t.width + 0.4, height=0.5, stroke_color=TEAL_M, stroke_width=2.5).set_fill(fillc(TEAL_M), 1)
+        card = VGroup(cd_r, cd_t).move_to([2.7, sy, 0])
+        bl_lab = T("a line in the book", 16, GREY_B).next_to(bl, DOWN, buff=0.12)
+        cd_lab = T("one card per customer", 16, TEAL_M).next_to(card, DOWN, buff=0.12)
+        a_bc = Arrow(bl.get_right() + 0.1 * RIGHT, card.get_left() + 0.1 * LEFT, buff=0, stroke_width=3, color=GREY_B,
+                     max_tip_length_to_length_ratio=0.15)
+        ok_card = tick(True, 0.16).next_to(card, RIGHT, buff=0.25)
+        cd_new = M("customer 17 · Ana · 555-0199", FS, t2c={"555-0199": GREEN_M}).move_to(cd_t)
+        self.steps("Keep one card per customer, in a little box, with her name and number. Each line in the book then says customer 17. "
+                   "When her number changes, you change one card, and there's nothing to miss.", [
+            (lambda: [*self.uncap(), FadeIn(card, shift=0.1 * UP), FadeIn(cd_lab)], 0.7),
+            "Each line in the book",
+            (lambda: [FadeIn(bl, shift=0.1 * UP), FadeIn(bl_lab), GrowArrow(a_bc)], 0.8),
+            "you change one card",
+            (lambda: [Transform(cd_t, cd_new), glow(cd_r, TEAL_M, 1.04)], 0.8),
+            (lambda: [Create(ok_card)], 0.5),
+        ])
+        o18d2 = around(C["desc"][5], RED_M)
+        self.steps("Let's do the same with the table, starting with the categories. Someone still has to decide which spelling is true, "
+                   "but only once. The card companies' list says Electronics stores.", [
+            (lambda: [FadeOut(VGroup(bl, bl_lab, a_bc, card, cd_lab, ok_card))], 0.6),
+            "Someone still",
+            (lambda: [Create(o18d2)], 0.5),
+            "The card companies",
+            (lambda: [*self.cap("decided once, from the card companies' list"),
+                      Transform(C["desc"][5], cell("desc", "Electronics stores", ROW_Y[5], GREEN_M)), FadeOut(o18d2)], 0.8),
         ])
 
-        # ---- functional dependency ---------------------------------------------------------------------------------
-        b_em = mbox("customer_email", GOLD_M, h=0.56, size=F).move_to([NOTE_X, 1.05, 0])
-        b_nm = mbox("customer_name", GOLD_M, h=0.56, size=F).move_to([NOTE_X, -0.45, 0])
-        fd = Arrow(b_em.get_bottom() + 0.06 * DOWN, b_nm.get_top() + 0.06 * UP, buff=0, stroke_width=3, color=GOLD_M,
-                   max_tip_length_to_length_ratio=0.25)
-        fdl = left_at(T("determines", 20, GOLD_M), NOTE_X + 0.2, 0.3)
-        self.steps("Ask what the columns mean. "
-                   "An email belongs to one customer, so rows with the same email should have the same name.", [
-            (lambda: [FadeOut(two), FadeOut(anom), FadeOut(cur18)], 0.6),
-            "An email belongs",
-            (lambda: [FadeIn(b_em, shift=0.1 * DOWN)], 0.6),
-            "so rows with",
-            (lambda: [GrowArrow(fd), FadeIn(b_nm, shift=0.1 * DOWN), FadeIn(fdl)], 0.9),
-        ])
+        # move the categories out: every copy of a code and its description lands on that code's one row
+        cf = frame(CF_X0, CF_X1, CF_TOP, CF_BOT, TEAL_M)
+        c_ttl = left_at(M("mcc_codes", 18, GREY_B), XC_MCC, CTTL_Y)
+        c_sub = right_at(T("one row per category", 18, TEAL_M), CF_X1 - 0.25, CTTL_Y)
+        c_hm = left_at(M("mcc", HS, GREY_B), XC_MCC, CHDR_Y)
+        c_hd = left_at(M("description", HS, GREY_B), XC_DESC, CHDR_Y)
+        c_rule = Line([CF_X0 + 0.15, CRULE_Y, 0], [CF_X1 - 0.15, CRULE_Y, 0], stroke_width=1.5, color=GREY_D)
+        CM = [cod_cell(k, "mcc") for k in range(4)]
+        CD = [cod_cell(k, "desc") for k in range(4)]
 
-        fdc = chip("a functional dependency", GOLD_M, 20).move_to([NOTE_X, -1.35, 0])
-        key_ul = Line([X_PID - 0.67, HDR_Y - 0.2, 0], [X_PID + 0.67, HDR_Y - 0.2, 0], stroke_width=3, color=BLUE_M)
-        keyc = chip("the key: names one payment", BLUE_M, 20).move_to([-4.6, RES_Y, 0])
-        self.steps("That rule is a functional dependency: the email determines the name. "
-                   "The payment id determines every column, because it names one payment. It's the table's key.", [
-            (lambda: [FadeIn(fdc, shift=0.1 * UP), glow(b_em[0], GOLD_M, 1.05)], 0.9),
-            "The payment id",
-            (lambda: [Transform(h_pid, hdr("payment_id", X_PID, "center", BLUE_M)), Create(key_ul)], 0.7),
-            (lambda: [*[Indicate(P[i], color=BLUE_M) for i in range(6)]], 0.8),
-            "It's the table's key",
-            (lambda: [FadeIn(keyc, shift=0.1 * UP)], 0.6),
-        ])
-
-        dim = VGroup(*P, *A, h_pid, h_amt, key_ul)
-        self.steps("The trouble is a dependency whose left side is not the key. "
-                   "Email to name is a fact about the customer, and this table stores it on every payment.", [
-            (lambda: [FadeOut(keyc), dim.animate.set_opacity(0.3)], 0.8),
-            "Email to name",
-            (lambda: [glow(b_em[0], GOLD_M, 1.05), glow(b_nm[0], GOLD_M, 1.05)], 0.9),
-            "on every payment",
-            (lambda: [LaggedStart(*[glow(t, CC[ROWS[i][4]], 1.03) for i, t in enumerate(tints)], lag_ratio=0.12)], 1.1),
-        ])
-
-        # ---- split -------------------------------------------------------------------------------------------------
-        ttl_c = left_at(T("customers", 22, GREY_B), X_CEM_L, TTL_Y)
-        hc_em = hdr("customer_email", X_CEM_L, color=GOLD_M)
-        hc_nm = hdr("customer_name", X_CNM_L)
-        r_cust = rule(X_CEM_L, X_CNM_L + 1.75)
-        key_c = Line([X_CEM_L, HDR_Y - 0.2, 0], [X_CEM_L + hc_em.width, HDR_Y - 0.2, 0], stroke_width=3, color=GOLD_M)
-        CE = {w: c_email(w) for w in CUST}
-        CN = {w: c_name(w) for w in ("ben", "jonas")}
-        ttl_p = left_at(T("payments", 22, GREY_B), X_L, TTL_Y)
-
-        def move_pair(who, rows):
-            """Both copies of a customer's email and name fly into one customers row and merge."""
-            an = []
-            for i in rows:
-                an.append(ReplacementTransform(E[i].copy(), CE[who]) if i == rows[0] else
-                          Transform(E[i].copy(), CE[who].copy(), remover=True))
-                an.append(ReplacementTransform(N[i], CN[who]) if i == rows[0] else
-                          Transform(N[i], CN[who].copy(), remover=True))
+        def move_codes():
+            an, seen = [], set()
+            for i, r in enumerate(ROWS):
+                k = CODES.index(r[3])
+                if k not in seen:
+                    an += [ReplacementTransform(C["mcc"][i].copy(), CM[k]), ReplacementTransform(C["desc"][i], CD[k])]
+                    seen.add(k)
+                else:
+                    an += [Transform(C["mcc"][i].copy(), CM[k].copy(), remover=True), Transform(C["desc"][i], CD[k].copy(), remover=True)]
             return an
 
-        land = c_name("farid", "Farid Hadad")
-        r_pay = rule(X_L, X_EM_L + 3.25)
-        self.steps("So give that fact a table of its own. Move the email and the name into customers, "
-                   "one row per email, and make the email its key.", [
-            (lambda: [FadeOut(VGroup(b_em, b_nm, fd, fdl, fdc)), Transform(ttl, ttl_p)], 0.7),
-            (lambda: [FadeIn(ttl_c, shift=0.1 * DOWN), FadeIn(hc_em), ReplacementTransform(h_nm, hc_nm), Create(r_cust),
-                      Transform(r_wide, r_pay), *[FadeOut(t) for t in tints]], 0.8),
-            "one row per email",
-            (lambda: [*move_pair("ben", [0, 4]), *move_pair("jonas", [1, 5]),
-                      ReplacementTransform(E[2].copy(), CE["farid"]), ReplacementTransform(N[2], land)], 1.3),
-            "make the email its key",
-            (lambda: [Create(key_c), *[Indicate(CE[w], color=GOLD_M, scale_factor=1.05) for w in CUST]], 0.8),
+        pf_m = frame(PF_X0, PF_X1_MID, PF_TOP, PF_BOT, BLUE_M)
+        p_rule_m = Line([PF_X0 + 0.15, RULE_Y, 0], [PF_X1_MID - 0.15, RULE_Y, 0], stroke_width=1.5, color=GREY_D)
+        self.steps("Then each code and its description move to a table of their own. Ten rows of copies become four.", [
+            (lambda: [*self.uncap(), FadeOut(p_sub), *move_codes(), ReplacementTransform(H["desc"], c_hd),
+                      Transform(pf, pf_m), Transform(p_rule, p_rule_m)], 1.6),
+            (lambda: [FadeIn(cf), FadeIn(c_ttl), FadeIn(c_sub), FadeIn(c_hm), Create(c_rule)], 0.7),
+            "Ten rows",
+            (lambda: self.cap("ten rows of copies, four rows of facts", TEAL_M), 0.5),
+        ])
+        # the moved descriptions on the right were removed from the file's table; keep its rule short of them
+        o5732 = row_box(CF_X0 + 0.12, CF_X1 - 0.12, CROW_Y[2], TEAL_M)
+        self.steps("From now on, there's one place to fix, and nowhere for a second spelling to live.", [
+            "one place",
+            (lambda: [Create(o5732)], 0.6),
+            "nowhere for",
+            (lambda: [glow(o5732, TEAL_M, 1.03)], 0.8),
         ])
 
-        e18 = E[3].copy()
-        err = chip("ERROR: duplicate key, customer_email = farid.haddad@example.com", RED_M, 18).move_to([0, RES_Y, 0])
-        cross = tick(False, 0.14).move_to([X_CEM_L - 0.38, ROW_Y[3], 0])
-        self.steps("But Farid's email comes with two names. His second row has the same key, and the key refuses it. "
-                   "Someone has to decide, once, which spelling is true.", [
-            (lambda: [Indicate(land, color=RED_M, scale_factor=1.06), Indicate(N[3], color=GREEN_M, scale_factor=1.06)], 0.9),
-            "His second row",
-            (lambda: [e18.animate.move_to(left_at(M(ROWS[3][2], F), X_CEM_L, ROW_Y[3]).get_center()),
-                      N[3].animate.move_to(left_at(M("Farid Haddad", F), X_CNM_L, ROW_Y[3]).get_center())], 0.9),
-            "and the key refuses it",
-            (lambda: [e18.animate.set_color(RED_M), N[3].animate.set_color(RED_M), Create(cross),
-                      FadeIn(err, shift=0.1 * UP)], 0.7),
-            "Someone has to decide",
-            (lambda: [FadeOut(e18), FadeOut(N[3]), FadeOut(cross), glow(err[0], RED_M, 1.02)], 0.8),
+        # move the shops out: each shop and its code, once; the payments keep the shop's name
+        mf = frame(MF_X0, MF_X1, MF_TOP, MF_BOT, TEAL_M)
+        m_ttl = left_at(M("merchants", 18, GREY_B), XM_NAME, TTL_Y)
+        m_sub = right_at(T("one row per shop", 18, TEAL_M), MF_X1 - 0.25, TTL_Y)
+        m_hn = left_at(M("name", HS, GREY_B), XM_NAME, HDR_Y)
+        m_hm = left_at(M("mcc", HS, GREY_B), XM_MCC, HDR_Y)
+        m_rule = Line([MF_X0 + 0.15, RULE_Y, 0], [MF_X1 - 0.15, RULE_Y, 0], stroke_width=1.5, color=GREY_D)
+        MN = [mer_cell(k, "name") for k in range(4)]
+        MM = [mer_cell(k, "mcc") for k in range(4)]
+
+        def move_shops():
+            an, seen = [], set()
+            for i, r in enumerate(ROWS):
+                k = SHOPS.index(r[2])
+                if k not in seen:
+                    an += [ReplacementTransform(C["mer"][i].copy(), MN[k]), ReplacementTransform(C["mcc"][i], MM[k])]
+                    seen.add(k)
+                else:
+                    an += [Transform(C["mer"][i].copy(), MN[k].copy(), remover=True), Transform(C["mcc"][i], MM[k].copy(), remover=True)]
+            return an
+
+        pf_s = frame(PF_X0, PF_X1_SPLIT, PF_TOP, PF_BOT, BLUE_M)
+        p_rule_s = Line([PF_X0 + 0.15, RULE_Y, 0], [PF_X1_SPLIT - 0.15, RULE_Y, 0], stroke_width=1.5, color=GREY_D)
+        p_sub_s = right_at(T("the payments", 18, GREY_C), PF_X1_SPLIT - 0.25, TTL_Y)
+        a_pm = Arrow([PF_X1_SPLIT + 0.06, 1.42, 0], [MF_X0 - 0.06, 1.42, 0], buff=0, stroke_width=3, color=GOLD_M,
+                     max_tip_length_to_length_ratio=0.3)
+        a_mc = Arrow([2.5, MF_BOT - 0.05, 0], [2.5, CF_TOP + 0.05, 0], buff=0, stroke_width=3, color=TEAL_M,
+                     max_tip_length_to_length_ratio=0.35)
+        self.steps("The shops get their own table too: each shop and its code, once. The payments keep only the shop's name, "
+                   "which points at its row.", [
+            (lambda: [*self.uncap(), FadeOut(o5732), *move_shops(), ReplacementTransform(H["mcc"], m_hm),
+                      Transform(pf, pf_s), Transform(p_rule, p_rule_s)], 1.6),
+            (lambda: [FadeIn(mf), FadeIn(m_ttl), FadeIn(m_sub), FadeIn(m_hn), Create(m_rule), FadeIn(p_sub_s)], 0.7),
+            "The payments keep",
+            (lambda: [*[Indicate(C["mer"][i], color=GOLD_M, scale_factor=1.06) for i in range(10)]], 0.9),
+            "which points",
+            (lambda: [GrowArrow(a_pm), GrowArrow(a_mc)], 0.7),
+        ])
+        ul_m = Line([XM_NAME, HDR_Y - 0.16, 0], [XM_NAME + m_hn.width, HDR_Y - 0.16, 0], stroke_width=3, color=GOLD_M)
+        ul_c = Line([XC_MCC, CHDR_Y - 0.16, 0], [XC_MCC + c_hm.width, CHDR_Y - 0.16, 0], stroke_width=3, color=GOLD_M)
+        self.steps("Each shop's name now appears once in its table, and so does each code. "
+                   "A column like that is called a key: its value names exactly one row, so other rows can point at it.", [
+            (lambda: [Transform(m_hn, left_at(M("name", HS, GOLD_M), XM_NAME, HDR_Y)), Create(ul_m)], 0.6),
+            (lambda: [LaggedStart(*[Indicate(m, color=GOLD_M, scale_factor=1.06) for m in MN], lag_ratio=0.25)], 1.2),
+            "and so does",
+            (lambda: [Transform(c_hm, left_at(M("mcc", HS, GOLD_M), XC_MCC, CHDR_Y)), Create(ul_c)], 0.6),
+            (lambda: [LaggedStart(*[Indicate(m, color=GOLD_M, scale_factor=1.1) for m in CM], lag_ratio=0.25)], 1.2),
+            "called a key",
+            (lambda: self.cap("a key: its value names exactly one row", GOLD_M), 0.5),
+            "so other rows",
+            (lambda: [glow(a_pm, GOLD_M, 1.0), glow(a_mc, TEAL_M, 1.0)], 0.9),
+        ])
+        c5814 = VGroup(cod_cell(4, "mcc", "5814", GREEN_M), cod_cell(4, "desc", "5814", GREEN_M))
+        qbm = row_box(MF_X0 + 0.12, MF_X1 - 0.12, ROW_Y[3], GREEN_M)
+        strike2 = Line([PF_X0 + 0.25, ROW_Y[8], 0], [PF_X1_SPLIT - 0.25, ROW_Y[8], 0], stroke_width=3, color=RED_M)
+        prow8 = VGroup(C["pid"][8], C["name"][8], C["mer"][8])
+        self.steps("And the other two problems are gone. 5814 gets its row today, with no payment needed. "
+                   "Delete payment 21, and Quick Bite keeps its category.", [
+            (lambda: self.uncap(), 0.3),
+            "5814 gets",
+            (lambda: [FadeIn(c5814, shift=0.1 * UP)], 0.7),
+            "Delete payment 21",
+            (lambda: [Create(strike2)], 0.4),
+            (lambda: [prow8.animate.set_opacity(0.12), strike2.animate.set_opacity(0.4)], 0.5),
+            "Quick Bite keeps",
+            (lambda: [Create(qbm)], 0.5),
+            (lambda: [glow(qbm, GREEN_M, 1.03)], 0.7),
+        ])
+        self.steps("Deciding which facts get a table of their own is called normalization. Farid's name needs the same cure: "
+                   "one row per customer.", [
+            (lambda: [FadeOut(strike2), FadeOut(qbm), prow8.animate.set_opacity(1), *[m.animate.set_color(WHITE) for m in c5814]], 0.6),
+            "called normalization",
+            (lambda: self.cap("normalization: deciding which facts get a table of their own", WHITE), 0.5),
+            "Farid's name",
+            (lambda: [Create(o17), Create(o18)], 0.6),
+            1.0,
+            (lambda: [FadeOut(o17), FadeOut(o18)], 0.5),
         ])
 
-        CN["farid"] = c_name("farid", "Farid Haddad", GREEN_M)
-        self.steps("Haddad, with two d's, goes in once. The payments table keeps only the payment's own facts: "
-                   "its id, its amount, and the email that points at the customer.", [
-            (lambda: [FadeOut(err), ReplacementTransform(land, CN["farid"])], 0.8),
-            "The payments table",
-            (lambda: [dim.animate.set_opacity(1)], 0.8),
-            "and the email",
-            (lambda: [*[E[i].animate.set_color(CC[ROWS[i][4]]) for i in range(6)],
-                      *[CE[w].animate.set_color(CC[w]) for w in CUST]], 0.9),
+        # ---------------- scene 6: the price ----------------
+        r15 = row_box(PF_X0 + 0.15, PF_X1_SPLIT - 0.15, ROW_Y[2], YELLOW_M)
+        rv = row_box(MF_X0 + 0.12, MF_X1 - 0.12, ROW_Y[2], YELLOW_M)
+        rc = row_box(CF_X0 + 0.12, CF_X1 - 0.12, CROW_Y[2], YELLOW_M)
+        self.steps("Splitting has a price. To print a payment with its category's description, the database now has to put "
+                   "three tables back together. That's called a join, and it's the next lesson.", [
+            (lambda: self.cap("the price: putting the tables back together", WHITE), 0.5),
+            "To print a payment",
+            (lambda: [Create(r15)], 0.5),
+            (lambda: [travel(a_pm, YELLOW_M, 0.6)], 0.7),
+            (lambda: [Create(rv)], 0.4),
+            (lambda: [travel(a_mc, YELLOW_M, 0.5)], 0.6),
+            (lambda: [Create(rc)], 0.4),
+            "That's called a join",
+            (lambda: self.cap("a join: the next lesson", WHITE), 0.5),
+        ])
+        self.steps("So split out the facts that belong to something else, like a shop or a category. Facts about the payment "
+                   "itself stay on its row.", [
+            (lambda: [FadeOut(VGroup(r15, rv, rc)), *self.cap("split out facts about something else: a shop, a category")], 0.6),
+            "Facts about the payment",
+            (lambda: [glow(pf, BLUE_M, 1.0), *self.cap("facts about the payment itself stay on its row")], 0.8),
         ])
 
-        links = VGroup(*[Line([X_EM_L + 3.27, ROW_Y[i], 0], [X_CEM_L - 0.1, ROW_Y[CUST["farid"][0]], 0],
-                              stroke_width=2.5, color=GOLD_M) for i in (2, 3)])
-        res2 = chip("UPDATE 1", GREEN_M, 20).move_to([X_CNM_L + 0.85, RES_Y + 0.75, 0])
-        o_f = outline(X_CEM_L - 0.12, X_CNM_L + 1.85, ROW_Y[2], GOLD_M)
-        self.steps("If Farid's name changes again, one update changes one row, "
-                   "and both of his payments read it through a join.", [
-            (lambda: [Transform(CN["farid"], c_name("farid", "Farid Haddad"))], 0.5),
-            (lambda: [Create(o_f)], 0.6),
-            "one update",
-            (lambda: [FadeIn(res2, shift=0.1 * UP), glow(o_f, GOLD_M, 1.02)], 0.8),
-            "and both of his payments",
-            (lambda: [Create(links[0]), Create(links[1])], 0.7),
-            (lambda: [Indicate(E[2], color=GOLD_M, scale_factor=1.0), Indicate(E[3], color=GOLD_M, scale_factor=1.0)], 0.8),
-        ])
-
-        self.steps("Find what determines what. Give each fact one home, keyed by what determines it, "
-                   "and point at it from everywhere else.", [
-            (lambda: [FadeOut(res2), Indicate(hc_em, color=GOLD_M)], 0.9),
-            "keyed by",
-            (lambda: [glow(o_f, GOLD_M, 1.03), Indicate(CN["farid"], color=GREEN_M)], 1.0),
+        # ---------------- scene 7: the moral, and a check ----------------
+        self.steps("So, which spelling was right? Now the question can't come up again, because each fact has one home. "
+                   "Store each fact once, keyed by what decides it, and point at it from everywhere else.", [
+            (lambda: self.cap("which spelling was right?", WHITE), 0.5),
+            "because each fact",
+            (lambda: [glow(cf, TEAL_M, 1.0), glow(mf, TEAL_M, 1.0)], 0.9),
+            "Store each fact",
+            (lambda: self.cap("store each fact once, keyed by what decides it", YELLOW_M, 28), 0.6),
             "and point at it",
-            (lambda: [*[Indicate(E[i], color=CC[ROWS[i][4]], scale_factor=1.0) for i in range(6)]], 1.0),
-        ])
-        self.wait(0.6)
+            (lambda: [travel(a_pm, YELLOW_M, 0.6), travel(a_mc, YELLOW_M, 0.6)], 0.9),
+        ], after=0.5)
+        o7011 = row_box(CF_X0 + 0.12, CF_X1 - 0.12, CROW_Y[0], YELLOW_M)
+        self.steps("One quick check. The card companies rename category 7011, hotels, motels, resorts. "
+                   "In the old file, how many rows had to change? And now? Pause and think.", [
+            (lambda: [*self.uncap(), Create(o7011)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(c=(-3.3, -2.6))
+        hh = [around(C["mer"][i], GOLD_M, 0.05) for i in (0, 3, 9)]
+        self.steps("Three in that file: payments 13, 16 and 22, and more every night. Now, one row in the categories table.", [
+            (lambda: [*self.uncap(), LaggedStart(*[Create(h) for h in hh], lag_ratio=0.3)], 1.0),
+            "Now, one row",
+            (lambda: [o7011.animate.set_stroke(GREEN_M), Create(tick(True, 0.15).move_to([6.05, CROW_Y[0], 0]))], 0.7),
+        ], after=0.3)
+        self.play(FadeOut(VGroup(*hh)), *self.cap("store each fact once, keyed by what decides it", YELLOW_M, 28), run_time=0.7)
+        self.wait(2.0)
