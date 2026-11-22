@@ -13,6 +13,7 @@ SAY.insert(0, (r"\bSubPlan\b", "sub plan"))
 SAY.insert(0, (r"\bmerchant_id\b", "merchant I D"))
 SAY.insert(0, (r"\b5\.50\b", "five fifty"))
 SAY.insert(0, (r"\b2\.75\b", "two seventy-five"))
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 Q_Y = [3.33, 3.0]

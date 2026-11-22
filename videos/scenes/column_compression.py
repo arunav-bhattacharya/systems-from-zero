@@ -6,6 +6,7 @@ SAY.insert(0, (r"\bGBP\b", "pound"))
 SAY.insert(0, (r"\bSEK\b", "krona"))
 SAY.insert(0, (r"\bUSD\b", "dollar"))
 SAY.insert(0, (r"\bgzip\b", "G zip"))
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 FIELDS = ["id", "shop", "currency", "status", "amount", "time"]

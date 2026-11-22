@@ -1,6 +1,7 @@
 from sfz import *
 
 SAY.insert(0, (r"\b8 KB\b", "8 kilobytes"))
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 TOP_Y, MID_Y, LEAF_Y = 2.3, 0.9, -0.6     # the new root's band, the root (later the middle level), the leaves

@@ -5,6 +5,7 @@ SAY.insert(0, (r"\bmmap\b", "em map"))
 SAY.insert(0, (r"\b2 TB\b", "2 terabytes"))
 SAY.insert(0, (r"\b8 KB\b", "8 kilobytes"))
 SAY.insert(0, (r"\b64 GB\b", "64 gigabytes"))
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 TITLE_Y = 2.9
