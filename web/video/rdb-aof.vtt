@@ -1,85 +1,269 @@
 WEBVTT
 
 1
-00:00:02.700 --> 00:00:06.539
-Redis holds three million idempotency keys, all in memory.
+00:00:02.700 --> 00:00:07.874
+Redis keeps all its data in memory, and memory is wiped when a program stops.
 
 2
-00:00:06.539 --> 00:00:12.100
-When the process restarts, it comes back empty, and every retried payment looks new.
+00:00:07.874 --> 00:00:13.316
+So now and then, Redis writes a copy of everything to a file on disk: a snapshot.
 
 3
-00:00:12.267 --> 00:00:17.957
-The simplest copy is SAVE, which writes every key to a file on the one command thread.
+00:00:13.533 --> 00:00:17.463
+But Redis runs every command on one thread, one path of work.
 
 4
-00:00:17.957 --> 00:00:23.117
-In the lab that took two seconds, and a GET sent meanwhile waited 1.8 seconds.
+00:00:17.463 --> 00:00:21.973
+So how can it copy gigabytes to disk without making every client wait?
 
 5
-00:00:23.300 --> 00:00:25.572
-BGSAVE hands the job to a child.
+00:00:22.167 --> 00:00:27.657
+The plain way is the command SAVE: the main thread writes the file itself.
 
 6
-00:00:25.572 --> 00:00:33.596
-The main thread calls fork, and the kernel copies only the page table, so both processes point at the same pages.
+00:00:27.657 --> 00:00:33.444
+In the lab, a million payments, 83 megabytes, took 2,065 milliseconds to save.
 
 7
-00:00:33.733 --> 00:00:38.305
-The child writes those pages to a file, while the parent keeps serving clients.
+00:00:33.633 --> 00:00:40.963
+A client that asked for one key 200 milliseconds in waited 1,761 milliseconds for its answer.
 
 8
-00:00:38.500 --> 00:00:41.156
-Now a client changes a key on page three.
+00:00:40.963 --> 00:00:47.663
+Nothing else ran, because the only thread that runs commands was busy writing a file.
 
 9
-00:00:41.156 --> 00:00:46.599
-The kernel first copies that one 4 kilobyte page, and the parent writes to its copy.
+00:00:47.833 --> 00:00:51.125
+With 25 gigabytes, that pause would last minutes.
 
 10
-00:00:46.767 --> 00:00:51.561
-The child still sees the old page, so its file shows the moment of the fork.
+00:00:51.400 --> 00:00:54.823
+Think of a café that keeps today's orders on a whiteboard.
 
 11
-00:00:51.561 --> 00:00:56.103
-That's copy-on-write, and only pages written during the save get copied.
+00:00:54.823 --> 00:00:59.072
+Wipe the board and they're gone, so now and then you take a photo of it.
 
 12
-00:00:56.267 --> 00:01:04.252
-When it's done, the child renames its file over dump.rdb in one step, so a crash never leaves half a snapshot.
+00:00:59.267 --> 00:01:05.268
+SAVE is a photographer who makes the staff stop writing until he has copied the whole board by hand.
 
 13
-00:01:04.433 --> 00:01:07.688
-On a busy server a snapshot runs about once a minute.
+00:01:05.567 --> 00:01:09.806
+So let a helper copy the board while the staff keep writing?
 
 14
-00:01:07.688 --> 00:01:12.233
-Crash fifty seconds after one, and those fifty seconds of writes are gone.
+00:01:09.806 --> 00:01:16.588
+Then the copy mixes moments: payment 5 from ten o'clock, payment 900,000 from two seconds later.
 
 15
-00:01:12.433 --> 00:01:18.029
-The append-only file logs every write as it happens, and Redis replays it on restart.
+00:01:16.767 --> 00:01:20.552
+A refund could land in the file without the payment it refunds.
 
 16
-00:01:18.233 --> 00:01:21.461
-But a write only reaches the kernel's page cache.
+00:01:20.552 --> 00:01:25.420
+We need both: someone else does the copying, and the copy still shows one moment.
 
 17
-00:01:21.461 --> 00:01:26.993
-Once a second, a background thread calls fsync, and only then does the disk hold it.
+00:01:25.633 --> 00:01:28.689
+Redis's answer is BGSAVE, a background save.
 
 18
-00:01:27.200 --> 00:01:33.269
-If just the Redis process dies, the kernel still writes the page cache out, and nothing is lost.
+00:01:28.689 --> 00:01:36.676
+The main thread calls fork: a request to the kernel, the core of the operating system, to copy the running program.
 
 19
-00:01:33.269 --> 00:01:36.493
-If the machine dies, up to the last second is gone.
+00:01:36.867 --> 00:01:40.133
+The original is the parent, and the copy is the child.
 
 20
-00:01:36.700 --> 00:01:40.132
-A snapshot loses every write since the last save.
+00:01:40.133 --> 00:01:44.368
+The child will write the file, and the parent goes on serving clients.
 
 21
-00:01:40.132 --> 00:01:44.265
-The log, fsynced each second, loses at most about a second.
+00:01:44.567 --> 00:01:48.780
+But copying 25 gigabytes of memory would take seconds too.
+
+22
+00:01:48.780 --> 00:01:51.104
+So what does fork actually copy?
+
+23
+00:01:51.104 --> 00:01:52.267
+Pause and guess.
+
+24
+00:01:55.500 --> 00:01:56.579
+Almost nothing.
+
+25
+00:01:56.579 --> 00:02:06.223
+Memory is handed out in pages, blocks of 4 kilobytes, and each program has a page table, the kernel's map from its addresses to pages.
+
+26
+00:02:06.400 --> 00:02:08.091
+Fork copies only the map.
+
+27
+00:02:08.091 --> 00:02:10.864
+Parent and child point at the same pages.
+
+28
+00:02:10.864 --> 00:02:16.276
+In the café, the photographer gets a list of the board's panels; no panel moves.
+
+29
+00:02:16.500 --> 00:02:22.181
+The child writes every key to a temporary file, and the parent serves clients at full speed.
+
+30
+00:02:22.400 --> 00:02:25.380
+Now a client changes payment 5 to refunded.
+
+31
+00:02:25.380 --> 00:02:28.707
+It lives on page B, which the child still needs.
+
+32
+00:02:28.900 --> 00:02:33.125
+So the kernel first copies page B, and gives the copy to the parent.
+
+33
+00:02:33.125 --> 00:02:35.548
+The parent writes refunded on its copy.
+
+34
+00:02:35.700 --> 00:02:39.769
+The child still sees page B as it was, with payment 5 settled.
+
+35
+00:02:39.769 --> 00:02:43.116
+Its picture stays frozen at the moment of the fork.
+
+36
+00:02:43.333 --> 00:02:48.352
+That's copy-on-write: a page is copied only when someone is about to change it.
+
+37
+00:02:48.352 --> 00:02:55.720
+In the café, a waiter about to write on a panel first swaps in a fresh copy, and the photographer keeps the old one.
+
+38
+00:02:55.900 --> 00:03:00.771
+Everyone's happy, except the memory chips, which now hold one page twice.
+
+39
+00:03:01.067 --> 00:03:05.088
+When the child finishes, it renames its file to dump.rdb.
+
+40
+00:03:05.088 --> 00:03:12.003
+A rename happens in one step, so a crash halfway leaves the old snapshot, never half of a new one.
+
+41
+00:03:12.200 --> 00:03:17.305
+Then the child exits, and the old page B, which only the child used, is freed.
+
+42
+00:03:17.533 --> 00:03:24.175
+In the lab, forking 83 megabytes took 6 to 31 milliseconds, instead of a two-second stop.
+
+43
+00:03:24.467 --> 00:03:27.899
+Two costs remain, and both fall on the parent.
+
+44
+00:03:27.899 --> 00:03:33.271
+The fork still copies the page table: 8 bytes for every 4 kilobyte page.
+
+45
+00:03:33.271 --> 00:03:41.553
+A 24 gigabyte Redis copies 48 megabytes of table, at about 10 to 25 milliseconds per gigabyte on most machines.
+
+46
+00:03:41.767 --> 00:03:45.762
+And every page the parent changes during the save gets copied.
+
+47
+00:03:45.762 --> 00:03:49.499
+In the lab, a few hundred updates copied 3 to 5 megabytes.
+
+48
+00:03:49.499 --> 00:03:54.075
+On a server that writes heavily, it can come close to twice the memory.
+
+49
+00:03:54.233 --> 00:03:58.293
+So keep Redis's memory limit well below the machine's memory.
+
+50
+00:03:58.567 --> 00:04:01.210
+And a snapshot is only as new as its fork.
+
+51
+00:04:01.210 --> 00:04:07.945
+With the default rules, a busy server saves about once a minute, so a crash loses about a minute of writes.
+
+52
+00:04:08.167 --> 00:04:11.769
+Kill Redis now, and the restart loads dump.rdb.
+
+53
+00:04:11.769 --> 00:04:16.521
+Payment 5 is settled again; the refund after the fork is gone.
+
+54
+00:04:16.700 --> 00:04:20.228
+For a cache, that's fine: it refills from the database.
+
+55
+00:04:20.228 --> 00:04:22.729
+For the café's payment notes, it isn't.
+
+56
+00:04:23.000 --> 00:04:28.678
+In Java and Kotlin, BGSAVE is one command, and Redis answers as soon as it has forked.
+
+57
+00:04:28.678 --> 00:04:33.893
+Its stats then tell you how long the fork took, and how much the kernel copied.
+
+58
+00:04:34.367 --> 00:04:38.072
+So, how does Redis photograph its memory without stopping?
+
+59
+00:04:38.072 --> 00:04:38.647
+It forks.
+
+60
+00:04:38.647 --> 00:04:46.696
+The child gets the picture, the parent keeps working, and the kernel copies a page only when the parent is about to change it.
+
+61
+00:04:47.033 --> 00:04:48.126
+One quick check.
+
+62
+00:04:48.126 --> 00:04:51.951
+During a save, the parent changes payment 5 three times.
+
+63
+00:04:51.951 --> 00:04:55.162
+How many copies of page B does the kernel make?
+
+64
+00:04:55.162 --> 00:04:56.255
+Pause and think.
+
+65
+00:04:59.500 --> 00:04:59.782
+One.
+
+66
+00:04:59.782 --> 00:05:06.895
+After the first copy, page B prime belongs to the parent alone, so the next writes go straight to it.
+
+67
+00:05:07.100 --> 00:05:12.141
+Next, to lose less than a minute, the café's notebook: a log of every change.

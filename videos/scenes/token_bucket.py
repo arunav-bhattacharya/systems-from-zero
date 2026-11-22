@@ -1,27 +1,23 @@
 from sfz import *
 
-AX_Y = -2.95                                 # the timeline
-RX, RY, RW, RH = 4.1, 0.75, 3.9, 2.5        # the Redis box
-BX, BY, BW, BH = -1.7, 0.55, 1.7, 2.5       # the bucket
-JX, JY = -5.3, 0.55                          # the client on the left
-CAP = 10
+SAY.insert(0, (r"\bGCRA\b", "G C R A"))
+SAY.insert(0, (r"\bts\b", "T S"))
+
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CL_X0, CL_X1, CL_TOP, CL_BOT = -6.5, -4.1, 1.7, -0.7        # the client: the shop's refund program
+CL_CX = (CL_X0 + CL_X1) / 2
+JAR_C, JAR_W, JAR_H = np.array([-1.25, 0.45, 0]), 2.5, 3.1    # the jar of tokens
+JAR_X0, JAR_X1 = JAR_C[0] - JAR_W / 2, JAR_C[0] + JAR_W / 2
+JAR_TOP, JAR_BOT = JAR_C[1] + JAR_H / 2, JAR_C[1] - JAR_H / 2
+SV_X0, SV_X1, SV_TOP, SV_BOT = 1.5, 6.5, 2.5, -1.4          # the payments service and the tally
+SV_CX = (SV_X0 + SV_X1) / 2
+REQ_Y = 0.5
+STATE_Y, BAR_Y, CAP_Y, CLOCK_Y = -2.1, -2.7, -3.27, 3.25
 
 
-def glow(rect, color=YELLOW_M, s=1.03):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0, back=False):
-    """A dot that runs along an arrow (or back along it) and stays invisible until its turn."""
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.07, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
-
-
-def fill(color, a=0.14):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+def tok_pos(k):
+    c, r = k % 2, k // 2
+    return np.array([JAR_C[0] - 0.5 + 1.0 * c, JAR_BOT + 0.45 + 0.55 * r, 0])
 
 
 class Base(VoiceScene):
@@ -77,299 +73,437 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
-
-def x1(t):
-    """Fixed-window timeline: t in seconds of the clock, 58.5 to 61.0."""
-    return -6.0 + (t - 58.5) * 4.8
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
 
-def x2(t):
-    """Token-bucket timeline: t in seconds since the burst, 0 to 5."""
-    return -5.6 + t * 2.24
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def rline(s, k, color=GREY_B, mono=False, size=20):
-    """Line k inside the Redis box (0 is the key, 1 and 2 the fields, 3 the status)."""
-    y = [RY + 0.35, RY - 0.15, RY - 0.6][k - 1] if k else RY + 0.35
-    return (M if mono else T)(s, size, color).move_to([RX, y, 0])
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def token_xy(i):
-    col, row = i % 2, i // 2
-    return [BX + (-0.36 if col == 0 else 0.36), BY - BH / 2 + 0.33 + row * 0.44, 0]
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def token(i):
-    return Dot(radius=0.16, color=GOLD_M).move_to(token_xy(i))
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def mark(t, ok, y=AX_Y + 0.22):
-    return Dot(radius=0.07, color=GREEN_M if ok else RED_M).move_to([x2(t), y, 0])
+def frame(x0, x1, top, bot, color, r=0.14):
+    return RoundedRectangle(corner_radius=r, width=x1 - x0, height=top - bot, stroke_color=color,
+                            stroke_width=3).set_fill(fillc(color), 1).move_to([(x0 + x1) / 2, (top + bot) / 2, 0])
+
+
+def harrow(x0, x1, y, color=GREY_B):
+    return Arrow([x0, y, 0], [x1, y, 0], buff=0, stroke_width=3, color=color, max_tip_length_to_length_ratio=0.15)
+
+
+def run_pts(pts, color=YELLOW_M, rt=0.7, r=0.07):
+    """A message dot running along a polyline, visible only while it runs."""
+    pts = [np.array(p, dtype=float) for p in pts]
+    d = Dot(radius=r, color=color).move_to(pts[0]).set_z_index(8)
+    path = VMobject().set_points_as_corners(pts)
+    return Succession(FadeIn(d, run_time=0.04), MoveAlongPath(d, path, rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.1))
+
+
+def code_panel(title, lines, x):
+    r = RoundedRectangle(corner_radius=0.14, width=6.5, height=3.9, stroke_color=GREY_B, stroke_width=2.5).set_fill("#0b0d10", 1)
+    r.move_to([x, 0.45, 0])
+    head = left_at(T(title, 22, GREY_B), x - 3.0, 2.08)
+    rows = VGroup()
+    for k, s in enumerate(lines):
+        col = GREY_B if s.strip().startswith("//") else WHITE
+        ind = (len(s) - len(s.lstrip())) * M("x" * 40, 14).width / 40
+        rows.add(left_at(M(s.strip() if s.strip() else " ", 14, col), x - 3.0 + ind, 1.55 - 0.4 * k))
+    return VGroup(r, head, rows).set_z_index(10)
+
+
+
+
+JAVA = ["boolean take(String merchant, long nowMillis) {",
+        "    Object r = redis.eval(TOKEN_BUCKET,",
+        "        List.of(\"bucket:\" + merchant),",
+        "        List.of(\"10\", \"500\",",
+        "            String.valueOf(nowMillis)));",
+        "    return Long.valueOf(1).equals(r);",
+        "}"]
+KOTLIN = ["fun take(merchant: String,",
+          "         nowMillis: Long): Boolean =",
+          "    redis.eval(TOKEN_BUCKET,",
+          "        listOf(\"bucket:$merchant\"),",
+          "        listOf(\"10\", \"500\",",
+          "            nowMillis.toString())) == 1L"]
 
 
 class TokenBucket(Base):
-    """cache-08, section 2 (with section 1's seam): a fixed window of 5 a minute lets 10 attempts through in 1.4 s at
-    the minute boundary. A token bucket of 10, one token per 500 ms: a burst of 15 gets 10, then one request every
-    250 ms gets every other one, 2 a second. The state is one hash (tokens, ts) changed by one Lua script, so two
-    pods can't both take the last token; its TTL is the time to refill from empty."""
+    """cache-08, section 2. A shop's program sends the hour's refunds in one burst: 40 in a second. A window limit
+    refuses it (5 a minute) or allows a flood (40 a second). The wish: a burst of up to 10, then 2 a second. The jar: at
+    most 10 tokens, one more every 500 ms. Predict: a burst of 15 gets 10; one request every 250 ms gets 10 of 20,
+    .+.+...; no timer: tokens and ts in a Redis hash, earned = floor((now - ts) / 500); after 5 quiet seconds the jar
+    is full: 10 again. The name, one script, TTL 5 s; GCRA keeps one number (TAT) and agrees on every request.
+    When to use it, the code in Java and Kotlin, the moral, and a check (2 quiet seconds: 4)."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for key in keys:
+            old = self.lab.pop(key, None)
+            if old is not None:
+                out.append(FadeOut(old))
+        return out
+
+    def clock(self, ms):
+        return self.put("clock", M(f"t = {ms:,} ms", 26, GREY_B).move_to([0, CLOCK_Y, 0]))
+
+    def state(self, tokens, ts, color=WHITE):
+        return self.put("state", M(f"bucket:merchant:m-17   tokens: {tokens}   ts: {ts:,} ms", 20, color).move_to([0, STATE_Y, 0]))
+
+    def sv(self, key, s, y, color=WHITE, size=22, mono=False):
+        m = (M if mono else T)(s, size, color)
+        return self.put(key, fit(m, SV_X1 - SV_X0 - 0.4).move_to([SV_CX, y, 0]))
+
+    # --- the jar ---
+    def refill(self, n):
+        anims = []
+        for _ in range(n):
+            k = len(self.jar)
+            if k >= 10:
+                break
+            t = Circle(radius=0.22, stroke_color=GOLD_M, stroke_width=2.5).set_fill(fillc(GOLD_M, 0.6), 1).move_to(tok_pos(k)).set_z_index(4)
+            self.jar.append(t)
+            anims.append(FadeIn(t, shift=0.3 * DOWN))
+        return anims
+
+    def request(self, rt=0.55, color=WHITE):
+        """One request: it takes the top token and goes on to the service, or is refused at the jar."""
+        a, b = np.array([CL_X1 + 0.1, REQ_Y, 0]), np.array([JAR_X0 - 0.1, REQ_Y, 0])
+        c = np.array([SV_X0 - 0.1, REQ_Y, 0])
+        if self.jar:
+            t = self.jar.pop()
+            go = AnimationGroup(run_pts([b + [0, 0, 0], c], GREEN_M, rt * 0.5), FadeOut(t, shift=0.25 * RIGHT, run_time=rt * 0.4))
+            return True, Succession(run_pts([a, b], color, rt * 0.5), go)
+        x = tick(False, 0.12).move_to(b + 0.35 * DOWN)
+        return False, Succession(run_pts([a, b], RED_M, rt * 0.5), Succession(FadeIn(x, run_time=0.05), FadeOut(x, run_time=rt * 0.45)))
+
+    def burst(self, n, lag=0.12):
+        res = [self.request(0.6) for _ in range(n)]
+        return sum(ok for ok, _ in res), LaggedStart(*[a for _, a in res], lag_ratio=lag)
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
     def construct(self):
-        self.title_card("Rate limits: the token bucket", "a burst up front, then a steady rate")
+        self.capm = None
+        self.lab, self.jar = {}, []
+        self.title_card("A burst, then a steady rate", "a jar of tokens that never needs a timer")
 
-        # ---- the fixed window and its seam -------------------------------------------------------------------
-        rule = chip("at most 5 attempts per card per minute", GREY_B, 20).move_to([2.4, 3.2, 0])
-        card = box("card 7", WHITE, w=2.0, h=0.9, size=24).move_to([JX, JY, 0])
-        rr = RoundedRectangle(corner_radius=0.14, width=RW, height=RH, stroke_color=BLUE_M, stroke_width=3)
-        rr.set_fill(fill(BLUE_M), 1).move_to([RX, RY, 0])
-        rt = T("Redis", 24).move_to([RX, RY + RH / 2 - 0.36, 0])
-        rk = M("rl:card:7", 20, WHITE).move_to([RX, RY + 0.3, 0])
-        rv = T("count: 0 of 5", 22, GREY_B).move_to([RX, RY - 0.25, 0])
-        rs = T("minute 0", 19, GOLD_M).move_to([RX, RY - 0.75, 0])
-        inc = Arrow([JX + 1.1, JY, 0], [RX - RW / 2 - 0.1, JY, 0], buff=0, stroke_width=3, color=GREY_B,
-                    max_tip_length_to_length_ratio=0.05)
-        inc_l = M("INCR rl:card:7", 17, GREY_B).next_to(inc, UP, buff=0.14).shift(0.6 * LEFT)
+        client = frame(CL_X0, CL_X1, CL_TOP, CL_BOT, PURPLE_M)
+        cl_lab = VGroup(T("the shop's", 21), T("refund program", 21), T("a client", 17, GREY_B)).arrange(DOWN, buff=0.12).move_to(
+            [CL_CX, (CL_TOP + CL_BOT) / 2, 0])
+        a_in = harrow(CL_X1 + 0.06, JAR_X0 - 0.06, REQ_Y)
+        a_out = harrow(JAR_X1 + 0.06, SV_X0 - 0.06, REQ_Y)
+        jar = VGroup(RoundedRectangle(corner_radius=0.3, width=JAR_W, height=JAR_H, stroke_color=GOLD_M, stroke_width=3)
+                     .set_fill(fillc(GOLD_M, 0.08), 1).move_to(JAR_C),
+                     RoundedRectangle(corner_radius=0.08, width=JAR_W * 0.7, height=0.2, stroke_color=GOLD_M, stroke_width=3)
+                     .set_fill(fillc(GOLD_M, 0.3), 1).move_to([JAR_C[0], JAR_TOP + 0.12, 0]))
+        jar_top = T("the jar: holds 10", 21, GOLD_M).move_to([JAR_C[0], JAR_TOP + 0.55, 0])
+        jar_bot = T("+1 token every 500 ms", 19, GREY_B).move_to([JAR_C[0], JAR_BOT - 0.32, 0])
+        sv = frame(SV_X0, SV_X1, SV_TOP, SV_BOT, BLUE_M)
+        sv_t = T("the payments service", 23).move_to([SV_CX, SV_TOP - 0.3, 0])
 
-        axis = Line([-6.3, AX_Y, 0], [6.3, AX_Y, 0], stroke_width=2.5, color=GREY_B)
-        bnd = DashedLine([x1(60), AX_Y - 0.15, 0], [x1(60), AX_Y + 1.25, 0], dash_length=0.08, stroke_width=2.5, color=WHITE)
-        band0 = Rectangle(width=x1(60) - x1(58.5), height=1.25, stroke_width=0).set_fill(GOLD_M, 0.14)
-        band0.move_to([(x1(58.5) + x1(60)) / 2, AX_Y + 0.65, 0])
-        band1 = Rectangle(width=x1(61) - x1(60), height=1.25, stroke_width=0).set_fill(BLUE_M, 0.14)
-        band1.move_to([(x1(60) + x1(61)) / 2, AX_Y + 0.65, 0])
-        bl0 = T("minute 0", 19, GOLD_M).move_to([x1(58.5) + 0.75, AX_Y + 1.05, 0])
-        bl1 = T("minute 1", 19, BLUE_M).move_to([x1(61) - 0.75, AX_Y + 1.05, 0])
-        tl = VGroup(*[T(s, 18, GREY_B).move_to([x1(v), AX_Y - 0.36, 0]) for s, v in (("0:59", 59), ("1:00", 60), ("1:01", 61))])
-        tt = VGroup(*[Line([x1(v), AX_Y - 0.08, 0], [x1(v), AX_Y + 0.08, 0], stroke_width=2, color=GREY_B) for v in (59, 60, 61)])
+        # ---------------- scene 1: the question ----------------
+        def flood(n=40, color=WHITE, rt=1.6):
+            a, b = np.array([CL_X1 + 0.1, REQ_Y, 0]), np.array([SV_X0 - 0.1, REQ_Y, 0])
+            return [LaggedStart(*[run_pts([a + [0, 0.05 * ((k % 5) - 2), 0], b], color, 0.5) for k in range(n)],
+                                lag_ratio=0.04, run_time=rt)]
 
-        self.steps("A fraud rule allows five attempts per card per minute. Every pod adds one to the same Redis key, "
-                   "and the count starts over each minute.", [
-            (lambda: [FadeIn(rule, shift=0.1 * DOWN)], 0.7),
-            (lambda: [FadeIn(card)], 0.5),
-            "Every pod",
-            (lambda: [FadeIn(rr), FadeIn(rt), FadeIn(rk), FadeIn(rv), GrowArrow(inc), FadeIn(inc_l)], 0.9),
-            "and the count",
-            (lambda: [Create(axis), FadeIn(tt), FadeIn(tl), FadeIn(band0), FadeIn(band1), Create(bnd),
-                      FadeIn(bl0), FadeIn(bl1), FadeIn(rs)], 1.1),
+        self.steps("Picture a shop's program that sends the hour's refunds all at once: 40 requests in one second, "
+                   "at the end of every hour, and nothing in between.", [
+            (lambda: [FadeIn(client), FadeIn(cl_lab), FadeIn(sv), FadeIn(sv_t)], 0.8),
+            "40 requests",
+            (lambda: [*flood(40), *self.sv("s1", "40 requests in 1 second", 1.35)], 1.6),
+            "nothing in between",
+            (lambda: self.sv("s2", "then nothing for an hour", 0.85, GREY_B), 0.5),
+        ])
+        self.steps("Is that an attack? No, just a program in a hurry. But a broken program that sends 40 every second, forever, "
+                   "is a problem. How do you write one limit that lets the first through and stops the second?", [
+            "a program in a hurry",
+            (lambda: self.cap("an honest burst: a program in a hurry"), 0.5),
+            "a broken program",
+            (lambda: [*self.cap("a broken program: 40 every second, forever", RED_M), *flood(30, RED_M, 1.2)], 1.2),
+            (lambda: flood(30, RED_M, 1.2), 1.2),
+            "How do you",
+            (lambda: self.cap("one limit: let the burst in, stop the flood?", WHITE), 0.5),
         ])
 
-        m0 = [Dot(radius=0.08, color=GREEN_M).move_to([x1(59 + 0.1 * i), AX_Y + 0.3, 0]) for i in range(5)]
-        m1 = [Dot(radius=0.08, color=GREEN_M).move_to([x1(60 + 0.1 * i), AX_Y + 0.3, 0]) for i in range(5)]
-
-        def admit(dots, k, minute):
-            def f():
-                return [FadeIn(dots[k], scale=0.5), flow(inc, GREEN_M, 0.4),
-                        Transform(rv, T(f"count: {k + 1} of 5", 22, GREEN_M if k < 4 else GOLD_M).move_to(rv))]
-            return f
-
-        self.steps("That's a fixed window. Five attempts land in the last second of minute zero, and fill it.", [
-            "Five attempts",
-            *[(admit(m0, k, 0), 0.42) for k in range(5)],
-            (lambda: [Indicate(rv, color=GOLD_M, scale_factor=1.1)], 0.6),
+        # ---------------- scene 2: windows can't say it ----------------
+        self.steps("The limits so far count requests per window. A limit of 5 a minute refuses most of the burst. "
+                   "A limit of 40 a second lets the broken program flood you, forever.", [
+            (lambda: [*self.uncap(), *self.drop("s1", "s2"), *self.cap("limits so far: a count per window")], 0.5),
+            "5 a minute",
+            (lambda: [*self.sv("s1", "5 a minute: 5 of 40 get in", 1.35, RED_M)], 0.5),
+            "40 a second",
+            (lambda: [*self.sv("s2", "40 a second: the flood gets in", 0.85, RED_M)], 0.5),
+        ])
+        self.steps("One number per window can't say: bursts are fine, floods are not. "
+                   "What we want sounds like this: a burst of up to 10, then 2 a second on average.", [
+            (lambda: self.cap("one number per window can't say it"), 0.5),
+            "What we want",
+            (lambda: [*self.drop("s1", "s2"), *self.cap("the wish: a burst of up to 10, then 2 a second", YELLOW_M, 30)], 0.6),
         ])
 
-        self.steps("At the boundary the count resets, and minute one lets five more attempts in.", [
-            (lambda: [Transform(rv, T("count: 0 of 5", 22, GREY_B).move_to(rv)),
-                      Transform(rs, T("minute 1", 19, BLUE_M).move_to(rs)), glow(bnd, YELLOW_M, 1.0)], 0.8),
-            "five more",
-            *[(admit(m1, k, 1), 0.38) for k in range(5)],
-        ])
-
-        br = Brace(VGroup(*m0, *m1), UP, buff=1.0, color=RED_M)
-        brl = T("10 attempts in 1.4 seconds", 21, RED_M).next_to(br, UP, buff=0.12)
-        self.steps("The rule said five a minute. The card got ten in 1.4 seconds.", [
-            "The card got",
-            (lambda: [GrowFromCenter(br), FadeIn(brl, shift=0.1 * UP), *[d.animate.set_color(RED_M) for d in m0 + m1]], 1.0),
-            (lambda: [glow(rr, RED_M, 1.03)], 0.8),
-        ])
-
-        # ---- the token bucket --------------------------------------------------------------------------------
-        want = chip("a burst of up to 10, then 2 a second", GREEN_M, 20).move_to([2.6, 3.2, 0])
-        job = box("refund job", WHITE, w=2.0, h=0.9, size=24).move_to([JX, JY, 0])
-        self.steps("Some clients burst on purpose. A merchant's refund job sends forty requests at once, every hour. "
-                   "You want a burst of up to ten, then two a second.", [
-            (lambda: [FadeOut(br), FadeOut(brl), *[FadeOut(d) for d in m0 + m1], FadeOut(band0), FadeOut(band1),
-                      FadeOut(bnd), FadeOut(bl0), FadeOut(bl1), FadeOut(inc), FadeOut(inc_l), FadeOut(rv), FadeOut(rs),
-                      FadeOut(rk)], 0.8),
-            "A merchant's",
-            (lambda: [Transform(card, job), FadeOut(rule)], 0.7),
-            "You want",
-            (lambda: [FadeIn(want, shift=0.1 * DOWN)], 0.7),
-        ])
-
-        rk2 = M("bucket:m-17", 20, WHITE).move_to([RX, RY + 0.45, 0])
-        bucket = VMobject(stroke_color=WHITE, stroke_width=4).set_points_as_corners(
-            [[BX - BW / 2, BY + BH / 2, 0], [BX - BW / 2, BY - BH / 2, 0], [BX + BW / 2, BY - BH / 2, 0], [BX + BW / 2, BY + BH / 2, 0]])
-        toks = [token(i) for i in range(CAP)]
-        cap_l = T("holds at most 10", 19, GREY_B).move_to([BX, BY - BH / 2 - 0.33, 0])
-        drip = Arrow([BX, BY + BH / 2 + 0.95, 0], [BX, BY + BH / 2 + 0.12, 0], buff=0, stroke_width=3, color=GOLD_M,
-                     max_tip_length_to_length_ratio=0.2)
-        drip_l = T("+1 token every 500 ms", 19, GOLD_M).next_to(drip, LEFT, buff=0.2).shift(0.25 * UP)
-        self.steps("A token bucket does that. The bucket holds at most ten tokens, and gains one every 500 milliseconds.", [
-            (lambda: [Create(bucket), FadeIn(rk2)], 0.7),
-            "holds at most",
-            (lambda: [LaggedStart(*[FadeIn(t, scale=0.5) for t in toks], lag_ratio=0.12), FadeIn(cap_l)], 1.2),
+        # ---------------- scene 3: the jar ----------------
+        self.steps("Picture a jar of tokens on a counter, like tokens for an arcade. It holds at most 10, "
+                   "and gains one token every 500 milliseconds.", [
+            (lambda: [*self.uncap(), FadeIn(jar), FadeIn(jar_top)], 0.7),
+            "It holds",
+            (lambda: [LaggedStart(*self.refill(10), lag_ratio=0.15)], 1.2),
             "and gains",
-            (lambda: [GrowArrow(drip), FadeIn(drip_l)], 0.8),
+            (lambda: [FadeIn(jar_bot)], 0.5),
+        ])
+        self.steps("Each request takes a token. If the jar is empty, the request is refused.", [
+            (lambda: [GrowArrow(a_in), GrowArrow(a_out)], 0.5),
+            "Each request",
+            (lambda: [self.request(0.9)[1]], 0.9),
+            "If the jar is empty",
+            (lambda: [glow(jar[0], RED_M, 1.02)], 0.6),
+        ])
+        self.steps("Map it: a token is permission for one request. The jar's size, 10, is the burst. "
+                   "One new token every 500 milliseconds is the rate: 2 a second.", [
+            (lambda: [*self.refill(1), *self.cap("a token: permission for one request")], 0.5),
+            "The jar's size",
+            (lambda: [*self.cap("the jar's size, 10: the burst"), Indicate(jar_top, color=GOLD_M)], 0.7),
+            "One new token",
+            (lambda: [*self.cap("one token per 500 ms: the rate, 2 a second"), Indicate(jar_bot, color=WHITE)], 0.7),
         ])
 
-        req = Arrow([JX + 1.1, BY, 0], [BX - BW / 2 - 0.15, BY, 0], buff=0, stroke_width=3, color=GREY_B,
-                    max_tip_length_to_length_ratio=0.12)
-        ok_c = T("allowed: 0", 22, GREEN_M).move_to([0.45, 1.05, 0])
-        no_c = T("refused: 0", 22, RED_M).move_to([0.45, 0.45, 0])
-        burst = [mark(0, k < CAP, AX_Y + 0.22 + 0.105 * k) for k in range(15)]
-        burst_l = T("burst of 15", 18, GREY_B).move_to([x2(0) + 1.05, AX_Y + 1.55, 0])
-        ticks2 = VGroup(*[Line([x2(v), AX_Y - 0.08, 0], [x2(v), AX_Y + 0.08, 0], stroke_width=2, color=GREY_B) for v in range(6)])
-        tl2 = VGroup(*[T(f"{v} s", 18, GREY_B).move_to([x2(v), AX_Y - 0.36, 0]) for v in range(6)])
-
-        def take(k):
-            def f():
-                return [flow(req, GREEN_M, 0.3), FadeOut(toks[CAP - 1 - k], shift=0.5 * RIGHT),
-                        Transform(ok_c, T(f"allowed: {k + 1}", 22, GREEN_M).move_to(ok_c)), FadeIn(burst[k], scale=0.5)]
-            return f
-
-        def refuse(k):
-            def f():
-                return [flow(req, RED_M, 0.3), Transform(no_c, T(f"refused: {k + 1}", 22, RED_M).move_to(no_c)),
-                        FadeIn(burst[CAP + k], scale=0.5)]
-            return f
-
-        self.steps("Each request takes a token. A burst of fifteen arrives. "
-                   "The first ten take every token, and the last five find the bucket empty and are refused.", [
-            (lambda: [GrowArrow(req), FadeIn(ok_c), FadeIn(no_c), FadeOut(tt), FadeOut(tl), FadeIn(ticks2), FadeIn(tl2)], 0.8),
-            "The first ten",
-            *[(take(k), 0.32) for k in range(CAP)],
-            (lambda: [FadeIn(burst_l)], 0.3),
-            "and the last five",
-            *[(refuse(k), 0.3) for k in range(5)],
-            (lambda: [glow(bucket, RED_M, 1.02)], 0.6),
+        # ---------------- scene 4: predict a burst, then a steady stream ----------------
+        self.steps("The program was quiet, so its jar is full. It sends 15 requests at once. How many get in? Pause and guess.", [
+            (lambda: [*self.uncap(), *self.clock(0), *self.state(10, 0)], 0.6),
+            "15 requests",
+            (lambda: [*self.cap("a burst of 15 at t = 0. how many get in? pause and guess", YELLOW_M)], 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        n, anim = self.burst(15)
+        self.steps("Ten. It spends the whole jar, and the last 5 find it empty.", [
+            (lambda: [anim], 2.4),
+            (lambda: [*self.sv("r1", f"burst of 15 at t = 0:  {n} in", 1.4, GREEN_M), *self.state(0, 0), *self.uncap()], 0.5),
         ])
 
-        # steady phase: a request every 250 ms; a token lands every 500 ms
-        steady = [mark(0.25 * (k + 1), k % 2 == 1) for k in range(20)]
-        stats = {"ok": CAP, "no": 5}
+        marks = []
 
-        def drop():
-            t = token(0)
-            t.move_to([BX, BY + BH / 2 + 0.55, 0])
-            return t
+        def tick_req(i):
+            t = 250 * i
+            anims = [*self.clock(t)]
+            if i % 2 == 0:
+                anims += self.refill(1)
+            return anims
 
-        def quarter(k, rt_tok=0.35):
-            def f():
-                anims = [FadeIn(steady[k], scale=0.5)]
-                if k % 2 == 1:
-                    stats["ok"] += 1
-                    t = drop()
-                    self.add(t)
-                    anims += [Succession(t.animate(run_time=rt_tok).move_to(token_xy(0)),
-                                         t.animate(run_time=rt_tok).shift(0.5 * RIGHT).set_opacity(0)),
-                              flow(req, GREEN_M, 2 * rt_tok),
-                              Transform(ok_c, T(f"allowed: {stats['ok']}", 22, GREEN_M).move_to(ok_c))]
-                else:
-                    stats["no"] += 1
-                    anims += [flow(req, RED_M, 0.5), Transform(no_c, T(f"refused: {stats['no']}", 22, RED_M).move_to(no_c))]
-                return anims
-            return f
+        def mark_anims(i, ok):
+            m = M("+" if ok else ".", 28, GREEN_M if ok else RED_M).move_to([SV_X0 + 0.4 + 0.22 * (i - 1), 0.42, 0])
+            marks.append(m)
+            return [FadeIn(m)]
 
-        rate = chip("2 a second", GREEN_M, 20).move_to([x2(3.6), AX_Y + 1.0, 0])
-        self.steps("Now one request comes every 250 milliseconds. A token arrives every 500, "
-                   "so every other request gets through. That's two a second.", [
-            (quarter(0), 0.6), (quarter(1), 0.8), (quarter(2), 0.6), (quarter(3), 0.8),
-            "so every other",
-            *[(quarter(k, 0.11), 0.22) for k in range(4, 20)],
-            "That's two",
-            (lambda: [FadeIn(rate, shift=0.1 * UP)], 0.6),
+        self.steps("Now it sends one request every 250 milliseconds, for 5 seconds. That's 20 requests. How many get in?", [
+            (lambda: [*self.sv("r2", "then one every 250 ms for 5 s:", 0.9)], 0.5),
+            "How many",
+            (lambda: self.cap("20 requests, one every 250 ms: how many get in?", YELLOW_M), 0.5),
+        ], after=0.6)
+        steady = []
+        for i in range(1, 21):
+            steady.append((lambda i=i: tick_req(i), 0.12))
+            steady.append((lambda i=i: (lambda ok_a: [ok_a[1], *mark_anims(i, ok_a[0])])(self.request(0.4)), 0.34))
+        self.steps("Ten. A new token arrives every 500 milliseconds, so every second request finds one. "
+                   "Refused, let in, refused, let in: 2 a second, exactly the rate.", [
+            (lambda: self.uncap(), 0.2),
+            *steady,
+            (lambda: [*self.sv("r3", "10 of 20 got in", -0.1, GREEN_M), *self.state(0, 5000)], 0.5),
         ])
+        self.stamp("steady")
 
-        refill = [token(i) for i in range(CAP)]
-
-        # ---- the state in Redis ------------------------------------------------------------------------------
-        f1 = M("tokens   0", 20, GOLD_M).move_to([RX, RY + 0.0, 0])
-        f2 = M("ts       5000", 20, GREY_A).move_to([RX, RY - 0.42, 0])
-        hint = T("a hash with two fields", 18, GREY_B).move_to([RX, RY - RH / 2 - 0.35, 0])
-        self.steps("Nothing drips tokens in. Redis keeps two numbers per merchant, in one hash: "
-                   "the tokens left after the last request, and ts, when it last refilled.", [
-            (lambda: [FadeOut(rate), FadeOut(burst_l), *[FadeOut(d) for d in burst + steady],
-                      FadeOut(drip), FadeOut(drip_l)], 0.9),
-            "Redis keeps",
-            (lambda: [FadeIn(hint), glow(rr, BLUE_M, 1.03)], 0.8),
-            "the tokens left",
-            (lambda: [FadeIn(f1)], 0.6),
+        # ---------------- scene 5: no timer ----------------
+        self.steps("So who drops a token into the jar every 500 milliseconds? A timer for every client? "
+                   "With a million clients, that's a million timers ticking for jars nobody is using.", [
+            (lambda: [Indicate(jar_bot, color=YELLOW_M, scale_factor=1.15), *self.cap("who drops the tokens in? a timer per client?", PURPLE_M)], 0.8),
+            "With a million",
+            (lambda: self.cap("a million clients: a million timers, for jars nobody is using", RED_M), 0.6),
+        ])
+        self.steps("The trick is a lazy shopkeeper. He tops up the jar only when someone walks in, by checking the clock.", [
+            (lambda: [*self.cap("a lazy shopkeeper: top up only when someone walks in", YELLOW_M),
+                      jar_bot.animate.set_opacity(0.25)], 0.6),
+        ])
+        self.steps("Store two numbers per client in a Redis hash, a small table of named fields under one key: tokens, "
+                   "what was left after the last request, and ts, when the jar was last topped up.", [
+            "a Redis hash",
+            (lambda: [Indicate(self.lab["state"], color=TEAL_M, scale_factor=1.06), *self.cap("a Redis hash: named fields under one key")], 0.8),
+            "tokens, what",
+            (lambda: self.cap("tokens: what was left after the last request"), 0.5),
             "and ts",
-            (lambda: [FadeIn(f2)], 0.6),
+            (lambda: self.cap("ts: when the jar was last topped up"), 0.5),
+        ])
+        self.steps("On each request, work out the tokens earned since ts: the time gone by, divided by 500 milliseconds, "
+                   "rounded down. Add them, never above 10, and take one.", [
+            (lambda: self.cap("earned = floor((now - ts) / 500)", YELLOW_M), 0.5),
+            "Add them",
+            (lambda: self.cap("tokens = min(10, tokens + earned); then take one", YELLOW_M), 0.5),
+        ])
+        self.steps("Watch it after 5 quiet seconds. Nothing moved while the program was quiet.", [
+            (lambda: [*self.uncap(), *self.clock(10000)], 0.6),
+            "Nothing moved",
+            (lambda: [glow(jar[0], GREY_B, 1.02)], 0.9),
+        ])
+        n2 = [0]
+
+        def burst2():
+            n, a = self.burst(15)
+            n2[0] = n
+            return [a]
+
+        self.steps("Then a burst of 15 arrives. The time gone by is 5,000 milliseconds: 10 tokens earned, and the jar is full again. "
+                   "Ten get in.", [
+            "The time gone by",
+            (lambda: self.cap("10,000 - 5,000 = 5,000 ms: 10 tokens earned", YELLOW_M), 0.5),
+            "the jar is full",
+            (lambda: [LaggedStart(*self.refill(10), lag_ratio=0.05), *self.state(10, 10000)], 0.7),
+            "Ten get in",
+            (lambda: burst2(), 2.2),
+            (lambda: [*self.sv("r4", f"burst after 5 quiet s:  {n2[0]} in", -0.75, GREEN_M), *self.state(0, 10000)], 0.5),
+        ])
+        self.steps("This is a token bucket. The jar is the bucket.", [
+            (lambda: [*self.cap("a token bucket", GOLD_M, 32), Transform(jar_top, T("the jar: the bucket", 21, GOLD_M).move_to(jar_top))], 0.6),
+        ], after=0.4)
+        self.stamp("poster")
+
+        # ---------------- scene 6: details, and GCRA ----------------
+        self.steps("Two details. The whole calculation runs as one script inside Redis, so two servers never both take the last token.", [
+            (lambda: self.cap("one script inside Redis: two servers never both take the last token"), 0.6),
+        ])
+        self.steps("And the key gets a TTL of 5 seconds, the time to fill an empty jar. "
+                   "After 5 quiet seconds the jar would be full anyway, so Redis may forget it.", [
+            (lambda: self.cap("TTL: 5 s, the time to fill an empty jar"), 0.5),
+            "so Redis may forget",
+            (lambda: [self.lab["state"].animate(rate_func=there_and_back).set_opacity(0.15), *self.cap("forgotten = full: no answer changes")], 1.2),
         ])
 
-        calc = VGroup(T("a request at 6,200 ms:", 19, GREY_B),
-                      T("1,200 ms since ts = 2 whole tokens", 19, WHITE),
-                      T("ts moves on to 6,000", 19, GREY_B)).arrange(DOWN, buff=0.16, aligned_edge=LEFT)
-        calc.move_to([RX - 0.2, -1.55, 0])
-        self.steps("On each request, a script counts the whole 500 millisecond steps since ts, adds that many tokens, "
-                   "never more than ten, and takes one.", [
-            (lambda: [FadeOut(hint), FadeOut(ok_c), FadeOut(no_c)], 0.6),
-            "a script counts",
-            (lambda: [FadeIn(calc[0]), FadeIn(calc[1])], 0.8),
-            "adds that many",
-            (lambda: [Transform(f1, M("tokens   2", 20, GOLD_M).move_to(f1)), FadeIn(calc[2]),
-                      Transform(f2, M("ts       6000", 20, GREY_A).move_to(f2)),
-                      FadeIn(refill[0], shift=0.3 * DOWN), FadeIn(refill[1], shift=0.3 * DOWN)], 0.8),
-            "and takes one",
-            (lambda: [Transform(f1, M("tokens   1", 20, GOLD_M).move_to(f1)), FadeOut(refill[1], shift=0.5 * RIGHT),
-                      flow(req, GREEN_M, 0.5)], 0.8),
+        axis_x0, step_w = -4.0, 0.8
+        axis = VGroup(Line([axis_x0, STATE_Y, 0], [axis_x0 + 10 * step_w + 0.6, STATE_Y, 0], stroke_width=2, color=GREY_C),
+                      *[Line([axis_x0 + k * step_w, STATE_Y - 0.08, 0], [axis_x0 + k * step_w, STATE_Y + 0.08, 0], stroke_width=2, color=GREY_C)
+                        for k in range(11)])
+        now_l = T("now", 16, GREY_B).move_to([axis_x0, STATE_Y - 0.36, 0])
+        lim = DashedLine([axis_x0 + 10 * step_w, STATE_Y - 0.12, 0], [axis_x0 + 10 * step_w, STATE_Y + 0.25, 0], color=RED_M, dash_length=0.06)
+        lim_l = T("now + 10 x 500 ms", 16, RED_M).move_to([axis_x0 + 10 * step_w, STATE_Y - 0.36, 0])
+        tat = Triangle(color=YELLOW_M).set_fill(YELLOW_M, 1).scale(0.11).rotate(PI).move_to([axis_x0, STATE_Y + 0.22, 0])
+        tat_l = T("next due", 15, YELLOW_M).next_to(tat, UP, buff=0.06)
+        gx = tick(False, 0.14).move_to([axis_x0 + 11 * step_w, STATE_Y + 0.45, 0])
+        self.steps("There's a version with only one number, called GCRA, the generic cell rate algorithm. "
+                   "It keeps a schedule instead of a jar: the time the client's next request would be due, if it sent at exactly the allowed rate.", [
+            (lambda: [*self.drop("state"), *self.cap("GCRA: the generic cell rate algorithm", WHITE)], 0.5),
+            "It keeps a schedule",
+            (lambda: [Create(axis), FadeIn(now_l), FadeIn(tat), FadeIn(tat_l)], 0.8),
+            "next request",
+            (lambda: self.cap("one number: when the next request would be due"), 0.5),
+        ])
+        self.steps("Each request that gets in pushes that time 500 milliseconds later. "
+                   "A request is refused if it would push it more than 10 steps past now.", [
+            (lambda: [FadeIn(lim), FadeIn(lim_l)], 0.4),
+            *[(lambda: [VGroup(tat, tat_l).animate.shift(step_w * RIGHT)], 0.22) for _ in range(10)],
+            "A request is refused",
+            (lambda: [VGroup(tat, tat_l).animate(rate_func=there_and_back).shift(step_w * RIGHT).set_color(RED_M)], 0.7),
+            (lambda: [Create(gx)], 0.3),
+        ])
+        self.steps("In the lesson's demo, the bucket and GCRA got the same traffic, and agreed on every single request. "
+                   "The bucket keeps two numbers, GCRA keeps one.", [
+            (lambda: self.cap("same traffic: the same answer on every request", GREEN_M), 0.5),
+            "The bucket keeps",
+            (lambda: self.cap("bucket: {tokens=0, ts=1762500010000}     GCRA: 1762500015000"), 0.5),
+        ])
+        gcra_parts = VGroup(axis, now_l, lim, lim_l, tat, tat_l, gx)
+        self.steps("When should you use one? When you want to cap how often a customer's program calls your service, and still allow "
+                   "its bursts. For a small exact limit, like attempts per card, the sliding log from earlier fits better.", [
+            (lambda: [*[FadeOut(m) for m in gcra_parts],
+                      *self.cap("a cap on a customer's program, bursts allowed: a token bucket or GCRA")], 0.6),
+            "For a small",
+            (lambda: self.cap("a small exact limit (attempts per card): the sliding log"), 0.5),
         ])
 
-        # ---- two pods, one token -----------------------------------------------------------------------------
-        pa = box("pod A", WHITE, w=1.7, h=0.75, size=22).move_to([RX - 1.15, -1.75, 0])
-        pb = box("pod B", WHITE, w=1.7, h=0.75, size=22).move_to([RX + 1.15, -1.75, 0])
-        aa = Arrow(pa.get_top() + 0.05 * UP, [pa.get_x(), RY - RH / 2 - 0.05, 0], buff=0, stroke_width=3, color=GREY_B,
-                   max_tip_length_to_length_ratio=0.2)
-        ab = Arrow(pb.get_top() + 0.05 * UP, [pb.get_x(), RY - RH / 2 - 0.05, 0], buff=0, stroke_width=3, color=GREY_B,
-                   max_tip_length_to_length_ratio=0.2)
-        ra = T("reads 1, takes it", 18, RED_M).next_to(pa, DOWN, buff=0.2)
-        rb = T("reads 1, takes it", 18, RED_M).next_to(pb, DOWN, buff=0.2)
-        twice = T("one token, two requests in", 20, RED_M).move_to([RX, -3.2, 0])
-        self.steps("Two pods ask at once, with one token left. "
-                   "If each one reads and then writes, both see one token, and both take it.", [
-            (lambda: [FadeOut(calc), FadeOut(axis), FadeOut(ticks2), FadeOut(tl2), FadeIn(pa), FadeIn(pb),
-                      GrowArrow(aa), GrowArrow(ab)], 0.9),
-            "both see one",
-            (lambda: [flow(aa, GOLD_M, 0.6, back=True), flow(ab, GOLD_M, 0.6, back=True), FadeIn(ra), FadeIn(rb)], 0.8),
-            "and both take it",
-            (lambda: [flow(aa, RED_M, 0.6), flow(ab, RED_M, 0.6),
-                      Transform(f1, M("tokens   0", 20, RED_M).move_to(f1)), FadeIn(twice)], 0.8),
-        ])
+        # ---------------- scene 7: the code ----------------
+        keep = [m for m in self.mobjects if m is not self.capm and isinstance(m, VMobject)]
+        diagram = VGroup(*keep)
+        diagram.save_state()
+        jp = code_panel("Java", JAVA, -3.35)
+        kp = code_panel("Kotlin", KOTLIN, 3.35)
 
-        ra2 = T("script: 1 left, takes it", 18, GREEN_M).next_to(pa, DOWN, buff=0.2)
-        rb2 = T("script: 0 left, refused", 18, RED_M).next_to(pb, DOWN, buff=0.2)
-        self.steps("Redis runs the whole script as one command. Pod A's runs first and takes the token. "
-                   "Pod B's sees zero, and refuses.", [
-            (lambda: [FadeOut(ra), FadeOut(rb), FadeOut(twice), Transform(f1, M("tokens   1", 20, GOLD_M).move_to(f1))], 0.7),
-            "Pod A's",
-            (lambda: [flow(aa, GOLD_M, 0.6), glow(rr, GREEN_M, 1.03)], 0.7),
-            (lambda: [Transform(f1, M("tokens   0", 20, GOLD_M).move_to(f1)), FadeOut(refill[0], shift=0.5 * RIGHT),
-                      FadeIn(ra2), flow(aa, GREEN_M, 0.5, back=True)], 0.7),
-            "Pod B's",
-            (lambda: [flow(ab, GOLD_M, 0.6)], 0.6),
-            (lambda: [FadeIn(rb2), flow(ab, RED_M, 0.5, back=True)], 0.6),
-        ])
+        def hl(rows_j, rows_k, color):
+            return [jp[2][r].animate(rate_func=there_and_back).set_color(color) for r in rows_j] + \
+                   [kp[2][r].animate(rate_func=there_and_back).set_color(color) for r in rows_k]
 
-        ttl = M("TTL      5 s", 20, TEAL_M).move_to([RX, RY - 0.84, 0])
-        back10 = [token(i) for i in range(CAP)]
-        gone = T("expired: same as a full bucket", 18, TEAL_M).move_to([RX, RY - RH / 2 - 0.35, 0])
-        self.steps("The key's time to live is five seconds, the time to refill from empty. "
-                   "A bucket quiet that long is full anyway, so Redis can drop the key.", [
-            (lambda: [FadeOut(ra2), FadeOut(rb2), FadeOut(aa), FadeOut(ab), FadeOut(pa), FadeOut(pb)], 0.6),
-            (lambda: [FadeIn(ttl)], 0.6),
-            "A bucket quiet",
-            (lambda: [LaggedStart(*[FadeIn(t, shift=0.4 * DOWN) for t in back10], lag_ratio=0.3)], 2.0),
-            "so Redis can",
-            (lambda: [rk2.animate.set_opacity(0.3), f1.animate.set_opacity(0.3), f2.animate.set_opacity(0.3),
-                      ttl.animate.set_opacity(0.3), FadeIn(gone)], 0.8),
-        ])
+        self.steps("In Java and Kotlin, the call is the same: run the script on the client's key, with 10 tokens, "
+                   "500 milliseconds, and the time now. A 1 means let it in.", [
+            (lambda: [*self.uncap(), diagram.animate.set_opacity(0.06)], 0.6),
+            (lambda: [FadeIn(jp, shift=0.1 * UP), FadeIn(kp, shift=0.1 * UP)], 0.7),
+            "run the script",
+            (lambda: hl((1, 2), (2, 3), TEAL_M), 1.2),
+            "with 10 tokens",
+            (lambda: hl((3, 4), (4, 5), GOLD_M), 1.4),
+            "A 1 means",
+            (lambda: hl((5,), (5,), GREEN_M), 1.0),
+        ], after=0.6)
 
-        self.steps("A token bucket lets a quiet client spend a burst, then holds it to the refill rate. "
-                   "One script on one key keeps every pod on the same count.", [
-            (lambda: [glow(bucket, GOLD_M, 1.02)], 0.9),
-            "then holds it",
-            (lambda: [glow(want[0], GREEN_M, 1.04)], 0.9),
-            "One script",
-            (lambda: [glow(rr, GREEN_M, 1.03)], 1.0),
+        # ---------------- scene 8: the moral, and a check ----------------
+        self.steps("So, a burst, then a steady rate: the jar's size is the burst, and its refill is the rate.", [
+            (lambda: [FadeOut(jp), FadeOut(kp), Restore(diagram)], 0.8),
+            "the jar's size",
+            (lambda: [Indicate(jar_top, color=GOLD_M), *self.cap("the jar's size: the burst.   its refill: the rate", WHITE)], 0.7),
         ])
-        self.wait(0.6)
+        self.steps("And the jar never needs a timer. It only needs to remember how full it was, and when it last looked.", [
+            (lambda: [*self.state(0, 10000), *self.cap("no timer: just how full it was, and when it last looked", YELLOW_M)], 0.6),
+        ], after=0.4)
+        self.steps("One quick check. A program empties its jar, then stays quiet for 2 seconds, and sends 10 requests at once. "
+                   "How many get in? Pause and think.", [
+            (lambda: [*self.uncap(), *self.clock(12000), *self.drop("r1", "r2", "r3", "r4"), *[FadeOut(m) for m in marks]], 0.6),
+            "stays quiet",
+            (lambda: [glow(jar[0], GREY_B, 1.02)], 0.8),
+            "Pause and think",
+            (lambda: self.cap("2 quiet seconds, then 10 at once: how many get in? pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        n3 = [0]
+
+        def last_burst():
+            n, a = self.burst(10)
+            n3[0] = n
+            return [a]
+
+        self.steps("Four. Two seconds is 2,000 milliseconds: four tokens earned, so four get in, and six are refused.", [
+            (lambda: [LaggedStart(*self.refill(4), lag_ratio=0.15), *self.state(4, 12000),
+                      *self.cap("2,000 ms / 500 ms = 4 tokens earned", YELLOW_M)], 0.7),
+            "so four get in",
+            (lambda: last_burst(), 1.8),
+            (lambda: [*self.sv("r1", f"10 at once after 2 quiet s:  {n3[0]} in", 1.4, GREEN_M), *self.state(0, 12000)], 0.5),
+        ])
+        self.steps("Next, the customer who pressed Pay twice. A limit lets both presses through, so we'll learn to recognize a repeat.", [
+            (lambda: self.cap("a burst, then a steady rate: the jar's size, and its refill", WHITE), 0.6),
+        ], after=0.3)
+        self.wait(2.0)
