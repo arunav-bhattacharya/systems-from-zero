@@ -1,14 +1,24 @@
 from sfz import *
 
-SAY.insert(0, (r"\bcard-status\b", "card status"))
+SAY.insert(0, (r"\bGiB\b", "gibibyte"))
+SAY.insert(0, (r"\bMiB\b", "mebibyte"))
+SAY.insert(0, (r"\bsegment\.bytes\b", "segment dot bytes"))
+SAY.insert(0, (r"\bsegment\.ms\b", "segment dot M S"))
+SAY.insert(0, (r"(?<![\w])\.log\b", "dot log"))
+SAY.insert(0, (r"(?<![\w])\.index\b", "dot index"))
+SAY.insert(0, (r"\b4,096\b", "four thousand and ninety-six"))
 
-SW, SH, SY = 2.8, 1.2, 0.9                  # segment boxes: width, height, row
-SX = [-4.65, -1.55, 1.55, 4.65]             # segment centres
-SP, STW = 0.32, 0.24                        # record strips: pitch and width
-BASE = [0, 104, 208, 312]
-NY, STY, MKY = 1.78, 0.02, -0.62             # file names, status line under the boxes, first-readable marker
-RW, RP, RY = 1.3, 1.42, 0.9                 # compaction: record boxes
-CX0 = -5.15                                 # x of offset 0 in the card-status segment
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+ROW_Y, SEG_H = 1.3, 1.65
+SEG_W, SEG_GAP = 2.9, 0.25
+SEG_X0 = [-6.2 + (SEG_W + SEG_GAP) * k for k in range(4)]       # left edge of segment k
+SEG_CX = [x + SEG_W / 2 for x in SEG_X0]
+BASES = [0, 104, 208, 312]
+LASTS = [103, 207, 311, 399]
+LX0, RX1 = SEG_X0[0], SEG_X0[3] + SEG_W
+STRIP_Y, STRIP_X0, STRIP_X1 = -0.95, -5.6, 5.6
+TOP_Y, CAP_Y, BAR_Y = 3.1, -3.25, -2.7
+SEGC = BLUE_M
 
 
 class Base(VoiceScene):
@@ -38,9 +48,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+    def steps(self, text, items, after=0.3):
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -66,295 +74,331 @@ class Base(VoiceScene):
 
 
 def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def strip(x, y=SY, color=TEAL_M):
-    r = RoundedRectangle(corner_radius=0.04, width=STW, height=0.8, stroke_color=color, stroke_width=2)
-    return r.set_fill(fillc(color, 0.45), 1).move_to([x, y, 0]).set_z_index(2)
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def bx(j):
-    """x of strip j in the one big file."""
-    return SX[0] - 1.12 + j * SP
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def sx(s, i):
-    """x of strip i (0 to 7) in segment s."""
-    return SX[s] - 1.12 + i * SP
+def seg_box(k, color=SEGC):
+    r = RoundedRectangle(corner_radius=0.12, width=SEG_W, height=SEG_H, stroke_color=color, stroke_width=3)
+    return r.set_fill(fillc(color), 1).move_to([SEG_CX[k], ROW_Y, 0])
 
 
-def bar(n, y=SY):
-    w = n * SP + 0.24
-    r = RoundedRectangle(corner_radius=0.12, width=w, height=SH, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1)
-    return r.move_to([SX[0] - SW / 2 + w / 2, y, 0])
+def fill_bar(k, frac, color=SEGC):
+    """How full segment k is: a soft band along its bottom."""
+    w = (SEG_W - 0.2) * frac
+    return Rectangle(width=w, height=0.12, stroke_width=0).set_fill(color, 0.75).move_to(
+        [SEG_X0[k] + 0.1 + w / 2, ROW_Y - SEG_H / 2 + 0.16, 0])
 
 
-def seg(s, color=WHITE):
-    r = RoundedRectangle(corner_radius=0.12, width=SW, height=SH, stroke_color=color, stroke_width=3).set_fill(BLACK, 1)
-    return r.move_to([SX[s], SY, 0])
+def nb_label(k):
+    return T(f"notebook {k + 1}", 26).move_to([SEG_CX[k], ROW_Y + 0.15, 0])
 
 
-def fname(s):
-    n = f"{BASE[s]:020d}"
-    k = len(n) - len(str(BASE[s])) if BASE[s] else 19
-    return Text(n + ".log", font=MONO, font_size=13, t2c={f"[0:{k}]": GREY_D}).move_to([SX[s], NY, 0])
-
-
-def under(s, text, color=GREY_B):
-    return T(text, 18, color).move_to([SX[s], STY, 0])
-
-
-def marker(x, k):
-    tri = Triangle(color=GOLD_M, fill_opacity=1, stroke_width=0).scale(0.1).move_to([x, MKY, 0])
-    lab = T(f"first readable offset: {k}", 18, GOLD_M).next_to(tri, RIGHT, buff=0.12)
-    return VGroup(tri, lab)
-
-
-def rx(k):
-    return CX0 + k * RP
-
-
-def record(k, key, val, color, x=None):
-    x = rx(k) if x is None else x
-    tomb = val == "null"
-    r = RoundedRectangle(corner_radius=0.1, width=RW, height=1.3, stroke_color=RED_M if tomb else GREY_B, stroke_width=2.5)
-    r.set_fill(fillc(RED_M if tomb else GREY_B, 0.12), 1).move_to([x, RY, 0])
-    v = (M(val, 18, color) if tomb else T(val, 19, color)).move_to([x, RY - 0.38, 0])
-    return VGroup(r, M(str(k), 16, GREY_B).move_to([x, RY + 0.4, 0]), M(key, 17).move_to([x, RY, 0]), v)
+def file_label(k):
+    name = M(f"{BASES[k]:020d}.log", 13)
+    rng = T(f"{BASES[k]} to {LASTS[k]}", 26)
+    st = T("active: 88 so far" if k == 3 else "closed: 104 records", 18, GOLD_M if k == 3 else GREY_B)
+    return VGroup(name, rng, st).arrange(DOWN, buff=0.08).move_to([SEG_CX[k], ROW_Y + 0.12, 0])
 
 
 class SegmentsCompaction(Base):
-    """msg-03, section 1: a partition only grows (about 260 GB a day); one big file can only be cut at its end, so
-    dropping a day means copying 1.5 TB. The broker keeps a chain of segments named after base offsets 0, 104, 208, 312;
-    the active one rolls when full. Retention (7 days) deletes a segment only when its newest record has expired: 0 and
-    104 go, 208 stays with 208 to 249 still readable, and the first readable offset jumps from 0 to 208. Then
-    compaction on card-status: the cleaner maps each key to its last offset, rewrites the closed segment keeping 3, 4, 5
-    (gaps where 0 to 2 were), and keeps card-2's tombstone for a day."""
+    """msg-03, section 1. The café's notebooks: shelve a full one, throw out whole old ones. A log only grows: 3,000
+    payments a second at 1 KB is 3 MB a second, 260 GB a day, 1.8 TB a week. One big file can't be cut at its start:
+    dropping 260 GB means copying 1.5 TB. So a partition is a chain of segment files; only the active one grows,
+    rolling closes it, deleting old data deletes files. The lab's segments 0, 104, 208, 312 (base offsets); offset 230
+    is in 208. Inside a 1 GiB file, a sparse .index (an entry about every 4,096 bytes) finds the place. segment.bytes
+    and segment.ms; whole files only, so old records can outlive their limit. A check: offset 103."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        return [FadeOut(self.lab.pop(k)) for k in keys if k in self.lab]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def head(self, s, color=GREY_B):
+        return self.put("head", left_at(T(s, 22, color), LX0, ROW_Y + SEG_H / 2 + 0.35))
+
+    def query(self, s):
+        return self.put("q", chip(s, YELLOW_M, 24).move_to([0, TOP_Y, 0]))
 
     def construct(self):
-        self.title_card("Segments, retention and compaction", "how a broker deletes from a log it only appends to")
+        self.capm = None
+        self.lab = {}
+        self.title_card("How does a log forget?", "a chain of files called segments")
 
-        title = T("card-auths topic, partition 0: one big file", 20, GREY_B).move_to([-6.05, 3.25, 0], aligned_edge=LEFT)
-        bars = {"b": bar(0.01)}
-        strips = []
-        cnt = {}
-
-        def day(d):
-            new = [strip(bx(3 * d + i)) for i in range(3)]
-            strips.extend(new)
-            sz = ["260 GB", "520 GB", "780 GB", "1 TB", "1.3 TB", "1.6 TB", "1.8 TB"][d]
-            c = T(f"{d + 1} day{'s' if d else ''}: {sz}", 22, WHITE).move_to([4.4, SY, 0])
-            out = [Transform(bars["b"], bar(3 * d + 3)), LaggedStart(*[FadeIn(s, shift=0.1 * LEFT) for s in new], lag_ratio=0.3)]
-            if d == 0:
-                cnt["m"] = c
-                return out + [FadeIn(c)]
-            return out + [Transform(cnt["m"], c)]
-
-        old = VGroup()
-        oldl = T("oldest day", 18, RED_M).move_to([bx(1), NY, 0])
-        self.steps("A busy payments partition takes about 260 gigabytes a day. "
-                   "After seven days, the oldest records must go.", [
-            (lambda: [FadeIn(title), FadeIn(bars["b"])], 0.5),
-            *[(lambda d=d: day(d), 0.5) for d in range(7)],
-            "the oldest records",
-            (lambda: [*[s.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.45), 1) for s in strips[:3]], FadeIn(oldl)], 0.7),
+        # ---------------- scene 1: the café's notebooks, and the question ----------------
+        segs = [seg_box(k, GOLD_M) for k in range(4)]
+        nbl = [nb_label(k) for k in range(4)]
+        fills = [fill_bar(k, 1.0, GOLD_M) for k in range(3)] + [fill_bar(3, 0.4, GOLD_M)]
+        self.steps("Picture a café that writes every order in a notebook. When a notebook fills, the owner shelves it and starts a new one.", [
+            (lambda: [FadeIn(segs[0]), FadeIn(nbl[0]), GrowFromEdge(fills[0], LEFT)], 1.0),
+            "When a notebook fills",
+            (lambda: [LaggedStart(*[AnimationGroup(FadeIn(segs[k], shift=0.2 * RIGHT), FadeIn(nbl[k], shift=0.2 * RIGHT),
+                                                   GrowFromEdge(fills[k], LEFT)) for k in (1, 2, 3)], lag_ratio=0.5)], 2.0),
+        ])
+        self.steps("Each Monday, she throws out every notebook whose last order is over a week old.", [
+            "throws out",
+            (lambda: [glow(segs[0], RED_M, 1.04), *self.cap("each Monday: out with every notebook whose last order is over a week old")], 0.9),
+        ])
+        big = RoundedRectangle(corner_radius=0.12, width=RX1 - LX0, height=SEG_H, stroke_color=SEGC, stroke_width=3)
+        big.set_fill(fillc(SEGC), 1).move_to([(LX0 + RX1) / 2, ROW_Y, 0])
+        self.steps("Kafka, the program that keeps logs of records for other programs to read, has the owner's problem. A log only grows.", [
+            (lambda: [*self.uncap(), *[FadeOut(m) for m in segs + nbl + fills]], 0.7),
+            (lambda: [FadeIn(big), *self.head("one partition of a log: one file")], 0.8),
+            "A log only grows",
+            (lambda: [glow(big, TEAL_M, 1.02)], 0.9),
+        ])
+        self.steps("At 3,000 payments a second, about 1 KB each, that's 3 MB a second. About 260 GB a day, and 1.8 TB a week. "
+                   "How do you delete the front of something that only grows?", [
+            (lambda: self.cap("3,000 payments a second x 1 KB = 3 MB a second"), 0.5),
+            "About 260",
+            (lambda: [*self.cap("about 260 GB a day; about 1.8 TB a week"),
+                      *self.put("size", T("1.8 TB", 30).move_to(big))], 0.7),
+            "How do you delete",
+            (lambda: self.cap("how do you delete the front?", YELLOW_M), 0.5),
         ])
 
-        cutx = (bx(2) + bx(3)) / 2
-        endx = bars["b"].get_right()[0]
-        cut0 = DashedLine([cutx, SY - 0.72, 0], [cutx, SY + 0.58, 0], dash_length=0.07, stroke_width=3, color=RED_M)
-        cut1 = DashedLine([endx + 0.12, SY - 0.72, 0], [endx + 0.12, SY + 0.72, 0], dash_length=0.07, stroke_width=3, color=GREEN_M)
-        lab0 = VGroup(tick(False, 0.16), T("can't cut at the start", 18, RED_M)).arrange(RIGHT, buff=0.14)
-        lab0.next_to([cutx, STY - 0.06, 0], RIGHT, buff=0.18)
-        lab1 = VGroup(tick(True, 0.16), T("cheap to cut at the end", 18, GREEN_M)).arrange(RIGHT, buff=0.14)
-        lab1.next_to([endx + 0.12, STY - 0.06, 0], RIGHT, buff=0.18)
-        CY = -1.6
-        copybar = bar(18, CY)
-        copies = [strip(bx(j), CY) for j in range(18)]
-        cost = chip("copy 1.5 TB, every day", RED_M, 20).move_to([4.4, CY, 0])
-        self.steps("One big file won't do. A file system can cut a file short only at its end, "
-                   "so dropping the oldest day means copying the other one and a half terabytes, every day.", [
-            "A file system",
-            (lambda: [Create(cut1), FadeIn(lab1)], 0.7),
-            "only at its end",
-            (lambda: [Create(cut0), FadeIn(lab0)], 0.7),
-            "so dropping",
-            (lambda: [FadeIn(copybar)], 0.4),
-            (lambda: [LaggedStart(*[FadeIn(c, shift=0.25 * DOWN) for c in copies], lag_ratio=0.08),
-                      FadeIn(cost, shift=0.1 * UP)], 2.0),
+        # ---------------- scene 2: one big file, broken ----------------
+        fw = (RX1 - LX0) * 260 / 1800
+        front = Rectangle(width=fw, height=SEG_H - 0.1, stroke_width=0).set_fill(RED_M, 0.35).move_to([LX0 + fw / 2, ROW_Y, 0])
+        front_l = T("oldest 260 GB", 18, RED_M).move_to([LX0 + fw / 2, ROW_Y - SEG_H / 2 - 0.3, 0])
+        self.steps("The simplest idea: keep the log in one big file, and cut the oldest part off the front.", [
+            (lambda: [*self.cap("the simplest idea: one big file, cut off the front", PURPLE_M)], 0.5),
+            "cut the oldest",
+            (lambda: [FadeIn(front), FadeIn(front_l)], 0.7),
+        ])
+        endcut = DashedLine([RX1 - 0.5, ROW_Y + 1.0, 0], [RX1 - 0.5, ROW_Y - 1.0, 0], dash_length=0.08, stroke_width=3, color=GREEN_M)
+        startcut = DashedLine([LX0 + fw, ROW_Y + 1.0, 0], [LX0 + fw, ROW_Y - 1.0, 0], dash_length=0.08, stroke_width=3, color=RED_M)
+        self.steps("Here's the catch. A file system, the part of the computer that keeps files on disk, can cut a file short at its end "
+                   "for almost nothing. It can't cut at the start.", [
+            "can cut a file short",
+            (lambda: [Create(endcut), *self.cap("cut at the end: almost free", GREEN_M)], 0.6),
+            "It can't",
+            (lambda: [Create(startcut), *self.cap("cut at the start: not possible", RED_M)], 0.6),
+        ])
+        copy = Rectangle(width=RX1 - LX0 - fw, height=0.7, stroke_color=YELLOW_M, stroke_width=2.5).set_fill(fillc(YELLOW_M), 1)
+        copy.move_to([(LX0 + fw + RX1) / 2, -0.6, 0])
+        copy_l = T("a new file: copy the other 1.5 TB", 20, YELLOW_M).move_to(copy)
+        self.steps("So to drop the oldest 260 GB from a 1.8 TB file, you'd copy the other 1.5 TB into a new file. Every day.", [
+            "you'd copy",
+            (lambda: [GrowFromEdge(copy, LEFT), FadeIn(copy_l)], 1.6),
+            "Every day",
+            (lambda: [*self.cap("every day", RED_M, 30), glow(copy, RED_M, 1.02)], 0.7),
+        ])
+        self.steps("That's tearing out page one of a notebook by copying every other page into a new notebook. By hand. Every morning. "
+                   "So deleting has to mean throwing away whole files.", [
+            "So deleting",
+            (lambda: self.cap("deleting must mean throwing away whole files", YELLOW_M), 0.6),
         ])
 
-        segs = [seg(0), seg(1), seg(2, BLUE_M)]
-        names = [fname(s) for s in range(4)]
-        title2 = T("card-auths topic, partition 0: a chain of segments", 20, GREY_B).move_to(title, aligned_edge=LEFT)
-        slot = [(0, i) for i in range(8)] + [(1, i) for i in range(8)] + [(2, i) for i in range(5)]
-
-        def split():
-            return [ReplacementTransform(bars["b"], VGroup(*segs)), Transform(title, title2),
-                    *[s.animate.move_to([sx(a, i), SY, 0]).set_stroke(TEAL_M).set_fill(fillc(TEAL_M, 0.45), 1)
-                      for s, (a, i) in zip(strips, slot)]]
-
-        self.steps("So the broker cuts the log into a chain of files called segments, each named after its first record's offset.", [
-            (lambda: [FadeOut(VGroup(copybar, *copies, cost, cut0, cut1, lab0, lab1, oldl, cnt["m"]))], 0.6),
-            (lambda: split(), 1.3),
-            "each named",
-            (lambda: [LaggedStart(*[FadeIn(names[s], shift=0.1 * DOWN) for s in range(3)], lag_ratio=0.3)], 1.0),
-            (lambda: [*[glow(names[s], WHITE, 1.08) for s in range(3)]], 0.7),
+        # ---------------- scene 3: the café's answer, mapped ----------------
+        segs = [seg_box(k) for k in range(4)]
+        fills = [fill_bar(k, 1.0) for k in range(3)] + [fill_bar(3, 88 / 104, GOLD_M)]
+        self.steps("The café already solved this: many notebooks, not one. Only the newest takes new orders. "
+                   "When it's full, it goes on the shelf, and nobody writes in it again.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(front, front_l, endcut, startcut, copy, copy_l)), *self.drop("size")], 0.6),
+            (lambda: [ReplacementTransform(big, VGroup(*segs)), *self.head("one partition: a chain of files")], 1.0),
+            "Only the newest",
+            (lambda: [segs[3].animate.set_stroke(GOLD_M), GrowFromEdge(fills[3], LEFT)], 0.7),
+            "When it's full",
+            (lambda: [LaggedStart(*[GrowFromEdge(f, LEFT) for f in fills[:3]], lag_ratio=0.3)], 1.0),
+        ])
+        bin_x = tick(False, 0.2).move_to([SEG_CX[0], ROW_Y, 0])
+        self.steps("And throwing out the oldest costs one trip to the bin, however thick the notebook is.", [
+            "one trip",
+            (lambda: [VGroup(segs[0], fills[0]).animate.set_opacity(0.15), Create(bin_x)], 0.8),
+            1.0,
+            (lambda: [VGroup(segs[0], fills[0]).animate.set_opacity(1), FadeOut(bin_x)], 0.5),
+        ])
+        fl = [file_label(k) for k in range(4)]
+        self.steps("Kafka does the same. Each notebook is a file called a segment. The one taking new records is the active segment.", [
+            "Each notebook",
+            (lambda: [LaggedStart(*[FadeIn(f[0]) for f in fl], lag_ratio=0.15), *self.cap("notebook = segment, one file", SEGC)], 1.0),
+            "the active segment",
+            (lambda: [FadeIn(fl[3][2]), *self.cap("the newest: the active segment", GOLD_M), glow(segs[3], GOLD_M, 1.04)], 0.8),
+        ])
+        self.steps("Closing a full one and opening a new one is called rolling. A closed segment never changes. "
+                   "And deleting old data means deleting old files, which costs almost nothing.", [
+            "called rolling",
+            (lambda: [*self.cap("full: close it, open a new one. That's rolling."), LaggedStart(*[FadeIn(f[2]) for f in fl[:3]], lag_ratio=0.2)], 0.9),
+            "never changes",
+            (lambda: [LaggedStart(*[glow(s, GREY_A, 1.03) for s in segs[:3]], lag_ratio=0.2)], 1.0),
+            "deleting old data",
+            (lambda: self.cap("deleting old data: deleting old files", GREEN_M), 0.6),
         ])
 
-        act = T("active", 18, BLUE_M).move_to([SX[2], STY, 0])
-        more = [strip(sx(2, i)) for i in range(5, 8)]
-        seg3 = seg(3, BLUE_M)
-        s3 = [strip(sx(3, i)) for i in range(7)]
-        closed = [under(s, "closed") for s in range(3)]
-        self.steps("Only the newest, the active segment, takes appends. When it's full, the broker closes it and starts the next. "
-                   "Closed segments never change.", [
-            (lambda: [FadeIn(act), glow(segs[2], BLUE_M, 1.03)], 0.7),
-            "takes appends",
-            (lambda: [LaggedStart(*[FadeIn(s, shift=0.15 * LEFT) for s in more], lag_ratio=0.4)], 1.0),
-            "the broker closes",
-            (lambda: [segs[2].animate.set_stroke(WHITE)], 0.5),
-            "starts the next",
-            (lambda: [FadeIn(seg3), FadeIn(names[3], shift=0.1 * DOWN), act.animate.move_to([SX[3], STY, 0])], 0.7),
-            (lambda: [LaggedStart(*[FadeIn(s, shift=0.15 * LEFT) for s in s3], lag_ratio=0.25)], 1.2),
-            "Closed segments",
-            (lambda: [*[FadeIn(c) for c in closed], *[glow(segs[s], WHITE, 1.03) for s in range(3)]], 0.9),
+        # ---------------- scene 4: the lab's segments ----------------
+        self.steps("Here's a small log from the lesson's lab: 400 records of 10 KB each, in segments of 1 MiB, a little more than a megabyte. "
+                   "About 104 records fit in each.", [
+            (lambda: self.cap("the lab: 400 records of 10 KB, segments of 1 MiB"), 0.6),
+            "About 104",
+            (lambda: [*self.cap("104 records fit in each"), LaggedStart(*[Indicate(f[2], color=WHITE) for f in fl[:3]], lag_ratio=0.2)], 1.0),
         ])
-        strips = strips + more
-        expired = strips[:19]          # offsets 0 to 249: all of 0 and 104, the first three strips of 208
-
-        leg = VGroup(strip(0, 0, RED_M), T("older than 7 days", 18, GREY_B), strip(0, 0), T("newer", 18, GREY_B))
-        leg.arrange(RIGHT, buff=0.16)
-        leg[2].shift(0.3 * RIGHT)
-        leg[3].shift(0.3 * RIGHT)
-        leg.move_to([-4.0, -2.4, 0])
-        self.steps("Retention lets records older than seven days go: the red ones. "
-                   "But the broker deletes files, so a segment goes only when its newest record has expired.", [
-            "the red ones",
-            (lambda: [LaggedStart(*[s.animate.set_stroke(RED_M).set_fill(fillc(RED_M, 0.45), 1) for s in expired], lag_ratio=0.05),
-                      FadeIn(leg)], 1.2),
-            "deletes files",
-            (lambda: [*[glow(segs[s], WHITE, 1.03) for s in range(3)]], 0.8),
-            "its newest record",
-            (lambda: [*[glow(strips[8 * s + 7], YELLOW_M, 1.25) for s in range(3)]], 1.0),
+        self.steps("Each segment is named after the offset of its first record, its base offset, padded with zeros to 20 digits. "
+                   "So: 0, 104, 208, and the active one, 312, holding the last 88.", [
+            "Each segment is named",
+            (lambda: [*self.cap("base offset: the first record's offset, in the file's name", YELLOW_M),
+                      LaggedStart(*[Indicate(f[0], color=YELLOW_M, scale_factor=1.1) for f in fl], lag_ratio=0.2)], 1.2),
+            "So: 0",
+            (lambda: [LaggedStart(*[FadeIn(f[1], shift=0.1 * UP) for f in fl], lag_ratio=0.35)], 1.6),
+            "holding the last",
+            (lambda: [glow(segs[3], GOLD_M, 1.04)], 0.7),
         ])
 
-        exp0, exp1 = under(0, "newest expired", RED_M), under(1, "newest expired", RED_M)
-        keep = under(2, "newest is fresh: keep", TEAL_M)
-        self.steps("Every five minutes it checks from the oldest. Segments 0 and 104 have expired. "
-                   "208's newest record is fresh, so the check stops.", [
-            "Segments 0",
-            (lambda: [glow(strips[7], YELLOW_M, 1.3), Transform(closed[0], exp0)], 0.7),
-            (lambda: [glow(strips[15], YELLOW_M, 1.3), Transform(closed[1], exp1)], 0.7),
-            "208's newest",
-            (lambda: [glow(strips[23], YELLOW_M, 1.3), Transform(closed[2], keep)], 0.8),
+        # ---------------- scene 5: predict which file ----------------
+        self.steps("Now a reader asks for offset 230. Which file does the broker open? Pause and guess.", [
+            (lambda: [*self.uncap(), *self.query("read offset 230")], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("which file?", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        marks = [tick(True, 0.14).move_to([SEG_X0[k] + SEG_W - 0.22, ROW_Y + SEG_H / 2 - 0.2, 0]) for k in range(3)]
+        no = tick(False, 0.13).move_to([SEG_X0[3] + SEG_W - 0.22, ROW_Y + SEG_H / 2 - 0.2, 0])
+        pick = Arrow([0, TOP_Y - 0.35, 0], [SEG_CX[2], ROW_Y + SEG_H / 2 + 0.05, 0], buff=0.05, stroke_width=3, color=YELLOW_M,
+                     max_tip_length_to_length_ratio=0.12)
+        self.steps("208. The broker keeps its files sorted by base offset, and picks the largest one at or below 230. "
+                   "312 is too high. 208 is the one.", [
+            (lambda: [*self.uncap(), Indicate(fl[2][1], color=YELLOW_M, scale_factor=1.2)], 0.6),
+            "picks the largest",
+            (lambda: [LaggedStart(*[Create(m) for m in marks], lag_ratio=0.3), *self.cap("the largest base offset at or below 230")], 1.0),
+            "312 is too high",
+            (lambda: [Create(no)], 0.5),
+            "208 is the one",
+            (lambda: [GrowArrow(pick), glow(segs[2], YELLOW_M, 1.04), FadeOut(VGroup(*marks)), FadeOut(no)], 0.8),
         ])
 
-        mk = marker(sx(0, 0), 0)
-        gone = VGroup(segs[0], segs[1], *strips[:16], names[0], names[1], closed[0], closed[1])
-        self.steps("Both files are deleted whole, and the first readable offset jumps from 0 to 208.", [
-            (lambda: [FadeIn(mk, shift=0.1 * UP)], 0.5),
-            (lambda: [segs[0].animate.set_stroke(RED_M), segs[1].animate.set_stroke(RED_M)], 0.4),
-            (lambda: [FadeOut(gone, shift=0.2 * DOWN)], 0.9),
-            "jumps from",
-            (lambda: [Transform(mk, marker(sx(2, 0), 208))], 1.0),
+        # ---------------- scene 6: inside the file ----------------
+        strip = Rectangle(width=STRIP_X1 - STRIP_X0, height=0.7, stroke_color=SEGC, stroke_width=2.5).set_fill(fillc(SEGC), 1)
+        strip.move_to([(STRIP_X0 + STRIP_X1) / 2, STRIP_Y, 0])
+        zl = VGroup(DashedLine(segs[2].get_corner(DL), [STRIP_X0, STRIP_Y + 0.35, 0], dash_length=0.08, stroke_width=1.5, color=GREY_C),
+                    DashedLine(segs[2].get_corner(DR), [STRIP_X1, STRIP_Y + 0.35, 0], dash_length=0.08, stroke_width=1.5, color=GREY_C))
+        strip_l = M("00000000000000000208.log", 16, GREY_A).move_to(strip.get_center() + [2.3, 0, 0])
+        self.steps("But a segment can be 1 GiB. Reading it from the start, at 2 GB a second, takes half a second for one lookup.", [
+            (lambda: [Create(zl), FadeIn(strip), FadeIn(strip_l)], 0.9),
+            "Reading it from the start",
+            (lambda: [*self.cap("from the start: 1 GiB at 2 GB a second, half a second", RED_M)], 0.5),
+            (lambda: [Succession(FadeIn(sweep := Line([STRIP_X0, STRIP_Y + 0.42, 0], [STRIP_X0, STRIP_Y - 0.42, 0], stroke_width=5, color=RED_M), run_time=0.1),
+                                 sweep.animate(run_time=2.4, rate_func=linear).move_to([STRIP_X1, STRIP_Y, 0]),
+                                 FadeOut(sweep, run_time=0.2))], 2.7),
+        ])
+        ticks = VGroup(*[Line([x, STRIP_Y + 0.35, 0], [x, STRIP_Y + 0.6, 0], stroke_width=3, color=TEAL_M)
+                         for x in np.linspace(STRIP_X0 + 0.35, STRIP_X1 - 0.35, 16)])
+        idx_l = T(".index: an entry about every 4,096 bytes", 20, TEAL_M).move_to([0, STRIP_Y - 0.65, 0])
+        self.steps("So next to each .log file sits a .index file. It maps offsets to byte positions in the file, "
+                   "like the index at the back of a book.", [
+            (lambda: [*self.uncap(), LaggedStart(*[Create(t) for t in ticks], lag_ratio=0.08)], 1.4),
+            "like the index",
+            (lambda: [*self.cap("offset to byte position, like the index at the back of a book", TEAL_M)], 0.6),
+        ])
+        self.steps("It's sparse: an entry about every 4,096 bytes, not one per record, so it's small enough to keep in memory.", [
+            (lambda: [FadeIn(idx_l, shift=0.1 * UP), *self.cap("sparse: small enough to keep in memory", TEAL_M)], 0.7),
+        ])
+        k_near = 4
+        tx = ticks[k_near].get_start()[0]
+        hop = Arrow([tx - 1.0, STRIP_Y + 0.95, 0], [tx, STRIP_Y + 0.62, 0], buff=0, stroke_width=4, color=YELLOW_M, max_tip_length_to_length_ratio=0.3)
+        tgt_x = tx + 0.42
+        scan = Line([tx, STRIP_Y, 0], [tgt_x, STRIP_Y, 0], stroke_width=8, color=YELLOW_M)
+        t230 = VGroup(Line([tgt_x, STRIP_Y + 0.35, 0], [tgt_x, STRIP_Y - 0.35, 0], stroke_width=3, color=YELLOW_M),
+                      T("230", 22, YELLOW_M).move_to([tgt_x + 0.38, STRIP_Y, 0]))
+        self.steps("The broker looks up 230 in the index, jumps to the nearest entry at or below it, and reads forward a few kilobytes. "
+                   "A third file, the time index, does the same for times.", [
+            "jumps to",
+            (lambda: [GrowArrow(hop), *self.cap("jump to the nearest entry at or below 230", YELLOW_M)], 0.7),
+            "and reads forward",
+            (lambda: [Create(scan), *self.cap("read forward a few kilobytes", YELLOW_M)], 0.8),
+            (lambda: [FadeIn(t230)], 0.4),
+            "A third file",
+            (lambda: self.cap(".timeindex: the same, for times"), 0.5),
         ])
 
-        still = chip("208 to 249: past 7 days, still readable", RED_M, 18).move_to([2.6, -2.4, 0])
-        self.steps("Records 208 to 249 are past seven days but still readable, since they share a file with fresh ones. "
-                   "Seven days is a minimum.", [
-            (lambda: [*[glow(s, YELLOW_M, 1.25) for s in strips[16:19]], FadeIn(still, shift=0.1 * UP)], 1.0),
-            "since they share",
-            (lambda: [glow(segs[2], WHITE, 1.03)], 0.9),
-            "Seven days is",
-            (lambda: [glow(still[0], RED_M, 1.04)], 0.8),
+        # ---------------- scene 7: when it rolls, and the catch ----------------
+        zoom = VGroup(zl, strip, strip_l, ticks, idx_l, hop, scan, t230)
+        sb = chip("segment.bytes: 1 GiB (default)", SEGC, 22, mono=False).move_to([-3.2, -0.9, 0])
+        sm = chip("segment.ms: 7 days (default)", SEGC, 22, mono=False).move_to([3.2, -0.9, 0])
+        self.steps("Two settings decide when the active segment rolls. segment.bytes, 1 GiB by default: roll before the file grows past it.", [
+            (lambda: [FadeOut(zoom), FadeOut(pick), *self.drop("q"), *self.uncap()], 0.6),
+            (lambda: [glow(segs[3], GOLD_M, 1.04)], 0.7),
+            "segment.bytes",
+            (lambda: [FadeIn(sb, shift=0.1 * UP), *self.cap("roll before the file would grow past 1 GiB")], 0.6),
+        ])
+        self.steps("segment.ms, 7 days: roll if the segment is older than that when a new record arrives.", [
+            (lambda: [FadeIn(sm, shift=0.1 * UP), *self.cap("or: older than 7 days when a new record arrives")], 0.6),
+        ])
+        self.steps("And the catch. Deleting means whole files only. Remember the owner who keeps orders for a week? "
+                   "A notebook that also holds last Thursday's orders stays on the shelf.", [
+            (lambda: [FadeOut(sb), FadeOut(sm), *self.cap("deleting: whole files only", RED_M)], 0.6),
+            "Remember the owner",
+            (lambda: [*self.head("the café's notebooks", GOLD_M), *[s.animate.set_stroke(GOLD_M) for s in segs]], 0.7),
+            "A notebook that also",
+            (lambda: [glow(segs[0], GOLD_M, 1.04), *self.cap("one old order and last Thursday's: the notebook stays")], 0.8),
+        ])
+        self.steps("So an inspector can find a twelve-day-old order there, and the rule wasn't broken. "
+                   "Kafka keeps records the same way: often longer than you asked. The next section shows it.", [
+            "twelve-day-old",
+            (lambda: [*self.cap("a twelve-day-old order, rule not broken", GOLD_M)], 0.6),
+            "Kafka keeps",
+            (lambda: [*self.head("one partition: a chain of files"), *[s.animate.set_stroke(SEGC) for s in segs[:3]],
+                      segs[3].animate.set_stroke(GOLD_M), *self.cap("records live at least as long as you asked, often longer")], 0.8),
         ])
 
-        # ---- compaction --------------------------------------------------------------------------------------------
-        title3 = T("card-status topic, partition 0", 20, GREY_B).move_to(title, aligned_edge=LEFT)
-        cseg = RoundedRectangle(corner_radius=0.14, width=8.8, height=1.7, stroke_color=BLUE_M, stroke_width=3).set_fill(BLACK, 1)
-        cseg.move_to([-1.6, RY, 0])
-        clab = T("active segment", 18, BLUE_M).move_to([-1.6, RY + 1.15, 0])
-        data = [("card-1", "active", GREEN_M), ("card-2", "active", GREEN_M), ("card-1", "frozen", BLUE_M),
-                ("card-3", "active", GREEN_M), ("card-1", "active", GREEN_M), ("card-2", "null", RED_M)]
-        recs = [record(k, *d) for k, d in enumerate(data)]
-        rest = VGroup(segs[2], seg3, *strips[16:], *s3, names[2], names[3], closed[2], act, mk, still, leg)
-        self.steps("Some topics hold state. Each card-status record gives a card's latest status, "
-                   "and services replay them to rebuild a map.", [
-            (lambda: [FadeOut(rest)], 0.8),
-            (lambda: [Transform(title, title3), FadeIn(cseg), FadeIn(clab)], 0.7),
-            "Each card-status",
-            (lambda: [LaggedStart(*[FadeIn(r, shift=0.2 * LEFT) for r in recs[:5]], lag_ratio=0.35)], 2.2),
+        # ---------------- scene 8: the moral, and a check ----------------
+        self.steps("So: one log, cut into files. New records go only into the active one, closed ones never change, "
+                   "and deleting old data means throwing away whole files.", [
+            (lambda: self.cap("one log, cut into files", YELLOW_M, 28), 0.5),
+            "New records",
+            (lambda: [glow(segs[3], GOLD_M, 1.04)], 0.7),
+            "closed ones",
+            (lambda: [LaggedStart(*[glow(s, GREY_A, 1.03) for s in segs[:3]], lag_ratio=0.2)], 0.9),
+            "and deleting",
+            (lambda: self.cap("delete old data by throwing away whole files", YELLOW_M, 28), 0.5),
         ])
-
-        age = T("unchanged for 3 weeks", 18, RED_M).move_to([rx(3), RY - 1.15, 0])
-        self.steps("Deleting by age would drop a card unchanged for three weeks. You want the last record for each key.", [
-            (lambda: [glow(recs[3][0], RED_M, 1.06), FadeIn(age)], 0.8),
-            "You want",
-            (lambda: [FadeOut(age), recs[0].animate.set_opacity(0.3), recs[2].animate.set_opacity(0.3)], 0.7),
-            (lambda: [*[glow(recs[k][0], YELLOW_M, 1.06) for k in (1, 3, 4)]], 0.9),
-        ])
-
-        tlab = T("tombstone", 18, RED_M).move_to([rx(5), RY - 1.15, 0])
-        self.steps("To delete a card, you append its key with no value. That record is a tombstone.", [
-            (lambda: [FadeIn(recs[5], shift=0.2 * LEFT)], 0.8),
-            (lambda: [recs[1].animate.set_opacity(0.3)], 0.6),
-            "That record",
-            (lambda: [FadeIn(tlab), glow(recs[5][0], RED_M, 1.06)], 0.8),
-        ])
-
-        aseg = RoundedRectangle(corner_radius=0.14, width=1.7, height=1.7, stroke_color=BLUE_M, stroke_width=3).set_fill(BLACK, 1)
-        aseg.move_to([4.1, RY, 0])
-        alab = T("active", 18, BLUE_M).move_to([4.1, RY + 1.15, 0])
-        r6 = record(6, "card-4", "active", GREEN_M, x=4.1)
-        clab2 = T("closed segment", 18, GREY_B).move_to(clab)
-        mbx = RoundedRectangle(corner_radius=0.14, width=4.6, height=2.1, stroke_color=GOLD_M, stroke_width=2.5).set_fill(fillc(GOLD_M, 0.1), 1)
-        mbx.move_to([-1.6, -2.05, 0])
-        mtl = T("log cleaner: last offset per key", 20, GOLD_M).move_to([-1.6, -1.32, 0])
-        rows = [M(f"{k} → {o}", 20).move_to([-1.6, y, 0]) for (k, o), y in zip((("card-1", 4), ("card-2", 5), ("card-3", 3)),
-                                                                              (-1.8, -2.25, -2.7))]
-        self.steps("Once the segment rolls, the log cleaner, a background thread, notes the offset of each key's last record.", [
-            (lambda: [cseg.animate.set_stroke(WHITE), Transform(clab, clab2), FadeIn(aseg), FadeIn(alab)], 0.7),
-            (lambda: [FadeIn(r6, shift=0.2 * LEFT)], 0.6),
-            "the log cleaner",
-            (lambda: [FadeIn(mbx), FadeIn(mtl)], 0.7),
-            "notes the offset",
-            (lambda: [FadeIn(rows[0]), glow(recs[4][0], GOLD_M, 1.06)], 0.6),
-            (lambda: [FadeIn(rows[1]), glow(recs[5][0], GOLD_M, 1.06)], 0.6),
-            (lambda: [FadeIn(rows[2]), glow(recs[3][0], GOLD_M, 1.06)], 0.6),
-        ])
-
-        gap = T("0 to 2: removed", 18, GREY_B).move_to([rx(1), RY, 0])
-        self.steps("Then it rewrites the segment, keeping only those. Offsets never change, so it has gaps.", [
-            (lambda: [*[recs[k][0].animate.set_stroke(RED_M) for k in (0, 1, 2)]], 0.5),
-            (lambda: [FadeOut(VGroup(recs[0], recs[1], recs[2]), scale=0.8)], 0.8),
-            "Offsets never",
-            (lambda: [*[glow(recs[k][0], GREEN_M, 1.06) for k in (3, 4, 5)]], 0.8),
-            "so it has gaps",
-            (lambda: [FadeIn(gap)], 0.6),
-        ])
-
-        kept = T("kept for 1 day", 18, RED_M).move_to(tlab)
-        self.steps("The tombstone stays a day, so every reader sees card-2 go. Then it goes too.", [
-            (lambda: [Transform(tlab, kept), glow(recs[5][0], RED_M, 1.06)], 0.8),
-            "Then it goes",
-            (lambda: [FadeOut(recs[5], scale=0.8), FadeOut(tlab), rows[1].animate.set_opacity(0.3)], 0.8),
-        ])
-
-        f1 = chip("retention: drop old segments whole", TEAL_M, 18).move_to([3.7, -1.55, 0])
-        f2 = chip("compaction: keep each key's last value", GOLD_M, 18).move_to([3.7, -2.45, 0])
-        self.steps("Retention drops whole old segments, "
-                   "and compaction rewrites them to keep each key's last value.", [
-            (lambda: [FadeIn(f1, shift=0.1 * UP)], 0.7),
-            "and compaction",
-            (lambda: [FadeIn(f2, shift=0.1 * UP), *[glow(recs[k][0], GREEN_M, 1.06) for k in (3, 4)]], 0.9),
-        ])
-        self.wait(0.6)
+        self.steps("The file names find the right file, and a small index finds the place inside it.", [
+            (lambda: [LaggedStart(*[Indicate(f[0], color=YELLOW_M, scale_factor=1.1) for f in fl], lag_ratio=0.15),
+                      *self.cap("names find the file; the index finds the place", YELLOW_M, 28)], 1.0),
+        ], after=0.5)
+        self.steps("One quick check. A reader asks for offset 103. Which file does the broker open? Pause and think.", [
+            (lambda: [*self.uncap(), *self.query("read offset 103")], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        pick0 = Arrow([0, TOP_Y - 0.35, 0], [SEG_CX[0], ROW_Y + SEG_H / 2 + 0.05, 0], buff=0.05, stroke_width=3, color=YELLOW_M,
+                      max_tip_length_to_length_ratio=0.12)
+        self.steps("The one named 0. The next file starts at 104, one record later, so 103 is the last record of the first file.", [
+            (lambda: [*self.uncap(), GrowArrow(pick0), glow(segs[0], YELLOW_M, 1.04)], 0.8),
+            "The next file",
+            (lambda: [Indicate(fl[1][1], color=RED_M, scale_factor=1.2)], 0.8),
+            "the last record",
+            (lambda: [Indicate(fl[0][1], color=YELLOW_M, scale_factor=1.2),
+                      *self.cap("103: the last record of file 0", YELLOW_M, 28)], 0.8),
+        ], after=0.3)
+        self.wait(2.0)
