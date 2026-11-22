@@ -1,15 +1,24 @@
 from sfz import *
 
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz"; spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 SAY.insert(0, (r"\bpgactive\b", "P G active"))
-SAY.insert(0, (r"\ball-to-all\b", "all to all"))   # hyphenated, Kokoro runs it into one word
-SAY.insert(0, (r"\bM-0042\b", "M zero zero four two"))
-SAY.insert(0, (r"\b38\.5%", "thirty eight and a half percent"))
-SAY.insert(0, (r"\b12\.5%", "twelve and a half percent"))
+SAY.insert(0, (r"\ball-to-all\b", "all to all"))
+SAY.insert(0, (r"\bpay-81723\b", "pay eight one seven two three"))
 
-EU, US, AP = np.array([-4.3, 1.45, 0]), np.array([4.3, 1.45, 0]), np.array([0, -1.55, 0])
-PW, PH = 4.6, 1.45
-CHIP_W, CHIP_H = 1.25, 0.46
-COL = {"eu": BLUE_M, "us": GOLD_M, "ap": TEAL_M}
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+BW, BH = 3.6, 1.5
+C = {"eu": np.array([-4.3, 1.55, 0]), "us": np.array([4.3, 1.55, 0]), "ap": np.array([0, -1.3, 0])}
+NAME = {"eu": "eu  (Frankfurt)", "us": "us  (Virginia)", "ap": "ap  (Asia)"}
+COL = {"eu": BLUE_M, "us": TEAL_M, "ap": PURPLE_M}
+LINKS = {("eu", "us"): ([-4.3 + BW / 2 + 0.1, 1.55, 0], [4.3 - BW / 2 - 0.1, 1.55, 0]),
+         ("eu", "ap"): ([-3.4, 0.7, 0], [-1.15, -0.45, 0]),
+         ("us", "ap"): ([3.4, 0.7, 0], [1.15, -0.45, 0])}
+DELAY = {("eu", "us"): 40, ("eu", "ap"): 150, ("us", "ap"): 30}
+HELD_C = np.array([3.75, -1.55, 0])
+CLOCK_C = np.array([0, 3.2, 0])
+CAP_Y, BAR_Y = -3.25, -2.75
+STAT = {"AUTHORIZED": GOLD_M, "CAPTURED": GREEN_M, "—": GREY_B}
 
 
 class Base(VoiceScene):
@@ -40,8 +49,8 @@ class Base(VoiceScene):
         return super().remove(*fam)
 
     def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        """Speak one line and play steps inside it. A step is (fn, run_time), built just before it plays; a number
+        waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -65,233 +74,384 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def cap(self, s, color=GREY_B, size=24):
+        return self.put("cap", fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0]))
 
-def leader(name, city, c):
-    col = COL[name]
-    r = RoundedRectangle(corner_radius=0.14, width=PW, height=PH, stroke_color=col, stroke_width=2.5)
-    r.set_fill(interpolate_color(ManimColor("#000000"), ManimColor(col), 0.08), opacity=1).move_to(c)
-    head = VGroup(T(name, 30, col), T(city, 22, GREY_B)).arrange(RIGHT, buff=0.25, aligned_edge=DOWN)
-    head.move_to(c + UP * (PH / 2 - 0.38))
-    return VGroup(r, head)
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
 
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
 
-def row(c, key, value, color=WHITE):
-    """The one row each leader shows: a key on the left, a value on the right."""
-    k = M(key, 20, GREY_B)
-    v = M(value, 20, color)
-    k.move_to(c + DOWN * 0.22 + LEFT * (PW / 2 - 0.3 - k.width / 2))
-    v.move_to(c + DOWN * 0.22 + RIGHT * (PW / 2 - 0.3 - v.width / 2))
-    return VGroup(k, v)
-
-
-def solid_chip(text, color, size=20):
-    t = M(text, size, WHITE)
-    r = RoundedRectangle(corner_radius=0.08, width=t.width + 0.3, height=max(0.46, t.height + 0.24), stroke_color=color, stroke_width=2.5)
-    r.set_fill(interpolate_color(ManimColor("#000000"), ManimColor(color), 0.3), opacity=1)
-    return VGroup(r, t)
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def ext(n, w, h):
-    """Half-extent of a w x h box along unit direction n."""
-    return abs(n[0]) * w / 2 + abs(n[1]) * h / 2
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def side_label(txt, line, sign, along=0.0, gap=0.3):
-    """Put txt beside line, far enough that a message chip sliding along the line never touches it."""
-    a, b = line.get_start(), line.get_end()
-    d = (b - a) / np.linalg.norm(b - a)
-    n = sign * np.array([-d[1], d[0], 0])
-    return txt.move_to((a + b) / 2 + n * (ext(n, CHIP_W, CHIP_H) + gap + ext(n, txt.width, txt.height)) + d * along)
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def inset(line):
-    """The stretch of a line a chip's centre can travel without the chip touching the boxes at its ends."""
-    a, b = line.get_start(), line.get_end()
-    d = (b - a) / np.linalg.norm(b - a)
-    k = ext(d, CHIP_W, CHIP_H) + 0.08
-    return a + d * k, b - d * k
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def edge(a, b):
-    d = (b - a) / np.linalg.norm(b - a)
-    pa = exit_point(Rectangle(width=PW, height=PH).move_to(a), d) + 0.12 * d
-    pb = exit_point(Rectangle(width=PW, height=PH).move_to(b), -d) - 0.12 * d
-    return Line(pa, pb, stroke_width=2.5, color=GREY_C)
+def dot_run(a, b, color=YELLOW_M, rt=0.6, frac=1.0):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    d = Dot(radius=0.09, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, a + frac * (b - a)), rate_func=smooth, run_time=rt),
+                      FadeOut(d, run_time=0.12))
+
+
+def run(ar, color=YELLOW_M, rt=0.6):
+    return dot_run(ar.get_start(), ar.get_end(), color, rt)
+
+
+
+def link_pts(a, b):
+    if (a, b) in LINKS:
+        p, q = LINKS[(a, b)]
+        return np.array(p, dtype=float), np.array(q, dtype=float)
+    p, q = LINKS[(b, a)]
+    return np.array(q, dtype=float), np.array(p, dtype=float)
+
+
+def msg(text, color):
+    return chip(text, color, 14, mono=True).set_z_index(7)
 
 
 class MultiLeader(Base):
-    """repl-05, sections 1-2: all-to-all multi-leader replication, an UPDATE that overtakes its INSERT,
-    and what last write wins does to concurrent edits."""
+    """repl-05, section 1. Three regions, each a leader, every leader sending to every other. Topologies: circle,
+    star, all-to-all; the origin stops echoes; all-to-all's weakness is links of different speeds. pay-81723: eu's
+    INSERT (40 ms to us, 150 ms to ap), us's capture at 45 ms reaches ap at 75 ms, before its insert. pgactive's
+    default discards it: ap AUTHORIZED forever. Timestamps with us's clock 60 ms behind: everyone keeps the insert.
+    Carrying causality ("needs eu: 1") holds the update until the insert lands: all CAPTURED. Version vector, moral,
+    the limit (writes that never saw each other: next) and a check."""
+
+    def status(self, r, s, color=None):
+        m = T("pay-81723: no row", 20, GREY_B)
+        if s != "—":
+            m = VGroup(M("pay-81723", 18, GREY_B), T(s.lower(), 22, color or STAT.get(s, WHITE))).arrange(RIGHT, buff=0.25)
+        return self.put("st" + r, m.move_to(C[r] + [0, -0.25, 0]))
+
+    def clock(self, t):
+        return self.put("clock", chip(f"{t} ms" if isinstance(t, int) else t, YELLOW_M, 24, mono=True).move_to(CLOCK_C))
+
+    def outline(self, r, color):
+        return [self.box[r].animate.set_stroke(color)]
+
+    def send(self, key, text, color, a, b, t0):
+        """Start a message from a to b at time t0 (in ms); it moves when advance() is called."""
+        p0, q0 = link_pts(a, b)
+        p, q = p0 + 0.2 * (q0 - p0), p0 + 0.8 * (q0 - p0)
+        delay = DELAY.get((a, b)) or DELAY.get((b, a))
+        if (a, b) == ("us", "eu"):
+            delay = 40
+        m = msg(text, color).move_to(p)
+        self.msgs[key] = (m, p, q, t0, delay)
+        self.lab["m" + key] = m
+        return [FadeIn(m, scale=0.7)]
+
+    def advance(self, t):
+        out = []
+        for k, (m, p, q, t0, d) in list(self.msgs.items()):
+            f = min(1.0, max(0.0, (t - t0) / d))
+            out.append(m.animate.move_to(p + f * (q - p)))
+        return out + self.clock(t)
+
+    def arrive(self, key):
+        self.msgs.pop(key, None)
+        return self.drop("m" + key)
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def reset(self):
+        out = []
+        for k in list(self.msgs):
+            out += self.arrive(k)
+        out += self.drop("held", "x", "note", "tick_eu", "tick_us", "tick_ap")
+        for r in C:
+            out += self.status(r, "—") + self.outline(r, COL[r])
+        return out + self.clock(0)
 
     def construct(self):
-        self.title_card("Many leaders", "an update that overtakes its insert")
+        self.lab = {}
+        self.msgs = {}
+        self.title_card("The update that arrived first", "three leaders, one payment, two answers")
 
-        eu, us, ap = leader("eu", "Frankfurt", EU), leader("us", "Virginia", US), leader("ap", "Asia Pacific", AP)
-        eu_us, eu_ap, us_ap = edge(EU, US), edge(EU, AP), edge(US, AP)
-        self.steps("A payments company runs a database leader in three regions. Each takes its own customers' writes, "
-                   "and sends every change to the other two.", [
-            (lambda: [LaggedStart(*[FadeIn(p, scale=0.95) for p in (eu, us, ap)], lag_ratio=0.3)], 1.6),
-            "and sends",
-            (lambda: [Create(eu_us), Create(eu_ap), Create(us_ap)], 1.2),
+        # ---------------- scene 1: two answers forever ----------------
+        self.box = {r: RoundedRectangle(corner_radius=0.14, width=BW, height=BH, stroke_color=COL[r], stroke_width=3)
+                    .set_fill(fillc(COL[r]), 1).move_to(C[r]) for r in C}
+        names = {r: T(NAME[r], 22).move_to(C[r] + [0, BH / 2 - 0.35, 0]) for r in C}
+        lines = {k: Line(*v, stroke_width=2.5, color=GREY_C) for k, v in LINKS.items()}
+        self.steps("Three databases, one in Frankfurt, one in Virginia, one in Asia. They all copy each other.", [
+            "Three databases",
+            (lambda: [LaggedStart(*[FadeIn(VGroup(self.box[r], names[r])) for r in C], lag_ratio=0.4)], 1.4),
+            "They all copy",
+            (lambda: [*[Create(l) for l in lines.values()]], 0.8),
+        ])
+        self.steps("Every message arrived. Nothing was lost. And yet, for one card payment, two of them say captured and the third says "
+                   "authorized, and nothing will ever fix it.", [
+            "two of them",
+            (lambda: [*self.status("eu", "CAPTURED"), *self.status("us", "CAPTURED")], 0.6),
+            "the third",
+            (lambda: [*self.status("ap", "AUTHORIZED"), *self.outline("ap", RED_M)], 0.6),
+        ])
+        qm = T("?", 60, YELLOW_M).move_to(CLOCK_C + 0.1 * DOWN)
+        self.steps("How do three careful copies end up disagreeing forever?", [
+            (lambda: [FadeIn(qm, scale=0.6)], 0.6),
+        ], after=0.5)
+
+        # ---------------- scene 2: a leader in every region ----------------
+        self.steps("Here's how we got here. A leader is the one database that takes writes and puts them in order in its log.", [
+            (lambda: [FadeOut(qm), *[a for r in C for a in self.status(r, "—") + self.outline(r, COL[r])],
+                      *[l.animate.set_opacity(0.15) for l in lines.values()]], 0.7),
+            "A leader is",
+            (lambda: [glow(self.box["us"], TEAL_M, 1.03), *self.cap("leader: takes the writes and puts them in order in its log", WHITE)], 0.9),
+        ])
+        self.steps("With customers on three continents, one leader means every card tap crosses an ocean. So each region gets its own leader.", [
+            "every card tap",
+            (lambda: [dot_run(C["eu"] + [BW / 2, 0, 0], C["us"] - [BW / 2, 0, 0], WHITE, 1.0)], 1.0),
+            "So each region",
+            (lambda: [LaggedStart(*[glow(self.box[r], COL[r], 1.03) for r in C], lag_ratio=0.3)], 1.2),
+        ])
+        self.steps("It saves its own customers' writes at once, and sends its log to the others a moment later.", [
+            (lambda: [*self.cap("each region: a leader for its own customers, a follower of the others", WHITE),
+                      *[l.animate.set_opacity(1) for l in lines.values()]], 0.8),
+            "sends its log",
+            (lambda: [dot_run(*link_pts("eu", "us"), YELLOW_M, 0.8), dot_run(*link_pts("eu", "ap"), YELLOW_M, 0.8)], 0.8),
+        ])
+        self.steps("Picture cafés that each keep a copy of the same notebook. Each café writes new lines in its own copy, "
+                   "and phones the others its new lines a little later.", [
+            (lambda: self.cap("cafés, each with a copy of the same notebook", GREY_B), 0.5),
+            "and phones",
+            (lambda: [dot_run(*link_pts("us", "ap"), YELLOW_M, 0.8), dot_run(*link_pts("us", "eu"), YELLOW_M, 0.8)], 0.8),
+        ])
+        self.steps("The notebooks are the databases, each café is a leader, and the phone calls carry the logs.", [
+            (lambda: self.cap("notebook = database      café = leader      phone call = the log, sent", WHITE), 0.6),
+            "phone calls",
+            (lambda: [*[Indicate(l, color=YELLOW_M) for l in lines.values()]], 0.8),
         ])
 
-        l_eu_us = side_label(T("40 ms", 24, GREY_B), eu_us, 1)
-        l_us_ap = side_label(T("30 ms", 24, GREY_B), us_ap, 1, along=-0.5)
-        l_eu_ap = side_label(VGroup(T("150 ms", 24, RED_M), T("slow today", 22, RED_M)).arrange(DOWN, buff=0.08), eu_ap, -1, along=-0.5)
-        self.steps("This is all-to-all replication. Today the link from Europe to Asia is slow: 150 milliseconds.", [
-            (lambda: [FadeIn(l_eu_us), FadeIn(l_us_ap)], 0.8),
-            "Today the link",
-            (lambda: [FadeIn(l_eu_ap), eu_ap.animate.set_color(RED_M)], 0.9),
+        # ---------------- scene 3: who calls whom ----------------
+        circ = VGroup(*[Arrow(*link_pts(a, b), buff=0, stroke_width=4, color=YELLOW_M, max_tip_length_to_length_ratio=0.08)
+                        for a, b in (("eu", "us"), ("us", "ap"), ("ap", "eu"))])
+        self.steps("With three cafés, who calls whom? In a circle, each one passes changes to the next.", [
+            (lambda: [*self.drop("cap"), *[l.animate.set_opacity(0.2) for l in lines.values()]], 0.5),
+            "In a circle",
+            (lambda: [LaggedStart(*[GrowArrow(a) for a in circ], lag_ratio=0.4), *self.cap("a circle", YELLOW_M)], 1.2),
+        ])
+        self.steps("In a star, one hub hears everything and passes it on.", [
+            (lambda: [FadeOut(circ), lines[("eu", "us")].animate.set_opacity(1), lines[("us", "ap")].animate.set_opacity(1),
+                      *self.cap("a star: us is the hub", YELLOW_M)], 0.6),
+            "one hub",
+            (lambda: [glow(self.box["us"], YELLOW_M, 1.04)], 0.9),
+        ])
+        loop = VGroup(*[Line(*link_pts(a, b)) for a, b in (("eu", "us"), ("us", "ap"), ("ap", "eu"))])
+        self.steps("Both forward, so a change could come home and go round forever.", [
+            (lambda: [lines[("eu", "ap")].animate.set_opacity(1), *self.cap("forwarding: a change comes home, and goes round again", RED_M)], 0.4),
+            (lambda: [Succession(*[dot_run(l.get_start(), l.get_end(), RED_M, 0.45) for l in list(loop) * 2])], 2.7),
+        ])
+        org = msg("origin: eu", YELLOW_M).move_to(C["eu"] + [0, -BH / 2 - 0.35, 0])
+        self.steps("So every change carries its origin, where it was first written, and a café drops a change it has already applied.", [
+            "carries its origin",
+            (lambda: [FadeIn(org), *self.cap("every change carries its origin", WHITE)], 0.6),
+            "drops a change",
+            (lambda: [Succession(*[dot_run(l.get_start(), l.get_end(), YELLOW_M, 0.4) for l in loop])], 1.4),
+            (lambda: [*self.put("x", tick(False, 0.15).move_to(C["eu"] + [BW / 2 - 0.35, -BH / 2 + 0.3, 0]))], 0.4),
+        ])
+        self.steps("Circles and stars depend on single cafés: lose the hub, and nobody hears anything.", [
+            (lambda: [FadeOut(org), *self.drop("x"), lines[("eu", "ap")].animate.set_opacity(0.2)], 0.4),
+            "lose the hub",
+            (lambda: [*self.outline("us", RED_M), *self.cap("hub down: nobody hears anything", RED_M),
+                      lines[("eu", "us")].animate.set_opacity(0.2), lines[("us", "ap")].animate.set_opacity(0.2)], 0.7),
+        ])
+        dl = {k: T(t, 20, c) for k, t, c in [(("eu", "us"), "40 ms", GREY_B), (("eu", "ap"), "150 ms (slow today)", RED_M),
+                                              (("us", "ap"), "30 ms", GREY_B)]}
+        dl[("eu", "us")].next_to(lines[("eu", "us")], UP, buff=0.38)
+        dl[("eu", "ap")].move_to([-4.3, -0.35, 0])
+        dl[("us", "ap")].move_to([3.55, -0.2, 0])
+        self.steps("So all-to-all is the usual choice: everyone calls everyone. Its weakness is quieter. The lines run at different speeds.", [
+            (lambda: [*self.outline("us", TEAL_M), *[l.animate.set_opacity(1) for l in lines.values()], *self.cap("all-to-all", WHITE)], 0.6),
+            "different speeds",
+            (lambda: [LaggedStart(*[FadeIn(v) for v in dl.values()], lag_ratio=0.3)], 1.0),
         ])
 
-        # ---- one clock drives every message in flight ------------------------------------------------------
-        clock = ValueTracker(0)
-        cache = {}
+        # ---------------- scene 4: the update that overtakes ----------------
+        self.steps("Two words for a card payment. When you tap, your bank sets the money aside, and the payment is authorized. "
+                   "Later the money really moves, and it's captured.", [
+            (lambda: [*self.cap("authorized: the money is set aside", GOLD_M)], 0.5),
+            "Later the money",
+            (lambda: [*self.cap("captured: the money really moves", GREEN_M)], 0.5),
+        ])
+        self.steps("At 0 ms, Frankfurt inserts payment pay-81723 as authorized, and sends the insert to both others.", [
+            (lambda: [*self.drop("cap"), *self.clock(0)], 0.4),
+            "inserts payment",
+            (lambda: self.status("eu", "AUTHORIZED"), 0.5),
+            "sends the insert",
+            (lambda: [*self.send("i_us", "INSERT", GOLD_M, "eu", "us", 0), *self.send("i_ap", "INSERT", GOLD_M, "eu", "ap", 0)], 0.5),
+        ])
+        self.steps("Virginia gets it at 40 ms, and captures the payment at 45. It sends that update on.", [
+            (lambda: self.advance(40), 1.2),
+            (lambda: [*self.arrive("i_us"), *self.status("us", "AUTHORIZED")], 0.4),
+            "captures",
+            (lambda: [*self.advance(45), *self.status("us", "CAPTURED")], 0.5),
+            "It sends",
+            (lambda: [*self.send("u_ap", "UPDATE", GREEN_M, "us", "ap", 45), *self.send("u_eu", "UPDATE", GREEN_M, "us", "eu", 45)], 0.5),
+        ])
+        self.steps("Asia's line from Virginia takes 30 ms. Its line from Frankfurt takes 150. So what reaches Asia first? Pause and guess.", [
+            "takes 30",
+            (lambda: [Indicate(dl[("us", "ap")], color=WHITE)], 0.6),
+            "takes 150",
+            (lambda: [Indicate(dl[("eu", "ap")], color=RED_M)], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        nsr = T("no such row", 18, RED_M).move_to(C["ap"] + [0, -BH / 2 + 0.22, 0])
+        self.steps("The update, at 75 ms, for a row Asia doesn't have yet.", [
+            (lambda: [*self.drop("cap"), *self.advance(75)], 1.4),
+            (lambda: [*self.put("note", nsr), Indicate(self.lab["mu_ap"], color=RED_M)], 0.5),
+        ])
+        self.steps("pgactive, a free add-on from Amazon that lets several PostgreSQL servers all take writes, "
+                   "documents its default for this case: throw the update away.", [
+            "documents its default",
+            (lambda: [*self.cap("pgactive's default: discard an update for a row it doesn't have", WHITE)], 0.5),
+            "throw the update",
+            (lambda: [*self.put("x", tick(False, 0.2).move_to(self.lab["mu_ap"])), *self.arrive("u_ap")], 0.6),
+        ])
+        self.steps("The insert lands at 150 ms. Asia says authorized, the others say captured, and no message is left on its way to repair it.", [
+            (lambda: [*self.drop("x", "note"), *self.advance(85)], 0.6),
+            (lambda: [*self.arrive("u_eu"), *self.status("eu", "CAPTURED")], 0.4),
+            (lambda: self.advance(150), 1.2),
+            (lambda: [*self.arrive("i_ap"), *self.status("ap", "AUTHORIZED"), *self.outline("ap", RED_M)], 0.5),
+            "no message",
+            (lambda: self.cap("final: eu captured, us captured, ap authorized, for good", RED_M), 0.5),
+        ])
+        self.steps("It's a call saying change that order to blue, about an order nobody has heard of yet. So the café shrugs, and bins it.", [
+            "shrugs",
+            (lambda: [Wiggle(self.box["ap"], scale_value=1.03)], 0.9),
+        ], after=0.5)
 
-        def clock_t():
-            s = f"t = {int(round(clock.get_value()))} ms"
-            if s not in cache:
-                cache[s] = T(s, 30)
-            return cache[s].copy().move_to([0, 3.15, 0])
-        clk = always_redraw(clock_t)
+        # ---------------- scene 5: timestamps, tested ----------------
+        self.steps("You may be thinking: timestamps. Every leader keeps whichever version carries the later time.", [
+            (lambda: self.reset(), 0.7),
+            "keeps whichever",
+            (lambda: self.cap("keep the version with the later time", WHITE), 0.5),
+        ])
+        skew = T("us clock: 60 ms behind", 20, RED_M).move_to(C["us"] + [0, BH / 2 + 0.35, 0])
+        self.steps("But say Virginia's clock runs 60 ms behind Frankfurt's. Then the capture is stamped minus 15, and the insert 0.", [
+            "Virginia's clock",
+            (lambda: [*self.put("skew", skew)], 0.5),
+            "the capture",
+            (lambda: [*self.status("eu", "AUTHORIZED"), *self.send("i_us", "INSERT ts 0", GOLD_M, "eu", "us", 0),
+                      *self.send("i_ap", "INSERT ts 0", GOLD_M, "eu", "ap", 0)], 0.5),
+            (lambda: self.advance(40), 0.8),
+            (lambda: [*self.arrive("i_us"), *self.status("us", "AUTHORIZED"), *self.advance(45)], 0.4),
+            (lambda: [*self.send("u_ap", "UPDATE ts -15", GREEN_M, "us", "ap", 45), *self.send("u_eu", "UPDATE ts -15", GREEN_M, "us", "eu", 45)], 0.5),
+        ])
+        self.steps("Every region keeps the insert, Virginia included, so it ignores its own capture. They agree, on the wrong answer.", [
+            (lambda: [*self.cap("-15 is earlier than 0: keep the insert", WHITE), glow(self.box["us"], RED_M, 1.03)], 0.5),
+            (lambda: self.advance(75), 0.8),
+            (lambda: [*self.arrive("u_ap"), *self.status("ap", "CAPTURED")], 0.4),
+            (lambda: self.advance(85), 0.4),
+            (lambda: [*self.arrive("u_eu")], 0.3),
+            (lambda: self.advance(150), 0.8),
+            (lambda: [*self.arrive("i_ap"), *self.status("ap", "AUTHORIZED")], 0.4),
+            "They agree",
+            (lambda: [*[a for r in C for a in self.outline(r, RED_M)], *self.cap("they agree, on a capture that never happened", RED_M)], 0.6),
+        ])
+        self.steps("A clock is a very confident witness, and that's all it is.", [
+            (lambda: [Indicate(self.lab["clock"], color=RED_M)], 0.9),
+        ], after=0.4)
 
-        def flight(label, color, line, start, dur, reverse=False):
-            c = solid_chip(label, color)
-            pa, pb = inset(line)
-            if reverse:
-                pa, pb = pb, pa
-
-            def upd(m):
-                t = clock.get_value()
-                if start <= t < start + dur:
-                    m.move_to(pa + (pb - pa) * (t - start) / dur)
-                else:
-                    m.move_to([0, 30, 0])
-            c.add_updater(upd)
-            return c
-
-        ins_us = flight("INSERT", BLUE_M, eu_us, 0, 40)
-        ins_ap = flight("INSERT", BLUE_M, eu_ap, 0, 150)
-        upd_ap = flight("UPDATE", GOLD_M, us_ap, 45, 30)
-        upd_eu = flight("UPDATE", GOLD_M, eu_us, 45, 40, reverse=True)
-
-        key = "pay-81723"
-        r_eu = row(EU, key, "AUTHORIZED", BLUE_M)
-        r_us = row(US, key, "no row", GREY_D)
-        r_ap = row(AP, key, "no row", GREY_D)
-        self.steps("At time zero, Europe inserts a payment as authorized, and sends the insert to both.", [
-            (lambda: [FadeIn(clk), FadeIn(r_us), FadeIn(r_ap)], 0.6),
-            (lambda: [FadeIn(r_eu, shift=0.1 * UP)], 0.7),
-            "and sends",
-            (lambda: [*[FadeIn(m) for m in (ins_us, ins_ap, upd_ap, upd_eu)], clock.animate(rate_func=linear).set_value(20)], 1.6),
+        # ---------------- scene 6: say what you'd seen ----------------
+        self.steps("What works is to carry what each change had already seen, instead of the time.", [
+            (lambda: [*self.reset(), *self.drop("skew")], 0.7),
+            "carry what",
+            (lambda: self.cap("carry what each change had seen, not the time", YELLOW_M), 0.5),
+        ])
+        self.steps("Back at the cafés, Virginia's call starts: I've already heard Frankfurt's line 1.", [
+            (lambda: [*self.status("eu", "AUTHORIZED"), *self.send("i_us", "INSERT eu:1", GOLD_M, "eu", "us", 0),
+                      *self.send("i_ap", "INSERT eu:1", GOLD_M, "eu", "ap", 0)], 0.5),
+            (lambda: self.advance(40), 0.8),
+            (lambda: [*self.arrive("i_us"), *self.status("us", "AUTHORIZED"), *self.advance(45)], 0.4),
+            (lambda: [*self.status("us", "CAPTURED"), *self.send("u_ap", "UPDATE needs eu:1", GREEN_M, "us", "ap", 45),
+                      *self.send("u_eu", "UPDATE needs eu:1", GREEN_M, "us", "eu", 45)], 0.5),
+        ])
+        held_box = DashedVMobject(RoundedRectangle(corner_radius=0.1, width=2.7, height=0.7, stroke_color=YELLOW_M, stroke_width=2), num_dashes=40)
+        held_box.move_to(HELD_C)
+        held_t = T("held", 18, YELLOW_M).next_to(held_box, UP, buff=0.1)
+        self.steps("Asia hasn't heard it yet, so it holds the update, and waits.", [
+            (lambda: self.advance(75), 0.9),
+            "holds the update",
+            (lambda: [FadeIn(held_box), FadeIn(held_t), self.lab["mu_ap"].animate.move_to(HELD_C)], 0.6),
+        ])
+        self.msgs.pop("u_ap")
+        self.steps("At 150 ms, the insert arrives. Asia applies it, sees the held update is now ready, and applies that too.", [
+            (lambda: self.advance(85), 0.4),
+            (lambda: [*self.arrive("u_eu"), *self.status("eu", "CAPTURED")], 0.4),
+            (lambda: self.advance(150), 1.0),
+            (lambda: [*self.arrive("i_ap"), *self.status("ap", "AUTHORIZED")], 0.4),
+            "sees the held",
+            (lambda: [self.lab["mu_ap"].animate.move_to(C["ap"]).set_opacity(0)], 0.6),
+            (lambda: [*self.drop("mu_ap"), *self.status("ap", "CAPTURED"), FadeOut(held_box), FadeOut(held_t)], 0.4),
+        ])
+        self.steps("All three say captured, whatever the clocks read. That record, one counter per leader, is called a version vector.", [
+            (lambda: [*[self.put("tick_" + r, tick(True, 0.17).move_to(C[r] + [BW / 2 - 0.3, BH / 2 - 0.3, 0]))[0] for r in C]], 0.7),
+            "version vector",
+            (lambda: self.cap("version vector: one counter per leader, saying what a change had seen", YELLOW_M), 0.6),
         ])
 
-        def setv(r, c, s, color):
-            return Transform(r[1], row(c, key, s, color)[1])
-
-        self.steps("The US gets it at 40 milliseconds, and at 45 it captures the payment: an update to captured.", [
-            (lambda: [clock.animate(rate_func=linear).set_value(40)], 1.2),
-            (lambda: [setv(r_us, US, "AUTHORIZED", BLUE_M)], 0.6),
-            "at 45",
-            (lambda: [clock.animate(rate_func=linear).set_value(45)], 0.6),
-            (lambda: [setv(r_us, US, "CAPTURED", GOLD_M)], 0.8),
+        # ---------------- scene 7: moral, guardrail, check ----------------
+        self.steps("So how did three careful copies disagree forever? A later change took a faster line, and got thrown away.", [
+            (lambda: [*self.cap("a later change took a faster line, and got thrown away", WHITE)], 0.6),
+            "faster line",
+            (lambda: [Indicate(dl[("us", "ap")], color=WHITE)], 0.7),
         ])
-
-        self.steps("It sends the update on. Its link to Asia takes only 30 milliseconds.", [
-            (lambda: [clock.animate(rate_func=linear).set_value(62)], 2.4),
-            "Its link",
-            (lambda: [Indicate(l_us_ap, color=GOLD_M)], 1.0),
+        self.steps("Carry what each change had seen, not what time it was.", [
+            (lambda: self.cap("carry what you'd seen, not what time it was", YELLOW_M, 30), 0.6),
+        ], after=0.5)
+        self.steps("One limit: holding works because the update had seen the insert. Two writes that never saw each other are a harder problem, "
+                   "and that's next.", [
+            (lambda: self.cap("holding works because the update had seen the insert", WHITE), 0.5),
+            "Two writes",
+            (lambda: self.cap("two writes that never saw each other: next", GREY_B), 0.5),
         ])
-
-        miss = T("update for a row it doesn't have", 22, RED_M).next_to(ap, DOWN, buff=0.18)
-        self.steps("So at 75 milliseconds, the update reaches Asia before the insert. Asia has no such row.", [
-            (lambda: [clock.animate(rate_func=linear).set_value(75)], 1.6),
-            "Asia has no",
-            (lambda: [FadeIn(miss), Indicate(r_ap[1], color=RED_M)], 1.0),
-        ])
-
-        drop = T("pgactive's default: discard the update", 22, RED_M).next_to(ap, DOWN, buff=0.18)
-        self.steps("pgactive, an active-active extension for PostgreSQL, discards such an update by default.", [
-            (lambda: [Transform(miss, drop)], 1.0),
-        ])
-
-        bad = T("eu and us: CAPTURED.  ap: AUTHORIZED, for good.", 26, RED_M)
-        self.steps("At 150 milliseconds the insert arrives. Europe and the US say captured. "
-                   "Asia says authorized, and nothing left in flight can repair it.", [
-            (lambda: [clock.animate(rate_func=linear).set_value(85)], 0.6),
-            (lambda: [setv(r_eu, EU, "CAPTURED", GOLD_M)], 0.5),
-            (lambda: [clock.animate(rate_func=linear).set_value(150)], 1.6),
-            (lambda: [setv(r_ap, AP, "AUTHORIZED", RED_M), FadeOut(miss)], 0.6),
-            "Asia says",
-            (lambda: [Indicate(r_ap[1], color=RED_M), ap[0].animate.set_stroke(RED_M)], 1.0),
-        ])
-
-        skew = T("us clock 60 ms behind", 22, RED_M).next_to(us, UP, buff=0.18)
-        self.steps("Timestamps don't help either. If the US clock runs 60 milliseconds behind, the capture gets an earlier stamp than the insert. "
-                   "Keep the later stamp, and every region throws the capture away.", [
-            "If the US clock",
-            (lambda: [FadeIn(skew)], 0.8),
-            "and every region",
-            (lambda: [setv(r_eu, EU, "AUTHORIZED", RED_M), setv(r_us, US, "AUTHORIZED", RED_M)], 1.0),
-        ])
-
-        # ---- last write wins on concurrent edits ------------------------------------------------------------
-        hkey = "M-0042 holds"
-        h_eu = row(EU, hkey, "h-eu", BLUE_M)
-        h_us = row(US, hkey, "h-us", GOLD_M)
-        lww = chip("last write wins", RED_M, 26).move_to([0, 3.15, 0])
-        self.steps("That rule, keep the later stamp, is called last write wins. It also settles two regions editing the same row at once.", [
-            (lambda: [FadeOut(skew), FadeOut(clk), *[FadeOut(r) for r in (r_eu, r_us, r_ap)],
-                      FadeOut(ap), FadeOut(us_ap), FadeOut(eu_ap), FadeOut(l_us_ap), FadeOut(l_eu_ap), FadeOut(l_eu_us)], 1.0),
-            "last write wins",
-            (lambda: [FadeIn(lww, shift=0.15 * DOWN)], 0.8),
-        ])
-
-        st_eu = T("10:00:00.000", 22, GREY_B).next_to(eu, DOWN, buff=0.18)
-        st_us = T("10:00:00.010", 22, GREY_B).next_to(us, DOWN, buff=0.18)
-        ok_eu = tick(True, 0.16).next_to(st_eu, RIGHT, buff=0.2)
-        ok_us = tick(True, 0.16).next_to(st_us, RIGHT, buff=0.2)
-        self.steps("Europe adds hold h-eu to merchant M-0042. Ten milliseconds later, before that crosses the ocean, "
-                   "the US adds hold h-us. Both are told OK.", [
-            (lambda: [FadeIn(h_eu, shift=0.1 * UP), FadeIn(st_eu)], 0.8),
-            "the US adds",
-            (lambda: [FadeIn(h_us, shift=0.1 * UP), FadeIn(st_us)], 0.8),
-            "Both are told",
-            (lambda: [Create(ok_eu), Create(ok_us)], 0.6),
-        ])
-
-        m1 = solid_chip("h-eu  .000", BLUE_M)
-        m2 = solid_chip("h-us  .010", GOLD_M)
-        for f in (ins_us, ins_ap, upd_ap, upd_eu):
-            f.clear_updaters()
-            self.remove(f)
-        a0, a1 = eu_us.get_start(), eu_us.get_end()
-        k = max(m1.width, m2.width) / 2 + 0.2
-        p0, p1 = a0 + RIGHT * k, a1 + LEFT * k
-        m1.move_to(p0 + 0.3 * UP)
-        m2.move_to(p1 + 0.3 * DOWN)
-        lost = T("h-eu is gone, and no error anywhere", 30, RED_M).move_to([0, -0.4, 0])
-        self.steps("The changes cross, and each leader keeps the newer one. "
-                   "Both end with h-us, and hold h-eu is gone, with no error anywhere.", [
-            (lambda: [FadeIn(m1), FadeIn(m2)], 0.4),
-            (lambda: [m1.animate.move_to(p1 + 0.3 * UP), m2.animate.move_to(p0 + 0.3 * DOWN)], 1.6),
-            "Both end with",
-            (lambda: [FadeOut(m1), FadeOut(m2), Transform(h_eu[1], row(EU, hkey, "h-us", GOLD_M)[1])], 0.9),
-            "and hold h-eu",
-            (lambda: [FadeIn(lost, shift=0.15 * UP)], 0.9),
-        ])
-
-        nums = VGroup(T("lab, 20 to 80 ms of lag:", 24, GREY_B),
-                      T("writes 5 s apart: 1% lost", 24), T("300 ms apart: 12.5%", 24), T("50 ms apart: 38.5%", 24, RED_M))
-        nums.arrange(RIGHT, buff=0.45).move_to([0, -2.1, 0])
-        fit(nums, 13.0)
-        self.steps("In the lesson's lab, with writes 50 milliseconds apart, 38.5% of acknowledged holds vanish.", [
-            (lambda: [FadeIn(nums[0]), FadeIn(nums[1]), FadeIn(nums[2])], 1.0),
-            "with writes 50",
-            (lambda: [FadeIn(nums[3], shift=0.15 * UP)], 0.8),
-        ])
-
-        self.steps("With many leaders, a change can arrive before the change it depends on, and a clock can't put them back in order.", [
-            (lambda: [Indicate(lww, color=RED_M)], 1.4),
-        ])
-        self.wait(0.6)
+        applied = T("applied from eu: 1", 18, GREY_B).move_to(C["ap"] + [0, -BH / 2 + 0.22, 0])
+        self.steps("One quick check. An update says: needs Frankfurt's change 2. Asia has applied only change 1. What does Asia do? Pause and think.", [
+            (lambda: [*self.drop("cap", "tick_eu", "tick_us", "tick_ap"), *self.clock("check")], 0.4),
+            "An update says",
+            (lambda: self.send("q", "UPDATE needs eu:2", GREEN_M, "us", "ap", 0), 0.4),
+            (lambda: [self.lab["mq"].animate.move_to(self.msgs["q"][2])], 0.8),
+            "Asia has applied",
+            (lambda: self.put("note", applied), 0.5),
+            "Pause and think",
+            (lambda: [*self.cap("pause and think", YELLOW_M), *self.clock("check")], 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("It holds the update, until Frankfurt's change 2 arrives.", [
+            (lambda: [*self.drop("cap"), FadeIn(held_box), FadeIn(held_t), self.lab["mq"].animate.move_to(HELD_C)], 0.7),
+            "until",
+            (lambda: self.cap("hold it until eu's change 2 arrives", YELLOW_M, 30), 0.5),
+        ], after=0.3)
+        self.wait(2.0)
