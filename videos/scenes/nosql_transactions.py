@@ -1,51 +1,22 @@
 from sfz import *
 
-SAY.insert(0, (r"\bA-1001's\b", "A-10 oh 1's"))
-SAY.insert(0, (r"\bA-1001\b", "A-10 oh 1"))
-SAY.insert(0, (r"\bA-2002\b", "A-20 oh 2"))
-SAY.insert(0, (r"\bT1\b", "T one"))
-SAY.insert(0, (r"\bT2\b", "T two"))
+# Amounts are said the way people say them ("seventy"); captions keep "70.00".
+SAY[0:0] = [
+    (r"\b(\d+)\.00\b", r"\1"),
+    (r"\bA-(\d)00(\d)\b", r"A \1 thousand \2"),
+    (r"\bT(\d)\b", r"T \1"),
+    (r"\bTransactionConflict\b", "Transaction Conflict"),
+]
 
-CALLER = np.array([-4.9, 2.75, 0])
-COORD = np.array([0.0, 2.75, 0])
-LEDGER = np.array([4.9, 2.75, 0])
-TOPW, TOPH = 3.1, 1.1
-NODE = {1: np.array([-3.4, -0.4, 0]), 2: np.array([3.4, -0.4, 0])}
-NW, NH = 4.2, 2.2
-ACCT = {1: "A-1001", 2: "A-2002"}
-TOTAL_Y, NOTE_Y = -2.4, -3.2
-
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0, back=False):
-    """A dot that runs along an arrow (or back along it) and stays invisible until its turn."""
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
-
-
-def lost(path, color, frac=0.55, back=False):
-    """A message that dies partway; returns (animation, point where it died)."""
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    mid = a + frac * (b - a)
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, mid), run_time=0.6),
-                      FadeOut(d, run_time=0.25)), mid
-
-
-def arr(a, b, color=GREY_B):
-    return Arrow(a, b, buff=0, stroke_width=3, color=color, max_tip_length_to_length_ratio=0.08)
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CO_X, CO_Y, CO_W, CO_H = [-5.4, -3.6, -1.8], 2.2, 1.5, 1.0         # the coordinator fleet
+CO_LAB_Y = 3.08
+LG_X, LG_Y, LG_W, LG_H = 3.9, 2.35, 5.0, 1.6                         # the ledger
+NX, NY, NW, NH = [-4.4, 0.0, 4.4], -0.45, 3.8, 2.6                    # three storage nodes
+N_TOP = NY + NH / 2
+ID_Y, OWN_Y, BAL_Y, HELD_Y = 0.52, 0.15, -0.42, -1.25
+BAR_Y, CAP_Y = -2.55, -3.2
+TC = {"T1": BLUE_M, "T2": GOLD_M, "T3": PURPLE_M}
 
 
 class Base(VoiceScene):
@@ -75,7 +46,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.3):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -102,227 +73,388 @@ class Base(VoiceScene):
             self.wait(after)
 
 
-def topbox(title, c, color=WHITE, sub="", scolor=GREY_B):
-    r = RoundedRectangle(corner_radius=0.14, width=TOPW, height=TOPH, stroke_color=color, stroke_width=3)
-    r.set_fill(fillc(color), 1).move_to(c)
-    return VGroup(r, T(title, 26).move_to(c + 0.22 * UP), topsub(c, sub, scolor))
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def topsub(c, s, color=GREY_B):
-    if not s:
-        return T("T1", 20, color).move_to(c + 0.25 * DOWN).set_opacity(0)
-    return T(s, 20, color).move_to(c + 0.25 * DOWN)
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def bal_text(i, s, color=WHITE):
-    c = NODE[i]
-    m = M(s, 28, color)
-    return m.move_to([c[0] + 1.65 - m.width / 2, c[1] + 0.05, 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def nstatus(i, s, color=GREY_B):
-    c = NODE[i]
-    return T(s, 22, color).move_to([c[0], c[1] - 0.64, 0])
+def rbox(cx, cy, w, h, color, a=0.14):
+    return RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(
+        fillc(color, a), 1).move_to([cx, cy, 0])
 
 
-def node(i, bal):
-    c = NODE[i]
-    r = RoundedRectangle(corner_radius=0.14, width=NW, height=NH, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1).move_to(c)
-    title = T(f"storage node {i}", 22, GREY_B).move_to(c + 0.72 * UP)
-    a = M(ACCT[i], 26)
-    a.move_to([c[0] - 1.65 + a.width / 2, c[1] + 0.05, 0])
-    return VGroup(r, title, a, bal_text(i, bal), nstatus(i, "free"))
-
-
-def total(s, color=WHITE):
-    return M(f"A-1001 + A-2002 = {s}", 26, color).move_to([0, TOTAL_Y, 0])
-
-
-def note(s, color=GREY_B):
-    return chip(s, color, 20).move_to([0, NOTE_Y, 0])
+def padlock(at, color=RED_M):
+    body = RoundedRectangle(corner_radius=0.04, width=0.26, height=0.2, stroke_color=color, stroke_width=2.5).set_fill(fillc(color, 0.4), 1)
+    shackle = Arc(radius=0.085, start_angle=0, angle=PI, stroke_color=color, stroke_width=2.5)
+    shackle.next_to(body, UP, buff=-0.01)
+    return VGroup(shackle, body).move_to(at)
 
 
 class NosqlTransactions(Base):
-    """txn-08, section 0: a transfer of 30.00 from A-1001 (100.00) to A-2002 (50.00), in two partitions. Two plain
-    writes lose 30 when the credit times out. A coordinator prepares both items (condition checked, item held), T2
-    holding A-2002 makes that node refuse at once and T1 is cancelled; a retry with the same client token prepares
-    both, the coordinator writes commit in its ledger, then commits both (70.00 and 80.00). A repeat with the same
-    token is answered without writing. The price: two writes per item, and conflicts on busy items."""
+    """txn-08, section 0. A family's second payment comes back at once with "try again". Last lesson's weak spot was
+    waiting on one coordinator. DynamoDB: items in partitions on storage nodes; one request, all or none. The travel
+    agent: holds, no waiting list, a file in a shared cabinet any colleague can finish. T1 and T2 collide on A-1001:
+    three checks at prepare, T2 rejected at once, one no cancels; T1's decision in the ledger; its coordinator dies
+    and another finishes it; two writes per item; T2 retried with the same idempotency key. The rule, limits, check."""
+
+    # --- small state helpers: each returns animations and updates what is on screen ---
+    def cap(self, s, color=GREY_B, size=24):
+        new = T(s, size, color).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def _set(self, store, key, new):
+        old, store[key] = store[key], new
+        if new is None:
+            return [FadeOut(old)] if old is not None else []
+        return [swap(old, new)]
+
+    def node_id(self, n, s, owner):
+        return self._set(self.ids, n, VGroup(M(s, 24).move_to([NX[n], ID_Y, 0]), T(owner, 19, GREY_B).move_to([NX[n], OWN_Y, 0])))
+
+    def bal(self, n, s, color=WHITE):
+        return self._set(self.bals, n, M(s, 34, color).move_to([NX[n], BAL_Y, 0]))
+
+    def held(self, n, t, color=None):
+        """Mark node n as held by transaction t (or free when t is None)."""
+        if t is None:
+            return self._set(self.helds, n, T("free", 19, GREY_B).move_to([NX[n], HELD_Y, 0]))
+        g = VGroup(T("held by", 19, GREY_B), M(t, 20, color or TC.get(t, WHITE))).arrange(RIGHT, buff=0.2)
+        return self._set(self.helds, n, g.move_to([NX[n], HELD_Y, 0]))
+
+    def job(self, c, t):
+        if t is None:
+            return self._set(self.jobs, c, None)
+        return self._set(self.jobs, c, M(t, 20, TC[t]).move_to([CO_X[c], CO_Y - 0.22, 0]))
+
+    def ledger(self, s, color=GREEN_M):
+        if s is None:
+            return self._set(self.lgs, 0, None)
+        return self._set(self.lgs, 0, M(s, 22, color).move_to([LG_X, LG_Y - 0.4, 0]))
+
+    def go(self, c, n, color=YELLOW_M, back=False):
+        """A dot runs from coordinator c to node n (a message), or back (an answer)."""
+        a = np.array([CO_X[c], CO_Y - CO_H / 2, 0])
+        b = np.array([NX[n], N_TOP, 0])
+        if back:
+            a, b = b, a
+        d = Dot(radius=0.08, color=color).move_to(a)
+        return [Succession(FadeIn(d, run_time=0.05), d.animate(run_time=0.5, rate_func=smooth).move_to(b),
+                           FadeOut(d, run_time=0.1))]
+
+    def to_ledger(self, c, color=GREEN_M, back=False):
+        a = np.array([CO_X[c] + CO_W / 2, CO_Y + 0.25, 0])
+        b = np.array([LG_X - LG_W / 2, CO_Y + 0.25, 0])
+        if back:
+            a, b = b, a
+        d = Dot(radius=0.08, color=color).move_to(a)
+        return [Succession(FadeIn(d, run_time=0.05), d.animate(run_time=0.5, rate_func=smooth).move_to(b),
+                           FadeOut(d, run_time=0.1))]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
     def construct(self):
-        self.title_card("Transactions across partitions", "prepare every item, then commit or cancel them all")
+        self.capm = None
+        self.ids, self.bals, self.helds = [None] * 3, [None] * 3, [None] * 3
+        self.jobs = [None] * 3
+        self.lgs = [None]
+        self.title_card("Why didn't my payment wait its turn?", "transactions across machines, with nobody to wait for")
 
-        caller = topbox("wallet service", CALLER)
-        n = {1: node(1, "100.00"), 2: node(2, "50.00")}
-        tot = total("150.00")
-        self.steps("A wallet moves 30 from account A-1001 to A-2002. "
-                   "They live in different partitions, on two storage nodes.", [
-            (lambda: [FadeIn(caller)], 0.6),
-            "They live",
-            (lambda: [FadeIn(n[1], shift=0.1 * UP), FadeIn(n[2], shift=0.1 * UP)], 0.9),
-            (lambda: [FadeIn(tot)], 0.6),
+        # ---------------- scene 1: the hook ----------------
+        acct = VGroup(rbox(0, 0.9, 3.6, 2.0, WHITE, 0.08), T("family account", 22, GREY_B).move_to([0, 1.55, 0]))
+        hb = M("100.00", 44).move_to([0, 0.7, 0])
+        groc = VGroup(T("groceries", 22, GOLD_M), M("50.00", 30, GOLD_M)).arrange(DOWN, buff=0.15).move_to([-4.6, 0.9, 0])
+        bike = VGroup(T("bike repair", 22, BLUE_M), M("30.00", 30, BLUE_M)).arrange(DOWN, buff=0.15).move_to([4.6, 0.9, 0])
+        same = T("the same second", 22, GREY_B).move_to([0, 2.55, 0])
+        self.steps("Picture a family sharing one account in a payments app, with 100.00 in it. "
+                   "Two of them pay at the same second: 50.00 for groceries, and 30.00 for a bike repair.", [
+            (lambda: [FadeIn(acct, shift=0.2 * UP)], 0.7),
+            (lambda: [FadeIn(hb)], 0.4),
+            "Two of them",
+            (lambda: [FadeIn(groc, shift=0.2 * RIGHT), FadeIn(bike, shift=0.2 * LEFT), FadeIn(same)], 0.8),
+        ])
+        ok = VGroup(tick(True, 0.18), T("paid", 22, GREEN_M)).arrange(RIGHT, buff=0.2).next_to(bike, DOWN, buff=0.35)
+        err = VGroup(T("\"someone else is busy with", 21, RED_M), T("this account, try again\"", 21, RED_M)).arrange(DOWN, buff=0.1)
+        err.next_to(groc, DOWN, buff=0.35)
+        self.steps("There's enough for both. The bike repair goes through. The groceries come back at once, "
+                   "with an error: someone else is busy with this account, try again.", [
+            "The bike repair",
+            (lambda: [FadeIn(ok, shift=0.1 * UP), Transform(hb, M("70.00", 44).move_to(hb))], 0.7),
+            "The groceries",
+            (lambda: [FadeIn(err, shift=0.1 * UP)], 0.7),
+        ])
+        self.steps("Why didn't it just wait its turn, like a queue at a counter? Waiting feels fair, and safe.", [
+            (lambda: self.cap("why not wait in line?", WHITE), 0.6),
         ])
 
-        one = note("one partition: one node decides alone")
-        self.steps("In one partition, one node decides alone, so a single write is atomic for free.", [
-            (lambda: [glow(n[1][0], BLUE_M)], 1.0),
-            "so a single write",
-            (lambda: [FadeIn(one, shift=0.1 * UP)], 0.7),
+        # ---------------- scene 2: last lesson's weak spot ----------------
+        nodes = [rbox(NX[n], NY, NW, NH, WHITE, 0.0).set_fill(BLACK, 1) for n in range(3)]
+        cos = [VGroup(rbox(CO_X[c], CO_Y, CO_W, CO_H, PURPLE_M), M(f"C{c + 1}", 20, PURPLE_M).move_to([CO_X[c], CO_Y + 0.25, 0]))
+               for c in range(3)]
+        machine = [T("a machine", 22, GREY_B).move_to([NX[n], ID_Y, 0]) for n in range(2)]
+        locks = [padlock([NX[n] + NW / 2 - 0.35, ID_Y, 0]) for n in range(2)]
+        dead = tick(False, 0.28).move_to(cos[0][0])
+        self.steps("Last lesson, waiting was exactly the weak spot. When one payment touches records on two machines, "
+                   "a coordinator, the program in charge, asks each machine to promise, writes its decision in its log, "
+                   "and then tells them to commit.", [
+            (lambda: [FadeOut(VGroup(acct, hb, groc, bike, same, ok, err)), *self.uncap()], 0.6),
+            "When one payment",
+            (lambda: [FadeIn(nodes[0]), FadeIn(nodes[1]), FadeIn(machine[0]), FadeIn(machine[1])], 0.6),
+            "a coordinator",
+            (lambda: [FadeIn(cos[0])], 0.5),
+            "asks each machine",
+            (lambda: [*self.go(0, 0), *self.go(0, 1)], 0.6),
+            (lambda: [FadeIn(locks[0], scale=0.6), FadeIn(locks[1], scale=0.6), *self.go(0, 0, GREEN_M, True), *self.go(0, 1, GREEN_M, True)], 0.6),
+        ])
+        self.steps("And if the coordinator crashes after the promises, the machines wait, holding their records locked, "
+                   "until that one program comes back. Everyone in the queue waits with them.", [
+            "crashes",
+            (lambda: [Create(dead), cos[0][0].animate.set_stroke(RED_M)], 0.6),
+            "the machines wait",
+            (lambda: [*self.cap("last lesson: one coordinator dies, and everyone waits", RED_M),
+                      locks[0].animate(rate_func=there_and_back).scale(1.6), locks[1].animate(rate_func=there_and_back).scale(1.6)], 0.9),
         ])
 
-        w1 = arr(CALLER + np.array([0.6, -TOPH / 2 - 0.05, 0]), NODE[1] + np.array([-0.9, NH / 2 + 0.08, 0]))
-        w2 = arr(CALLER + np.array([1.1, -TOPH / 2 - 0.05, 0]), NODE[2] + np.array([-1.2, NH / 2 + 0.08, 0]))
-        self.steps("So try two separate writes. First, debit A-1001.", [
-            (lambda: [FadeOut(one)], 0.4),
-            "First, debit",
-            (lambda: [GrowArrow(w1)], 0.5),
-            (lambda: [flow(w1, GOLD_M, 0.7)], 0.7),
-            (lambda: [Transform(n[1][3], bal_text(1, "70.00", GOLD_M))], 0.6),
+        # ---------------- scene 3: DynamoDB ----------------
+        self.steps("Today's database is DynamoDB, Amazon's database service. You store items, records you look up by a key, "
+                   "and Amazon spreads them over many machines.", [
+            (lambda: [FadeOut(dead), FadeOut(locks[0]), FadeOut(locks[1]), cos[0][0].animate.set_stroke(PURPLE_M), *self.uncap()], 0.6),
+            "Amazon spreads",
+            (lambda: [FadeIn(nodes[2])], 0.6),
+        ])
+        self.steps("Each slice of the data is called a partition, and lives on its own machine, a storage node. "
+                   "The family's account is item A-1001. The bike shop is A-2002, and the grocer is A-3003. "
+                   "Three items, three machines.", [
+            "a storage node",
+            (lambda: [*self.cap("a partition: one slice of the data, on its own storage node", WHITE)], 0.5),
+            "The family's",
+            (lambda: [FadeOut(machine[0]), *self.node_id(0, "A-1001", "the family"), *self.bal(0, "100.00"), *self.held(0, None)], 0.6),
+            "The bike shop",
+            (lambda: [FadeOut(machine[1]), *self.node_id(1, "A-2002", "the bike shop"), *self.bal(1, "50.00"), *self.held(1, None)], 0.6),
+            "and the grocer",
+            (lambda: [*self.node_id(2, "A-3003", "the grocer"), *self.bal(2, "0.00"), *self.held(2, None)], 0.6),
+        ])
+        self.steps("DynamoDB takes a list of changes in one request, and applies all of them, or none.", [
+            (lambda: self.cap("one request: a list of changes, all or none", WHITE), 0.6),
         ])
 
-        xs = {}
-
-        def lose():
-            an, pt = lost(w2, GOLD_M, 0.6)
-            xs["c"] = tick(False, 0.18).move_to(pt)
-            return [an]
-
-        self.steps("Then the credit times out. 30 left one account and reached none. The total fell to 120.", [
-            (lambda: [GrowArrow(w2)], 0.4),
-            (lambda: lose(), 0.9),
-            (lambda: [Create(xs["c"])], 0.4),
-            "The total fell",
-            (lambda: [Transform(tot, total("120.00", RED_M))], 0.7),
+        # ---------------- scene 4: the travel agent ----------------
+        lg = VGroup(rbox(LG_X, LG_Y, LG_W, LG_H, GREEN_M), T("ledger", 26, GREEN_M).move_to([LG_X, LG_Y + 0.55, 0]),
+                    T("a table, with copies on several machines", 18, GREY_B).move_to([LG_X, LG_Y + 0.18, 0]))
+        co_lab = T("coordinators: any one can take any transaction", 19, GREY_B).move_to([-3.6, CO_LAB_Y, 0])
+        self.steps("So how does it avoid the waiting? Picture a travel agent booking a flight and a hotel for one trip. "
+                   "She asks each to hold a booking, and a held seat can't go to anyone else.", [
+            (lambda: self.cap("a travel agent: one trip, a flight and a hotel", YELLOW_M), 0.6),
+            "She asks each",
+            (lambda: [*self.go(0, 1), *self.go(0, 2)], 0.6),
+            "a held seat",
+            (lambda: [*self.cap("\"please hold it\"   a held seat goes to nobody else", YELLOW_M)], 0.5),
+        ])
+        self.steps("When both are held, she writes confirmed in the file, and tells both.", [
+            "she writes",
+            (lambda: self.cap("both held: write \"confirmed\" in the file, then tell both", YELLOW_M), 0.6),
+        ])
+        self.steps("Here's the twist. If the seat is already held for another trip, the airline says no at once. No waiting list. "
+                   "And the file sits in a shared cabinet, so if she goes home sick, any colleague can finish the booking.", [
+            "says no at once",
+            (lambda: self.cap("already held for another trip? \"no\", at once", RED_M), 0.6),
+            "shared cabinet",
+            (lambda: self.cap("the file sits in a shared cabinet; any colleague can finish", YELLOW_M), 0.6),
+        ])
+        self.steps("Let's map it. The hold is a prepare. The file is DynamoDB's ledger. And the colleague is another coordinator, "
+                   "because Amazon runs a whole fleet of them, and any one can take any transaction.", [
+            "The hold is",
+            (lambda: self.cap("the hold = prepare,   the file = ledger,   a colleague = another coordinator", WHITE), 0.6),
+            "The file is",
+            (lambda: [FadeIn(lg, shift=0.1 * DOWN)], 0.7),
+            "a whole fleet",
+            (lambda: [FadeIn(cos[1]), FadeIn(cos[2]), FadeIn(co_lab)], 0.7),
+        ])
+        self.steps("The picture breaks on time. A hold lasts a day. Here, the whole thing takes milliseconds.", [
+            (lambda: self.cap("where the picture breaks: a day, against milliseconds"), 0.6),
         ])
 
-        coord = topbox("coordinator", COORD, BLUE_M)
-        cc = arr(CALLER + np.array([TOPW / 2 + 0.1, 0, 0]), COORD + np.array([-TOPW / 2 - 0.1, 0, 0]))
-        self.steps("Try again. DynamoDB gives the transfer, T1, to a coordinator that works in two rounds.", [
-            (lambda: [FadeOut(w1), FadeOut(w2), FadeOut(xs["c"]), Transform(n[1][3], bal_text(1, "100.00")),
-                      Transform(tot, total("150.00"))], 0.8),
-            "DynamoDB gives",
-            (lambda: [FadeIn(coord), GrowArrow(cc)], 0.7),
-            (lambda: [flow(cc, WHITE, 0.6)], 0.6),
-            (lambda: [Transform(coord[2], topsub(COORD, "T1", BLUE_M))], 0.4),
+        # ---------------- scene 5: two payments collide ----------------
+        self.steps("Now the two payments. T1, the bike repair, goes to coordinator one. T2, the groceries, goes to coordinator two.", [
+            (lambda: self.uncap(), 0.3),
+            "T1, the bike",
+            (lambda: [*self.job(0, "T1"), *self.cap("T1: 30.00 to the bike shop     T2: 50.00 to the grocer", WHITE)], 0.6),
+            "T2, the groceries",
+            (lambda: self.job(1, "T2"), 0.6),
         ])
-
-        c1 = arr(COORD + np.array([-0.7, -TOPH / 2 - 0.05, 0]), NODE[1] + np.array([0.9, NH / 2 + 0.08, 0]))
-        c2 = arr(COORD + np.array([0.7, -TOPH / 2 - 0.05, 0]), NODE[2] + np.array([-0.9, NH / 2 + 0.08, 0]))
-        self.steps("Round one, prepare. Node 1 checks that A-1001 holds at least 30 and is free, "
-                   "so it says yes and holds the item for T1. Nothing has changed yet.", [
-            (lambda: [GrowArrow(c1), Transform(coord[2], topsub(COORD, "T1: prepare", BLUE_M))], 0.6),
-            (lambda: [flow(c1, BLUE_M, 0.7)], 0.7),
-            "so it says yes",
-            (lambda: [Transform(n[1][4], nstatus(1, "held for T1", GOLD_M)), n[1][0].animate.set_stroke(GOLD_M)], 0.6),
-            (lambda: [flow(c1, GREEN_M, 0.6, back=True)], 0.6),
+        checks = VGroup(T("1. balance at least 30.00?", 21), T("2. newer than the item's last write?", 21),
+                        T("3. nobody else busy with it?", 21)).arrange(DOWN, buff=0.12, aligned_edge=LEFT)
+        checks.move_to([0, -2.62, 0])
+        self.steps("Phase one is prepare. Coordinator one asks the family's node to check three things. Is the balance at least 30? "
+                   "Is this transaction newer than the item's last write? And is nobody else busy with it?", [
+            (lambda: [*self.uncap(), *self.go(0, 0)], 0.6),
+            "Is the balance",
+            (lambda: [FadeIn(checks[0], shift=0.1 * UP)], 0.4),
+            "Is this transaction",
+            (lambda: [FadeIn(checks[1], shift=0.1 * UP)], 0.4),
+            "And is nobody",
+            (lambda: [FadeIn(checks[2], shift=0.1 * UP)], 0.4),
+        ])
+        self.steps("All three hold, so the node says yes, and notes T1 next to the item. "
+                   "Nothing has changed yet, but the account is now spoken for.", [
+            (lambda: [LaggedStart(*[Indicate(c, color=GREEN_M, scale_factor=1.05) for c in checks], lag_ratio=0.25)], 0.9),
+            "says yes",
+            (lambda: [FadeOut(checks), *self.go(0, 0, GREEN_M, True), *self.held(0, "T1")], 0.7),
             "Nothing has changed",
-            (lambda: [glow(n[1][0], GOLD_M)], 0.9),
+            (lambda: [Indicate(self.bals[0], color=WHITE, scale_factor=1.12)], 0.8),
+        ])
+        self.steps("T2 happens to reach the grocer first, and that node says yes. Then it reaches the family's account, "
+                   "which T1 holds. Does T2 wait in line? Pause and guess.", [
+            "T2 happens",
+            (lambda: self.go(1, 2), 0.6),
+            "that node says yes",
+            (lambda: [*self.go(1, 2, GREEN_M, True), *self.held(2, "T2")], 0.6),
+            "Then it reaches",
+            (lambda: self.go(1, 0), 0.6),
+            "which T1 holds",
+            (lambda: [Indicate(self.helds[0], color=BLUE_M, scale_factor=1.15)], 0.7),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("No. The node rejects it at once. DynamoDB never makes one transaction wait for another's item.", [
+            (lambda: [*self.uncap(), *self.go(1, 0, RED_M, True)], 0.6),
+            (lambda: [self.jobs[1].animate.set_color(RED_M)], 0.4),
+            "never makes",
+            (lambda: self.cap("no waiting list: a held item says no at once", RED_M), 0.6),
+        ])
+        self.steps("And one no cancels the whole thing. Coordinator two tells the grocer's node to forget T2. "
+                   "Your code gets an error called TransactionConflict. That's the family's try again.", [
+            "Coordinator two tells",
+            (lambda: self.go(1, 2, RED_M), 0.6),
+            (lambda: self.held(2, None), 0.5),
+            "Your code gets",
+            (lambda: self.cap("T2 cancelled: TransactionConflict, \"try again\"", RED_M), 0.6),
         ])
 
-        xs2 = {}
-        self.steps("But another transfer, T2, holds A-2002. When T1's prepare arrives, that node says no at once, without waiting.", [
-            (lambda: [Transform(n[2][4], nstatus(2, "held for T2", PURPLE_M)), n[2][0].animate.set_stroke(PURPLE_M)], 0.7),
-            "When T1's prepare",
-            (lambda: [GrowArrow(c2)], 0.4),
-            (lambda: [flow(c2, BLUE_M, 0.7)], 0.7),
-            "says no",
-            (lambda: [flow(c2, RED_M, 0.6, back=True)], 0.6),
-            (lambda: [Transform(coord[2], topsub(COORD, "T1: one no", RED_M))], 0.5),
+        # ---------------- scene 6: the ledger, a crash, and another coordinator ----------------
+        self.steps("Meanwhile the bike shop's node says yes to T1. Everyone has promised, so coordinator one writes "
+                   "T1 commit in the ledger, before anything changes. That line is the commit point.", [
+            (lambda: [*self.uncap(), *self.go(0, 1)], 0.6),
+            "says yes to T1",
+            (lambda: [*self.go(0, 1, GREEN_M, True), *self.held(1, "T1")], 0.6),
+            "writes",
+            (lambda: self.to_ledger(0), 0.6),
+            (lambda: self.ledger("T1: commit"), 0.5),
+            "That line",
+            (lambda: [*self.cap("the commit point: the decision, in the ledger", GREEN_M), Indicate(self.lgs[0], color=GREEN_M, scale_factor=1.2)], 0.8),
+        ])
+        dead1 = tick(False, 0.28).move_to(cos[0][0])
+        self.steps("Now suppose coordinator one crashes, right here. Last lesson, everything would wait for it. "
+                   "Here, a recovery program reads the ledger, and hands T1 to coordinator three.", [
+            (lambda: self.uncap(), 0.3),
+            "crashes",
+            (lambda: [Create(dead1), cos[0][0].animate.set_stroke(RED_M), self.jobs[0].animate.set_opacity(0.3)], 0.6),
+            "a recovery program",
+            (lambda: [Indicate(self.lgs[0], color=GREEN_M, scale_factor=1.2), *self.cap("a recovery program reads the ledger", WHITE)], 0.8),
+            "hands T1",
+            (lambda: [*self.to_ledger(2, GREEN_M, back=True), *self.job(2, "T1")], 0.6),
+        ])
+        self.steps("Coordinator three sends the commits. Each node applies its change and lets go of the item. "
+                   "The family has 70.00, the bike shop 80.00.", [
+            "sends the commits",
+            (lambda: [*self.go(2, 0, GREEN_M), *self.go(2, 1, GREEN_M)], 0.6),
+            "Each node applies",
+            (lambda: [*self.bal(0, "70.00"), *self.bal(1, "80.00", GREEN_M), *self.held(0, None), *self.held(1, None)], 0.7),
+            "The family has",
+            (lambda: [Indicate(self.bals[0], color=WHITE, scale_factor=1.12), Indicate(self.bals[1], color=GREEN_M, scale_factor=1.12)], 0.8),
+        ])
+        self.steps("Two rounds, with a write on each item in each round. So every item in a transaction costs two writes.", [
+            (lambda: self.cap("prepare + commit: two writes per item", WHITE), 0.6),
+            (lambda: [LaggedStart(*[st for n in (0, 1) for st in self.go(2, n)], lag_ratio=0.3),], 0.8),
         ])
 
-        conflict = M("transaction conflict", 18, RED_M).move_to(CALLER + 0.82 * DOWN)
-        self.steps("A single no cancels everything. The coordinator tells node 1 to forget T1, "
-                   "and the caller gets a transaction conflict. Nothing was written.", [
-            "The coordinator tells",
-            (lambda: [flow(c1, RED_M, 0.7)], 0.7),
-            (lambda: [Transform(n[1][4], nstatus(1, "free")), n[1][0].animate.set_stroke(WHITE),
-                      Transform(coord[2], topsub(COORD, "T1: cancelled", RED_M))], 0.6),
-            "and the caller",
-            (lambda: [flow(cc, RED_M, 0.6, back=True)], 0.6),
-            (lambda: [FadeIn(conflict)], 0.5),
-            "Nothing was written",
-            (lambda: [glow(n[1][0], WHITE, 1.03), glow(n[2][0], PURPLE_M, 1.03)], 0.8),
+        # ---------------- scene 7: the retry ----------------
+        self.steps("And T2? DynamoDB's library doesn't retry it for you. Your code waits a few random milliseconds, "
+                   "and sends T2 again, with the same idempotency key, a unique id that makes a repeat do nothing.", [
+            (lambda: [*self.uncap(), FadeOut(dead1), cos[0][0].animate.set_stroke(PURPLE_M), *self.job(0, None), *self.job(2, None),
+                      *self.ledger(None)], 0.6),
+            "Your code waits",
+            (lambda: self.cap("your code retries: same idempotency key, a new attempt", WHITE), 0.6),
+            "and sends T2",
+            (lambda: [*self.job(1, "T2")], 0.5),
+        ])
+        self.steps("The new try checks the balance again: 70 is at least 50. Everyone says yes, and it commits. "
+                   "The family has 20.00 left, and the grocer 50.00.", [
+            (lambda: [*self.go(1, 0), *self.go(1, 2)], 0.6),
+            "70 is at least",
+            (lambda: [Indicate(self.bals[0], color=WHITE, scale_factor=1.15)], 0.6),
+            "Everyone says yes",
+            (lambda: [*self.go(1, 0, GREEN_M, True), *self.go(1, 2, GREEN_M, True), *self.held(0, "T2"), *self.held(2, "T2")], 0.6),
+            "and it commits",
+            (lambda: [*self.to_ledger(1), *self.ledger("T2: commit")], 0.6),
+            "The family has",
+            (lambda: [*self.go(1, 0, GREEN_M), *self.go(1, 2, GREEN_M)], 0.5),
+            (lambda: [*self.bal(0, "20.00"), *self.bal(2, "50.00", GREEN_M), *self.held(0, None), *self.held(2, None),
+                      *self.cap("100.00 - 30.00 - 50.00 = 20.00", GREEN_M)], 0.6),
         ])
 
-        token = M("client token k-1", 18, GOLD_M).move_to(CALLER + 0.82 * DOWN)
-        self.steps("T2 finishes. The caller retries T1 "
-                   "with the same client token, an id it picked for this transfer. This time both nodes say yes.", [
-            (lambda: [Transform(n[2][4], nstatus(2, "free")), n[2][0].animate.set_stroke(WHITE)], 0.6),
-            "The caller retries",
-            (lambda: [FadeOut(conflict), Transform(coord[2], topsub(COORD, "T1", BLUE_M))], 0.4),
-            (lambda: [flow(cc, WHITE, 0.6)], 0.6),
-            "with the same client token",
-            (lambda: [FadeIn(token)], 0.5),
-            "This time",
-            (lambda: [Transform(coord[2], topsub(COORD, "T1: prepare", BLUE_M)), flow(c1, BLUE_M, 0.6), flow(c2, BLUE_M, 0.6)], 0.6),
-            (lambda: [Transform(n[1][4], nstatus(1, "held for T1", GOLD_M)), n[1][0].animate.set_stroke(GOLD_M),
-                      Transform(n[2][4], nstatus(2, "held for T1", GOLD_M)), n[2][0].animate.set_stroke(GOLD_M)], 0.5),
-            (lambda: [flow(c1, GREEN_M, 0.6, back=True), flow(c2, GREEN_M, 0.6, back=True)], 0.6),
+        # ---------------- scene 8: the rule ----------------
+        self.steps("So here's the rule across machines. Everyone promises first. One decision is written where a crash can't erase it. "
+                   "Only then does anything change.", [
+            (lambda: [*self.job(1, None), *self.cap("1. everyone promises", YELLOW_M)], 0.5),
+            "One decision",
+            (lambda: [*self.cap("2. one decision, written where a crash can't erase it", YELLOW_M), glow(lg[0], GREEN_M, 1.02)], 0.8),
+            "Only then",
+            (lambda: self.cap("3. only then does anything change", YELLOW_M), 0.5),
+        ])
+        self.steps("DynamoDB adds two things. A busy item says no, instead of making you wait. And any coordinator can finish the job.", [
+            "A busy item",
+            (lambda: self.cap("a busy item says no;  any coordinator can finish", WHITE), 0.6),
+            "any coordinator",
+            (lambda: [LaggedStart(*[glow(c[0], PURPLE_M, 1.05) for c in cos], lag_ratio=0.2)], 0.9),
         ])
 
-        ledger = topbox("ledger", LEDGER, GREEN_M)
-        cl = arr(COORD + np.array([TOPW / 2 + 0.1, 0, 0]), LEDGER + np.array([-TOPW / 2 - 0.1, 0, 0]))
-        self.steps("The coordinator writes commit in its ledger before it changes anything. "
-                   "If it crashed now, another coordinator would finish T1 from there.", [
-            (lambda: [FadeIn(ledger), GrowArrow(cl)], 0.7),
-            (lambda: [flow(cl, GREEN_M, 0.6)], 0.6),
-            (lambda: [Transform(ledger[2], topsub(LEDGER, "T1: commit", GREEN_M)),
-                      Transform(coord[2], topsub(COORD, "T1: commit", GREEN_M))], 0.5),
-            "If it crashed",
-            (lambda: [coord[0].animate.set_stroke(GREY_D)], 0.5),
-            "would finish",
-            (lambda: [glow(ledger[0], GREEN_M), coord[0].animate.set_stroke(BLUE_M)], 0.9),
+        # ---------------- scene 9: limits ----------------
+        self.steps("It has limits. One transaction holds up to 100 changes, in one Region, one of Amazon's areas of data centres. "
+                   "And a busy account means more rejections and more retries, each paying for its writes. "
+                   "So keep transactions small, and few on the same item.", [
+            (lambda: self.cap("up to 100 changes, in one Region", WHITE), 0.5),
+            "And a busy account",
+            (lambda: self.cap("a busy account: more no's, more retries, more writes", RED_M), 0.5),
+            "So keep",
+            (lambda: self.cap("keep transactions small, and few on one item", YELLOW_M), 0.5),
         ])
+        self.steps("Think of it as an airline that never keeps a waiting list. A bit rude, but nobody is ever stuck in it.", [
+            "A bit rude",
+            (lambda: [Wiggle(nodes[0], scale_value=1.03)], 0.8),
+        ], after=0.5)
 
-        self.steps("Round two is the commit. Each node applies its change and lets the item go. 70 and 80: the total is still 150.", [
-            (lambda: [flow(c1, GREEN_M, 0.7), flow(c2, GREEN_M, 0.7)], 0.7),
-            (lambda: [Transform(n[1][3], bal_text(1, "70.00", GREEN_M)), Transform(n[2][3], bal_text(2, "80.00", GREEN_M))], 0.6),
-            "and lets the item go",
-            (lambda: [Transform(n[1][4], nstatus(1, "free")), n[1][0].animate.set_stroke(WHITE),
-                      Transform(n[2][4], nstatus(2, "free")), n[2][0].animate.set_stroke(WHITE)], 0.6),
-            "the total",
-            (lambda: [Transform(tot, total("150.00", GREEN_M))], 0.6),
-        ])
-
-        xs3 = {}
-
-        def lose_ok():
-            an, pt = lost(cc, GREEN_M, 0.55, back=True)
-            xs3["x"] = tick(False, 0.16).move_to(pt)
-            return [an]
-
-        self.steps("If the OK is lost, the caller sends T1 once more. Same token, already committed, "
-                   "so DynamoDB just answers OK and writes nothing.", [
-            (lambda: lose_ok(), 0.9),
-            (lambda: [Create(xs3["x"])], 0.4),
-            "the caller sends",
-            (lambda: [FadeOut(xs3["x"]), flow(cc, WHITE, 0.6)], 0.6),
-            "Same token",
-            (lambda: [Transform(coord[2], topsub(COORD, "k-1: already done", GREEN_M)), glow(token, GOLD_M, 1.06)], 0.8),
-            "just answers OK",
-            (lambda: [flow(cc, GREEN_M, 0.6, back=True), glow(n[1][0], WHITE, 1.03), glow(n[2][0], WHITE, 1.03)], 0.8),
-        ])
-
-        cost1 = chip("2 writes per item: twice the capacity", GOLD_M, 19)
-        cost2 = chip("held items: more conflicts", RED_M, 19)
-        VGroup(cost1, cost2).arrange(RIGHT, buff=0.4).move_to([0, NOTE_Y, 0])
-        self.steps("The price: each item is written in both rounds, twice the write capacity. "
-                   "And held items turn others away, so busy accounts see more conflicts.", [
-            "each item is written",
-            (lambda: [flow(c1, BLUE_M, 0.5), flow(c2, BLUE_M, 0.5)], 0.5),
-            (lambda: [flow(c1, GREEN_M, 0.5), flow(c2, GREEN_M, 0.5)], 0.5),
-            "twice the write",
-            (lambda: [FadeIn(cost1, shift=0.1 * UP)], 0.6),
-            "And held items",
-            (lambda: [FadeIn(cost2, shift=0.1 * UP)], 0.6),
-        ])
-
-        self.steps("When a transaction spans partitions, every node promises first, one decision is saved where a crash can't lose it, "
-                   "and only then does anything change.", [
-            (lambda: [glow(n[1][0], GOLD_M), glow(n[2][0], GOLD_M)], 0.9),
-            "one decision",
-            (lambda: [glow(ledger[0], GREEN_M)], 0.9),
-            "and only then",
-            (lambda: [Indicate(n[1][3], color=GREEN_M), Indicate(n[2][3], color=GREEN_M)], 0.9),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 10: a check ----------------
+        self.steps("One quick check. T3 wants to take money from the bike shop's account while T1 holds it, "
+                   "prepared but not yet committed. What does the bike shop's node say? Pause and think.", [
+            (lambda: [*self.uncap(), *self.ledger(None), *self.held(1, "T1"), *self.job(0, "T1")], 0.6),
+            "T3 wants",
+            (lambda: [*self.job(1, "T3")], 0.5),
+            (lambda: self.go(1, 1, PURPLE_M), 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("No, at once. T3 is cancelled, and its code tries again after T1 lets go.", [
+            (lambda: [*self.uncap(), *self.go(1, 1, RED_M, True)], 0.6),
+            (lambda: self.cap("held? \"no\", at once. Then retry.", YELLOW_M, 30), 0.6),
+        ], after=0.3)
+        self.wait(2.0)

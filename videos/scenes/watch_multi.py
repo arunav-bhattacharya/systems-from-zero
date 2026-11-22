@@ -1,26 +1,27 @@
 from sfz import *
 
-SAY.insert(0, (r"\bbalance:7\b", "balance 7"))
-SAY.insert(0, (r"\bMULTI\b", "multi"))
-SAY.insert(0, (r"\bEXEC\b", "exec"))
-SAY.insert(0, (r"\bWATCH\b", "watch"))
-# "pod A" alone reads as "pod uh"; "eh" lands on the letter.
-SAY.insert(0, (r"\b[Pp]od A\b", "pod eh"))
+# How the narrator says the commands and names.
+SAY[0:0] = [
+    (r"\bbalance:7\b", "balance seven"),
+    (r"\bMULTI\b", "multi"), (r"\bEXEC\b", "exec"), (r"\bWATCH\b", "watch"), (r"\bQUEUED\b", "queued"),
+    (r"\bGETs\b", "gets"), (r"\bSETs\b", "sets"), (r"\bGET\b", "get"), (r"\bSET\b", "set"),
+    # "pod A" alone reads as "pod uh"; "eh" lands on the letter.
+    (r"\b[Pp]od A\b", lambda m: m.group(0)[0] + "od eh"),
+]
 
-PA, PB = np.array([-5.0, 2.1, 0]), np.array([-5.0, 0.3, 0])     # the two pods
-NOTE_X = -3.6                                                    # each pod's own reasoning, right of it
-RX, RY, RW, RH = 4.1, 1.25, 3.8, 2.4                               # Redis and the balance
-TY, TLY = -1.85, -2.25                                             # command blocks on the thread, and its line
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+BOX_TOP, BOX_BOT = 2.8, -0.9
+BOX_CY = (BOX_TOP + BOX_BOT) / 2
+POD_W = 4.0
+PX = {"A": -4.6, "B": 4.6}                       # pod centres
 WHO = {"A": BLUE_M, "B": GOLD_M}
-
-
-def glow(rect, color=YELLOW_M, s=1.03):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def fill(color, a=0.14):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+RW = 3.6                                         # Redis in the middle
+LY = [1.55 - 0.43 * i for i in range(6)]         # a pod's command lines
+LINK_Y = 0.93
+STRIP_Y, STRIP_LAB_Y = -1.85, -1.33              # the thread's order
+BAR_Y, CAP_Y = -2.6, -3.2
+VAL_Y = 0.93
+WROW_Y = {"A": -0.25, "B": -0.62}                # the watch list inside Redis
 
 
 class Base(VoiceScene):
@@ -50,7 +51,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
+    def steps(self, text, items, after=0.3):
         """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
         it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
@@ -77,190 +78,509 @@ class Base(VoiceScene):
             self.wait(after)
 
 
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
 def left_at(m, x, y):
     return m.move_to([x + m.width / 2, y, 0])
 
 
-def slot_x(i):
-    return -5.4 + i * 1.68
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def cmd(label, who, i, w=1.5, queued=False):
-    """A command on the Redis thread, in slot i, coloured by the pod that sent it."""
-    c = WHO[who]
-    r = RoundedRectangle(corner_radius=0.08, width=w, height=0.66, stroke_color=c, stroke_width=2.5)
-    r.set_fill(fill(c, 0.25), 1)
-    if queued:
-        r = DashedVMobject(r, num_dashes=24).set_stroke(c, 2.5)
-    x = slot_x(i) + (w - 1.5) / 2
-    return VGroup(r.move_to([x, TY, 0]), M(label, 19, WHITE).move_to([x, TY, 0]))
+def frame_box(cx, w, color):
+    return RoundedRectangle(corner_radius=0.16, width=w, height=BOX_TOP - BOX_BOT, stroke_color=color,
+                            stroke_width=3).set_fill(fillc(color), 1).move_to([cx, BOX_CY, 0])
 
 
-def reply(s, i, color=GREY_B, w=1.5):
-    return M(s, 18, color).move_to([slot_x(i) + (w - 1.5) / 2, TY - 0.8, 0])
+def pod(p, what):
+    cx = PX[p]
+    return VGroup(frame_box(cx, POD_W, WHO[p]), T(f"pod {p}", 28, WHO[p]).move_to([cx, BOX_TOP - 0.36, 0]),
+                  T(what, 19, GREY_B).move_to([cx, BOX_TOP - 0.76, 0]))
 
 
-def note(s, pod, color=GREY_B):
-    y = PA[1] if pod == "A" else PB[1]
-    return left_at(T(s, 22, color), NOTE_X, y)
+def redis_box():
+    r = frame_box(0, RW, WHITE).set_fill(BLACK, 1)
+    return r
+
+
+def cmd_line(p, i, text, reply=None, rcolor=GREY_B):
+    x0 = PX[p] - POD_W / 2 + 0.22
+    g = VGroup(left_at(M(text, 16), x0, LY[i]))
+    if reply:
+        g.add(M("→ " + reply, 16, rcolor).next_to(g[0], RIGHT, buff=0.13))
+    return g
+
+
+def thought(p, i, text, color=GREY_B):
+    x0 = PX[p] - POD_W / 2 + 0.22
+    return left_at(T(text, 19, color, slant=ITALIC), x0, LY[i])
 
 
 class WatchMulti(Base):
-    """txn-06, sections 1 to 3: balance:7 holds 100; pod A (30, coffee) and pod B (50, fuel) both GET 100, A writes 70,
-    B writes 50: paid 80, shows 50. MULTI/EXEC runs a batch as one step but can't decide. WATCH, GET 100, decide, B's
-    write lands, MULTI SET 70 EXEC answers nil; A retries from 50 and writes 20. A Lua script does the read, test and
-    write as one command."""
+    """txn-06, section 2. A prepaid card with 100 pays 30 and 50 at once and ends at 50: a lost update between two
+    commands, although Redis runs one command at a time. The one-barista café. MULTI/EXEC is one slip of orders that
+    runs as one step, but a GET on the slip answers QUEUED, so it can't decide, and it never rolls back. WATCH is
+    telling the barista to throw your slip away if anyone changes the card first: B's write marks A dirty, A's EXEC
+    answers nil, A retries and writes 20. Check-and-set, optimistic; one connection; hot keys mean retries; a check."""
+
+    # --- small state helpers: each returns animations and updates what is on screen ---
+    def cap(self, s, color=GREY_B, size=24):
+        new = T(s, size, color).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def set_val(self, s, color=WHITE):
+        new = M(s, 46, color).move_to([0, VAL_Y, 0])
+        old, self.val = self.val, new
+        return [swap(old, new)]
+
+    def line(self, p, m):
+        """Put a command or thought on pod p's next empty line."""
+        self.lines[p].append(m)
+        return [FadeIn(m, shift=0.08 * RIGHT)]
+
+    def clear(self, p):
+        olds, self.lines[p] = self.lines[p], []
+        return [FadeOut(m) for m in olds]
+
+    def reply(self, p, i, text, color=GREY_B):
+        """Add Redis's answer to pod p's line i."""
+        g = self.lines[p][i]
+        r = M("→ " + text, 16, color).next_to(g[0], RIGHT, buff=0.13)
+        g.add(r)
+        return [FadeIn(r, shift=0.08 * LEFT)]
+
+    def go(self, p, color=YELLOW_M, back=False):
+        """A dot runs from pod p to Redis (a command), or back (an answer)."""
+        a, b = self.links[p].get_start(), self.links[p].get_end()
+        if p == "B":
+            a, b = b, a
+        if back:
+            a, b = b, a
+        d = Dot(radius=0.08, color=color).move_to(a)
+        return [Succession(FadeIn(d, run_time=0.05), d.animate(run_time=0.45, rate_func=smooth).move_to(b),
+                           FadeOut(d, run_time=0.1))]
+
+    def chip(self, p, text, color=None):
+        t = M(text, 17, color or WHITE)
+        r = RoundedRectangle(corner_radius=0.1, width=t.width + 0.34, height=0.48, stroke_color=WHO[p], stroke_width=2.5)
+        r.set_fill(fillc(WHO[p]), 1)
+        g = VGroup(r, t.move_to(r))
+        x = -6.55 if not self.chips else self.chips[-1].get_right()[0] + 0.14
+        left_at(g, x, STRIP_Y)
+        self.chips.append(g)
+        return [FadeIn(g, shift=0.1 * RIGHT)]
+
+    def clear_chips(self):
+        olds, self.chips = self.chips, []
+        return [FadeOut(c) for c in olds]
+
+    def wrow(self, p, state):
+        """The watch list row for pod p: 'clean', 'dirty' or None (gone)."""
+        new = None
+        if state:
+            c = GREEN_M if state == "clean" else RED_M
+            new = VGroup(T(f"pod {p}", 20, WHO[p]), T(state, 20, c)).arrange(RIGHT, buff=0.35).move_to([0, WROW_Y[p], 0])
+        old, self.wr[p] = self.wr[p], new
+        if new is None:
+            return [FadeOut(old)] if old is not None else []
+        return [swap(old, new)]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
     def construct(self):
-        self.title_card("Redis transactions: WATCH, MULTI and Lua", "a read, a decision and a write, with nothing in between")
+        self.capm = self.val = None
+        self.lines = {"A": [], "B": []}
+        self.chips = []
+        self.wr = {"A": None, "B": None}
+        self.title_card("Where did the 30 go?", "one command at a time, and the gap between two commands")
 
-        rr = RoundedRectangle(corner_radius=0.14, width=RW, height=RH, stroke_color=RED_M, stroke_width=3)
-        rr.set_fill(fill(RED_M), 1).move_to([RX, RY, 0])
-        rt = T("Redis", 24, GREY_B).move_to([RX, RY + RH / 2 - 0.35, 0])
-        rk = M("balance:7", 24, WHITE).move_to([RX, RY + 0.35, 0])
-        val = T("100", 52, WHITE).move_to([RX, RY - 0.45, 0])
-        line = Line([-6.1, TLY, 0], [6.1, TLY, 0], stroke_width=2, color=GREY_C)
-        tlab = left_at(T("the one Redis thread runs commands in this order", 20, GREY_B), -6.1, TY + 0.72)
-        self.steps("Redis runs one command at a time, on one thread. A prepaid card, balance:7, holds 100 euros.", [
-            (lambda: [FadeIn(rr), FadeIn(rt)], 0.6),
-            (lambda: [Create(line), FadeIn(tlab)], 0.8),
-            "A prepaid card",
-            (lambda: [FadeIn(rk), FadeIn(val, scale=0.8)], 0.8),
+        # ---------------- scene 1: the hook ----------------
+        card = RoundedRectangle(corner_radius=0.2, width=3.4, height=2.1, stroke_color=WHITE, stroke_width=3).set_fill("#15191d", 1)
+        card.move_to([0, 0.9, 0])
+        card_t = T("prepaid card", 24, GREY_B).move_to([0, 1.6, 0])
+        bal = M("100", 52).move_to([0, 0.75, 0])
+        coffee = VGroup(T("coffee", 22, BLUE_M), M("-30", 30, BLUE_M)).arrange(DOWN, buff=0.15).move_to([-4.4, 0.9, 0])
+        fuel = VGroup(T("fuel", 22, GOLD_M), M("-50", 30, GOLD_M)).arrange(DOWN, buff=0.15).move_to([4.4, 0.9, 0])
+        same = T("at the same moment", 22, GREY_B).move_to([0, 2.6, 0])
+        self.steps("A prepaid card has 100 on it. At the same moment, it pays 30 for a coffee and 50 for fuel.", [
+            (lambda: [FadeIn(VGroup(card, card_t), shift=0.2 * UP)], 0.7),
+            (lambda: [FadeIn(bal)], 0.4),
+            "At the same",
+            (lambda: [FadeIn(coffee, shift=0.2 * RIGHT), FadeIn(fuel, shift=0.2 * LEFT), FadeIn(same)], 0.8),
+        ])
+        should = VGroup(T("should be", 22, GREY_B), M("20", 36, GREEN_M)).arrange(RIGHT, buff=0.25).move_to([-2.6, -1.0, 0])
+        says = VGroup(T("the card says", 22, GREY_B), M("50", 36, RED_M)).arrange(RIGHT, buff=0.25).move_to([2.6, -1.0, 0])
+        self.steps("So 20 should be left. The card says 50. Somewhere, 30 just walked out the door.", [
+            (lambda: [FadeIn(should, shift=0.1 * UP)], 0.6),
+            "The card says",
+            (lambda: [FadeIn(says, shift=0.1 * UP), Transform(bal, M("50", 52, RED_M).move_to(bal))], 0.7),
+            "Somewhere",
+            (lambda: [Indicate(says[1], color=RED_M, scale_factor=1.25)], 0.9),
+        ])
+        qm = T("?", 60, YELLOW_M).move_to([0, -2.3, 0])
+        self.steps("And the program that keeps the balance runs one command at a time, so nothing ever runs at once. "
+                   "How did money go missing? And how do we stop it?", [
+            (lambda: self.cap("one command at a time"), 0.6),
+            "How did money",
+            (lambda: [FadeIn(qm, scale=0.6)], 0.6),
         ])
 
-        pa = VGroup(box("pod A", BLUE_M, w=2.3, h=0.9, size=26).move_to(PA))
-        pb = VGroup(box("pod B", GOLD_M, w=2.3, h=0.9, size=26).move_to(PB))
-        na = note("coffee: 30 euros", "A", BLUE_M)
-        nb = note("fuel: 50 euros", "B", GOLD_M)
-        g1 = cmd("GET", "A", 0)
-        g2 = cmd("GET", "B", 1)
-        r1, r2 = reply("100", 0), reply("100", 1)
-        self.steps("Two pods authorize it at once: 30 euros for coffee, 50 for fuel. "
-                   "Each one reads the balance, and both see 100.", [
-            (lambda: [FadeIn(pa), FadeIn(pb)], 0.6),
-            "30 euros",
-            (lambda: [FadeIn(na), FadeIn(nb)], 0.7),
-            "Each one reads",
-            (lambda: [FadeIn(g1, target_position=PA)], 0.6),
-            (lambda: [FadeIn(g2, target_position=PB)], 0.6),
-            "and both see",
-            (lambda: [FadeIn(r1), FadeIn(r2), Transform(na, note("read 100: 100 minus 30 is 70", "A", BLUE_M)),
-                      Transform(nb, note("read 100: 100 minus 50 is 50", "B", GOLD_M))], 0.8),
+        # ---------------- scene 2: one barista, Redis, pods ----------------
+        rb = redis_box()
+        r_name = T("one barista", 28).move_to([0, BOX_TOP - 0.36, 0])
+        r_sub = T("one drink at a time", 19, GREY_B).move_to([0, BOX_TOP - 0.76, 0])
+        orders = [mbox_order(s) for s in ("latte", "tea", "mocha")]
+        for k, o in enumerate(orders):
+            o.move_to([-3.2 - 1.45 * k, VAL_Y, 0])
+        self.steps("Picture a café with one barista. She makes one drink at a time, and never starts the next until it's handed over.", [
+            (lambda: [FadeOut(VGroup(card, card_t, bal, coffee, fuel, same, should, says, qm)), *self.uncap()], 0.7),
+            (lambda: [FadeIn(rb), FadeIn(r_name), FadeIn(r_sub)], 0.7),
+            (lambda: [LaggedStart(*[FadeIn(o, shift=0.2 * RIGHT) for o in orders], lag_ratio=0.25)], 0.8),
+            "one drink",
+            *[st for k in range(3) for st in (
+                (lambda k=k: [orders[k].animate.move_to([0, VAL_Y, 0]),
+                              *[orders[j].animate.shift(1.45 * RIGHT) for j in range(k + 1, 3)]], 0.55),
+                (lambda k=k: [FadeOut(orders[k], scale=0.5)], 0.3))],
+        ])
+        r_name2 = T("Redis", 28).move_to(r_name)
+        r_sub2 = T("one thread", 19, GREY_B).move_to(r_sub)
+        cmds = [mbox_order(c, mono=True) for c in ("GET", "SET", "GET")]
+        for k, o in enumerate(cmds):
+            o.move_to([-3.2 - 1.45 * k, VAL_Y, 0])
+        self.steps("Redis, a program that keeps data in memory and answers short commands, works the same way. "
+                   "One thread, a single line of work, runs every command to the end before it takes the next.", [
+            "Redis, a program",
+            (lambda: [swap(r_name, r_name2)], 0.6),
+            "One thread",
+            (lambda: [swap(r_sub, r_sub2), glow(rb, WHITE, 1.02)], 0.8),
+            (lambda: [LaggedStart(*[FadeIn(o, shift=0.2 * RIGHT) for o in cmds], lag_ratio=0.25)], 0.7),
+            "runs every",
+            *[st for k in range(3) for st in (
+                (lambda k=k: [cmds[k].animate.move_to([0, VAL_Y, 0]),
+                              *[cmds[j].animate.shift(1.45 * RIGHT) for j in range(k + 1, 3)]], 0.5),
+                (lambda k=k: [FadeOut(cmds[k], scale=0.5)], 0.25))],
+        ])
+        key = M("balance:7", 22, GREY_B).move_to([0, 1.52, 0])
+        self.steps("Redis keeps each value under a name, called its key. The card's balance sits under the key balance:7.", [
+            "under the key",
+            (lambda: [FadeIn(key, shift=0.1 * DOWN)], 0.5),
+            (lambda: self.set_val("100"), 0.5),
+        ])
+        pa, pb = pod("A", "coffee, 30"), pod("B", "fuel, 50")
+        self.links = {
+            "A": Line([PX["A"] + POD_W / 2, LINK_Y, 0], [-RW / 2, LINK_Y, 0], stroke_width=2.5, color=GREY_C),
+            "B": Line([RW / 2, LINK_Y, 0], [PX["B"] - POD_W / 2, LINK_Y, 0], stroke_width=2.5, color=GREY_C),
+        }
+        self.steps("Big apps run several copies of their program, so payments keep flowing if one machine fails. "
+                   "Call each copy a pod. The coffee reaches pod A, and the fuel reaches pod B.", [
+            "Call each copy",
+            (lambda: [FadeIn(pa[0]), FadeIn(pa[1]), FadeIn(pb[0]), FadeIn(pb[1]), Create(self.links["A"]), Create(self.links["B"])], 0.8),
+            "The coffee",
+            (lambda: [FadeIn(pa[2], shift=0.1 * DOWN)], 0.5),
+            "the fuel",
+            (lambda: [FadeIn(pb[2], shift=0.1 * DOWN)], 0.5),
         ])
 
-        s1 = cmd("SET 70", "A", 2)
-        s2 = cmd("SET 50", "B", 3)
-        bad = chip("paid 80 euros, balance says 50", RED_M, 19).move_to([RX, -0.5, 0])
-        self.steps("Pod A writes 70, then pod B writes 50. The card paid 80 euros, and the balance says 50.", [
-            (lambda: [FadeIn(s1, target_position=PA)], 0.6),
-            (lambda: [Transform(val, T("70", 52, WHITE).move_to(val))], 0.5),
-            "then pod B",
-            (lambda: [FadeIn(s2, target_position=PB)], 0.6),
-            (lambda: [Transform(val, T("50", 52, RED_M).move_to(val))], 0.5),
-            "The card paid",
-            (lambda: [FadeIn(bad, shift=0.1 * UP), glow(rr, RED_M, 1.03)], 0.8),
+        # ---------------- scene 3: the lost update ----------------
+        order_lab = left_at(T("the thread's order", 19, GREY_B), -6.55, STRIP_LAB_Y)
+        self.steps("Each pod does what looks right. GET the balance, check that it's enough, then SET the new one.", [
+            (lambda: [FadeIn(order_lab)], 0.5),
+            "GET the",
+            (lambda: self.cap("GET the balance,  check it,  SET the new one", WHITE), 0.6),
+        ])
+        self.steps("Pod A reads the balance: 100. Pod B reads it too: 100.", [
+            (lambda: [*self.uncap(), *self.line("A", cmd_line("A", 0, "GET balance:7")), *self.go("A")], 0.6),
+            (lambda: [*self.chip("A", "A: GET"), *self.go("A", WHITE, back=True), *self.reply("A", 0, "100")], 0.55),
+            "Pod B",
+            (lambda: [*self.line("B", cmd_line("B", 0, "GET balance:7")), *self.go("B")], 0.6),
+            (lambda: [*self.chip("B", "B: GET"), *self.go("B", WHITE, back=True), *self.reply("B", 0, "100")], 0.55),
+        ])
+        self.steps("Pod A works out 100 minus 30, and SETs 70. Pod B works out 100 minus 50, and SETs 50.", [
+            (lambda: self.line("A", thought("A", 1, "100 - 30 = 70")), 0.5),
+            "and SETs 70",
+            (lambda: [*self.line("A", cmd_line("A", 2, "SET balance:7 70")), *self.go("A")], 0.55),
+            (lambda: [*self.chip("A", "A: SET 70"), *self.set_val("70")], 0.45),
+            "Pod B works",
+            (lambda: self.line("B", thought("B", 1, "100 - 50 = 50")), 0.5),
+            "and SETs 50",
+            (lambda: [*self.line("B", cmd_line("B", 2, "SET balance:7 50")), *self.go("B")], 0.55),
+            (lambda: [*self.chip("B", "B: SET 50"), *self.set_val("50", RED_M)], 0.45),
+        ])
+        self.steps("The card paid 80, and the balance says 50. The last SET won, and it never saw the first. "
+                   "That's called a lost update.", [
+            (lambda: self.cap("paid 80,  balance says 50", RED_M), 0.5),
+            "The last SET",
+            (lambda: [Indicate(self.chips[3], color=RED_M, scale_factor=1.1), self.chips[2].animate.set_opacity(0.3)], 0.9),
+            "called a lost",
+            (lambda: self.cap("a lost update: one write replaced another it never saw", RED_M), 0.6),
+        ])
+        gap = SurroundingRectangle(VGroup(self.chips[1]), color=YELLOW_M, buff=0.07, corner_radius=0.1)
+        self.steps("Notice, every command ran alone. The thread did nothing wrong. "
+                   "A decision took two commands, and between them, the thread served the other pod.", [
+            (lambda: [*self.uncap(), self.chips[2].animate.set_opacity(1),
+                      LaggedStart(*[glow(c[0], WHITE, 1.05) for c in self.chips], lag_ratio=0.2)], 1.2),
+            "A decision took",
+            (lambda: [Indicate(self.chips[0][1], color=BLUE_M), Indicate(self.chips[2][1], color=BLUE_M)], 0.8),
+            "between them",
+            (lambda: [Create(gap)], 0.6),
+        ])
+        self.steps("A real barista would notice someone asking about your card in the middle of your order. "
+                   "Redis doesn't remember who asked what. It serves each command, and moves on.", [
+            (lambda: self.cap("where the café picture stops working"), 0.5),
+            "Redis doesn't",
+            (lambda: self.cap("Redis serves each command alone, and doesn't remember who asked"), 0.5),
         ])
 
-        gap = SurroundingRectangle(VGroup(g2, s1, s2), buff=0.08, color=RED_M, corner_radius=0.08, stroke_width=3)
-        gl = T("between pod B's read and its write, pod A wrote", 20, RED_M).move_to([slot_x(2), TY + 0.72, 0])
-        self.steps("Each command ran alone, but between two commands the thread serves everyone else, "
-                   "and that's where the other write landed.", [
-            (lambda: [*[glow(c[0], WHITE, 1.06) for c in (g1, g2, s1, s2)]], 0.9),
-            "between two commands",
-            (lambda: [Create(gap), FadeOut(tlab), FadeIn(gl)], 0.8),
-            "and that's where",
-            (lambda: [glow(s1[0], RED_M, 1.12)], 0.9),
+        # ---------------- scene 4: the batch, and its break ----------------
+        self.steps("Wouldn't it be nice to hand over the whole thing in one go? Redis has a batch for that, "
+                   "like one slip with all your orders on it.", [
+            (lambda: [FadeOut(gap), *self.uncap(), *self.clear("A"), *self.clear("B"), *self.clear_chips(),
+                      pb.animate.set_opacity(0.25), self.links["B"].animate.set_opacity(0.25)], 0.8),
+            (lambda: self.set_val("100"), 0.5),
+            "one slip",
+            (lambda: self.cap("a batch: one slip of commands", WHITE), 0.5),
+        ])
+        slip = RoundedRectangle(corner_radius=0.08, width=POD_W - 0.24, height=0.43 * 3 + 0.18, stroke_color=YELLOW_M, stroke_width=2)
+        slip.move_to([PX["A"], (LY[0] + LY[2]) / 2, 0])
+        self.steps("MULTI says: start a slip. Every command after it answers QUEUED instead of running. "
+                   "EXEC then runs the whole slip as one step. No other pod's command can land in the middle.", [
+            "MULTI says",
+            (lambda: [*self.line("A", cmd_line("A", 0, "MULTI")), Create(slip)], 0.6),
+            "Every command",
+            (lambda: [*self.line("A", cmd_line("A", 1, "SET balance:7 70")), *self.go("A")], 0.55),
+            (lambda: [*self.go("A", WHITE, back=True), *self.reply("A", 1, "QUEUED", YELLOW_M)], 0.5),
+            "EXEC then",
+            (lambda: [*self.line("A", cmd_line("A", 2, "EXEC")), *self.go("A")], 0.55),
+            (lambda: [*self.chip("A", "A: MULTI..EXEC"), glow(slip, YELLOW_M, 1.02), *self.go("A", WHITE, back=True),
+                      *self.reply("A", 2, "1) OK"), *self.set_val("70")], 0.7),
+            "No other",
+            (lambda: [glow(self.chips[0][0], BLUE_M, 1.05)], 0.8),
+        ])
+        self.steps("So let's put the GET on the slip too. What does it answer? Pause and guess.", [
+            (lambda: [*self.clear("A"), *self.clear_chips(), FadeOut(slip), *self.cap("back to 100, and a new slip"),
+                      *self.set_val("100")], 0.5),
+            (lambda: [*self.line("A", cmd_line("A", 0, "MULTI")), *self.line("A", cmd_line("A", 1, "GET balance:7"))], 0.6),
+            (lambda: self.line("A", thought("A", 2, "enough for 30?")), 0.5),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("QUEUED. The balance comes back with all the other answers, after EXEC. That's too late to decide what to SET. "
+                   "A batch runs together, but it can't decide.", [
+            (lambda: [*self.uncap(), *self.go("A"), *self.reply("A", 1, "QUEUED", YELLOW_M)], 0.6),
+            "after EXEC",
+            (lambda: [*self.line("A", cmd_line("A", 3, "EXEC")), *self.go("A")], 0.5),
+            (lambda: [*self.go("A", WHITE, back=True), *self.reply("A", 3, "1) 100")], 0.5),
+            "too late",
+            (lambda: [*self.line("A", thought("A", 4, "too late to decide", RED_M))], 0.5),
+            "A batch runs",
+            (lambda: self.cap("a batch runs together, but it can't decide", WHITE), 0.6),
+        ])
+        self.steps("And one more surprise. If a command on the slip fails while it runs, it fails alone, and the rest still run. "
+                   "There's no rollback. A batch means nothing can interrupt it. It doesn't mean all or nothing.", [
+            "fails alone",
+            (lambda: self.cap("one command fails alone; the rest still run", WHITE), 0.5),
+            "There's no rollback",
+            (lambda: self.cap("no rollback: not all or nothing", RED_M), 0.5),
         ])
 
-        old = VGroup(g1, g2, s1, s2, r1, r2, gap, gl)
-        batch = VGroup(cmd("MULTI", "A", 0), cmd("SET 70", "A", 1, queued=True), cmd("EXEC", "A", 2))
-        qb = VGroup(reply("OK", 0), reply("QUEUED", 1), reply("runs it", 2, GREEN_M))
-        nodec = chip("but a GET inside answers QUEUED: too late to decide", GREY_B, 19).move_to([1.4, -0.5, 0])
-        self.steps("MULTI and EXEC send a batch that runs as one step. "
-                   "But a batch can't read a value and decide, so WATCH adds a check.", [
-            (lambda: [FadeOut(old), FadeOut(bad), FadeIn(tlab), Transform(val, T("100", 52, WHITE).move_to(val)),
-                      Transform(na, note("coffee: 30 euros", "A", BLUE_M)), Transform(nb, note("fuel: 50 euros", "B", GOLD_M))], 0.8),
-            (lambda: [LaggedStart(*[FadeIn(b, target_position=PA) for b in batch], lag_ratio=0.35)], 1.2),
-            (lambda: [FadeIn(qb)], 0.5),
-            "But a batch",
-            (lambda: [FadeIn(nodec, shift=0.1 * UP)], 0.7),
+        # ---------------- scene 5: the watch list ----------------
+        div = Line([-RW / 2 + 0.25, 0.4, 0], [RW / 2 - 0.25, 0.4, 0], stroke_width=1.5, color=GREY_D)
+        wl = T("watch list", 19, GREY_B).move_to([0, 0.13, 0])
+        self.steps("So the decision stays in your code. We just need to know "
+                   "if anyone changed the card while we were thinking.", [
+            (lambda: [*self.clear("A"), *self.uncap(), pb.animate.set_opacity(1), self.links["B"].animate.set_opacity(1)], 0.7),
+            "We just need",
+            (lambda: self.cap("did anyone change the card while we were thinking?", WHITE), 0.6),
+        ])
+        self.steps("Back to the café. You tell the barista: I'm keeping an eye on card 7. "
+                   "If anyone changes it before my slip arrives, throw my slip away.", [
+            "You tell",
+            (lambda: self.cap("\"keep an eye on card 7 for me\"", YELLOW_M), 0.5),
+            "If anyone",
+            (lambda: self.cap("\"if it changes before my slip, throw my slip away\"", YELLOW_M), 0.5),
+        ])
+        self.steps("She keeps a little list of who is watching which card. "
+                   "Whenever anyone writes card 7, she puts a mark next to every other name watching it.", [
+            (lambda: [Create(div), FadeIn(wl, shift=0.1 * UP)], 0.6),
+            "Whenever anyone",
+            (lambda: self.cap("any write to card 7: a mark by every other watcher", WHITE), 0.5),
+        ])
+        self.steps("That's exactly what Redis does. The command is WATCH. The list lives inside Redis, one entry per connection. "
+                   "And a name with a mark is what Redis calls dirty.", [
+            "The command is",
+            (lambda: self.cap("keep an eye on it = WATCH", WHITE), 0.5),
+            "The list lives",
+            (lambda: [glow(rb, WHITE, 1.02)], 0.8),
+            "what Redis calls",
+            (lambda: self.cap("a name with a mark = dirty", RED_M), 0.5),
         ])
 
-        w1 = cmd("WATCH", "A", 0)
-        g3 = cmd("GET", "A", 1)
-        wr, gr = reply("OK", 0), reply("100", 1)
-        eye = T("watched by pod A", 20, BLUE_M).move_to([RX, RY - RH / 2 - 0.32, 0])
-        self.steps("Pod A watches the balance, reads 100, and decides in its own code that 30 fits.", [
-            (lambda: [FadeOut(batch), FadeOut(qb), FadeOut(nodec)], 0.5),
-            (lambda: [FadeIn(w1, target_position=PA)], 0.6),
-            (lambda: [FadeIn(wr), FadeIn(eye), rr.animate.set_stroke(BLUE_M)], 0.6),
-            "reads 100",
-            (lambda: [FadeIn(g3, target_position=PA), FadeIn(gr)], 0.6),
-            "and decides",
-            (lambda: [Transform(na, note("read 100: 30 fits, new balance 70", "A", BLUE_M))], 0.8),
+        # ---------------- scene 6: the race, replayed with WATCH ----------------
+        self.steps("Let's replay the race. Both pods WATCH balance:7, then GET it: 100. "
+                   "Each decides in its own code. Pod A plans 70, pod B plans 50.", [
+            (lambda: self.uncap(), 0.4),
+            "Both pods",
+            (lambda: [*self.line("A", cmd_line("A", 0, "WATCH balance:7")), *self.line("B", cmd_line("B", 0, "WATCH balance:7")),
+                      *self.go("A"), *self.go("B")], 0.6),
+            (lambda: [*self.wrow("A", "clean"), *self.wrow("B", "clean")], 0.5),
+            "then GET",
+            (lambda: [*self.line("A", cmd_line("A", 1, "GET balance:7")), *self.line("B", cmd_line("B", 1, "GET balance:7")),
+                      *self.go("A"), *self.go("B")], 0.55),
+            (lambda: [*self.reply("A", 1, "100"), *self.reply("B", 1, "100"), *self.chip("A", "A: WATCH, GET"),
+                      *self.chip("B", "B: WATCH, GET")], 0.5),
+            "Pod A plans",
+            (lambda: self.line("A", thought("A", 2, "plan: write 70")), 0.4),
+            "pod B plans",
+            (lambda: self.line("B", thought("B", 2, "plan: write 50")), 0.4),
         ])
-
-        sb = cmd("SET 50", "B", 2)
-        m1 = cmd("MULTI", "A", 3)
-        q1 = cmd("SET 70", "A", 4, queued=True)
-        e1 = cmd("EXEC", "A", 5)
-        sbr, m1r, q1r = reply("OK", 2), reply("OK", 3), reply("QUEUED", 4)
-        chg = T("changed since WATCH", 20, RED_M).move_to(eye)
-        self.steps("Meanwhile pod B's payment writes 50. Pod A queues its new balance, 70, and sends EXEC.", [
-            (lambda: [FadeIn(sb, target_position=PB)], 0.6),
-            (lambda: [FadeIn(sbr), Transform(val, T("50", 52, WHITE).move_to(val)), Transform(eye, chg)], 0.7),
-            "Pod A queues",
-            (lambda: [FadeIn(m1, target_position=PA), FadeIn(m1r)], 0.5),
-            (lambda: [FadeIn(q1, target_position=PA), FadeIn(q1r)], 0.5),
-            "and sends EXEC",
-            (lambda: [FadeIn(e1, target_position=PA)], 0.6),
+        self.steps("Pod B is quicker. MULTI, SET 50, EXEC. Its name has no mark, so the slip runs. The balance is 50.", [
+            "MULTI",
+            (lambda: [*self.line("B", cmd_line("B", 3, "MULTI")), *self.line("B", cmd_line("B", 4, "SET balance:7 50"))], 0.6),
+            "EXEC",
+            (lambda: [*self.line("B", cmd_line("B", 5, "EXEC")), *self.go("B")], 0.5),
+            "no mark",
+            (lambda: [Indicate(self.wr["B"][1], color=GREEN_M)], 0.6),
+            "so the slip",
+            (lambda: [*self.chip("B", "B: MULTI..EXEC"), *self.go("B", WHITE, back=True), *self.reply("B", 5, "OK", GREEN_M)], 0.5),
+            "The balance",
+            (lambda: self.set_val("50"), 0.5),
         ])
-
-        e1r = reply("nil", 5, RED_M)
-        xq = tick(False, 0.2).move_to(q1)
-        self.steps("The watched key changed after WATCH, so EXEC runs nothing and answers nil.", [
-            (lambda: [glow(e1[0], RED_M, 1.1), Indicate(eye, color=RED_M, scale_factor=1.06)], 0.8),
-            "so EXEC runs nothing",
-            (lambda: [Create(xq), q1[0].animate.set_stroke(RED_M), FadeIn(e1r)], 0.7),
-            (lambda: [Transform(na, note("EXEC answered nil: start over", "A", RED_M))], 0.7),
+        self.steps("And because the card was written, Redis marks every other watcher. "
+                   "Pod A is now dirty, and pod A doesn't know it yet.", [
+            "marks every",
+            (lambda: [*self.wrow("A", "dirty"), *self.wrow("B", None)], 0.6),
+            "doesn't know",
+            (lambda: [glow(pa[0], BLUE_M, 1.02)], 0.8),
         ])
-
-        retry = [cmd("WATCH", "A", 0), cmd("GET", "A", 1), cmd("MULTI", "A", 2), cmd("SET 20", "A", 3, queued=True), cmd("EXEC", "A", 4)]
-        rre = [reply("OK", 0), reply("50", 1), reply("OK", 2), reply("QUEUED", 3), reply("OK", 4, GREEN_M)]
-        good = chip("paid 80 euros, balance 20", GREEN_M, 19).move_to([RX, -0.5, 0])
-        self.steps("Pod A starts over: it watches, reads 50, and writes 20. This time EXEC runs. Both payments count.", [
-            (lambda: [FadeOut(VGroup(w1, g3, wr, gr, sb, m1, q1, e1, sbr, m1r, q1r, e1r, xq)),
-                      Transform(eye, T("watched by pod A", 20, BLUE_M).move_to(eye))], 0.6),
-            (lambda: [LaggedStart(*[FadeIn(c, target_position=PA) for c in retry[:2]], lag_ratio=0.5), FadeIn(rre[0]), FadeIn(rre[1])], 0.9),
+        self.steps("Now pod A sends its slip: MULTI, SET 70, EXEC. Without the watch, this SET would wipe out B's payment. "
+                   "What happens now? Pause and guess.", [
+            "MULTI",
+            (lambda: [*self.line("A", cmd_line("A", 3, "MULTI")), *self.line("A", cmd_line("A", 4, "SET balance:7 70"))], 0.6),
+            "EXEC",
+            (lambda: [*self.line("A", cmd_line("A", 5, "EXEC")), *self.go("A")], 0.5),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("EXEC checks the mark first. It finds it, throws the SET away, and answers nil, Redis's word for no value. "
+                   "Nothing ran, and B's payment survives.", [
+            (lambda: [*self.uncap(), Indicate(self.wr["A"][1], color=RED_M, scale_factor=1.2)], 0.8),
+            "throws the SET",
+            (lambda: [self.lines["A"][4].animate.set_opacity(0.25)], 0.5),
+            "answers nil",
+            (lambda: [*self.go("A", RED_M, back=True), *self.reply("A", 5, "nil", RED_M), *self.chip("A", "A: MULTI..EXEC", RED_M)], 0.6),
+            "Nothing ran",
+            (lambda: [*self.cap("nil: nothing ran", RED_M), Indicate(self.val, color=WHITE, scale_factor=1.15)], 0.8),
+        ])
+        self.steps("Nil means: you lost the race, start over. Pod A watches again, reads 50, checks that 30 still fits, and writes 20. "
+                   "Nobody touched the card this time, so EXEC runs.", [
+            (lambda: [*self.cap("nil means: you lost the race, start over", WHITE)], 0.5),
+            "Pod A watches",
+            (lambda: [*self.clear("A"), *self.clear("B"), *self.clear_chips(), *self.wrow("A", None), *self.uncap()], 0.5),
+            (lambda: [*self.line("A", cmd_line("A", 0, "WATCH balance:7")), *self.go("A"), *self.wrow("A", "clean")], 0.5),
+            "reads 50",
+            (lambda: [*self.line("A", cmd_line("A", 1, "GET balance:7", "50")), *self.chip("A", "A: WATCH, GET")], 0.5),
+            "checks that",
+            (lambda: self.line("A", thought("A", 2, "50 - 30 = 20")), 0.5),
             "and writes 20",
-            (lambda: [Transform(na, note("read 50: 30 fits, new balance 20", "A", BLUE_M)),
-                      LaggedStart(*[FadeIn(c, target_position=PA) for c in retry[2:]], lag_ratio=0.4), FadeIn(rre[2]), FadeIn(rre[3])], 1.1),
-            "This time",
-            (lambda: [Transform(retry[3], cmd("SET 20", "A", 3)), FadeIn(rre[4]), Transform(val, T("20", 52, GREEN_M).move_to(val))], 0.8),
-            "Both payments",
-            (lambda: [FadeIn(good, shift=0.1 * UP), FadeOut(eye), rr.animate.set_stroke(GREEN_M)], 0.7),
+            (lambda: [*self.line("A", cmd_line("A", 3, "MULTI")), *self.line("A", cmd_line("A", 4, "SET balance:7 20"))], 0.5),
+            "so EXEC runs",
+            (lambda: [*self.line("A", cmd_line("A", 5, "EXEC")), *self.go("A")], 0.5),
+            (lambda: [*self.reply("A", 5, "OK", GREEN_M), *self.chip("A", "A: MULTI..EXEC", GREEN_M), *self.set_val("20", GREEN_M), *self.wrow("A", None)], 0.5),
+        ])
+        ok = tick(True, 0.2).move_to([1.25, VAL_Y, 0])
+        self.steps("20. Both payments count. And notice, Redis never made anyone wait. It only refused a decision made from old news.", [
+            (lambda: [Create(ok), *self.cap("100 - 50 - 30 = 20", GREEN_M)], 0.6),
+            "Redis never",
+            (lambda: self.cap("no waiting, no locks: a refused decision, and a retry", WHITE), 0.6),
         ])
 
-        ev_a = cmd("EVAL: read, test, write", "A", 0, w=4.2)
-        ev_b = cmd("EVAL: read, test, write", "B", 2.6, w=4.2)
-        ra, rb = reply("1: 70 left", 0, w=4.2), reply("1: 20 left", 2.6, w=4.2)
-        one = chip("one command: nothing can run in between", GREEN_M, 18).move_to([RX - 0.6, -0.5, 0])
-        self.steps("A Lua script removes the retry. Its read, test and write run as one command, "
-                   "so nothing can land in between.", [
-            (lambda: [FadeOut(VGroup(*retry, *rre)), FadeOut(good), Transform(val, T("100", 52, WHITE).move_to(val)),
-                      rr.animate.set_stroke(RED_M), Transform(na, note("coffee: 30 euros", "A", BLUE_M))], 0.8),
-            "Its read",
-            (lambda: [FadeIn(ev_a, target_position=PA)], 0.7),
-            (lambda: [FadeIn(ra), Transform(val, T("70", 52, WHITE).move_to(val))], 0.5),
-            (lambda: [FadeIn(ev_b, target_position=PB)], 0.7),
-            (lambda: [FadeIn(rb), Transform(val, T("20", 52, GREEN_M).move_to(val))], 0.5),
-            "so nothing",
-            (lambda: [FadeIn(one, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 7: the name ----------------
+        self.steps("This pattern is called check and set. Read, decide, and write only if nothing changed since the read, "
+                   "inside a loop that tries again.", [
+            (lambda: self.cap("check-and-set: read, decide, write only if nothing changed", YELLOW_M), 0.6),
+            "inside a loop",
+            (lambda: [LaggedStart(*[Indicate(m, color=BLUE_M, scale_factor=1.06) for m in self.lines["A"]], lag_ratio=0.15)], 1.4),
+        ])
+        self.steps("It's optimistic: it bets that clashes are rare, and pays only when one happens.", [
+            (lambda: self.cap("optimistic: pay only when a clash happens", YELLOW_M), 0.6),
         ])
 
-        self.steps("One command runs alone. Send the decision as one script, or WATCH the key and retry when EXEC fails.", [
-            (lambda: [glow(ev_a[0], BLUE_M, 1.04), glow(ev_b[0], GOLD_M, 1.04)], 0.9),
-            "or WATCH",
-            (lambda: [glow(rr, GREEN_M, 1.03)], 0.9),
+        # ---------------- scene 8: guardrails ----------------
+        self.steps("Two things keep it honest. First, a watch belongs to a connection, the open line between your program and Redis. "
+                   "WATCH, MULTI and EXEC must travel on the same one.", [
+            (lambda: [FadeOut(ok), *self.uncap()], 0.4),
+            "a watch belongs",
+            (lambda: [glow(self.links["A"], YELLOW_M, 1.0), *self.cap("1. a watch belongs to one connection", WHITE)], 0.8),
+            "must travel",
+            (lambda: [LaggedStart(*[st for k in (0, 3, 5) for st in self.go("A")], lag_ratio=0.3)], 1.2),
         ])
-        self.wait(0.6)
+        self.steps("Second, every retry costs trips there and back. If fifty pods write the same card all day, "
+                   "it turns into musical chairs. Most attempts lose, and each loss costs another round.", [
+            (lambda: self.cap("2. every retry costs trips there and back", WHITE), 0.5),
+            "fifty pods",
+            (lambda: [LaggedStart(*[st for _ in range(4) for p in ("A", "B") for st in self.go(p)], lag_ratio=0.15)], 2.0),
+            "Most attempts",
+            (lambda: self.cap("a busy key: most attempts lose", RED_M), 0.5),
+        ])
+        self.steps("For a key that busy, send the whole decision to Redis as a script, which never needs to retry. That's next.", [
+            (lambda: self.cap("a busy key: send the decision as a script (next)", WHITE), 0.6),
+        ])
+
+        # ---------------- scene 9: moral and a check ----------------
+        self.steps("So where did the 30 go? Into the gap between two commands. The thread was never the problem.", [
+            (lambda: self.cap("where did the 30 go?  into the gap between two commands", WHITE), 0.6),
+        ])
+        self.steps("A batch runs together, but can't decide. WATCH lets your code decide, "
+                   "and refuses the write if the card changed while you were thinking.", [
+            (lambda: self.cap("a batch can't decide.  WATCH lets you decide, and checks.", YELLOW_M), 0.6),
+            "refuses the write",
+            (lambda: [glow(rb, WHITE, 1.02)], 0.8),
+        ], after=0.6)
+        self.steps("One quick check. After pod A's WATCH, pod B sets balance:7 to 100, the value it already had. "
+                   "Does pod A's EXEC run? Pause and think.", [
+            (lambda: [*self.uncap(), *self.clear("A"), *self.clear_chips(), *self.set_val("100")], 0.6),
+            (lambda: [*self.line("A", cmd_line("A", 0, "WATCH balance:7")), *self.wrow("A", "clean")], 0.5),
+            "pod B sets",
+            (lambda: [*self.line("B", cmd_line("B", 0, "SET balance:7 100")), *self.go("B")], 0.6),
+            (lambda: [*self.set_val("100")], 0.4),
+            "Does pod",
+            (lambda: [*self.line("A", cmd_line("A", 1, "MULTI")), *self.line("A", cmd_line("A", 2, "SET balance:7 70")),
+                      *self.line("A", cmd_line("A", 3, "EXEC"))], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("No. It answers nil. Redis doesn't compare values. Any write marks the watchers, even one that changes nothing.", [
+            (lambda: [*self.uncap(), *self.wrow("A", "dirty")], 0.5),
+            "It answers",
+            (lambda: [*self.go("A", RED_M, back=True), *self.reply("A", 3, "nil", RED_M)], 0.6),
+            "Any write",
+            (lambda: self.cap("any write marks the watchers", YELLOW_M, 30), 0.6),
+        ], after=0.3)
+        self.wait(2.0)
+
+
+def mbox_order(s, mono=False):
+    t = (M if mono else T)(s, 20)
+    r = RoundedRectangle(corner_radius=0.1, width=1.25, height=0.55, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1)
+    return VGroup(r, t.move_to(r))
