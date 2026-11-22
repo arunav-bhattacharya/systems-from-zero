@@ -1,38 +1,18 @@
 from sfz import *
 
-SAY.insert(0, (r"\bsearch_after\b", "search after"))
-SAY.insert(0, (r"\bids\b", "I Ds"))
-SAY.insert(0, (r"\bOpenSearch\b", "open search"))
+SAY.insert(0, (r"\bM-00(\d\d)\b", lambda m: "M zero zero " + " ".join(m.group(1))))
+SAY.insert(0, (r"\bBM25\b", "B M twenty-five"))
+SAY.insert(0, (r"\bOpenSearch\b", "Open Search"))
 
-SX = {1: -5.0, 2: -2.5, 3: 0.0, 4: 2.5, 5: 5.0}       # shard columns
-SY, SW, SH = -1.65, 2.2, 2.5                          # shard boxes
-CX, CY, CW = 0.0, 2.75, 3.2                           # coordinator
-MX0, MY0, MDY = 2.0, 3.32, 0.165                     # merged list: left edge, first row, row step
-SC = {1: BLUE_M, 2: TEAL_M, 3: PURPLE_M, 4: GOLD_M, 5: GREEN_M}
-SCORES = {1: [9.1, 8.4, 7.7, 6.2, 5.9, 5.1, 4.8, 4.0, 3.5, 3.1],
-          2: [9.6, 9.0, 8.8, 7.9, 6.0, 5.6, 5.0, 4.4, 4.1, 3.8],
-          3: [6.9, 6.5, 5.5, 5.2, 4.9, 4.6, 4.2, 3.9, 3.3, 3.0],
-          4: [8.1, 7.2, 6.6, 5.8, 5.3, 4.7, 4.5, 3.6, 3.2, 2.9],
-          5: [7.5, 7.0, 6.4, 6.1, 5.4, 4.3, 3.7, 3.4, 3.0, 2.7]}
-TOP = sorted([(s, k, i) for k in SCORES for i, s in enumerate(SCORES[k])], reverse=True)[:10]
-
-
-def glow(rect, color=YELLOW_M, s=1.03):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0, back=False):
-    """A dot that runs along an arrow (or back along it) and stays invisible until its turn."""
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.07, color=color).move_to(a).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
-
-
-def fill(color, a=0.14):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+Q_POS = np.array([-4.7, 2.95, 0])          # the request chip, top left
+COORD = np.array([-0.6, 2.95, 0])          # the coordinating node
+HITS_X, HITS_Y = 4.35, 3.05                # the merged hit list, top right
+X3 = [-4.2, 0.0, 4.2]
+X5 = [-5.4, -2.7, 0.0, 2.7, 5.4]
+PY, RY = 0.75, -0.3                        # primary row, replica row
+RET_Y = [-1.2, -1.7]                     # what a shard sends back
+CNT_Y, BAR_Y, CAP_Y = -2.45, -2.9, -3.35
 
 class Base(VoiceScene):
     def add_mobjects_from_animations(self, animations):
@@ -62,8 +42,8 @@ class Base(VoiceScene):
         return super().remove(*fam)
 
     def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        """Speak one line and play steps inside it. A step is (fn, run_time), built just before it plays; a number
+        waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -87,176 +67,349 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-def shard(k, sub="6 million notes", scolor=GREY_B):
-    x = SX[k]
-    r = RoundedRectangle(corner_radius=0.14, width=SW, height=SH, stroke_color=SC[k], stroke_width=3)
-    r.set_fill(fill(SC[k]), 1).move_to([x, SY, 0])
-    return VGroup(r, T(f"shard {k}", 21).move_to([x, SY + SH / 2 - 0.27, 0]), ssub(k, sub, scolor))
+    # captions, a counter line, and labels that swap in place
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color) if isinstance(s, str) else s, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def count(self, s, color=WHITE, size=24):
+        return self.put("cnt", fit(T(s, size, color), 13.0).move_to([0, CNT_Y, 0]))
+
+    def query(self, s, color=YELLOW_M):
+        """A query chip; a list of strings stacks into lines so long filters stay readable."""
+        lines = s if isinstance(s, list) else [s]
+        t = VGroup(*[M(x, 19) for x in lines]).arrange(DOWN, buff=0.1, aligned_edge=LEFT)
+        r = RoundedRectangle(corner_radius=0.08, width=t.width + 0.3, height=t.height + 0.26, stroke_color=color, stroke_width=2.5)
+        r.set_fill(color, opacity=0.18)
+        return self.put("q", fit(VGroup(r, t.move_to(r)), 3.9).move_to(Q_POS + 0.25 * LEFT))
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def ssub(k, s, color=GREY_B):
-    return T(s, 15, color).move_to([SX[k], SY + SH / 2 - 0.58, 0])
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def row_y(i):
-    return SY + SH / 2 - 0.88 - i * 0.15
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def sbar(k, i, score, color=None):
-    """Row i of shard k's list: one id and its score, drawn as a bar as long as the score."""
-    r = Rectangle(width=score * 0.18, height=0.1, stroke_width=0).set_fill(color or SC[k], 0.9)
-    return r.move_to([SX[k] - 0.9 + r.width / 2, row_y(i), 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def mbar(j, score, k):
-    r = Rectangle(width=score * 0.18, height=0.1, stroke_width=0).set_fill(SC[k], 0.9)
-    return r.move_to([MX0 + r.width / 2, MY0 - j * MDY, 0])
+def dot_run(a, b, color=YELLOW_M, rt=0.6):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    d = Dot(radius=0.08, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.12))
 
 
-def doc(color=WHITE, s=1.0):
-    r = Rectangle(width=0.16, height=0.21, stroke_color=color, stroke_width=1.5).set_fill(BLACK, 1)
-    ls = VGroup(*[Line([-0.05, 0.05 - 0.05 * i, 0], [0.05, 0.05 - 0.05 * i, 0], stroke_width=1, color=color) for i in range(3)])
-    return VGroup(r, ls).scale(s)
+def copy_box(label, color, x, y, w=3.1, size=24, dashed=False):
+    r = RoundedRectangle(corner_radius=0.1, width=w, height=0.74, stroke_color=color, stroke_width=2.5).set_fill(fillc(color, 0.12), 1)
+    if dashed:
+        r = DashedVMobject(r, num_dashes=40).set_fill(fillc(color, 0.12), 1)
+    return VGroup(r, T(label, size, color)).move_to([x, y, 0])
 
 
-def dense(k):
-    """A shard's top 10,000: too many rows to draw, so a block of thin lines."""
-    return VGroup(*[Line([SX[k] - 0.9, row_y(0) + 0.05 - j * 0.037, 0],
-                         [SX[k] - 0.9 + 1.7 * (1 - j / 48), row_y(0) + 0.05 - j * 0.037, 0], stroke_width=1.5, color=SC[k])
-                    for j in range(40)])
+def ret_chip(s, color, x, y, w=2.4):
+    t = M(s, 19, WHITE)
+    r = RoundedRectangle(corner_radius=0.08, width=w, height=0.4, stroke_color=color, stroke_width=2).set_fill(fillc(color, 0.2), 1)
+    return VGroup(r, fit(t, w - 0.2).move_to(r)).move_to([x, y, 0])
+
+
+def hit_list(rows, color=WHITE, title="hits"):
+    g = VGroup(T(title, 20, GREY_B))
+    for i, (a, b) in enumerate(rows):
+        g.add(VGroup(M(a, 20, color), M(b, 20, GREY_B)).arrange(RIGHT, buff=0.45))
+    g.arrange(DOWN, buff=0.1, aligned_edge=LEFT)
+    return g.move_to([HITS_X, HITS_Y - g.height / 2 + 0.1, 0])
+
+
+PLAIN = [("M-0045", "0.769"), ("M-0042", "0.566"), ("M-0043", "0.284"), ("M-0054", "0.284")]
+DFS = [("M-0042", "0.929"), ("M-0045", "0.850"), ("M-0043", "0.735"), ("M-0054", "0.735")]
 
 
 class QueryThenFetch(Base):
-    """shard-09, section 2: a search over five shards. Fetching each shard's ten best documents whole moves 50 to return
-    10. Query then fetch: each shard returns ids and scores of its top ten, the coordinator merges them into the global
-    top ten (4 from shard 2, none from shard 3), then fetches only those ten. Page 1,000 (from 9,990) makes every shard
-    find its top 10,000 and the coordinator sort 50,000; max_result_window stops it, search_after pages instead."""
+    """shard-09, section 2. A write of M-0054 hashes to shard 2, goes to its primary and on to the replica (total 2,
+    successful 2); a search for "northwind bikes" asks one copy of every shard; the query phase (ids and scores) and the
+    fetch phase (the page's documents); from 9990 + size 10 on 5 shards = 50,000 hits sorted, max_result_window 10,000,
+    search_after; the slowest shard (0.99^10, about 90%); each shard's own word counts and dfs_query_then_fetch; a check."""
+
+    def query(self, s, color=YELLOW_M):
+        return self.put("q", fit(chip(s, color, 20, mono=True), 3.2).move_to(Q_POS))
 
     def construct(self):
-        self.title_card("Searching every shard: query, then fetch", "ids and scores first, documents last")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Three volumes, one search", "why a search asks every shard")
 
-        sh = {k: shard(k) for k in SX}
-        q = chip("search: chargeback", GREY_B, 19).move_to([-4.6, CY, 0])
-        self.steps("A search for chargeback notes runs on an index split into five shards. "
-                   "Each shard indexes only its own documents, so any of them might hold the best matches.", [
-            (lambda: [FadeIn(q, shift=0.1 * DOWN)], 0.6),
-            "split into five",
-            (lambda: [LaggedStart(*[FadeIn(sh[k], shift=0.1 * UP) for k in SX], lag_ratio=0.15)], 1.2),
-            "Each shard indexes",
-            (lambda: [*[glow(sh[k][0], SC[k], 1.03) for k in SX]], 1.0),
-        ])
+        coord = mbox("coordinating node", PURPLE_M, w=3.0, h=0.62, size=20).move_to(COORD)
+        prim = [copy_box(f"shard {i}: primary", BLUE_M, x, PY) for i, x in enumerate(X3)]
+        repl = [copy_box(f"shard {i}: copy", GREY_B, x, RY) for i, x in enumerate(X3)]
+        vols = [copy_box(f"volume {i + 1}", GOLD_M, x, PY) for i, x in enumerate(X3)]
+        photo = [copy_box(f"photocopy {i + 1}", GOLD_M, x, RY, dashed=True) for i, x in enumerate(X3)]
+        idx = [T("index at the back", 20, GOLD_M).move_to([x, PY + 0.62, 0]) for x in X3]
 
-        co = box("coordinator", WHITE, w=CW, h=0.8, size=24).move_to([CX, CY, 0])
-        ar = {k: Arrow([CX + (k - 3) * 0.55, CY - 0.42, 0], [SX[k], SY + SH / 2 + 0.06, 0], buff=0, stroke_width=2.5,
-                       color=GREY_C, max_tip_length_to_length_ratio=0.04) for k in SX}
-        grid = [doc().move_to([-6.05 + (n % 10) * 0.25, 2.1 - (n // 10) * 0.29, 0]) for n in range(50)]
-        self.steps("The coordinator, the node that took the request, needs the global top ten. "
-                   "The simplest plan: every shard sends back its ten best documents, whole.", [
-            (lambda: [FadeIn(co)], 0.6),
-            "needs the global",
-            (lambda: [*[GrowArrow(ar[k]) for k in SX]], 0.8),
-            (lambda: [*[flow(ar[k], GREY_A, 0.7) for k in SX]], 0.8),
-            "every shard sends",
-            (lambda: [LaggedStart(*[FadeIn(grid[n], shift=0.6 * DOWN) for n in range(50)], lag_ratio=0.06),
-                      *[LaggedStart(*[flow(ar[k], WHITE, 0.6, back=True) for _ in range(3)], lag_ratio=0.4) for k in SX]], 2.2),
-        ])
+        def ptop(i, xs=X3):
+            return np.array([xs[i], PY + 0.42, 0])
 
-        wasted = T("50 sent, 10 used", 19, RED_M).move_to([-5.05, 0.55, 0])
-        self.steps("That's fifty full documents to return ten. Forty were read, sent and thrown away.", [
-            (lambda: [FadeIn(wasted, shift=0.1 * UP)], 0.7),
-            "Forty were",
-            (lambda: [*[grid[n][0].animate.set_stroke(RED_M) for n in range(10, 50)]], 0.6),
-            (lambda: [*[grid[n].animate.set_opacity(0.15) for n in range(10, 50)]], 0.8),
-        ])
+        cbot = COORD + 0.36 * DOWN
 
-        bars = {k: [sbar(k, i, s) for i, s in enumerate(SCORES[k])] for k in SX}
-        self.steps("So the search runs in two phases. In the query phase, each shard scores its own matches "
-                   "and sends back only ids and scores for its top ten.", [
-            (lambda: [*[FadeOut(g) for g in grid], FadeOut(wasted), *[a.animate.set_color(GREY_C) for a in ar.values()]], 0.7),
-            "In the query phase",
-            (lambda: [*[flow(ar[k], GOLD_M, 0.7) for k in SX],
-                      *[Transform(sh[k][2], ssub(k, "query phase: score", GOLD_M)) for k in SX]], 0.8),
-            "each shard scores",
-            (lambda: [*[LaggedStart(*[GrowFromEdge(b, LEFT) for b in bars[k]], lag_ratio=0.12) for k in SX]], 1.4),
-            "and sends back",
-            (lambda: [*[Transform(sh[k][2], ssub(k, "top 10: ids, scores", GOLD_M)) for k in SX]], 0.7),
+        # ---------------- scene 1: the question ----------------
+        self.steps("Support types northwind bikes into the shop search. The search index is split over three machines.", [
+            (lambda: self.query('"northwind bikes"'), 0.6),
+            "split over three",
+            (lambda: [LaggedStart(*[FadeIn(p, shift=0.1 * UP) for p in prim], lag_ratio=0.25)], 1.0),
         ])
+        self.steps("When we look up one shop by its id, we know exactly which machine to ask. But a word isn't an id.", [
+            "by its id",
+            (lambda: self.cap("an id: we know which machine to ask", WHITE), 0.6),
+            "But a word",
+            (lambda: self.cap("a word isn't an id", YELLOW_M), 0.6),
+        ])
+        self.steps("So how does the search find the ten best shops? And why won't most sites let you jump straight to page 1,000? Hold both questions.", [
+            (lambda: self.cap("how does it find the ten best shops?", YELLOW_M), 0.6),
+            "page 1,000",
+            (lambda: self.cap("and why can't you jump to page 1,000?", YELLOW_M), 0.6),
+        ], after=0.3)
 
-        ups = []
-        for j, (s, k, i) in enumerate(TOP):
-            ups.append((bars[k][i], mbar(j, s, k)))
-        topl = T("global top 10", 18, WHITE).move_to([4.85, MY0 - 4.5 * MDY, 0])
-        cnt = T("4 from shard 2, none from shard 3", 18, GREY_B).move_to([4.6, 1.45, 0])
-        self.steps("That's fifty small pairs. The coordinator merges them into the global top ten. "
-                   "Here, four come from shard two, and none from shard three.", [
-            (lambda: [*[LaggedStart(*[flow(ar[k], SC[k], 0.5, back=True) for _ in range(3)], lag_ratio=0.3) for k in SX]], 1.3),
-            "The coordinator merges",
-            (lambda: [LaggedStart(*[ReplacementTransform(b.copy(), m) for b, m in ups], lag_ratio=0.15), FadeIn(topl)], 1.8),
-            "Here, four",
-            (lambda: [glow(sh[2][0], TEAL_M, 1.03), FadeIn(cnt)], 0.8),
-            "none from shard three",
-            (lambda: [sh[3].animate.set_opacity(0.35), *[b.animate.set_opacity(0.3) for b in bars[3]]], 0.8),
+        # ---------------- scene 2: the encyclopedia ----------------
+        self.steps("Picture an encyclopedia in three volumes, each with its own index at the back.", [
+            (lambda: [*self.uncap(), *self.query('"bicycles"', GOLD_M), *[ReplacementTransform(p, v) for p, v in zip(prim, vols)]], 0.9),
+            "its own index",
+            (lambda: [LaggedStart(*[FadeIn(t) for t in idx], lag_ratio=0.2)], 0.7),
         ])
+        self.steps("To find every page about bicycles, you open all three indexes and put the pages together. No volume can tell you what the others hold.", [
+            "you open all three",
+            (lambda: [LaggedStart(*[dot_run(Q_POS + 0.35 * DOWN, ptop(i) + 0.5 * UP, YELLOW_M, 0.6) for i in range(3)], lag_ratio=0.3)], 1.2),
+            "No volume",
+            (lambda: self.cap("no volume knows what the others hold", WHITE), 0.6),
+        ])
+        self.steps("And a careful librarian keeps a photocopy of every volume on a different shelf.", [
+            "a photocopy",
+            (lambda: [LaggedStart(*[FadeIn(p, shift=0.1 * DOWN) for p in photo], lag_ratio=0.25)], 1.0),
+        ], after=0.3)
+        prim = [copy_box(f"shard {i}: primary", BLUE_M, x, PY) for i, x in enumerate(X3)]
+        self.steps("OpenSearch, a free search program, works the same way. Each volume is a shard, a piece of the search index.", [
+            (lambda: self.cap("OpenSearch: a free search program", WHITE), 0.6),
+            "Each volume is a shard",
+            (lambda: [*[ReplacementTransform(v, p) for v, p in zip(vols, prim)], *self.cap("volume = shard, a piece of the search index", WHITE)], 0.9),
+        ])
+        self.steps("Its index at the back is the shard's inverted index, a list of every word with the documents that contain it.", [
+            "inverted index",
+            (lambda: [*[t.animate.set_color(BLUE_M) for t in idx], *self.cap("index at the back = inverted index: each word, with the documents that hold it", WHITE)], 0.7),
+        ])
+        self.steps("And each photocopy is a replica, a copy of the shard kept on another machine.", [
+            "a replica",
+            (lambda: [*[ReplacementTransform(p, r) for p, r in zip(photo, repl)], FadeOut(VGroup(*idx)),
+                      *self.cap("photocopy = replica, a copy on another machine", WHITE)], 0.9),
+        ], after=0.3)
+        self.stamp("map")
 
-        need = {1: 3, 2: 4, 4: 2, 5: 1}
-        docs = [doc(SC[k]).move_to([MX0 + 1.95, MY0 - j * MDY, 0]).scale(0.75) for j, (s, k, i) in enumerate(TOP)]
-        got = T("10 documents, from 4 shards", 18, GREEN_M).move_to([4.6, 1.45, 0])
-        self.steps("In the fetch phase, it asks for just those ten documents, and only from the shards that hold them.", [
-            (lambda: [FadeOut(cnt), *[Transform(sh[k][2], ssub(k, f"fetch: {need[k]} document" + ("s" if need[k] > 1 else ""), GREEN_M)) for k in need],
-                      Transform(sh[3][2], ssub(3, "not asked", GREY_B)), ar[3].animate.set_opacity(0.2)], 0.8),
-            (lambda: [*[flow(ar[k], GREEN_M, 0.7) for k in need]], 0.8),
-            "and only from",
-            (lambda: [*[flow(ar[k], GREEN_M, 0.7, back=True) for k in need],
-                      LaggedStart(*[FadeIn(d, shift=0.2 * RIGHT) for d in docs], lag_ratio=0.1)], 1.3),
-            (lambda: [FadeIn(got)], 0.5),
+        # ---------------- scene 3: a write goes to one shard ----------------
+        self.steps("First, a write. A new shop, M-0054, can arrive at any node, which coordinates the request.", [
+            (lambda: [*self.uncap(), *self.query("PUT merchants/_doc/M-0054", GREEN_M)], 0.6),
+            "any node",
+            (lambda: [FadeIn(coord, shift=0.1 * DOWN), dot_run(Q_POS + 1.6 * RIGHT, COORD + 1.5 * LEFT, GREEN_M, 0.5)], 0.7),
         ])
+        self.steps("It hashes the id, and the hash says shard 2. So it sends the shop to shard 2's primary copy, which passes it on to the replica.", [
+            "the hash says",
+            (lambda: self.cap("hash(M-0054) → shard 2", WHITE), 0.6),
+            "sends the shop",
+            (lambda: [dot_run(cbot, ptop(2), GREEN_M, 0.8)], 0.85),
+            (lambda: [glow(prim[2][0], GREEN_M, 1.04)], 0.5),
+            "passes it on",
+            (lambda: [dot_run([X3[2] + 1.7, PY, 0], [X3[2] + 1.7, RY, 0], GREEN_M, 0.5), glow(repl[2][0], GREEN_M, 1.04)], 0.7),
+        ])
+        self.steps("Only when both have it does the answer come back: total 2, successful 2. One shard, two copies, nobody else bothered.", [
+            (lambda: [dot_run(ptop(2), cbot, GREEN_M, 0.7)], 0.75),
+            (lambda: self.count('"_shards": {"total": 2, "successful": 2}', GREEN_M, 22), 0.5),
+            "nobody else",
+            (lambda: [*[glow(prim[i][0], GREY_B, 1.02) for i in (0, 1)], *self.cap("a write: one shard, two copies", WHITE)], 0.7),
+        ], after=0.3)
 
-        page = chip("page 1,000: from 9,990, size 10", RED_M, 19).move_to([-4.3, CY, 0])
-        blocks = {k: dense(k) for k in SX}
-        self.steps("Now ask for page one thousand: skip 9,990 hits, return ten. "
-                   "No shard knows which of its hits get skipped, so each must find its top 10,000.", [
-            (lambda: [FadeOut(got), *[FadeOut(d) for d in docs], FadeOut(q), FadeIn(page, shift=0.1 * DOWN),
-                      sh[3].animate.set_opacity(1), ar[3].animate.set_opacity(1),
-                      *[Transform(sh[k][2], ssub(k, "6 million notes")) for k in SX]], 0.9),
-            "No shard knows",
-            (lambda: [*[flow(ar[k], GOLD_M, 0.6) for k in SX]], 0.7),
-            "so each must",
-            (lambda: [*[FadeOut(b) for k in SX for b in bars[k]], *[FadeIn(blocks[k]) for k in SX],
-                      *[Transform(sh[k][2], ssub(k, "top 10,000", RED_M)) for k in SX]], 1.0),
+        # ---------------- scene 4: a search asks everyone ----------------
+        q_q = '"northwind bikes"'
+        self.steps("Now the search. You might think it works the same way: find the right shard and ask it. But which shard holds northwind?", [
+            (lambda: [*self.drop("cnt"), *self.query(q_q)], 0.6),
+            "find the right shard",
+            (lambda: self.cap("find the right shard and ask it?", PURPLE_M), 0.6),
         ])
+        self.steps("Each shard's index covers only its own shops, like the index at the back of one volume. No shard can say which other shards hold matches.", [
+            (lambda: self.cap("each shard's index covers only its own shops", WHITE), 0.6),
+            "No shard can say",
+            (lambda: [*[glow(p[0], RED_M, 1.03) for p in prim]], 0.7),
+        ])
+        chosen = [0, 1, 0]   # which copy each shard's request goes to: primary (0) or replica (1)
 
-        sortl = T("sorts 50,000 to return 10", 19, RED_M).move_to([4.6, 1.45, 0])
-        self.steps("The coordinator sorts 50,000 ids and scores to return ten documents, "
-                   "and the cost grows with every page.", [
-            (lambda: [*[LaggedStart(*[flow(ar[k], RED_M, 0.45, back=True) for _ in range(6)], lag_ratio=0.2) for k in SX],
-                      co[0].animate.set_stroke(RED_M)], 1.6),
-            (lambda: [FadeIn(sortl)], 0.6),
-            "and the cost",
-            (lambda: [glow(co[0], RED_M, 1.04)], 0.9),
-        ])
+        def target(i):
+            return ptop(i) if chosen[i] == 0 else np.array([X3[i] - 1.7, RY, 0])
 
-        win = chip("max_result_window: 10,000", GREY_B, 16, mono=True).move_to([-4.55, 2.0, 0])
-        sa = chip("search_after: the last hit's sort values", GREEN_M, 17).move_to([-4.55, 2.0, 0])
-        nxt = {k: [sbar(k, i, s * 0.35) for i, s in enumerate(SCORES[k])] for k in SX}
-        self.steps("That's why OpenSearch stops at 10,000 by default. To page deeper, search_after passes the last hit's "
-                   "sort values, so each shard sends only its next ten.", [
-            (lambda: [FadeIn(win, shift=0.1 * DOWN)], 0.7),
-            "To page deeper",
-            (lambda: [FadeOut(win), FadeIn(sa, shift=0.1 * DOWN), FadeOut(sortl), co[0].animate.set_stroke(WHITE),
-                      Transform(page, chip("page 1,000", GREY_B, 19).move_to(page))], 0.8),
-            (lambda: [*[flow(ar[k], GREEN_M, 0.6) for k in SX]], 0.7),
-            "so each shard",
-            (lambda: [*[FadeOut(blocks[k]) for k in SX], *[FadeIn(b) for k in SX for b in nxt[k]],
-                      *[Transform(sh[k][2], ssub(k, "next 10 only", GREEN_M)) for k in SX]], 0.9),
-        ])
+        self.steps("So the coordinator asks them all. It sends the query to one copy of every shard, primary or replica, "
+                   "picking the copy that has answered fastest lately.", [
+            "asks them all",
+            (lambda: [*self.cap("a search: one copy of every shard", YELLOW_M)], 0.5),
+            "one copy of every shard",
+            (lambda: [*[dot_run(cbot, target(i), YELLOW_M, 0.8) for i in range(3)]], 0.85),
+            (lambda: [glow(prim[0][0], YELLOW_M, 1.04), glow(repl[1][0], YELLOW_M, 1.04), glow(prim[2][0], YELLOW_M, 1.04)], 0.6),
+            "picking the copy",
+            (lambda: self.cap("each time, the copy that has answered fastest lately", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("fanout")
 
-        self.steps("Ask every shard for ids and scores, fetch only the page you return, and page with search_after "
-                   "rather than skipping.", [
-            (lambda: [*[flow(ar[k], GOLD_M, 0.6) for k in SX]], 0.8),
-            "fetch only",
-            (lambda: [glow(co[0], GREEN_M, 1.04)], 0.9),
-            "and page with",
-            (lambda: [glow(sa[0], GREEN_M, 1.05)], 0.9),
+        # ---------------- scene 5: query, then fetch ----------------
+        rets = [VGroup(ret_chip("id, score", BLUE_M, x, RET_Y[0]), ret_chip("id, score", BLUE_M, x, RET_Y[1])) for x in X3]
+        merged = hit_list(PLAIN, WHITE, "merged ranking")
+        self.steps("Here's the trick that keeps it cheap. In the first round, each shard scores its own shops with BM25, the ranking formula, "
+                   "and sends back only ids and scores, for the best few it has. No documents yet. That's the query phase.", [
+            "In the first round",
+            (lambda: self.count("round 1: the query phase", YELLOW_M), 0.5),
+            "scores its own",
+            (lambda: [*[glow(p[0], BLUE_M, 1.03) for p in prim]], 0.6),
+            "sends back only",
+            (lambda: [LaggedStart(*[FadeIn(r, shift=0.1 * DOWN) for r in rets], lag_ratio=0.2)], 0.9),
+            (lambda: [*[dot_run(target(i), cbot, BLUE_M, 0.7) for i in range(3)]], 0.75),
+            "No documents",
+            (lambda: self.cap("only ids and scores travel; no documents yet", WHITE), 0.6),
         ])
-        self.wait(0.6)
+        self.steps("The coordinator merges those short lists into one ranking. Then the second round asks for the full documents of the page it will show, "
+                   "and nothing else. That's the fetch phase.", [
+            (lambda: [FadeIn(merged, shift=0.1 * LEFT), glow(coord[0], PURPLE_M, 1.05)], 0.8),
+            "the second round",
+            (lambda: [*self.count("round 2: the fetch phase", YELLOW_M)], 0.5),
+            "the full documents",
+            (lambda: [dot_run(cbot, ptop(0), YELLOW_M, 0.6), dot_run(cbot, ptop(2), YELLOW_M, 0.6)], 0.65),
+            (lambda: [dot_run(ptop(0), cbot, GREEN_M, 0.6), dot_run(ptop(2), cbot, GREEN_M, 0.6)], 0.65),
+            "nothing else",
+            (lambda: self.cap("then only the page's documents are fetched", WHITE), 0.6),
+        ])
+        self.steps("Query, then fetch. Like jotting page numbers from each volume's index before you carry any book to the desk.", [
+            (lambda: self.cap("query, then fetch", YELLOW_M, 28), 0.6),
+            "Like jotting",
+            (lambda: [LaggedStart(*[Indicate(r, color=YELLOW_M, scale_factor=1.06) for r in rets], lag_ratio=0.2)], 1.0),
+        ], after=0.3)
+        self.stamp("qtf")
+
+        # ---------------- scene 6: page 1,000 ----------------
+        prim5 = [copy_box(f"shard {i}", BLUE_M, x, PY, w=2.2) for i, x in enumerate(X5)]
+        self.steps("Now ask for a deep page: skip 9,990 hits and show 10, on an index with five shards. How many hits does the coordinator have to sort? Pause and guess.", [
+            (lambda: [*self.drop("cnt"), *self.uncap(), FadeOut(merged), FadeOut(VGroup(*rets)), FadeOut(VGroup(*prim, *repl)),
+                      *self.query('{ "from": 9990, "size": 10 }')], 0.7),
+            "five shards",
+            (lambda: [LaggedStart(*[FadeIn(p, shift=0.1 * UP) for p in prim5], lag_ratio=0.15)], 0.9),
+            "Pause and guess",
+            (lambda: self.cap("how many hits to sort?  pause and guess", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        rets5 = [ret_chip("top 10,000", RED_M, x, RET_Y[0], w=2.2) for x in X5]
+        self.steps("50,000. No shard knows where its hits fall in the overall order, so each must send its own top 10,000, "
+                   "and the coordinator sorts all 50,000 to return 10.", [
+            (lambda: [*self.uncap(), *[dot_run(cbot, ptop(i, X5), YELLOW_M, 0.7) for i in range(5)]], 0.75),
+            "each must send",
+            (lambda: [LaggedStart(*[FadeIn(r, shift=0.1 * DOWN) for r in rets5], lag_ratio=0.15)], 0.9),
+            (lambda: [*[dot_run(ptop(i, X5), cbot, RED_M, 0.7) for i in range(5)]], 0.75),
+            "sorts all 50,000",
+            (lambda: self.count("5 shards × 10,000 = 50,000 hits sorted, to return 10", RED_M), 0.6),
+        ])
+        self.steps("That's five librarians each copying out ten thousand page numbers so you can read the last ten.", [
+            (lambda: [LaggedStart(*[glow(r[0], RED_M, 1.06) for r in rets5], lag_ratio=0.15)], 1.0),
+        ], after=0.3)
+        self.steps("So OpenSearch stops skip plus size at 10,000 by default, with a setting called max result window. "
+                   "To go deeper, search after carries on from the last hit of the page before. And that's why page 1,000 is out of reach.", [
+            (lambda: self.cap(M("index.max_result_window: from + size ≤ 10,000", 22, WHITE)), 0.6),
+            "To go deeper",
+            (lambda: self.cap(M("search_after: carry on from the last hit of the page before", 22, GREEN_M)), 0.6),
+            "page 1,000",
+            (lambda: self.cap("page 1,000: every shard would rank everything before it", YELLOW_M), 0.6),
+        ], after=0.3)
+        self.stamp("deep")
+
+        # ---------------- scene 7: the slowest shard ----------------
+        DX = [-5.4 + 1.2 * k for k in range(10)]
+        dots = VGroup(*[Dot(radius=0.12, color=GREEN_M).move_to([x, RET_Y[1] + 0.05, 0]) for x in DX])
+        self.steps("There's a second cost. A search is as slow as its slowest shard.", [
+            (lambda: [*self.drop("cnt"), *self.uncap(), FadeOut(VGroup(*rets5)), *self.query("any search")], 0.6),
+            "slowest shard",
+            (lambda: [glow(prim5[3][0], RED_M, 1.05), *self.cap("a search is as slow as its slowest shard", WHITE)], 0.7),
+        ])
+        self.steps("Say each shard answers in time 99% of the time. Then all 10 shards of a search answer in time only 0.99 to the power 10, about 90% of the time.", [
+            "each shard",
+            (lambda: [FadeIn(dots), *self.count("each shard: on time 99% of the time", WHITE)], 0.6),
+            "all 10 shards",
+            (lambda: [LaggedStart(*[Indicate(d, color=YELLOW_M, scale_factor=1.6) for d in dots], lag_ratio=0.08)], 1.0),
+            "0.99 to the power",
+            (lambda: [dots[6].animate.set_color(RED_M), *self.count("all 10 on time: 0.99¹⁰ ≈ 0.90, about 90%", RED_M)], 0.6),
+        ], after=0.3)
+
+        # ---------------- scene 8: each volume counts on its own ----------------
+        prim = [copy_box(f"shard {i}: primary", BLUE_M, x, PY) for i, x in enumerate(X3)]
+        plain = hit_list(PLAIN, WHITE, "plain search")
+        self.steps("One more surprise. BM25 counts how rare a word is, and each shard counts only its own shops.", [
+            (lambda: [FadeOut(dots), *self.drop("cnt"), FadeOut(VGroup(*prim5)), *self.query(q_q)], 0.6),
+            (lambda: [LaggedStart(*[FadeIn(p) for p in prim], lag_ratio=0.2), *self.uncap()], 0.8),
+            "each shard counts",
+            (lambda: self.cap("how rare is a word? each shard counts its own shops", WHITE), 0.6),
+        ])
+        self.steps("With millions per shard, they agree. With a handful, they don't. In the lesson's lab, the plain search ranks M-0045 first.", [
+            "With a handful",
+            (lambda: [*[glow(p[0], RED_M, 1.03) for p in prim]], 0.6),
+            "the plain search",
+            (lambda: [FadeIn(plain, shift=0.1 * LEFT)], 0.7),
+        ])
+        dfs = hit_list(DFS, GREEN_M, "dfs_query_then_fetch")
+        self.steps("Ask for D F S query then fetch, which adds a first round to collect those counts from every shard, "
+                   "and M-0042, which has both words, comes first again.", [
+            "adds a first round",
+            (lambda: [*[dot_run(cbot, ptop(i), GREY_B, 0.6) for i in range(3)], *self.count("round 0: collect the word counts from every shard", WHITE)], 0.7),
+            (lambda: [*[dot_run(ptop(i), cbot, GREY_B, 0.6) for i in range(3)]], 0.65),
+            "comes first again",
+            (lambda: [FadeOut(plain), FadeIn(dfs, shift=0.1 * LEFT)], 0.7),
+            (lambda: [Indicate(dfs[1], color=GREEN_M, scale_factor=1.08)], 0.6),
+        ], after=0.3)
+
+        # ---------------- scene 9: the moral, and a check ----------------
+        self.steps("So the moral of the story: a search asks every shard, and more shards add work to every search.", [
+            (lambda: [*self.drop("cnt"), *self.cap("a search asks every shard", YELLOW_M, 26)], 0.6),
+            "more shards",
+            (lambda: [*[dot_run(cbot, ptop(i), YELLOW_M, 0.6) for i in range(3)], *self.cap("more shards add work to every search", YELLOW_M, 26)], 0.7),
+        ], after=0.3)
+        self.steps("One quick check. Support fetches shop M-0054 by its id. How many shards get asked? Pause and think.", [
+            (lambda: [*self.uncap(), FadeOut(dfs), *self.query("GET merchants/_doc/M-0054", GREEN_M)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("how many shards?  pause and think", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Just one. The id hashes to shard 2, so it goes straight there. Words make you ask everyone; ids don't.", [
+            (lambda: [*self.uncap(), dot_run(cbot, ptop(2), GREEN_M, 0.7)], 0.75),
+            (lambda: [glow(prim[2][0], GREEN_M, 1.05), *self.count("hash(M-0054) → shard 2: one shard", GREEN_M)], 0.6),
+            "Words make you",
+            (lambda: self.cap("words ask every shard; ids ask one", YELLOW_M, 26), 0.6),
+        ], after=0.3)
+        self.wait(2.0)
