@@ -7,6 +7,8 @@ SAY.insert(0, (r"\bGROUP BY\b", "group by"))
 SAY.insert(0, (r"\bWHERE\b", "where"))
 SAY.insert(0, (r"\bHAVING\b", "having"))
 SAY.insert(0, (r"\b(\d+)\.00\b", r"\1"))
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 TITLE_Y = 2.62

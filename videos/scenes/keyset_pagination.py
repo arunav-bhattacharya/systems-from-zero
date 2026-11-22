@@ -12,6 +12,8 @@ SAY[0:0] = [
     (r"\bcreated_at\b", "created at"),
     (r"\bpayment_id\b", "payment I D"),
 ]
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 Q_Y = [3.35, 2.95]

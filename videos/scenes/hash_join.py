@@ -2,6 +2,8 @@ from sfz import *
 
 SAY.insert(0, (r"\bwork_mem\b", "work mem"))
 SAY.insert(0, (r"\bEXPLAIN\b", "explain"))
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 ROW_Y = [1.75, 0.85, -0.05, -0.95]
