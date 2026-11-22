@@ -1,5 +1,7 @@
 from sfz import *
 
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 # Applied in this order, before the course-wide rules.
 SAY[0:0] = [
     (r"\b189\.99\b", "one eighty-nine ninety-nine"),

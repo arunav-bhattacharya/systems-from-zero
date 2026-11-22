@@ -1,5 +1,7 @@
 from sfz import *
 
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 # Amounts are said the way people say them ("twenty-five"); captions keep "25.00".
 SAY.insert(0, (r"\b(\d+)\.00\b", r"\1"))
 SAY.insert(0, (r"\bT([123])('s)?\b", lambda m: "T " + ["one", "two", "three"][int(m.group(1)) - 1] + (m.group(2) or "")))

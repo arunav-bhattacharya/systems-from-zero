@@ -1,5 +1,7 @@
 from sfz import *
 
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 SAY.insert(0, (r"\bM-0042('s)?", lambda m: "M forty-two" + (m.group(1) or "")))
 SAY.insert(0, (r"\bM-0007('s)?", lambda m: "M seven" + (m.group(1) or "")))
 SAY.insert(0, (r"\bpg_ivm\b", "P G I V M"))
