@@ -1,31 +1,33 @@
 from sfz import *
 
 SAY.insert(0, (r"\bpay-(\d+)", r"pay \1"))
+SAY.insert(0, (r"\bledger-0\b", "ledger zero"))
+SAY.insert(0, (r"\binitTransactions\b", "init transactions"))
+SAY.insert(0, (r"\bbeginTransaction\b", "begin transaction"))
+SAY.insert(0, (r"\bsendOffsetsToTransaction\b", "send offsets to transaction"))
+SAY.insert(0, (r"\bcommitTransaction\b", "commit transaction"))
+SAY.insert(0, (r"\bProducerFencedException\b", "producer fenced exception"))
+SAY.insert(0, (r"\bread_uncommitted\b", "read uncommitted"))
+SAY.insert(0, (r"\bread_committed\b", "read committed"))
 
-X0, PITCH, CW, CH = -2.75, 0.94, 0.84, 0.6     # partition rows: left end, cell pitch, cell size
-NCELL = 9
-RY = [2.1, 0.0, -2.1]                         # ledger-entries 0, ledger-entries 1, __consumer_offsets
-NAMES = ["ledger-entries, partition 0", "ledger-entries, partition 1", "__consumer_offsets (the group's bookmarks)"]
-SVX, SVY, SVW = -5.25, 0.55, 2.55               # the ledger service
-COX, COY = -5.25, -2.25                         # the transaction coordinator
-READ_Y = 3.3                                    # what the read_committed reader of partition 0 gets
-
-
-def glow(rect, color=YELLOW_M, s=1.03):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0):
-    """A dot that runs along an arrow and stays invisible until its turn."""
-    d = Dot(radius=0.07, color=color).move_to(path.get_start()).set_opacity(0)
-    return Succession(d.animate(run_time=0.05).set_opacity(1),
-                      MoveAlongPath(d, Line(path.get_start(), path.get_end()), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+SRC_Y, ENT_Y, OFF_Y = 2.55, 0.55, -1.25       # payments, ledger-entries, __consumer_offsets
+CW, CH = 0.84, 0.66
+PG_C = np.array([1.0, 2.55, 0])               # the ledger program
+CO_C = np.array([4.85, 2.55, 0])              # the transaction coordinator
+NOTE_Y = 1.85                                 # the sticky note, under the source row
+CALL_Y = 1.72                                 # the call being made, under the program
+READ_Y = -2.4
+CAP_Y, BAR_Y = -3.35, -2.98
+NAMES = ["Ana", "Ben", "Cara", "Dev", "Eva", "Finn"]
 
 
-def fill(color, a=0.14):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+def sx(k):
+    return -5.6 + 0.92 * k
+
+
+def ex(i):
+    return -5.6 + 0.98 * i
 
 
 class Base(VoiceScene):
@@ -81,223 +83,489 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-def rbox(x, y, w, h, color, fa=0.14):
-    r = RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3)
-    white = ManimColor(color).to_hex().upper() == "#FFFFFF"
-    return r.set_fill(BLACK if white else fill(color, fa), 1).move_to([x, y, 0])
+    # labels that get replaced: one key, one thing on screen
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
 
+    def drop(self, *keys):
+        out = []
+        for key in keys:
+            old = self.lab.pop(key, None)
+            if old is not None:
+                out.append(FadeOut(old))
+        return out
 
-def cx(i):
-    return X0 + 0.1 + CW / 2 + i * PITCH
+    def cap(self, s, color=GREY_B, size=24):
+        return self.put("cap", fit(T(s, size, color), 12.6).move_to([0, CAP_Y, 0]))
 
-
-def row(r):
-    w = NCELL * PITCH + 0.1
-    track = RoundedRectangle(corner_radius=0.1, width=w, height=CH + 0.2, stroke_color=GREY_D, stroke_width=2)
-    track.set_fill(BLACK, 1).move_to([X0 + w / 2, RY[r], 0])
-    lab = M(NAMES[r], 17, GREY_B)
-    lab.move_to([X0 + lab.width / 2, RY[r] + 0.68, 0])
-    return VGroup(track, lab)
-
-
-def cell(r, i, label, color, tcolor=WHITE):
-    rect = RoundedRectangle(corner_radius=0.08, width=CW, height=CH, stroke_color=color, stroke_width=2.5)
-    rect.set_fill(fill(color, 0.22), 1).move_to([cx(i), RY[r], 0])
-    t = fit(M(label, 17, tcolor), CW - 0.14).move_to(rect)
-    num = M(str(i), 14, GREY_C).move_to([cx(i), RY[r] - 0.6, 0])
-    return VGroup(rect, t, num)
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def marker(r, i, kind):
-    c = cell(r, i, kind, GREEN_M if kind == "commit" else RED_M)
-    c[1].become(fit(M(kind, 15, GREEN_M if kind == "commit" else RED_M), CW - 0.14).move_to(c[0]))
-    return c
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def restate(c, color, tcolor=WHITE):
-    return [c[0].animate.set_stroke(color).set_fill(fill(color, 0.22), 1), c[1].animate.set_color(tcolor)]
+def glow(m, color=YELLOW_M, s=1.05):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def sv_sub(s, color=GREY_B):
-    return T(s, 17, color).move_to([SVX, SVY - 0.2, 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def reader(s, color=GREY_B):
-    g = VGroup(M("read_committed reader of partition 0 gets:", 17, GREY_B), T(s, 20, color)).arrange(RIGHT, buff=0.25)
-    return g.move_to([0.75, READ_Y, 0])
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def lso(i, r=0):
-    x = X0 + 0.1 + i * PITCH - (PITCH - CW) / 2
-    ln = Line([x, RY[r] + 0.48, 0], [x, RY[r] - 0.48, 0], stroke_width=5, color=YELLOW_M)
-    lab = T(f"last stable offset: {i}", 18, YELLOW_M).next_to(ln, DOWN, buff=0.35)
-    return VGroup(ln, lab)
+
+
+STYLE = {"src": BLUE_M, "plain": TEAL_M, "dup": YELLOW_M, "pencil": GREY_B, "ink": GREEN_M, "abort": RED_M, "name": WHITE}
+
+
+def cell(text, x, y, style="plain", w=CW):
+    c = STYLE[style]
+    r = RoundedRectangle(corner_radius=0.08, width=w, height=CH, stroke_color=c, stroke_width=2.5)
+    if style == "pencil":
+        r.set_fill(BLACK, 1)
+        edge = DashedVMobject(r.copy().set_fill(opacity=0), num_dashes=26, dashed_ratio=0.55)
+        lab = T(text, 16, GREY_B).move_to([x, y, 0])
+        return VGroup(r.move_to([x, y, 0]), lab, edge.move_to([x, y, 0])).set_z_index(3)
+    r.set_fill(BLACK if style == "name" else fillc(c, 0.2), 1).move_to([x, y, 0])
+    lab = T(text, 16, GREY_B if style == "abort" else WHITE).move_to([x, y, 0])
+    return VGroup(r, lab).set_z_index(3)
+
+
+def marker(kind, x, y):
+    c = GREEN_M if kind == "COMMIT" else RED_M
+    r = RoundedRectangle(corner_radius=0.08, width=CW, height=CH, stroke_color=GOLD_M, stroke_width=3).set_fill(fillc(GOLD_M, 0.25), 1)
+    return VGroup(r.move_to([x, y, 0]), M(kind, 12, c).move_to([x, y, 0])).set_z_index(3)
+
+
+def box(c, w, h, color):
+    return RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(BLACK if ManimColor(color).to_hex().upper() == "#FFFFFF" else fillc(color), 1).move_to(c)
+
+
+def dot_to(a, b, color=YELLOW_M, rt=0.45):
+    d = Dot(radius=0.07, color=color).move_to(a).set_z_index(8)
+    return Succession(FadeIn(d, run_time=0.03), d.animate(run_time=rt, rate_func=smooth).move_to(b), FadeOut(d, run_time=0.08))
+
+
+def code_panel(title, lines, x):
+    r = RoundedRectangle(corner_radius=0.14, width=6.3, height=5.0, stroke_color=GREY_B, stroke_width=2.5).set_fill("#0b0d10", 1)
+    r.move_to([x, 0.2, 0])
+    head = left_at(T(title, 22, GREY_B), x - 2.9, 2.35)
+    rows = VGroup()
+    cw = M("x" * 40, 14).width / 40
+    for k, s in enumerate(lines):
+        col = GREY_B if s.strip().startswith("//") else WHITE
+        ind = (len(s) - len(s.lstrip())) * cw
+        rows.add(left_at(M(s.strip() if s.strip() else " ", 14, col), x - 2.9 + ind, 1.85 - 0.31 * k))
+    if rows.width > 5.6:
+        rows.scale(5.6 / rows.width, about_point=rows.get_corner(UL))
+    return VGroup(r, head, rows).set_z_index(10)
+
+
+JAVA = ["producer.beginTransaction();",
+        "try {",
+        "    for (var r : records)",
+        "        producer.send(new ProducerRecord<>(",
+        "            \"ledger-entries\", r.key(), \"entry:\" + r.value()));",
+        "    producer.sendOffsetsToTransaction(nextOffsets(records),",
+        "            consumer.groupMetadata());",
+        "    producer.commitTransaction();    // together",
+        "} catch (ProducerFencedException fenced) {",
+        "    throw fenced;                    // a newer copy",
+        "} catch (KafkaException e) {",
+        "    producer.abortTransaction();     // cancel",
+        "    rewind(consumer, records);       // seek back",
+        "}"]
+KOTLIN = ["producer.beginTransaction()",
+          "try {",
+          "    for (r in records)",
+          "        producer.send(ProducerRecord(",
+          "            \"ledger-entries\", r.key(), \"entry:${r.value()}\"))",
+          "    producer.sendOffsetsToTransaction(nextOffsets(records),",
+          "        consumer.groupMetadata())",
+          "    producer.commitTransaction()     // together",
+          "} catch (fenced: ProducerFencedException) {",
+          "    throw fenced                     // a newer copy",
+          "} catch (e: KafkaException) {",
+          "    producer.abortTransaction()      // cancel",
+          "    rewind(consumer, records)        // seek back",
+          "}"]
 
 
 class KafkaTransactions(Base):
-    """msg-10, section 1: the ledger service reads payments and writes entries to two partitions of ledger-entries plus
-    its bookmark to __consumer_offsets. Without a transaction a crash between the writes duplicates four entries. With
-    one, the entries and the bookmark sit in the log as an open transaction until the coordinator writes a COMMIT
-    marker into each partition it touched. A read_committed reader stops at the last stable offset (an open
-    transaction at offset 3, so even a plain fee record at 4 waits); an abort writes ABORT markers and the reader skips
-    pay-4 and pay-5, then the retried batch commits."""
+    """msg-10, section 1. The address book copied with a sticky note: four copied, the doorbell, a friend carries on from
+    the note, 10 addresses for 6 people. The ledger program does the same (6 payments, 10 entries). The idempotent
+    producer doesn't help (a new copy is a new producer). Pencil and one ink stamp: a transaction. The coordinator,
+    the transactional id (ledger-0) and five calls, replayed on the crash: instance 1 pencils four entries and dies;
+    instance 2's initTransactions aborts them (an ABORT marker, nothing deleted), sends six, sends the bookmark, commits
+    (COMMIT markers in ledger-entries and __consumer_offsets). read_committed sees 6, the default sees 10. Rewind after
+    an abort, keep transactions short. Java and Kotlin, the moral, and a check (14 aborted entries, default reader)."""
 
     def construct(self):
-        self.title_card("Kafka transactions", "commit markers and the last stable offset")
+        self.lab = {}
+        self.ent = []
+        self.title_card("Ink the whole batch, or none of it", "a Kafka transaction: the entries and the bookmark as one write")
 
-        sv = VGroup(rbox(SVX, SVY, SVW, 1.0, TEAL_M), T("ledger service", 22).move_to([SVX, SVY + 0.2, 0]),
-                    sv_sub("instance 1"))
-        rows = [row(r) for r in range(3)]
-        arrs = [Arrow([SVX + SVW / 2 + 0.06, SVY + 0.25 - 0.25 * r, 0], [X0 - 0.12, RY[r], 0], buff=0, stroke_width=3,
-                      color=GREY_B, tip_length=0.2, max_tip_length_to_length_ratio=0.5) for r in range(3)]
-        self.steps("A ledger service reads payments and writes an entry for each into two partitions. "
-                   "Then it saves its bookmark, the next offset to read, in a third.", [
-            (lambda: [FadeIn(sv)], 0.7),
-            "into two partitions",
-            (lambda: [FadeIn(rows[0]), FadeIn(rows[1]), GrowArrow(arrs[0]), GrowArrow(arrs[1])], 1.0),
-            "Then it saves",
-            (lambda: [FadeIn(rows[2]), GrowArrow(arrs[2])], 0.9),
+        # ---------------- scene 1: the address book ----------------
+        src = [cell(NAMES[k], sx(k), SRC_Y, "name") for k in range(6)]
+        pg = box(PG_C, 2.5, 1.1, WHITE)
+
+        def pg_t(s):
+            return self.put("pg_t", T(s, 22).move_to(PG_C + [0, 0.2, 0]))
+
+        def pg_s(s, color=GREY_B):
+            return self.put("pg_s", T(s, 16, color).move_to(PG_C + [0, -0.22, 0]))
+
+        def note(s, k=0, color=GOLD_M):
+            t = T(s, 16, BLACK)
+            r = RoundedRectangle(corner_radius=0.05, width=max(1.2, t.width + 0.3), height=0.42, stroke_width=0).set_fill(color, 1)
+            g = VGroup(r, t).move_to([sx(k), NOTE_Y, 0])
+            return self.put("note", g)
+
+        def row_lab(key, s, y):
+            return self.put(key, left_at(T(s, 20, GREY_B), -6.05, y + 0.62))
+
+        self.steps("Picture copying the addresses from an old address book into a new one. You keep your place with a sticky note.", [
+            "from an old",
+            (lambda: [*row_lab("src_t", "old address book", SRC_Y), LaggedStart(*[FadeIn(c, shift=0.1 * DOWN) for c in src], lag_ratio=0.12)], 1.2),
+            "into a new one",
+            (lambda: [*row_lab("ent_t", "new address book", ENT_Y), FadeIn(pg), *pg_t("you")], 0.7),
+            "sticky note",
+            (lambda: note("sticky note"), 0.6),
         ])
 
-        first = [cell(0, 0, "pay-0", GREY_B), cell(0, 1, "pay-2", GREY_B), cell(1, 0, "pay-1", GREY_B), cell(1, 1, "pay-3", GREY_B)]
-        cross = tick(False, 0.3).move_to([SVX, SVY + 0.85, 0])
-        self.steps("These are three separate writes. Say it writes four entries, then dies before it saves the bookmark.", [
-            (lambda: [glow(a, YELLOW_M, 1.0) for a in arrs], 0.9),
-            "Say it writes",
-            (lambda: [flow(arrs[0], GREY_B, 0.6), flow(arrs[1], GREY_B, 0.6)], 0.6),
-            (lambda: [LaggedStart(*[FadeIn(c) for c in first], lag_ratio=0.2)], 0.9),
-            "then dies",
-            (lambda: [Transform(sv[2], sv_sub("crashed", RED_M)), sv[0].animate.set_stroke(RED_M), FadeIn(cross)], 0.7),
+        def write(i, text, style, k_src=None):
+            c = cell(text, ex(i), ENT_Y, style)
+            if i < len(self.ent):
+                self.ent[i] = c
+            else:
+                self.ent.append(c)
+            a = PG_C + [0, -0.55, 0]
+            return [Succession(dot_to(a, [ex(i), ENT_Y + 0.4, 0]), FadeIn(c, shift=0.05 * DOWN, run_time=0.2))]
+
+        self.steps("You've copied four when the doorbell rings. While you're away, a friend carries on from the sticky note, "
+                   "which still marks the start.", [
+            (lambda: [LaggedStart(*[AnimationGroup(*write(i, NAMES[i], "name")) for i in range(4)], lag_ratio=0.5)], 1.8),
+            "the doorbell",
+            (lambda: [*self.put("bell", T("ding dong", 20, YELLOW_M).move_to(PG_C + [0, 0.85, 0])), glow(pg, YELLOW_M, 1.04)], 0.6),
+            "a friend",
+            (lambda: [*self.drop("bell"), *pg_t("a friend")], 0.5),
+            "still marks",
+            (lambda: [Indicate(self.lab["note"], color=GOLD_M, scale_factor=1.2)], 0.8),
+        ])
+        self.steps("The friend copies from the note to the end. How many addresses are in the new book now? Pause and guess.", [
+            (lambda: [LaggedStart(*[AnimationGroup(*write(4 + i, NAMES[i], "name")) for i in range(6)], lag_ratio=0.35)], 2.0),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Ten, for six people. Four of them twice. Nobody did anything wrong. The sticky note stayed behind the work.", [
+            (lambda: [*self.cap("10 addresses for 6 people", WHITE)], 0.5),
+            "Four of them twice",
+            (lambda: [*[self.ent[i][0].animate.set_stroke(YELLOW_M, width=4) for i in list(range(4)) + list(range(4, 8))]], 0.7),
+            "The sticky note stayed",
+            (lambda: [Indicate(self.lab["note"], color=GOLD_M, scale_factor=1.2)], 0.8),
         ])
 
-        dup = [cell(0, 2, "pay-0", RED_M), cell(0, 3, "pay-2", RED_M), cell(1, 2, "pay-1", RED_M), cell(1, 3, "pay-3", RED_M)]
-        bm = cell(2, 0, "4", GREY_B)
-        twice = chip("four payments debited twice", RED_M, 20).move_to([0.75, READ_Y, 0])
-        self.steps("The next instance starts from the old bookmark and writes all four again. "
-                   "Four payments are debited twice.", [
-            (lambda: [FadeOut(cross), Transform(sv[2], sv_sub("instance 2")), sv[0].animate.set_stroke(TEAL_M)], 0.7),
-            "and writes",
-            (lambda: [flow(arrs[0], RED_M, 0.6), flow(arrs[1], RED_M, 0.6)], 0.6),
-            (lambda: [LaggedStart(*[FadeIn(c) for c in dup], lag_ratio=0.2)], 0.9),
-            (lambda: [flow(arrs[2], GREY_B, 0.5)], 0.5),
-            (lambda: [FadeIn(bm)], 0.4),
-            "Four payments are",
-            (lambda: [FadeIn(twice, shift=0.15 * UP)], 0.7),
+        # ---------------- scene 2: the payments program ----------------
+        def relabel_src():
+            out = []
+            for k in range(6):
+                new = cell(f"pay-{k}", sx(k), SRC_Y, "src")
+                out.append(Transform(src[k], new))
+            return out
+
+        def relabel_ent():
+            out = []
+            names = [f"pay-{i}" for i in range(4)] + [f"pay-{i}" for i in range(6)]
+            for i, n in enumerate(names):
+                new = cell(n, ex(i), ENT_Y, "dup" if i < 4 or i in (4, 5, 6, 7) else "plain")
+                out.append(Transform(self.ent[i], new))
+            return out
+
+        self.steps("The café payments program does the same. It reads card payments from Kafka, a program that keeps logs "
+                   "of messages for other programs to read.", [
+            (lambda: [*self.drop("cap"), *row_lab("src_t", "payments (a log in Kafka)", SRC_Y), *relabel_src()], 1.0),
+            "It reads",
+            (lambda: [*pg_t("ledger program"), *pg_s("instance 1")], 0.6),
+        ])
+        self.steps("For each payment, it writes a ledger entry, a line in the book of money movements, to a log called ledger-entries. "
+                   "Then it moves its bookmark.", [
+            "a log called",
+            (lambda: [*row_lab("ent_t", "ledger-entries", ENT_Y), *relabel_ent()], 1.0),
+            "its bookmark",
+            (lambda: note("bookmark: 0"), 0.6),
+        ])
+        offs0 = cell("offset 0", -5.25, OFF_Y, "plain", 1.5)
+        self.steps("Kafka keeps that bookmark in a log of its own. So these are two separate writes, often on different machines, "
+                   "and nothing ties them together. A crash in between, and the lesson's demo ends with 10 entries for 6 payments.", [
+            "a log of its own",
+            (lambda: [*row_lab("off_t", "__consumer_offsets (where the bookmark is kept)", OFF_Y), FadeIn(offs0)], 0.7),
+            "two separate writes",
+            (lambda: [dot_to(PG_C + [0, -0.55, 0], [ex(3), ENT_Y + 0.4, 0], WHITE, 0.6), dot_to(PG_C + [-1.3, -0.3, 0], [-4.5, OFF_Y + 0.3, 0], WHITE, 0.8),
+                      *self.cap("two writes, nothing tying them together", WHITE)], 0.9),
+            "10 entries",
+            (lambda: [*self.cap("10 entries for 6 payments: pay-0 to pay-3 twice", YELLOW_M)], 0.6),
         ])
 
-        self.steps("A Kafka transaction makes the three writes one: all of them count, or none of them do.", [
-            (lambda: [*[FadeOut(c) for c in first + dup], FadeOut(bm), FadeOut(twice), Transform(sv[2], sv_sub("instance 1"))], 0.9),
-            "all of them",
-            (lambda: [glow(r[0], YELLOW_M, 1.01) for r in rows], 1.0),
+        # ---------------- scene 3: the idempotent producer? ----------------
+        self.steps("You might be thinking: Kafka has an idempotent producer, which drops repeats. It drops one kind: "
+                   "the same producer sending the same batch twice.", [
+            (lambda: self.cap("the idempotent producer drops repeats?", PURPLE_M), 0.5),
+            "It drops one kind",
+            (lambda: self.cap("it drops one kind: the same producer, the same batch, sent twice", WHITE), 0.5),
+        ])
+        self.steps("The friend who took over is a new producer with a new id. To Kafka, its four entries are brand new. "
+                   "Same face, total stranger.", [
+            "a new producer",
+            (lambda: [*pg_s("instance 2: a new id", PURPLE_M)], 0.6),
+            "brand new",
+            (lambda: [LaggedStart(*[glow(self.ent[i][0], YELLOW_M, 1.08) for i in range(4, 8)], lag_ratio=0.2)], 1.0),
+        ])
+        self.steps("What we want is for the entries and the bookmark to be one write. All of it, or none of it.", [
+            (lambda: [*self.cap("the wish: entries and bookmark as one write", WHITE)], 0.6),
+            "All of it",
+            (lambda: [glow(offs0[0], TEAL_M, 1.05)], 0.6),
         ])
 
-        t1 = [cell(0, 0, "pay-0", YELLOW_M), cell(0, 1, "pay-2", YELLOW_M), cell(1, 0, "pay-1", YELLOW_M), cell(1, 1, "pay-3", YELLOW_M)]
-        b1 = cell(2, 0, "4", YELLOW_M)
-        self.steps("The service begins a transaction. Its four entries go into the partitions at once, "
-                   "marked as open. So does the new bookmark, 4.", [
-            (lambda: [Transform(sv[2], sv_sub("transaction open", YELLOW_M))], 0.7),
-            "Its four entries",
-            (lambda: [flow(arrs[0], YELLOW_M, 0.6), flow(arrs[1], YELLOW_M, 0.6)], 0.6),
-            (lambda: [LaggedStart(*[FadeIn(c) for c in t1], lag_ratio=0.2)], 0.9),
-            "So does",
-            (lambda: [flow(arrs[2], YELLOW_M, 0.6)], 0.6),
-            (lambda: [FadeIn(b1)], 0.5),
+        # ---------------- scene 4: pencil and ink ----------------
+        self.steps("Back to the address book. Suppose you copy each address in pencil, and move the sticky note in pencil too.", [
+            (lambda: [*[FadeOut(c) for c in self.ent], *self.drop("cap"), *pg_s("instance 1")], 0.6),
+            "in pencil",
+            (lambda: [LaggedStart(*[AnimationGroup(*write(i, f"pay-{i}", "pencil")) for i in range(3)], lag_ratio=0.4)], 1.2),
+            "sticky note in pencil",
+            (lambda: [*self.put("note", VGroup(DashedVMobject(RoundedRectangle(corner_radius=0.05, width=1.55, height=0.42, stroke_color=GOLD_M,
+                                                                                    stroke_width=2.5), num_dashes=20),
+                                               T("bookmark: 3", 16, GOLD_M)).move_to([sx(3), NOTE_Y, 0]))], 0.6),
+        ])
+        stamp = T("one stamp", 22, GREEN_M).move_to([ex(5) + 0.3, ENT_Y + 0.1, 0])
+        self.steps("At the end of the batch you either ink the whole lot with one stamp, or cross the whole lot out. "
+                   "A visitor who trusts only ink never sees half a batch.", [
+            "ink the whole lot",
+            (lambda: [*self.put("stamp", stamp), *[Transform(self.ent[i], cell(f"pay-{i}", ex(i), ENT_Y, "ink")) for i in range(3)]], 0.7),
+            "or cross",
+            (lambda: [*[Transform(self.ent[i], cell(f"pay-{i}", ex(i), ENT_Y, "abort")) for i in range(3)],
+                      *self.put("stamp", T("crossed out", 22, RED_M).move_to(stamp))], 0.7),
+            "A visitor",
+            (lambda: [*self.cap("a visitor who trusts only ink never sees half a batch", WHITE)], 0.6),
+        ])
+        self.steps("That's a transaction: a group of writes that count together or not at all. Kafka needs three things to do it.", [
+            "a transaction",
+            (lambda: [*self.cap("a transaction: writes that count together, or not at all", GREEN_M)], 0.6),
         ])
 
-        co = VGroup(rbox(COX, COY, SVW, 1.0, GOLD_M), T("coordinator", 22).move_to([COX, COY + 0.2, 0]),
-                    T("one of the brokers", 17, GREY_B).move_to([COX, COY - 0.2, 0]))
-        cm1 = [marker(0, 2, "commit"), marker(1, 2, "commit"), marker(2, 1, "commit")]
-        self.steps("On commit, the coordinator, one of the brokers, records the decision. "
-                   "Then it writes a commit marker into every partition the transaction touched.", [
-            (lambda: [Transform(sv[2], sv_sub("commit", GREEN_M))], 0.5),
-            "the coordinator",
-            (lambda: [FadeIn(co, shift=0.15 * UP)], 0.8),
-            "records the decision",
-            (lambda: [Transform(co[2], T("decided: commit", 17, GREEN_M).move_to([COX, COY - 0.2, 0]))], 0.6),
-            "Then it writes",
-            (lambda: [glow(co[0], GOLD_M, 1.04), LaggedStart(*[FadeIn(m, scale=1.3) for m in cm1], lag_ratio=0.25)], 1.2),
-            (lambda: [*[a for c in t1 + [b1] for a in restate(c, GREEN_M)]], 0.7),
+        # ---------------- scene 5: three things ----------------
+        co = box(CO_C, 2.6, 1.1, PURPLE_M)
+        self.steps("First, a referee who remembers which logs a transaction touched, and how it ended. Kafka calls it the "
+                   "transaction coordinator. One of Kafka's servers takes on the job, and keeps its notes in a log of its own.", [
+            (lambda: [*[FadeOut(c) for c in self.ent[:3]], *self.drop("note", "cap", "stamp")], 0.5),
+            "a referee",
+            (lambda: [FadeIn(co), *self.put("co_t", T("coordinator", 22, PURPLE_M).move_to(CO_C + [0, 0.2, 0]))], 0.7),
+            "keeps its notes",
+            (lambda: [*self.put("co_s", M("__transaction_state", 13, GREY_B).move_to(CO_C + [0, -0.22, 0]))], 0.6),
+        ])
+        self.ent = []
+        self.steps("Second, a name for each copy of the program, such as ledger-0. It's called the transactional id, and it stays "
+                   "the same across restarts, so Kafka knows the next copy is the same program.", [
+            "such as ledger-0",
+            (lambda: [*pg_s("id: ledger-0", GOLD_M)], 0.6),
+            "stays the same",
+            (lambda: [glow(pg, GOLD_M, 1.04)], 0.7),
         ])
 
-        rd = reader("pay-0, pay-2")
-        self.steps("A marker takes an offset, but no reader ever gets it. "
-                   "A reader set to read committed gets only committed records: now pay-0 and pay-2.", [
-            (lambda: [*[glow(m[0], GREEN_M, 1.1) for m in cm1]], 1.0),
-            "A reader set",
-            (lambda: [FadeIn(rd, shift=0.15 * DOWN)], 0.8),
+        def call(s, color=YELLOW_M):
+            return self.put("call", M(s, 17, color).move_to([PG_C[0], CALL_Y, 0]))
+
+        def link():
+            return [dot_to(PG_C + [1.3, 0, 0], CO_C + [-1.3, 0, 0], PURPLE_M, 0.5)]
+
+        self.steps("Third, five calls, in order. Let's replay the crash with them. initTransactions, once at start-up: "
+                   "the copy registers its name with the coordinator.", [
+            (lambda: [*note("bookmark: 0")], 0.5),
+            "initTransactions",
+            (lambda: [*call("1. initTransactions()"), *link()], 0.7),
+        ])
+        self.steps("beginTransaction: from now on, everything it sends belongs to the transaction.", [
+            (lambda: call("2. beginTransaction()"), 0.6),
+        ])
+        self.steps("Then send. Here's the surprise. The entries go into the log straight away, before anything is decided. "
+                   "They're in pencil, but they're in.", [
+            (lambda: call("3. send(...)"), 0.5),
+            "go into the log",
+            (lambda: [LaggedStart(*[AnimationGroup(*write(i, f"pay-{i}", "pencil")) for i in range(4)], lag_ratio=0.45)], 1.8),
+            "but they're in",
+            (lambda: [*self.cap("records reach the log before the decision", WHITE)], 0.5),
+        ])
+        crash = tick(False, 0.3).move_to(PG_C)
+        self.steps("And now the crash. Instance 1 dies with four entries in pencil.", [
+            "the crash",
+            (lambda: [Create(crash), pg.animate.set_stroke(RED_M), *self.drop("call")], 0.6),
+        ], after=0.5)
+
+        # ---------------- scene 6: instance 2 ----------------
+        ab = marker("ABORT", ex(4), ENT_Y)
+        self.steps("Instance 2 starts with the same name. Its initTransactions reaches the coordinator, which finishes what the "
+                   "older copy left open. It aborts it.", [
+            (lambda: [FadeOut(crash), pg.animate.set_stroke(WHITE), *pg_s("instance 2, id: ledger-0", GOLD_M), *self.drop("cap")], 0.6),
+            "initTransactions",
+            (lambda: [*call("1. initTransactions()"), *link()], 0.7),
+            "It aborts it",
+            (lambda: [*self.put("co_d", T("ledger-0's open one: abort", 17, RED_M).move_to([CO_C[0], CALL_Y, 0]))], 0.6),
+        ])
+        self.steps("An abort deletes nothing. It adds a marker after the four, a small record that tells careful readers: skip what came before.", [
+            "It adds a marker",
+            (lambda: [dot_to(CO_C + [0, -0.55, 0], [ex(4), ENT_Y + 0.4, 0], GOLD_M, 0.6), FadeIn(ab, run_time=0.01)], 0.7),
+            (lambda: [*[Transform(self.ent[i], cell(f"pay-{i}", ex(i), ENT_Y, "abort")) for i in range(4)]], 0.7),
+            "skip what came before",
+            (lambda: [*self.cap("ABORT marker: skip this transaction's records", RED_M)], 0.5),
+        ])
+        self.ent.append(ab)
+        self.steps("Instance 2 begins, reads from the bookmark at 0, and sends six entries, in pencil.", [
+            (lambda: [*call("2. beginTransaction()"), *self.drop("co_d", "cap")], 0.5),
+            "sends six",
+            (lambda: [*call("3. send(...)"), LaggedStart(*[AnimationGroup(*write(5 + i, f"pay-{i}", "pencil")) for i in range(6)], lag_ratio=0.35)], 2.0),
+        ])
+        offs6 = cell("offset 6", -3.6, OFF_Y, "pencil", 1.5)
+        self.steps("sendOffsetsToTransaction: the bookmark joins the transaction. It's in pencil too, and the program has "
+                   "turned off saving it on its own.", [
+            (lambda: call("4. sendOffsetsToTransaction(...)"), 0.5),
+            "the bookmark joins",
+            (lambda: [dot_to(PG_C + [-1.3, -0.3, 0], [-3.6, OFF_Y + 0.35, 0], YELLOW_M, 0.7), FadeIn(offs6, run_time=0.01)], 0.8),
+            "turned off",
+            (lambda: [*self.cap("enable.auto.commit=false", GREY_B)], 0.5),
+        ])
+        cm1 = marker("COMMIT", ex(11), ENT_Y)
+        cm2 = marker("COMMIT", -2.3, OFF_Y)
+        self.steps("commitTransaction. The coordinator writes its decision in its notes. Then it puts a COMMIT marker into every log "
+                   "the transaction touched: the entries, and the bookmark's log too.", [
+            (lambda: [*call("5. commitTransaction()", GREEN_M), *link(), *self.drop("cap")], 0.7),
+            "writes its decision",
+            (lambda: [*self.put("co_d", T("ledger-0: commit", 17, GREEN_M).move_to([CO_C[0], CALL_Y, 0])), glow(co, GREEN_M, 1.04)], 0.6),
+            "a COMMIT marker",
+            (lambda: [dot_to(CO_C + [0, -0.55, 0], [ex(11), ENT_Y + 0.4, 0], GOLD_M, 0.5), FadeIn(cm1, run_time=0.01)], 0.6),
+            "the bookmark's log",
+            (lambda: [dot_to(CO_C + [-0.5, -0.55, 0], [-2.3, OFF_Y + 0.35, 0], GOLD_M, 0.7), FadeIn(cm2, run_time=0.01)], 0.8),
+        ])
+        self.steps("One stamp, and the whole batch is in ink. The most powerful rubber stamp in the building. "
+                   "So the point is: one decision makes six entries and a bookmark count together.", [
+            (lambda: [*[Transform(self.ent[5 + i], cell(f"pay-{i}", ex(5 + i), ENT_Y, "ink")) for i in range(6)],
+                      Transform(offs6, cell("offset 6", -3.6, OFF_Y, "ink", 1.5)), *note("bookmark: 6", 0)], 0.9),
+            "So the point",
+            (lambda: [*self.cap("one decision: six entries and the bookmark, together", GREEN_M)], 0.6),
+        ])
+        self.ent.append(cm1)
+
+        # ---------------- scene 7: what readers see ----------------
+        self.steps("So ledger-entries holds ten entries. How many does a reader see? Pause and guess.", [
+            (lambda: [*self.drop("call", "co_d"), *self.cap("ten entries in the log", WHITE)], 0.5),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        rc = chip("read_committed: sees 6", GREEN_M, 20, mono=True).move_to([-3.4, READ_Y, 0])
+        ru = chip("the default, read_uncommitted: sees 10", RED_M, 20, mono=True).move_to([3.0, READ_Y, 0])
+        self.steps("It depends on the reader. A careful reader, set to read_committed, skips the aborted four and sees six, "
+                   "each payment once. A reader left on the default, read_uncommitted, sees all ten.", [
+            (lambda: self.drop("cap"), 0.3),
+            "A careful reader",
+            (lambda: [FadeIn(rc, shift=0.1 * UP), *[self.ent[i].animate.set_opacity(0.25) for i in range(5)]], 0.8),
+            "the default",
+            (lambda: [FadeIn(ru, shift=0.1 * UP), *[self.ent[i].animate.set_opacity(1) for i in range(5)]], 0.8),
+        ])
+        self.steps("So every program that reads ledger-entries must ask for read_committed, or the transaction protects nothing.", [
+            "must ask",
+            (lambda: [glow(rc[0], GREEN_M, 1.05), *self.cap("every reader: isolation.level=read_committed", GREEN_M)], 0.8),
         ])
 
-        t2 = [cell(0, 3, "pay-4", YELLOW_M), cell(1, 3, "pay-5", YELLOW_M)]
-        fee = cell(0, 4, "fee", GREY_B)
-        pl = T("a plain producer, no transaction", 17, GREY_B).move_to([cx(4) + 0.9, RY[0] - 1.0, 0])
-        self.steps("The next transaction writes pay-4 and pay-5. "
-                   "Then a plain producer, outside any transaction, appends a fee at offset 4.", [
-            (lambda: [Transform(sv[2], sv_sub("transaction open", YELLOW_M)), Transform(co[2], T("open: pay-4, pay-5", 17, YELLOW_M).move_to([COX, COY - 0.2, 0]))], 0.7),
-            "writes pay-4",
-            (lambda: [flow(arrs[0], YELLOW_M, 0.6), flow(arrs[1], YELLOW_M, 0.6)], 0.6),
-            (lambda: [FadeIn(t2[0]), FadeIn(t2[1])], 0.6),
-            "Then a plain",
-            (lambda: [FadeIn(pl)], 0.6),
-            "appends",
-            (lambda: [FadeIn(fee, shift=0.2 * DOWN)], 0.6),
+        # ---------------- scene 8: two habits ----------------
+        self.steps("Two more habits. After an abort, seek back to the first record of the batch. Reading the batch already moved "
+                   "the program's position past it. Without the seek, the next read skips the batch, and it's never written at all.", [
+            (lambda: [*self.cap("1. after an abort: seek back to the batch's first record", WHITE)], 0.5),
+            "Reading the batch",
+            (lambda: [Indicate(self.lab["note"], color=GOLD_M, scale_factor=1.15)], 0.8),
+            "never written",
+            (lambda: [glow(src[0][0], RED_M, 1.06)], 0.7),
+        ])
+        self.steps("And keep transactions short, one batch each. Every transaction costs a few extra round trips to the coordinator, "
+                   "so one per record is slow. And while one is open, the careful readers wait.", [
+            (lambda: [*self.cap("2. one batch per transaction: not one per record, not one per hour", WHITE)], 0.5),
+            "round trips",
+            (lambda: [*link(), *link()], 0.6),
+            "the careful readers wait",
+            (lambda: [glow(rc[0], GOLD_M, 1.05)], 0.8),
         ])
 
-        L = lso(3)
-        self.steps("A read committed reader stops at the last stable offset, the first offset of the oldest open transaction: "
-                   "here, 3. Even the fee waits, because Kafka hands out records in offset order.", [
-            (lambda: [FadeOut(pl), Create(L[0])], 0.7),
-            (lambda: [FadeIn(L[1])], 0.6),
-            "here, 3",
-            (lambda: [glow(t2[0][0], YELLOW_M, 1.1)], 0.8),
-            "Even the fee",
-            (lambda: [glow(fee[0], GREY_B, 1.1), Transform(rd[1], T("pay-0, pay-2, and it waits", 20, YELLOW_M).move_to(rd[1], aligned_edge=LEFT))], 1.0),
-        ])
+        # ---------------- scene 9: the code ----------------
+        diagram = VGroup(*[m for m in self.mobjects if isinstance(m, VMobject)])
+        diagram.save_state()
+        jp = code_panel("Java", JAVA, -3.3)
+        kp = code_panel("Kotlin", KOTLIN, 3.3)
 
-        am = [marker(0, 5, "abort"), marker(1, 4, "abort")]
-        self.steps("Now a send times out, and the service aborts. Nothing is deleted: "
-                   "the coordinator writes an abort marker into the two partitions it touched.", [
-            (lambda: [Transform(sv[2], sv_sub("abort", RED_M))], 0.6),
-            "Nothing is deleted",
-            (lambda: [*[a for c in t2 for a in restate(c, RED_M, GREY_C)]], 0.8),
-            "the coordinator writes",
-            (lambda: [Transform(co[2], T("decided: abort", 17, RED_M).move_to([COX, COY - 0.2, 0])), glow(co[0], GOLD_M, 1.04)], 0.8),
-            (lambda: [LaggedStart(*[FadeIn(m, scale=1.3) for m in am], lag_ratio=0.3)], 0.9),
-        ])
+        def hl(rows, color):
+            return [p[2][r].animate(rate_func=there_and_back).set_color(color) for p in (jp, kp) for r in rows]
 
-        L2 = lso(6)
-        self.steps("The last stable offset moves on, and the reader skips pay-4 to get the fee. "
-                   "A reader left on the default, read uncommitted, would take pay-4 too.", [
-            (lambda: [Transform(L, L2)], 1.0),
-            "and the reader skips",
-            (lambda: [Transform(rd[1], T("pay-0, pay-2, fee", 20, GREEN_M).move_to(rd[1], aligned_edge=LEFT))], 0.8),
-            "A reader left",
-            (lambda: [glow(t2[0][0], RED_M, 1.1)], 0.9),
+        self.steps("Here's one batch, in Java and in Kotlin.", [
+            (lambda: [diagram.animate.set_opacity(0.06)], 0.7),
+            (lambda: [FadeIn(jp, shift=0.1 * UP), FadeIn(kp, shift=0.1 * UP)], 0.8),
         ])
+        self.steps("Begin, send the entries, send the bookmark, commit.", [
+            (lambda: hl((0,), YELLOW_M), 0.6),
+            "send the entries",
+            (lambda: hl((3, 4), YELLOW_M), 0.7),
+            "send the bookmark",
+            (lambda: hl((5, 6), GOLD_M), 0.7),
+            "commit",
+            (lambda: hl((7,), GREEN_M), 0.6),
+        ])
+        self.steps("If anything fails, abort, and seek back. But catch ProducerFencedException first: it means a newer copy "
+                   "has taken over the name, so this one must stop.", [
+            (lambda: hl((11, 12), RED_M), 1.2),
+            "But catch",
+            (lambda: hl((8, 9), PURPLE_M), 1.2),
+        ], after=0.6)
 
-        t3 = [cell(0, 6, "pay-4", YELLOW_M), cell(1, 5, "pay-5", YELLOW_M)]
-        b3 = cell(2, 2, "6", YELLOW_M)
-        cm3 = [marker(0, 7, "commit"), marker(1, 6, "commit"), marker(2, 3, "commit")]
-        L3 = lso(8)
-        self.steps("The bookmark is still 4, so the service reads pay-4 and pay-5 again, "
-                   "writes them in a new transaction with bookmark 6, and commits.", [
-            (lambda: [Transform(sv[2], sv_sub("retry, transaction open", YELLOW_M)), glow(b1[0], GREEN_M, 1.1),
-                      Transform(co[2], T("open: pay-4, pay-5", 17, YELLOW_M).move_to([COX, COY - 0.2, 0]))], 0.9),
-            "writes them",
-            (lambda: [FadeIn(t3[0]), FadeIn(t3[1]), FadeIn(b3)], 0.7),
-            "and commits",
-            (lambda: [Transform(co[2], T("decided: commit", 17, GREEN_M).move_to([COX, COY - 0.2, 0])),
-                      LaggedStart(*[FadeIn(m, scale=1.3) for m in cm3], lag_ratio=0.2), Transform(sv[2], sv_sub("commit", GREEN_M))], 0.9),
-            (lambda: [*[a for c in t3 + [b3] for a in restate(c, GREEN_M)], Transform(L, L3),
-                      Transform(rd[1], T("pay-0, pay-2, fee, pay-4", 20, GREEN_M).move_to(rd[1], aligned_edge=LEFT))], 0.9),
+        # ---------------- scene 10: the moral, and a check ----------------
+        self.steps("So, how do you stop four entries landing twice? Make the entries and the bookmark one write. Everything goes "
+                   "in pencil, then one stamp inks it all, or one marker crosses it all out. And every reader trusts only ink.", [
+            (lambda: [FadeOut(jp), FadeOut(kp), Restore(diagram)], 0.8),
+            (lambda: self.cap("how do you stop four entries landing twice?", WHITE), 0.4),
+            "one write",
+            (lambda: [glow(offs6[0], GREEN_M, 1.05), *[glow(self.ent[5 + i][0], GREEN_M, 1.05) for i in range(6)]], 0.8),
+            "one stamp",
+            (lambda: [glow(cm1[0], GOLD_M, 1.08), glow(cm2[0], GOLD_M, 1.08)], 0.7),
+            "one marker",
+            (lambda: [glow(ab[0], GOLD_M, 1.08)], 0.6),
+            "trusts only ink",
+            (lambda: [glow(rc[0], GREEN_M, 1.05), *self.cap("pencil, then one stamp; readers trust only ink", GREEN_M, 28)], 0.8),
         ])
-
-        self.steps("Records land in the log before the decision. A marker decides, "
-                   "and a read committed reader waits at the first record that isn't decided yet.", [
-            (lambda: [*[glow(c[0], YELLOW_M, 1.08) for c in t1 + t2 + t3]], 1.1),
-            "A marker decides",
-            (lambda: [*[glow(m[0], GREEN_M if m in cm1 + cm3 else RED_M, 1.1) for m in cm1 + am + cm3]], 1.1),
-            "and a read committed",
-            (lambda: [glow(L[0], YELLOW_M, 1.05)], 1.0),
-        ])
-        self.wait(0.6)
+        self.steps("One quick check. A program writes 14 entries in a transaction, then aborts. Another program reads the topic with "
+                   "Kafka's default settings. What does it see? Pause and think.", [
+            (lambda: [*self.cap("14 entries, then ABORT. the default reader sees...?", WHITE)], 0.6),
+            "default settings",
+            (lambda: [glow(ru[0], RED_M, 1.05)], 0.7),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("All 14. The abort only added a marker, and the default reader doesn't look at markers. Set read_committed.", [
+            (lambda: [*self.cap("all 14: an abort deletes nothing", RED_M)], 0.6),
+            "only added a marker",
+            (lambda: [glow(ab[0], GOLD_M, 1.08)], 0.7),
+            "Set read_committed",
+            (lambda: [*self.cap("readers that trust only ink: read_committed", GREEN_M, 30), glow(rc[0], GREEN_M, 1.05)], 0.7),
+        ], after=0.4)
+        self.wait(2.0)
