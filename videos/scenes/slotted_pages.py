@@ -7,6 +7,8 @@ SAY.insert(0, (r"\b4 KB\b", "4 kilobytes"))
 SAY.insert(0, (r"\b8 KB\b", "8 kilobytes"))
 SAY.insert(0, (r"\bDelete B\.", "Delete row B."))
 SAY.insert(0, (r"\bbetween A and C\b", "between row A and row C"))
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 TITLE_Y = 2.9

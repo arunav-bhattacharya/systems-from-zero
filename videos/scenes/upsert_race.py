@@ -12,6 +12,8 @@ SAY[0:0] = [
     (r"\bRETURNING\b", "returning"),
     (r"\b23505\b", "two three five zero five"),
 ]
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
 # ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
 READER = np.array([0, 3.2, 0])
