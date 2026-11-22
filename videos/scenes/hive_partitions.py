@@ -1,48 +1,7 @@
 from sfz import *
 
 SAY.insert(0, (r"\bdt\b", "D T"))
-SAY.insert(0, (r"\bMSCK REPAIR TABLE\b", "M S C K repair table"))
-SAY.insert(0, (r"\bALTER TABLE ADD PARTITION\b", "alter table, add partition,"))
-
-LX = -6.35                                   # left edge of the storage tree
-LOC_Y = 2.45                                 # s3://lake/payments/
-EARLY_Y = 1.65                               # "1,088 earlier days"
-ROW_Y = [1.1, 0.55, 0.0, -0.55, -1.1, -1.65, -2.2, -2.75]   # dt=2026-11-01 .. 11-08
-FILES = [3, 2, 3, 3, 2, 3, 4]               # files per day
-FX0, FDX = -3.75, 0.55                       # first file column, spacing
-FW, FH = 0.42, 0.34
-EX, EY, EW, EH = 3.8, 1.75, 3.0, 0.85        # the engine
-QX, QY = 0.95, [3.15, 2.78]                  # the query, left aligned
-CX, CY = 2.5, [0.55, 0.05]                   # counters
-MX, MY, MW, MH = 3.8, -1.4, 5.0, 2.5         # the metastore
-ML = MX - MW / 2 + 0.25                      # left edge of metastore lines
-MLY = [-0.9, -1.3, -1.7, -2.2]
-
-
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def flow(path, color=YELLOW_M, run_time=1.0, back=False):
-    a, b = (path.get_end(), path.get_start()) if back else (path.get_start(), path.get_end())
-    d = Dot(radius=0.08, color=color).move_to(a).set_opacity(0).set_z_index(6)
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+SAY.insert(0, (r"\bcreated at\b", "created-at"))
 
 
 class Base(VoiceScene):
@@ -73,8 +32,8 @@ class Base(VoiceScene):
         return super().remove(*fam)
 
     def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        """Speak one line and play steps inside it. A step is (fn, run_time), built just before it plays; a number
+        waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -98,236 +57,363 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-def pfile(x, y, color=GREY_B):
-    r = RoundedRectangle(corner_radius=0.05, width=FW, height=FH, stroke_color=color, stroke_width=2)
-    return r.set_fill(fillc(color, 0.2), 1).move_to([x, y, 0])
+    # labelled slots: put() swaps whatever sat in a slot for a new mobject
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def cap(self, s, color=GREY_B, size=24):
+        return self.put("cap", fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0]))
+
+    def mid(self, mob, x=0.0, y=0.0):
+        return self.put("mid", mob.move_to([x, y, 0]))
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def fpos(day, k):
-    return [FX0 + k * FDX, ROW_Y[day], 0]
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def query(lines, color=WHITE):
-    return VGroup(*[left_at(M(s, 17, color), QX, QY[k]) for k, s in enumerate(lines)])
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def counter(s, k, color=GREY_B, size=22):
-    return left_at(T(s, size, color), CX, CY[k])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def bottom(s, color=GREY_B):
-    return left_at(T(s, 22, color), MX - MW / 2, -3.15)
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def mline(s, k, color=GREY_B, mono=False):
-    return left_at((M(s, 17, color) if mono else T(s, 21, color)), ML, MLY[k])
+def dot_run(a, b, color=YELLOW_M, rt=0.6):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    d = Dot(radius=0.08, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.12))
+
+
+def frame_box(x, y, w, h, color, a=0.14):
+    return RoundedRectangle(corner_radius=0.12, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(fillc(color, a), 1).move_to([x, y, 0])
+
+
+# ---- the one picture ----
+Q_Y = 2.9                                   # the query chip
+TBL_Y = 2.25                                # "payments/" label
+FY, FHGT = 0.55, 2.5                        # folder row centre and height
+F_TOP, F_BOT = FY + FHGT / 2, FY - FHGT / 2
+FW, FGAP = 1.66, 0.12
+FX = [-(7 * FW + 6 * FGAP) / 2 + FW / 2 + k * (FW + FGAP) for k in range(7)]
+FLAB_Y = F_TOP - 0.3
+SKIP_Y = F_BOT + 0.28
+RES_Y, PLAN_Y, BAR_Y, CAP_Y = -1.3, -2.1, -2.75, -3.3
+DAYC = [BLUE_M, TEAL_M, GREEN_M, YELLOW_M, GOLD_M, RED_M, "#B48ED0"]
+DAYS = [f"dt=2026-11-0{k + 1}" for k in range(7)]
+
+rng = np.random.default_rng(4)
+
+
+def dot_grid(k):
+    """Six payments of day k, inside its own folder."""
+    return [np.array([FX[k] + (c - 0.5) * 0.55, FY + 0.35 - r * 0.45, 0]) for r in range(3) for c in range(2)]
+
+
+def scattered():
+    """The same 42 payments mixed along the one long shelf."""
+    xs = rng.uniform(-6.0, 6.0, 42)
+    ys = rng.uniform(F_BOT + 0.35, F_TOP - 0.55, 42)
+    order = rng.permutation(42)
+    return [np.array([xs[i], ys[i], 0]) for i in order]
 
 
 class HivePartitions(Base):
-    """batch-04, section 1 (with section 2's metastore and section 3's listing cost): the payments table is a folder of
-    Parquet files on S3; a query for one day reads all 1,095 days. Split into dt=... folders, the query reads one (partition
-    pruning). Listing 30,000 folders on S3 takes 30 requests, so the metastore keeps the partition list; a late folder is
-    invisible until ADD PARTITION or MSCK REPAIR; a day of 50,000 small files still costs 50 listing requests."""
+    """batch-04, section 1. A year of payments in one folder: a question about yesterday reads everything (1,095 days
+    after three years). The library's long shelf, then one shelf per year with a label. One folder per day,
+    dt=2026-11-01..07; the value lives only in the name. WHERE dt = '2026-11-03' opens 1/8 files (partition pruning);
+    the same day by created_at opens all 8. The plan shows it. Put dt in the query; pick a column with few values."""
+
+    def query(self, s, color=YELLOW_M):
+        return self.put("q", fit(chip(s, color, 22, mono=True), 13.0).move_to([0, Q_Y, 0]))
+
+    def result(self, s, color=WHITE):
+        return self.put("res", fit(T(s, 26, color), 12.0).move_to([0, RES_Y, 0]))
 
     def construct(self):
-        self.title_card("Hive partitions", "a table is a folder, and a filter can skip folders")
+        self.lab = {}
+        self.title_card("One shelf per day", "how a folder name lets a query skip the rest")
 
-        loc = left_at(M("s3://lake/payments/", 20, GREY_B), LX, LOC_Y)
-        big = RoundedRectangle(corner_radius=0.14, width=5.0, height=3.9, stroke_color=GREY_B, stroke_width=2.5)
-        big.set_fill(BLACK, 1).move_to([-3.9, -0.2, 0])
-        grid = [[-5.4 + c * 0.75, 1.0 - r * 0.8] for r in range(4) for c in range(5)]
-        files = [pfile(x, y) for x, y in grid]
-        cap = T("every night's files land in one folder", 18, GREY_C).move_to([-3.9, -2.6, 0])
-        self.steps("The payments table is a folder of Parquet files on S3. Every night, the batch job adds a few more.", [
-            (lambda: [FadeIn(loc), FadeIn(big)], 0.7),
-            (lambda: [LaggedStart(*[FadeIn(f, scale=0.8) for f in files[:8]], lag_ratio=0.1)], 0.9),
+        # ---------------- scene 1: twenty minutes for one day ----------------
+        shelf = frame_box(0, FY, 12.9, FHGT, BLUE_M)
+        tbl = left_at(M("payments/", 22, BLUE_M), FX[0] - FW / 2, TBL_Y)
+        spots = scattered()
+        dots = VGroup(*[Dot(radius=0.075, color=DAYC[i % 7]).move_to(spots[i]).set_z_index(2) for i in range(42)])
+        self.steps("Picture a small company that records card payments for cafés and shops. Every night, a program saves the "
+                   "day's payments as files in one shared folder. By now, it holds a whole year.", [
             "Every night",
-            (lambda: [LaggedStart(*[FadeIn(f, scale=0.8) for f in files[8:]], lag_ratio=0.08), FadeIn(cap)], 1.3),
+            (lambda: [FadeIn(shelf), FadeIn(tbl)], 0.6),
+            (lambda: [LaggedStart(*[LaggedStart(*[FadeIn(dots[i], shift=0.3 * DOWN) for i in range(42) if i % 7 == k], lag_ratio=0.1)
+                                    for k in range(7)], lag_ratio=0.5)], 3.0),
+            "By now",
+            (lambda: self.cap("one folder, a whole year of payments"), 0.5),
+        ])
+        self.steps("A colleague in finance asks how much the shops took yesterday. The answer arrives twenty minutes later. "
+                   "Why so slow, for one day?", [
+            (lambda: self.query("how much did the shops take yesterday?", WHITE), 0.6),
+            "twenty minutes",
+            (lambda: self.cap("the answer: twenty minutes later", RED_M), 0.5),
+            "Why so slow",
+            (lambda: self.cap("why so slow, for one day?", YELLOW_M), 0.5),
         ])
 
-        eng = VGroup(RoundedRectangle(corner_radius=0.12, width=EW, height=EH, stroke_color=BLUE_M, stroke_width=3)
-                     .set_fill(fillc(BLUE_M), 1).move_to([EX, EY, 0]),
-                     T("engine", 24).move_to([EX, EY + 0.15, 0]), T("Spark or Trino", 17, GREY_B).move_to([EX, EY - 0.21, 0]))
-        q1 = query(["SELECT sum(amount_cents) FROM payments", "WHERE dt = '2026-11-07'"])
-        a_all = Arrow([EX - EW / 2 - 0.05, EY - 0.1, 0], [-1.3, 0.55, 0], buff=0, stroke_width=3, color=GOLD_M,
-                      max_tip_length_to_length_ratio=0.06)
-        self.steps("A query wants one day's total. With every day mixed in one folder, the engine can't tell which files "
-                   "hold that day, so it opens all of them.", [
-            (lambda: [FadeIn(q1), FadeIn(eng)], 0.8),
-            "so it opens",
-            (lambda: [GrowArrow(a_all)], 0.5),
-            (lambda: [LaggedStart(*[f.animate.set_stroke(GOLD_M, 3).set_fill(fillc(GOLD_M, 0.3), 1) for f in files],
-                                  lag_ratio=0.06)], 1.4),
+        # ---------------- scene 2: one folder reads everything ----------------
+        sweep = Rectangle(width=0.5, height=FHGT - 0.15, stroke_color=YELLOW_M, stroke_width=4).move_to([-6.1, FY, 0]).set_z_index(3)
+        self.steps("Because the program read the whole year to find one day. With one folder for the whole table, every question "
+                   "reads every file.", [
+            (lambda: [Create(sweep)], 0.3),
+            (lambda: [sweep.animate.move_to([6.1, FY, 0])], 2.2),
+            (lambda: [FadeOut(sweep)], 0.3),
+            "every question",
+            (lambda: self.cap("one folder: every question reads every file", WHITE), 0.5),
+        ])
+        self.steps("And the table grows by a day, every day. After three years, a question about yesterday reads 1,095 days of "
+                   "data, to use one of them.", [
+            "After three years",
+            (lambda: self.result("3 years: reads 1,095 days of data, to use 1", RED_M), 0.6),
         ])
 
-        c1 = counter("days of data read: 1,095", 0, RED_M)
-        c2 = counter("days the query needs: 1", 1, GREY_B)
-        self.steps("Three years in, that's 1,095 days of files read, to answer a question about one.", [
-            (lambda: [FadeIn(c1, shift=0.1 * UP)], 0.6),
-            "to answer",
-            (lambda: [FadeIn(c2, shift=0.1 * UP), glow(big, RED_M, 1.02)], 0.9),
+        # ---------------- scene 3: the long shelf ----------------
+        self.steps("A library with every book on one long shelf has the same problem. Ask for one year's books, and somebody walks "
+                   "the whole shelf. Usually the new person.", [
+            (lambda: [*self.drop("res", "q"), *self.cap("a library: every book on one long shelf")], 0.6),
+            "somebody walks",
+            (lambda: [glow(shelf, YELLOW_M, 1.01)], 1.0),
+            "Usually the new",
+            (lambda: self.cap("somebody walks the whole shelf (usually the new person)"), 0.5),
+        ])
+        self.steps("The library's old fix: one shelf per year, with the year on a label. A question about one year never visits "
+                   "the other shelves.", [
+            (lambda: self.cap("the old fix: one shelf per year, a label on each", WHITE), 0.6),
+        ])
+        folders = [frame_box(FX[k], FY, FW, FHGT, BLUE_M) for k in range(7)]
+        labels = [fit(M(DAYS[k], 16, WHITE), FW - 0.15).move_to([FX[k], FLAB_Y, 0]).set_z_index(3) for k in range(7)]
+        homes = [dot_grid(k) for k in range(7)]
+
+        def to_home():
+            anims = []
+            for i in range(42):
+                k, j = i % 7, i // 7
+                anims.append(dots[i].animate.move_to(homes[k][j]))
+            return anims
+
+        self.steps("Let's do the same with the table. Split the folder into smaller folders, one per day, and name each one after "
+                   "its day.", [
+            "Split the folder",
+            (lambda: [FadeOut(shelf), *[FadeIn(f) for f in folders], *to_home()], 1.4),
+            "name each one",
+            (lambda: [LaggedStart(*[FadeIn(l, shift=0.1 * DOWN) for l in labels], lag_ratio=0.12),
+                      *self.cap("the lesson's demo: one week, one folder per day")], 1.2),
+        ])
+        self.steps("The shelf is a folder. The label is the folder's name. And the books are the payments.", [
+            "The shelf",
+            (lambda: [*self.cap("shelf = folder"), *[glow(f, BLUE_M, 1.02) for f in folders]], 0.7),
+            "The label",
+            (lambda: [*self.cap("label = the folder's name"), *[Indicate(l, color=YELLOW_M, scale_factor=1.1) for l in labels]], 0.7),
+            "And the books",
+            (lambda: [*self.cap("book = payment"), Indicate(dots, color=WHITE, scale_factor=1.3)], 0.7),
+        ])
+        self.stamp("s4")
+
+        # ---------------- scene 4: the value lives in the name ----------------
+        self.steps("Each of these folders is called a partition, and dt, short for date, is the partition column. The name holds "
+                   "the column and its value together, so any program can rebuild the column from the path alone.", [
+            "called a partition",
+            (lambda: [*self.cap("each folder: a partition", WHITE), glow(folders[2], YELLOW_M, 1.04)], 0.8),
+            "and dt",
+            (lambda: self.cap("dt (short for date): the partition column", WHITE), 0.5),
+            "The name holds",
+            (lambda: [*self.result("dt=2026-11-03  :  column dt, value 2026-11-03"), Indicate(labels[2], color=YELLOW_M, scale_factor=1.25)], 0.8),
+        ])
+        cells = VGroup(*[mbox(s, GREY_B, h=0.6, size=20) for s in ("dt", "created_at", "amount_cents")]).arrange(RIGHT, buff=0)
+        cells.move_to([0, RES_Y, 0])
+        card_lab = T("one row, as Spark writes it", 20, GREY_B).next_to(cells, DOWN, buff=0.2)
+        self.steps("In fact, the value lives only there. Spark, the engine this course uses to run jobs over many machines, takes the "
+                   "dt column out of the rows when it writes, and puts it in the folder name instead.", [
+            (lambda: [*self.drop("res"), *self.cap("Spark: the engine that runs the jobs, over many machines")], 0.5),
+            "takes the",
+            (lambda: [FadeIn(cells, shift=0.1 * UP), FadeIn(card_lab)], 0.6),
+            "column out",
+            (lambda: [cells[0].animate.move_to(labels[2].get_center()).set_opacity(0),
+                      cells[1:].animate.shift(0.5 * cells[0].width * LEFT)], 1.0),
+            "puts it in",
+            (lambda: [Indicate(labels[2], color=YELLOW_M, scale_factor=1.3), *self.cap("the value lives only in the folder name", WHITE)], 0.8),
+        ])
+        back = mbox("dt", YELLOW_M, h=0.6, size=20)
+        back.move_to(labels[2].get_center())
+        self.steps("When a program reads the table, it turns the name back into a column.", [
+            (lambda: [FadeIn(back, run_time=0.01), back.animate.next_to(cells[1], LEFT, buff=0)], 1.0),
+            (lambda: self.cap("reading: the name becomes a column again"), 0.5),
         ])
 
-        # ---- one folder per day --------------------------------------------------------------------------------------
-        labels = [left_at(M(f"dt=2026-11-0{d + 1}/", 18), LX, ROW_Y[d]) for d in range(7)]
-        early = left_at(T("and 1,088 earlier days, one folder each", 18, GREY_C), LX, EARLY_Y)
-        slots = [(d, k) for d in range(7) for k in range(FILES[d])]
-        self.steps("So split the folder. Each day gets its own subfolder, named after the column and its value: "
-                   "dt equals the date.", [
-            (lambda: [FadeOut(c1), FadeOut(c2), FadeOut(a_all), FadeOut(cap),
-                      *[f.animate.set_stroke(GREY_B, 2).set_fill(fillc(GREY_B, 0.2), 1) for f in files]], 0.6),
-            "Each day",
-            (lambda: [FadeOut(big), *[f.animate.move_to(fpos(d, k)) for f, (d, k) in zip(files, slots)]], 1.3),
-            "named after",
-            (lambda: [LaggedStart(*[FadeIn(l, shift=0.1 * RIGHT) for l in labels], lag_ratio=0.1)], 1.0),
-            (lambda: [FadeIn(early)], 0.5),
-        ])
-        rows = [VGroup(labels[d], *[files[i] for i, (dd, _) in enumerate(slots) if dd == d]) for d in range(7)]
+        # ---------------- scene 5: pruning ----------------
+        def reset_folders():
+            return [*[f.animate.set_stroke(BLUE_M, 3).set_opacity(1) for f in folders], *[l.animate.set_opacity(1) for l in labels],
+                    dots.animate.set_opacity(1)]
 
-        a7 = Arrow([EX - EW / 2 - 0.05, EY - 0.15, 0], [-1.65, ROW_Y[6] + 0.05, 0], buff=0, stroke_width=3, color=GOLD_M,
-                   max_tip_length_to_length_ratio=0.05)
-        c3 = counter("folders read: 1 of 1,095", 0, GOLD_M)
-        prune = chip("partition pruning", GOLD_M, 22).move_to([CX + 1.5, CY[1] - 0.15, 0])
-        self.steps("Now the query for the seventh of November reads one folder and skips every other one, without opening "
-                   "a file. That's partition pruning.", [
-            (lambda: [*[rows[d].animate.set_opacity(0.25) for d in range(6)], early.animate.set_opacity(0.3)], 0.8),
-            (lambda: [GrowArrow(a7)], 0.6),
-            (lambda: [*[f.animate.set_stroke(GOLD_M, 3).set_fill(fillc(GOLD_M, 0.3), 1) for f in rows[6][1:]],
-                      FadeIn(c3, shift=0.1 * UP)], 0.7),
-            "That's partition",
-            (lambda: [FadeIn(prune, shift=0.1 * UP)], 0.6),
-        ])
+        def read_labels(hit):
+            """A cursor visits each label; folders in hit light up, the others dim with "skipped"."""
+            cur = SurroundingRectangle(labels[0], color=YELLOW_M, buff=0.06, stroke_width=3).set_z_index(4)
+            seq = [Create(cur, run_time=0.2)]
+            for k in range(7):
+                if k:
+                    seq.append(cur.animate(run_time=0.22).move_to(labels[k]))
+                if k in hit:
+                    seq.append(AnimationGroup(folders[k].animate.set_stroke(YELLOW_M, 5), run_time=0.2))
+                else:
+                    sk = T("skipped", 16, GREY_B).move_to([FX[k], SKIP_Y, 0]).set_z_index(3)
+                    self.skips.append(sk)
+                    seq.append(AnimationGroup(folders[k].animate.set_opacity(0.3), labels[k].animate.set_opacity(0.35),
+                                              *[dots[i].animate.set_opacity(0.2) for i in range(42) if i % 7 == k],
+                                              FadeIn(sk), run_time=0.2))
+            seq.append(FadeOut(cur, run_time=0.2))
+            return [Succession(*seq)]
 
-        # ---- where does the list of folders come from? ---------------------------------------------------------------
-        a_loc = Arrow([EX - EW / 2 - 0.05, EY + 0.15, 0], [loc.get_right()[0] + 0.15, LOC_Y - 0.05, 0], buff=0,
-                      stroke_width=3, color=TEAL_M, max_tip_length_to_length_ratio=0.06)
-        lst = M("LIST", 16, TEAL_M).next_to(a_loc.point_from_proportion(0.5), DOWN, buff=0.12)
-        n = ValueTracker(0)
-        req = always_redraw(lambda: counter(f"LIST requests: {int(round(n.get_value()))}", 0, TEAL_M))
-        c4 = counter("1,000 names per request", 1, GREY_B)
-        c5 = left_at(T("30,000 folders, by day and hour", 22, GREY_B), CX, -0.45)
-        self.steps("To skip folders, the engine first needs their list. S3 lists at most 1,000 names per request, so a "
-                   "table split by day and hour into 30,000 folders costs 30 requests before any data is read.", [
-            (lambda: [FadeOut(a7), FadeOut(c3), FadeOut(prune), *[r.animate.set_opacity(1) for r in rows[:6]],
-                      early.animate.set_opacity(1),
-                      *[f.animate.set_stroke(GREY_B, 2).set_fill(fillc(GREY_B, 0.2), 1) for f in rows[6][1:]]], 0.7),
-            (lambda: [GrowArrow(a_loc), FadeIn(lst)], 0.6),
-            "S3 lists",
-            (lambda: [FadeIn(c4, shift=0.1 * UP)], 0.5),
-            "so a",
-            (lambda: [FadeIn(c5, shift=0.1 * UP)], 0.5),
-            "costs 30",
-            (lambda: [FadeIn(req)], 0.2),
-            (lambda: [n.animate(rate_func=linear).set_value(30),
-                      LaggedStart(*[flow(a_loc, TEAL_M, 0.35) for _ in range(8)], lag_ratio=0.35)], 2.4),
-        ])
-        req.clear_updaters()
+        def open_all():
+            return [LaggedStart(*[f.animate.set_stroke(YELLOW_M, 5) for f in folders], lag_ratio=0.15)]
 
-        # ---- the metastore ---------------------------------------------------------------------------------------------
-        ms = RoundedRectangle(corner_radius=0.14, width=MW, height=MH, stroke_color=PURPLE_M, stroke_width=3)
-        ms.set_fill(fillc(PURPLE_M), 1).move_to([MX, MY, 0])
-        mt = T("metastore", 24).move_to([MX, MY + MH / 2 - 0.27, 0])
-        m1 = mline("payments: 8 columns, Parquet", 0)
-        m2 = mline("location: s3://lake/payments/", 1)
-        m3 = mline("partitions: one row per folder", 2)
-        self.steps("Hive keeps that list in the metastore: a database that maps each table name to its columns, its "
-                   "location, and one row per partition.", [
-            (lambda: [FadeOut(req), FadeOut(c4), FadeOut(c5), FadeOut(a_loc), FadeOut(lst)], 0.6),
-            (lambda: [FadeIn(ms), FadeIn(mt)], 0.7),
-            "maps each table",
-            (lambda: [FadeIn(m1, shift=0.1 * RIGHT)], 0.6),
-            "its location",
-            (lambda: [FadeIn(m2, shift=0.1 * RIGHT)], 0.5),
-            "and one row",
-            (lambda: [FadeIn(m3, shift=0.1 * RIGHT)], 0.6),
-        ])
+        def unskip():
+            s, self.skips = self.skips, []
+            return [FadeOut(x) for x in s]
 
-        a_ms = Arrow([MX, EY - EH / 2 - 0.05, 0], [MX, MY + MH / 2 + 0.05, 0], buff=0, stroke_width=3, color=PURPLE_M,
-                     max_tip_length_to_length_ratio=0.15)
-        flab = right_at(M("dt = '2026-11-07'", 16, PURPLE_M), MX - 0.2, (EY - EH / 2 + MY + MH / 2) / 2)
-        m4 = mline("→ dt=2026-11-07/", 3, GOLD_M, mono=True)
-        m4b = left_at(T("one partition", 18, GOLD_M), m4.get_right()[0] + 0.25, MLY[3])
-        req1 = bottom("LIST requests: 1", TEAL_M)
-        self.steps("The engine sends its filter along, and the metastore answers from its own table: one partition, with "
-                   "its folder. Then the engine lists only that folder.", [
-            (lambda: [GrowArrow(a_ms), FadeIn(flab)], 0.6),
-            (lambda: [flow(a_ms, PURPLE_M, 0.6)], 0.6),
-            "one partition",
-            (lambda: [FadeIn(m4, shift=0.1 * RIGHT), FadeIn(m4b)], 0.6),
-            (lambda: [flow(a_ms, GOLD_M, 0.6, back=True)], 0.6),
-            "Then the engine",
-            (lambda: [FadeOut(flab), GrowArrow(a7), *[r.animate.set_opacity(0.25) for r in rows[:6]],
-                      early.animate.set_opacity(0.3)], 0.7),
-            (lambda: [*[f.animate.set_stroke(GOLD_M, 3).set_fill(fillc(GOLD_M, 0.3), 1) for f in rows[6][1:]],
-                      FadeIn(req1)], 0.6),
+        self.skips = []
+        self.steps("Now ask for one day. Where dt is the third of November. The program reads the labels first, and skips every "
+                   "folder that can't match, before opening a single file.", [
+            (lambda: [FadeOut(cells[1:]), FadeOut(back), FadeOut(card_lab), *self.drop("cap")], 0.5),
+            "Where dt",
+            (lambda: self.query("WHERE dt = '2026-11-03'"), 0.6),
+            "reads the labels",
+            (lambda: read_labels({2}), 2.4),
+        ])
+        self.steps("That's called partition pruning. In the lesson's week of payments, DuckDB, a small database that runs inside a "
+                   "program, opens one file out of eight. Over three years, one day out of about a thousand.", [
+            (lambda: self.cap("partition pruning: skip what can't match, before opening a file", WHITE), 0.6),
+            "opens one file",
+            (lambda: self.result("DuckDB: opens 1/8 files", GREEN_M), 0.6),
+            "Over three years",
+            (lambda: self.cap("over 3 years: 1 day out of about 1,000"), 0.5),
+        ])
+        self.stamp("poster")
+
+        # ---------------- scene 6: the same day, another column ----------------
+        self.steps("Now a different filter. Every payment inside the files also has its exact time, in a column called created at.", [
+            (lambda: [*reset_folders(), *unskip(), *self.drop("res"), *self.cap("inside the files: created at, the exact time")], 0.7),
+            "its exact time",
+            (lambda: [Indicate(dots, color=WHITE, scale_factor=1.3)], 0.8),
+        ])
+        self.steps("Ask for the payments whose created at is on the third of November. The very same day. How many files does it "
+                   "open? Pause and guess.", [
+            "Ask for",
+            (lambda: self.query("WHERE created_at::DATE = DATE '2026-11-03'"), 0.6),
+            "The very same day",
+            (lambda: [Indicate(labels[2], color=YELLOW_M, scale_factor=1.25)], 0.7),
+            "Pause and guess",
+            (lambda: self.cap("same day: how many files? pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("All eight. The answer is right, nothing fails, and nobody notices the extra reading.", [
+            (lambda: [*open_all(), *self.result("DuckDB: opens all 8 files", RED_M), *self.drop("cap")], 1.0),
+            "The answer is right",
+            (lambda: self.cap("the right answer, nothing fails, and all the reading", RED_M), 0.5),
+        ])
+        self.steps("The program only reads labels, and the labels say dt. It can't know that created at and dt agree. Only you know "
+                   "that. The program would need to be a mind reader, and it's a file reader.", [
+            "only reads labels",
+            (lambda: [LaggedStart(*[Indicate(l, color=YELLOW_M, scale_factor=1.15) for l in labels], lag_ratio=0.1)], 1.2),
+            "It can't know",
+            (lambda: self.cap("created at and dt agree, but only you know that"), 0.5),
+            "mind reader",
+            (lambda: self.cap("it's not a mind reader; it's a file reader", WHITE), 0.5),
         ])
 
-        lab8 = left_at(M("dt=2026-11-08/", 18, GREEN_M), LX, ROW_Y[7])
-        f8 = [pfile(*fpos(7, k)[:2], GREEN_M) for k in range(3)]
-        row8 = VGroup(lab8, *f8)
-        late = left_at(T("late job, straight to S3", 17, GREEN_M), FX0 + 3 * FDX - 0.1, ROW_Y[7])
-        q8 = query(["SELECT sum(amount_cents) FROM payments", "WHERE dt = '2026-11-08'"])
-        m5 = mline("no partition for 2026-11-08", 3, RED_M)
-        zero = bottom("0 rows", RED_M)
-        self.steps("Now the metastore holds the truth. A late job writes the eighth of November straight to S3 and never "
-                   "tells it. A query for that day gets zero rows, though the files are right there.", [
-            (lambda: [FadeOut(a7), FadeOut(req1), FadeOut(m4b), *[r.animate.set_opacity(1) for r in rows[:6]],
-                      early.animate.set_opacity(1),
-                      *[f.animate.set_stroke(GREY_B, 2).set_fill(fillc(GREY_B, 0.2), 1) for f in rows[6][1:]]], 0.6),
-            (lambda: [glow(ms, PURPLE_M, 1.02)], 0.8),
-            "A late job",
-            (lambda: [FadeIn(lab8, shift=0.1 * RIGHT), LaggedStart(*[FadeIn(f, scale=0.8) for f in f8], lag_ratio=0.2),
-                      FadeIn(late)], 1.0),
-            "A query for",
-            (lambda: [Transform(q1, q8), flow(a_ms, PURPLE_M, 0.6)], 0.7),
-            (lambda: [Transform(m4, m5)], 0.5),
-            (lambda: [flow(a_ms, RED_M, 0.5, back=True), FadeIn(zero, shift=0.1 * UP)], 0.6),
-            "though the files",
-            (lambda: [*[glow(f, GREEN_M, 1.15) for f in f8]], 0.9),
+        # ---------------- scene 7: how to see it ----------------
+        p1 = chip("Scanning Files: 1/8", GREEN_M, 22, mono=True)
+        p2 = chip("PartitionFilters: []", RED_M, 22, mono=True)
+        plans = VGroup(p1, p2).arrange(RIGHT, buff=0.8).move_to([0, PLAN_Y, 0])
+        self.steps("The plan, the program's own description of how it will run a query, tells you. In DuckDB, a line like scanning "
+                   "files, one of eight, means it skipped files by their path. No such line means it reads them all.", [
+            (lambda: self.cap("the plan: the program's own description of how it will run a query", WHITE), 0.6),
+            "In DuckDB",
+            (lambda: [FadeIn(p1, shift=0.1 * UP), *self.cap("DuckDB: 'Scanning Files: 1/8' means files were skipped")], 0.6),
+            "No such line",
+            (lambda: self.cap("no such line: it reads them all"), 0.5),
+        ])
+        self.steps("In Spark, an empty list of partition filters means nothing was skipped.", [
+            (lambda: [FadeIn(p2, shift=0.1 * UP), *self.cap("Spark: an empty PartitionFilters list means nothing was skipped")], 0.6),
         ])
 
-        qa = query(["ALTER TABLE payments ADD PARTITION", "(dt = '2026-11-08');"], GREEN_M)
-        m6 = mline("→ dt=2026-11-08/", 3, GREEN_M, mono=True)
-        qm = query(["MSCK REPAIR TABLE payments;"], TEAL_M)
-        a_loc2 = Arrow([EX - EW / 2 - 0.05, EY + 0.15, 0], [loc.get_right()[0] + 0.15, LOC_Y - 0.05, 0], buff=0,
-                       stroke_width=3, color=TEAL_M, max_tip_length_to_length_ratio=0.06)
-        slow = bottom("lists all 30,000 folders again", TEAL_M)
-        self.steps("ALTER TABLE ADD PARTITION registers it. MSCK REPAIR TABLE finds it by listing the whole location: "
-                   "slow again.", [
-            (lambda: [FadeOut(zero), FadeOut(late), Transform(q1, qa)], 0.7),
-            (lambda: [Transform(m4, m6), flow(a_ms, GREEN_M, 0.6)], 0.7),
-            "MSCK REPAIR",
-            (lambda: [Transform(q1, qm)], 0.6),
-            "by listing",
-            (lambda: [GrowArrow(a_loc2)], 0.5),
-            (lambda: [FadeIn(slow, shift=0.1 * UP), LaggedStart(*[flow(a_loc2, TEAL_M, 0.35) for _ in range(5)],
-                                                                 lag_ratio=0.35)], 1.5),
+        # ---------------- scene 8: guardrails ----------------
+        self.steps("So, the rule: a filter on the partition column skips folders, and any other filter reads them all. Put dt in the "
+                   "query. Keep the created at filter too, for the exact hours.", [
+            (lambda: [FadeOut(plans), *reset_folders(), *self.drop("res"),
+                      *self.cap("a filter on the partition column skips folders; any other reads them all", WHITE)], 0.7),
+            "Put dt",
+            (lambda: self.query("WHERE dt = '2026-11-03' AND created_at ..."), 0.6),
+            (lambda: read_labels({2}), 2.4),
+            "Keep the created",
+            (lambda: self.cap("keep the created at filter too, for the exact hours"), 0.5),
+        ])
+        strike = Line(LEFT, RIGHT, stroke_width=4, color=RED_M)
+        self.steps("And pick a partition column that questions filter on, with few different values. A day is the classic: three "
+                   "years is about a thousand folders.", [
+            (lambda: [*reset_folders(), *unskip(), *self.drop("q"), *self.cap("pick a column questions filter on, with few values", WHITE)], 0.6),
+            "A day is",
+            (lambda: self.result("by day: 3 years is about 1,000 folders", GREEN_M), 0.6),
+        ])
+        self.steps("Split by shop as well, with 500,000 shops, and you get 500 million folders, most holding one tiny file. "
+                   "Strike that one.", [
+            "Split by shop",
+            (lambda: self.put("plan", T("by day and shop: 500,000 shops, 500 million folders of tiny files", 24, RED_M).move_to([0, PLAN_Y, 0])), 0.6),
+            "Strike that",
+            (lambda: [Create(strike.set_width(self.lab["plan"].width + 0.3).move_to(self.lab["plan"]).set_z_index(5))], 0.5),
         ])
 
-        q7 = query(["SELECT sum(amount_cents) FROM payments", "WHERE dt = '2026-11-07'"])
-        tiny = VGroup(*[pfile(0, 0, GOLD_M).scale(0.42).move_to([FX0 - 0.2 + c * 0.2, ROW_Y[6] + 0.12 - r * 0.24, 0])
-                        for r in range(2) for c in range(10)])
-        n2 = ValueTracker(0)
-        req2 = always_redraw(lambda: bottom(f"50,000 files, LIST requests: {int(round(n2.get_value()))}", TEAL_M))
-        self.steps("And the metastore knows folders, not files. The engine still lists each folder it reads, so a day of "
-                   "50,000 small files costs 50 requests before the first byte.", [
-            (lambda: [FadeOut(slow), FadeOut(a_loc2), Transform(q1, q7), Transform(m4, mline("→ dt=2026-11-07/", 3, GOLD_M, mono=True))], 0.8),
-            "The engine still",
-            (lambda: [GrowArrow(a7), FadeOut(VGroup(*rows[6][1:])), FadeIn(tiny)], 0.8),
-            "so a day",
-            (lambda: [FadeIn(req2)], 0.3),
-            (lambda: [n2.animate(rate_func=linear).set_value(50),
-                      LaggedStart(*[flow(a7, TEAL_M, 0.35) for _ in range(7)], lag_ratio=0.35)], 2.4),
-        ])
-        req2.clear_updaters()
-
-        self.steps("Partitions let a filter skip whole folders. Listing them is what stays slow, which is why the folder "
-                   "list lives in the metastore.", [
-            (lambda: [*[l.animate(rate_func=there_and_back).set_color(GOLD_M).scale(1.08) for l in labels]], 1.0),
-            "Listing them",
-            (lambda: [glow(eng[0], TEAL_M)], 0.9),
-            "which is why",
-            (lambda: [glow(ms, PURPLE_M, 1.03)], 1.0),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 9: moral and check ----------------
+        self.steps("The moral: the program skips by the label, never by what's inside. Name the folders by what you ask about, and "
+                   "ask by that name.", [
+            (lambda: [FadeOut(strike), *self.drop("plan", "res"), *self.cap("it skips by the label, never by what's inside", WHITE)], 0.6),
+            (lambda: [LaggedStart(*[Indicate(l, color=YELLOW_M, scale_factor=1.15) for l in labels], lag_ratio=0.1)], 1.2),
+            "Name the folders",
+            (lambda: self.cap("name the folders by what you ask about, and ask by that name", YELLOW_M), 0.6),
+        ], after=0.5)
+        self.steps("One quick check. Thirty folders, one per day of November. You ask for dt on or after the twenty ninth. How many "
+                   "folders does it open? Pause and think.", [
+            (lambda: [*self.cap("30 folders: dt=2026-11-01 to dt=2026-11-30", WHITE), *[f.animate.set_opacity(0.25) for f in folders], *[l.animate.set_opacity(0.3) for l in labels], dots.animate.set_opacity(0.2)], 0.6),
+            "You ask for",
+            (lambda: self.query("WHERE dt >= '2026-11-29'"), 0.6),
+            "Pause and think",
+            (lambda: self.result("how many folders? pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Two. The twenty ninth and the thirtieth. Ask by created at instead, and it opens all thirty.", [
+            (lambda: self.result("2: dt=2026-11-29 and dt=2026-11-30", GREEN_M), 0.6),
+            "Ask by created",
+            (lambda: self.cap("by created at instead: all 30", RED_M), 0.5),
+        ], after=0.3)
+        self.wait(2.0)
