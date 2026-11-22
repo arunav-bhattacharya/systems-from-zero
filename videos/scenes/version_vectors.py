@@ -1,24 +1,26 @@
 from sfz import *
 
-# card numbers are said the way people read them; the region names are letters
+# card numbers are said the way people read them; the regions are letters; clock times as people say them
 SAY.insert(0, (r"\b4417\b", "forty four seventeen"))
 SAY.insert(0, (r"\b5310\b", "fifty three ten"))
-SAY.insert(0, (r"\b2290\b", "twenty two ninety"))
+SAY.insert(0, (r"\b9921\b", "ninety nine twenty one"))
 SAY.insert(0, (r"\bEU\b", "E U"))
 SAY.insert(0, (r"\bUS\b", "U S"))
-# "client A" reads as "client uh"; "eh" lands on the letter
-SAY.insert(0, (r"\b[Cc]lient A\b", "client eh"))
+SAY.insert(0, (r"\b10:00:0(\d)\b", r"ten o'clock and \1 seconds"))
 
-RP = {"eu": np.array([-3.6, 0.95, 0]), "us": np.array([3.6, 0.95, 0])}   # replicas
-RW, RH = 4.6, 3.0
-VW, VH = 4.0, 0.95                                                        # one stored version
-SLOT = [1.35, 0.2]                                                        # y of the first and second version
-CLP = {"eu": np.array([-3.6, -1.75, 0]), "us": np.array([3.6, -1.75, 0])}
-PC = np.array([0, -1.78, 0])                                              # the comparison panel
-PW, PH = 4.2, 1.7
-COLX = [-1.05, 0.65, 1.45]                                                # label, eu, us columns
-ROWY = [-1.18, -1.53, -1.88, -2.23]                                       # header and three rows
-STY = -3.2
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+BX = {"eu": -4.2, "us": 4.2}          # the two copies of the list
+BW, BH, BY = 4.4, 4.4, 0.05
+B_TOP, B_BOT = BY + BH / 2, BY - BH / 2
+TITLE_Y = B_TOP - 0.4
+MARK_Y = B_TOP - 1.15                    # the bookmarks row
+SEP_Y = B_TOP - 1.68
+CARD_Y = [SEP_Y - 0.5, SEP_Y - 1.15, SEP_Y - 1.8]
+STAMP_Y = B_BOT - 0.4
+WIFI_Y = B_TOP - 0.35
+CAP_Y, BAR_Y, HEAD_Y = -3.3, -2.8, 3.3
+COL = {"eu": TEAL_M, "us": GOLD_M}
+CARDS = ["card-4417", "card-9921", "card-5310"]
 
 
 class Base(VoiceScene):
@@ -48,9 +50,9 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+    def steps(self, text, items, after=0.3):
+        """Speak one line and play steps inside it. A step is (fn, run_time), built just before it plays;
+        a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -74,214 +76,377 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
 
 def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def replica(k):
-    c = RP[k]
-    r = RoundedRectangle(corner_radius=0.16, width=RW, height=RH, stroke_color=WHITE, stroke_width=2.5).set_fill(BLACK, 1)
-    r.move_to(c)
-    return VGroup(r, T(f"{k.upper()} replica", 24).move_to(c + (RH / 2 - 0.33) * UP))
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def vline(e, u, ce=WHITE, cu=WHITE):
-    """A version vector: one counter per replica."""
-    g = VGroup(M("eu", 18, GREY_B), M(str(e), 18, ce), M("us", 18, GREY_B), M(str(u), 18, cu))
-    g[1].next_to(g[0], RIGHT, buff=0.15)
-    g[2].next_to(g[1], RIGHT, buff=0.45)
-    g[3].next_to(g[2], RIGHT, buff=0.15)
-    return g
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def version(k, slot, cards, line2, color=WHITE):
-    c = np.array([RP[k][0], SLOT[slot], 0])
-    r = RoundedRectangle(corner_radius=0.1, width=VW, height=VH, stroke_color=color, stroke_width=2.5).set_fill(fillc(color), 1)
-    r.move_to(c)
-    s = M("blocked: " + " ".join(cards), 18, WHITE).move_to(c + 0.2 * UP)
-    if isinstance(line2, str):
-        line2 = M(line2, 18, GREY_B)
-    line2.move_to(c + 0.21 * DOWN)
-    return VGroup(r, s, line2)
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
 
 
-def client(k, label):
-    return mbox(label, GREY_B, w=2.0, h=0.62, size=18).move_to(CLP[k])
+# ---- the pieces ----
+def list_box(side):
+    x = BX[side]
+    r = RoundedRectangle(corner_radius=0.14, width=BW, height=BH, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1).move_to([x, BY, 0])
+    sep = Line([x - BW / 2 + 0.25, SEP_Y, 0], [x + BW / 2 - 0.25, SEP_Y, 0], stroke_width=1.5, color=GREY_D)
+    return VGroup(r, sep)
 
 
-def heading(s, color=WHITE):
-    return T(s, 26, color).move_to([-6.5, 3.15, 0], aligned_edge=LEFT)
+def title(side, s):
+    return left_at(T(s, 28), BX[side] - BW / 2 + 0.3, TITLE_Y)
 
 
-def status(s, color=GREY_B):
-    return T(s, 22, color).move_to([0, STY, 0])
+def bookmark(who, n, x, y, hot=False):
+    """One bookmark: whose changes, and how far this copy has read into them."""
+    c = COL[who]
+    t = M(f"{who} {n}", 28, YELLOW_M if hot else WHITE)
+    tag = Polygon([-0.8, 0.3, 0], [0.8, 0.3, 0], [0.8, -0.3, 0], [0.0, -0.46, 0], [-0.8, -0.3, 0],
+                  stroke_color=c, stroke_width=2.5).set_fill(fillc(c, 0.3), 1)
+    return VGroup(tag, t.move_to([0, 0.02, 0])).move_to([x, y, 0])
 
 
-def cell(s, col, row, color=WHITE, mono=True):
-    t = (M(s, 18, color) if mono else T(s, 19, color))
-    if col == 0:
-        return t.move_to([PC[0] + COLX[0], ROWY[row], 0])
-    return t.move_to([PC[0] + COLX[col], ROWY[row], 0])
+def marks(side, eu, us, hot=None):
+    x = BX[side]
+    return VGroup(bookmark("eu", eu, x - 0.95, MARK_Y, hot == "eu"), bookmark("us", us, x + 0.95, MARK_Y, hot == "us"))
+
+
+def card(side, k, name, color=WHITE):
+    return M(name, 32, color).move_to([BX[side], CARD_Y[k], 0])
+
+
+def strike(m, color=RED_M):
+    return Line(m.get_left() + 0.1 * LEFT, m.get_right() + 0.1 * RIGHT, stroke_width=3, color=color)
 
 
 class VersionVectors(Base):
-    """repl-08, section 2: one key (the blocked-card set) on two replicas. Client A blocks card-4417 through EU while
-    client B blocks card-5310 through US. Last write wins keeps EU's version (stamped 1 ms later) and drops 5310 with
-    no error. Version vectors: [eu 3, us 0] against [eu 2, us 1], each ahead on one entry, so they are concurrent;
-    both are kept as siblings, a client merges them and writes [eu 4, us 1], which descends from both."""
+    """repl-08, section 2. Two tills (two regions) and a list of blocked cards. The Wi-Fi drops: EU unblocks 4417, US
+    blocks 5310. Last write wins keeps EU's later list and the stolen card works again. Bookmarks, one per till,
+    say how far each copy has read into each till's changes: the version vector. The easy case replaces; the clash
+    ([eu 3, us 0] vs [eu 2, us 1]) is concurrent, kept as siblings. The union merge brings 4417 back. Limits, moral,
+    and a check: does the merged write [eu 4, us 1] replace both siblings?"""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = T(s, size, color).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def set_title(self, side, s):
+        new = title(side, s)
+        old, self.titles[side] = self.titles[side], new
+        return [swap(old, new)]
+
+    def set_marks(self, side, eu, us, hot=None):
+        new = marks(side, eu, us, hot)
+        old, self.mk[side] = self.mk[side], new
+        return [swap(old, new)]
+
+    def set_stamp(self, side, s=None, color=GREY_B):
+        old = self.stamp[side]
+        new = T(s, 26, color).move_to([BX[side], STAMP_Y, 0]) if s else None
+        self.stamp[side] = new
+        if new is None:
+            return [FadeOut(old)] if old is not None else []
+        return [swap(old, new)]
 
     def construct(self):
-        self.title_card("Version vectors", "two writes that never saw each other")
+        self.capm = None
+        self.titles = {"eu": None, "us": None}
+        self.mk = {"eu": None, "us": None}
+        self.stamp = {"eu": None, "us": None}
+        self.title_card("Which list should the shop keep?", "two copies, two changes, and a test for who saw what")
 
-        rep = {k: replica(k) for k in RP}
-        v = {k: version(k, 0, ["2290"], "") for k in RP}
-        h1 = heading("one key: the set of blocked cards")
-        self.steps("Two regions keep copies of one key: the set of blocked cards. Both copies say card 2290 is blocked.", [
-            (lambda: [LaggedStart(*[FadeIn(rep[k], scale=0.96) for k in RP], lag_ratio=0.3)], 0.9),
-            (lambda: [FadeIn(h1, shift=0.1 * DOWN)], 0.6),
-            "Both copies",
-            (lambda: [*[FadeIn(v[k], scale=0.95) for k in RP]], 0.8),
+        # ---------------- scene 1: the two tills ----------------
+        boxes = {s: list_box(s) for s in ("eu", "us")}
+        cards = {s: [card(s, 0, CARDS[0]), card(s, 1, CARDS[1])] for s in ("eu", "us")}
+        wifi = DashedLine([BX["eu"] + BW / 2 + 0.1, WIFI_Y, 0], [BX["us"] - BW / 2 - 0.1, WIFI_Y, 0], dash_length=0.12,
+                          stroke_width=3, color=GREY_B)
+        wifi_l = T("Wi-Fi", 24, GREY_B).next_to(wifi, UP, buff=0.18)
+        self.steps("Picture a shop with two tills, and a list of cards to refuse, such as cards reported stolen. "
+                   "Each till keeps its own copy, and the copies sync over the shop's Wi-Fi.", [
+            "two tills",
+            (lambda: [FadeIn(boxes["eu"]), FadeIn(boxes["us"]), *self.set_title("eu", "till 1"), *self.set_title("us", "till 2")], 0.8),
+            "a list of cards",
+            (lambda: [*[FadeIn(c, shift=0.1 * DOWN) for s in ("eu", "us") for c in cards[s]], *self.cap("cards to refuse")], 0.8),
+            "sync over",
+            (lambda: [Create(wifi), FadeIn(wifi_l)], 0.6),
+            (lambda: [Succession(FadeIn(d := Dot(radius=0.08, color=YELLOW_M).move_to(wifi.get_start()), run_time=0.05),
+                                 d.animate(run_time=0.7).move_to(wifi.get_end()), FadeOut(d, run_time=0.15))], 0.9),
+        ])
+        cut = tick(False, 0.2).move_to(wifi.get_center())
+        s1 = strike(cards["eu"][0])
+        self.steps("One morning the Wi-Fi drops. At the first till, a customer's lost card has turned up, so the cashier takes card 4417 off the list.", [
+            (lambda: [*self.uncap(), wifi.animate.set_color(RED_M), Create(cut), Transform(wifi_l, T("Wi-Fi down", 22, RED_M).move_to(wifi_l))], 0.7),
+            "takes card 4417",
+            (lambda: [Create(s1)], 0.5),
+            (lambda: [cards["eu"][0].animate.set_opacity(0.3), s1.animate.set_opacity(0.6)], 0.5),
+        ])
+        c5310 = card("us", 2, CARDS[2], GOLD_M)
+        self.steps("At the second till, the bank phones about a stolen card, and the cashier adds card 5310.", [
+            "adds card",
+            (lambda: [FadeIn(c5310, shift=0.15 * DOWN)], 0.6),
+        ])
+        self.steps("When the Wi-Fi comes back, the two lists disagree. Which one should the shop keep?", [
+            (lambda: [FadeOut(cut), wifi.animate.set_color(GREY_B), Transform(wifi_l, T("Wi-Fi", 22, GREY_B).move_to(wifi_l))], 0.6),
+            "Which one",
+            (lambda: [glow(boxes["eu"][0], YELLOW_M, 1.02), glow(boxes["us"][0], YELLOW_M, 1.02), *self.cap("which list should the shop keep?", YELLOW_M)], 0.9),
         ])
 
-        cl = {"eu": client("eu", "client A"), "us": client("us", "client B")}
-        ca = {k: Arrow(cl[k].get_top() + 0.06 * UP, [CLP[k][0], RP[k][1] - RH / 2 - 0.06, 0], buff=0, stroke_width=3,
-                       color=GREY_B, max_tip_length_to_length_ratio=0.2) for k in RP}
-        self.steps("At the same moment, client A blocks card 4417 through EU, and client B blocks card 5310 through US. "
-                   "Neither has seen the other's write.", [
-            (lambda: [*[FadeIn(cl[k], shift=0.1 * UP) for k in RP], *[GrowArrow(ca[k]) for k in RP]], 0.8),
-            "client A blocks",
-            (lambda: [travel(ca["eu"], YELLOW_M, 0.6)], 0.6),
-            (lambda: [Transform(v["eu"], version("eu", 0, ["2290", "4417"], ""))], 0.6),
-            "client B blocks",
-            (lambda: [travel(ca["us"], YELLOW_M, 0.6)], 0.6),
-            (lambda: [Transform(v["us"], version("us", 0, ["2290", "5310"], ""))], 0.6),
+        # ---------------- scene 2: keep the later one ----------------
+        self.steps("The common answer is: keep the later one. On one computer, the later write is the newer decision. "
+                   "This rule is called last write wins.", [
+            (lambda: self.cap("keep the later one?"), 0.5),
+            "called last write wins",
+            (lambda: self.cap("last write wins: keep the highest time", WHITE), 0.6),
         ])
-
-        sync = DoubleArrow([RP["eu"][0] + RW / 2 + 0.1, SLOT[0], 0], [RP["us"][0] - RW / 2 - 0.1, SLOT[0], 0], buff=0,
-                           stroke_width=3, color=GREY_B, max_tip_length_to_length_ratio=0.12)
-        q = T("?", 40, GREY_B).move_to([0, SLOT[1], 0])
-        self.steps("Then the replicas swap versions. Which set should each one keep?", [
-            (lambda: [GrowFromCenter(sync)], 0.6),
-            (lambda: [travel(sync, YELLOW_M, 0.8), travel(Line(sync.get_end(), sync.get_start()), YELLOW_M, 0.8)], 0.8),
-            "Which set",
-            (lambda: [FadeIn(q, scale=0.8)], 0.5),
+        self.steps("The first till's list says 10:00:05. The second says 10:00:03. So the first list wins, the whole of it, "
+                   "and the second list is thrown away.", [
+            (lambda: self.set_stamp("eu", "stamped 10:00:05", WHITE), 0.5),
+            "The second says",
+            (lambda: self.set_stamp("us", "stamped 10:00:03", WHITE), 0.5),
+            "So the first",
+            (lambda: [glow(boxes["eu"][0], GREEN_M, 1.02)], 0.7),
+            "thrown away",
+            (lambda: [*[c.animate.set_opacity(0.25) for c in cards["us"]], c5310.animate.set_opacity(0.25),
+                      boxes["us"][0].animate.set_stroke(GREY_D)], 0.7),
         ])
-
-        h2 = heading("rule 1: last write wins")
-        self.steps("Last write wins stamps every write with the clock and keeps the higher stamp. "
-                   "EU's write says 2 milliseconds past ten. US's says 1.", [
-            (lambda: [FadeOut(q), FadeOut(h1), FadeIn(h2, shift=0.1 * DOWN)], 0.6),
-            "EU's write",
-            (lambda: [Transform(v["eu"], version("eu", 0, ["2290", "4417"], "stamped 10:00:00.002"))], 0.7),
-            "US's says",
-            (lambda: [Transform(v["us"], version("us", 0, ["2290", "5310"], "stamped 10:00:00.001"))], 0.7),
-        ])
-
-        lost = status("card 5310: lost, and client B was told OK", RED_M)
-        self.steps("So both replicas keep EU's set. Card 5310 is gone, though client B was told its block succeeded.", [
-            (lambda: [glow(v["eu"][0], GREEN_M)], 0.7),
-            (lambda: [travel(sync, GREEN_M, 0.7)], 0.7),
-            (lambda: [Transform(v["us"], version("us", 0, ["2290", "4417"], "stamped 10:00:00.002"))], 0.7),
+        self.steps("And with it, the stolen card. Card 5310 works again. No error, no warning. "
+                   "Well... the thief is having a better morning than the shop.", [
             "Card 5310",
-            (lambda: [FadeIn(lost, shift=0.1 * UP), glow(cl["us"][0], RED_M)], 0.8),
+            (lambda: [c5310.animate.set_opacity(1).set_color(RED_M), *self.cap("the stolen card works again", RED_M)], 0.7),
+            "No error",
+            (lambda: self.cap("no error, no warning", RED_M), 0.5),
+        ], after=0.5)
+        self.steps("Notice what went wrong. Neither cashier knew about the other's change. Later on the clock doesn't mean the "
+                   "writer had seen the other list. And if the first till's clock ran a few seconds fast, it wasn't even later.", [
+            (lambda: [*self.cap("neither cashier knew about the other's change")], 0.6),
+            "Later on the clock",
+            (lambda: self.cap("later on the clock is not \"saw the other list\""), 0.6),
+            "ran a few seconds fast",
+            (lambda: [Wiggle(self.stamp["eu"], scale_value=1.1, rotation_angle=0.02 * TAU), *self.cap("and a fast clock isn't even later", RED_M)], 0.9),
+        ])
+        self.steps("What we want is for each list to carry what its writer had already seen. Then the shop could tell a list "
+                   "that replaces another from two lists that clash.", [
+            (lambda: [*self.set_stamp("eu"), *self.set_stamp("us"), *[c.animate.set_opacity(1) for c in cards["us"]],
+                      c5310.animate.set_opacity(1).set_color(GOLD_M), boxes["us"][0].animate.set_stroke(WHITE),
+                      *self.cap("wanted: each list carries what its writer had seen", YELLOW_M)], 0.8),
+        ], after=0.4)
+
+        # ---------------- scene 3: bookmarks ----------------
+        self.steps("Here's an idea from everyday reading: bookmarks. Each till numbers its own changes, one, two, three. "
+                   "And every copy of the list carries one bookmark per till, saying how far into that till's changes it has read.", [
+            (lambda: self.uncap(), 0.3),
+            "bookmarks",
+            (lambda: self.cap("one bookmark per till: how far into its changes this copy has read"), 0.6),
+            "one bookmark per till",
+            (lambda: [*self.set_marks("eu", 2, 0), *self.set_marks("us", 2, 0)], 0.9),
+        ])
+        self.steps("In the app, the two tills are two copies of the list in two regions, Europe and the US. "
+                   "Before the Wi-Fi dropped, both copies had read EU's first two changes, and none from the US.", [
+            "two regions",
+            (lambda: [*self.set_title("eu", "EU copy"), *self.set_title("us", "US copy"), *self.cap("eu: Europe     us: the US")], 0.8),
+            "Before the Wi-Fi",
+            (lambda: [*self.set_marks("eu", 2, 0, "eu"), *self.set_marks("us", 2, 0, "eu")], 0.6),
+            "and none",
+            (lambda: [*self.set_marks("eu", 2, 0, "us"), *self.set_marks("us", 2, 0, "us")], 0.6),
+        ])
+        self.steps("When a copy takes a change, it moves its own bookmark forward by one. EU removes card 4417, so its EU bookmark "
+                   "goes from 2 to 3. US adds card 5310, so its US bookmark goes from 0 to 1.", [
+            (lambda: [*self.uncap(), *self.set_marks("eu", 2, 0), *self.set_marks("us", 2, 0)], 0.5),
+            "EU removes",
+            (lambda: [glow(s1, RED_M, 1.05)], 0.6),
+            "goes from 2 to 3",
+            (lambda: self.set_marks("eu", 3, 0, "eu"), 0.6),
+            "US adds",
+            (lambda: [Indicate(c5310, color=GOLD_M, scale_factor=1.1)], 0.6),
+            "goes from 0 to 1",
+            (lambda: self.set_marks("us", 2, 1, "us"), 0.6),
         ])
 
-        h3 = heading("rule 2: version vectors")
-        self.steps("The clock can't tell what each writer had seen. A version vector can. Each version keeps one counter per replica: how many of that replica's "
-                   "writes it has seen. The starting set had seen two from EU and none from US.", [
-            (lambda: [FadeOut(lost), FadeOut(h2), FadeIn(h3, shift=0.1 * DOWN),
-                      *[Transform(v[k], version(k, 0, ["2290"], "")) for k in RP]], 0.8),
-            "one counter per replica",
-            (lambda: [*[Transform(v[k], version(k, 0, ["2290"], vline(2, 0))) for k in RP]], 0.8),
-            "The starting set",
-            (lambda: [*[Indicate(v[k][2], color=YELLOW_M, scale_factor=1.1) for k in RP]], 0.9),
+        # ---------------- scene 4: the test ----------------
+        old_eu = marks("eu", 2, 0).move_to([0, 0.5, 0])
+        old_lab = T("EU, before", 20, GREY_B).next_to(old_eu, UP, buff=0.2)
+        cmp_ok = T("3 ≥ 2,  0 ≥ 0", 30, GREEN_M).next_to(old_eu, DOWN, buff=0.35)
+        self.steps("Now the test. Take the easy case first. EU's list before the change had bookmarks 2 and 0. After, 3 and 0. "
+                   "Every bookmark is at least as far along, so the newer list has read everything the old one had. It can replace it.", [
+            (lambda: [*self.set_marks("eu", 3, 0), *self.set_marks("us", 2, 1)], 0.4),
+            "before the change",
+            (lambda: [FadeIn(old_eu, shift=0.2 * RIGHT), FadeIn(old_lab)], 0.6),
+            "After, 3",
+            (lambda: [glow(self.mk["eu"][0][0], TEAL_M, 1.1)], 0.6),
+            "Every bookmark",
+            (lambda: [FadeIn(cmp_ok, shift=0.1 * UP)], 0.6),
+            "It can replace",
+            (lambda: self.cap("at least as far along everywhere: it saw the old one, so it replaces it", GREEN_M), 0.6),
+        ])
+        self.steps("Now the clash. EU's bookmarks: 3 and 0. US's: 2 and 1. Did either one see the other's change? Pause and guess.", [
+            (lambda: [FadeOut(VGroup(old_eu, old_lab, cmp_ok)), *self.uncap()], 0.5),
+            "EU's bookmarks",
+            (lambda: [glow(boxes["eu"][0], TEAL_M, 1.02)], 0.6),
+            "US's: 2",
+            (lambda: [glow(boxes["us"][0], GOLD_M, 1.02)], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        r_eu = VGroup(M("eu", 28, TEAL_M), M("3 > 2", 32, WHITE)).arrange(RIGHT, buff=0.35).move_to([0, 0.6, 0])
+        r_us = VGroup(M("us", 28, GOLD_M), M("0 < 1", 32, WHITE)).arrange(RIGHT, buff=0.35).move_to([0, -0.6, 0])
+        ahead_eu = T("EU ahead", 24, TEAL_M).next_to(r_eu, DOWN, buff=0.12)
+        ahead_us = T("US ahead", 24, GOLD_M).next_to(r_us, DOWN, buff=0.12)
+        self.steps("Compare them one at a time. On EU's changes, EU is ahead, 3 against 2. On US's changes, US is ahead, 1 against 0. "
+                   "Each has read something the other hasn't. So neither saw the other.", [
+            (lambda: self.uncap(), 0.3),
+            "On EU's changes",
+            (lambda: [*self.set_marks("eu", 3, 0, "eu"), *self.set_marks("us", 2, 1, "eu"), FadeIn(r_eu)], 0.6),
+            "3 against 2",
+            (lambda: [FadeIn(ahead_eu, shift=0.1 * LEFT)], 0.4),
+            "On US's changes",
+            (lambda: [*self.set_marks("eu", 3, 0, "us"), *self.set_marks("us", 2, 1, "us"), FadeIn(r_us)], 0.6),
+            "1 against 0",
+            (lambda: [FadeIn(ahead_us, shift=0.1 * RIGHT)], 0.4),
+            "So neither",
+            (lambda: self.cap("each is ahead somewhere: neither saw the other", YELLOW_M), 0.6),
         ])
 
-        self.steps("A write adds one to its own replica's counter. A's write through EU becomes EU 3, US 0. "
-                   "B's write through US becomes EU 2, US 1.", [
-            "A's write",
-            (lambda: [travel(ca["eu"], YELLOW_M, 0.5)], 0.5),
-            (lambda: [Transform(v["eu"], version("eu", 0, ["2290", "4417"], vline(3, 0, YELLOW_M)))], 0.7),
-            "B's write",
-            (lambda: [travel(ca["us"], YELLOW_M, 0.5)], 0.5),
-            (lambda: [Transform(v["us"], version("us", 0, ["2290", "5310"], vline(2, 1, WHITE, YELLOW_M)))], 0.7),
+        # ---------------- scene 5: the names ----------------
+        self.steps("That's the test. If every entry of one is at most the other's, the second saw the first, and the first can go. "
+                   "If each is ahead somewhere, the writes are concurrent: neither knew about the other.", [
+            "If every entry",
+            (lambda: self.cap("every entry at most the other's: an ancestor, it can go", GREEN_M), 0.6),
+            "If each is ahead",
+            (lambda: self.cap("each ahead somewhere: concurrent, neither knew about the other", YELLOW_M), 0.6),
+        ])
+        vec_eu = M("[(eu, 3)]", 26, TEAL_M).move_to([BX["eu"], STAMP_Y, 0])
+        vec_us = M("[(eu, 2), (us, 1)]", 26, GOLD_M).move_to([BX["us"], STAMP_Y, 0])
+        self.steps("The bookmarks have a name: a version vector, one counter per copy. "
+                   "Dynamo, Amazon's design for a store with many copies, called it a vector clock.", [
+            (lambda: [*self.set_marks("eu", 3, 0), *self.set_marks("us", 2, 1)], 0.4),
+            "a version vector",
+            (lambda: [*self.cap("version vector: one counter per copy", WHITE), FadeIn(vec_eu, shift=0.1 * UP), FadeIn(vec_us, shift=0.1 * UP)], 0.7),
+            "called it",
+            (lambda: self.cap("Dynamo's name for it: a vector clock"), 0.5),
+        ])
+        sib = {s: T("sibling", 26, YELLOW_M).move_to([BX[s], B_TOP + 0.35, 0]) for s in ("eu", "us")}
+        self.steps("And when two versions are concurrent, Dynamo doesn't pick one. It keeps both, side by side, as siblings, "
+                   "and hands both to the program on the next read.", [
+            (lambda: [FadeOut(VGroup(r_eu, r_us, ahead_eu, ahead_us)), *self.uncap()], 0.5),
+            "keeps both",
+            (lambda: [FadeIn(sib["eu"], shift=0.1 * DOWN), FadeIn(sib["us"], shift=0.1 * DOWN), *self.cap("siblings: both versions kept, side by side", YELLOW_M)], 0.7),
         ])
 
-        panel = RoundedRectangle(corner_radius=0.12, width=PW, height=PH, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1)
-        panel.move_to(PC)
-        hdr = VGroup(cell("eu", 1, 0, GREY_B), cell("us", 2, 0, GREY_B))
-        rA = VGroup(cell("A's write", 0, 1, WHITE, False), cell("3", 1, 1), cell("0", 2, 1))
-        rB = VGroup(cell("B's write", 0, 2, WHITE, False), cell("2", 1, 2), cell("1", 2, 2))
-        self.steps("To compare two versions, line the counters up. If every counter in one is at least as big as in the other, "
-                   "its writer saw the other version, so it may replace it.", [
-            (lambda: [FadeIn(panel), FadeIn(hdr)], 0.6),
-            (lambda: [FadeIn(rA, shift=0.1 * RIGHT)], 0.5),
-            (lambda: [FadeIn(rB, shift=0.1 * RIGHT)], 0.5),
-            "If every counter",
-            (lambda: [glow(panel, GREY_A, 1.03)], 1.0),
+        # ---------------- scene 6: break the obvious merge ----------------
+        ub = RoundedRectangle(corner_radius=0.14, width=3.3, height=2.9, stroke_color=GREEN_M, stroke_width=3).set_fill(fillc(GREEN_M), 1)
+        ub.move_to([0, -0.6, 0])
+        u_t = T("merged", 26, GREEN_M).move_to(ub.get_top() + 0.35 * DOWN)
+        u_cards = [M(c, 28, WHITE).move_to([0, ub.get_top()[1] - 1.0 - 0.6 * k, 0]) for k, c in enumerate([CARDS[1], CARDS[2]])]
+        u_back = M(CARDS[0], 28, RED_M).move_to([0, ub.get_top()[1] - 1.0 - 0.6 * 2, 0])
+        a_l = Arrow([BX["eu"] + BW / 2 + 0.03, -0.6, 0], [ub.get_left()[0] - 0.03, -0.6, 0], buff=0, stroke_width=3, color=GREY_B,
+                    max_tip_length_to_length_ratio=0.3)
+        a_r = Arrow([BX["us"] - BW / 2 - 0.03, -0.6, 0], [ub.get_right()[0] + 0.03, -0.6, 0], buff=0, stroke_width=3, color=GREY_B,
+                    max_tip_length_to_length_ratio=0.3)
+        self.steps("So the program has to merge them. The obvious merge: keep every card that's on either list. "
+                   "That keeps the stolen card 5310. So far so good.", [
+            (lambda: [*self.uncap(), FadeOut(wifi), FadeOut(wifi_l)], 0.4),
+            "The obvious merge",
+            (lambda: [FadeIn(ub), FadeIn(u_t), GrowArrow(a_l), GrowArrow(a_r), *self.cap("merge: every card on either list")], 0.8),
+            (lambda: [FadeIn(u_cards[0], shift=0.1 * DOWN)], 0.4),
+            "That keeps",
+            (lambda: [FadeIn(u_cards[1], shift=0.1 * DOWN)], 0.4),
+            (lambda: [Indicate(u_cards[1], color=GOLD_M, scale_factor=1.1)], 0.6),
         ])
+        self.steps("But look. Card 4417 is back. EU removed it, but the US list still had it, and a missing card could mean removed, "
+                   "or never added. The union can't tell which.", [
+            "Card 4417",
+            (lambda: [FadeIn(u_back, shift=0.1 * DOWN)], 0.5),
+            (lambda: [Indicate(u_back, color=RED_M, scale_factor=1.15)], 0.6),
+            "EU removed it",
+            (lambda: [glow(s1, RED_M, 1.05)], 0.6),
+            "the US list still",
+            (lambda: [Indicate(cards["us"][0], color=GOLD_M, scale_factor=1.1)], 0.6),
+            "a missing card",
+            (lambda: self.cap("missing: removed, or never added? the union can't tell", RED_M), 0.6),
+        ])
+        self.steps("So the customer whose lost card turned up gets refused again. Version vectors noticed the clash. They didn't settle it.", [
+            "gets refused",
+            (lambda: [Wiggle(u_back, scale_value=1.1, rotation_angle=0.02 * TAU)], 0.9),
+            "Version vectors noticed",
+            (lambda: self.cap("vectors notice the clash; they don't settle it", WHITE), 0.6),
+        ], after=0.4)
 
-        conc = status("each is ahead somewhere: concurrent", GOLD_M)
-        self.steps("Here A's version is ahead on EU, and B's is ahead on US. Each holds a write the other never saw. "
-                   "They're concurrent.", [
-            (lambda: [rA[1].animate.set_color(GREEN_M).scale(1.3), rB[1].animate.set_color(GREY_D)], 0.7),
-            "and B's is ahead",
-            (lambda: [rB[2].animate.set_color(GREEN_M).scale(1.3), rA[2].animate.set_color(GREY_D)], 0.7),
-            "They're concurrent",
-            (lambda: [FadeIn(conc, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 7: limits ----------------
+        self.steps("Two more limits. Your code gets the siblings and has to merge them well, and the Dynamo paper warns about "
+                   "exactly this: a deleted item can come back.", [
+            "Your code",
+            (lambda: [*self.cap("1. your code merges the siblings"), glow(ub, GREEN_M, 1.03)], 0.7),
+            "a deleted item",
+            (lambda: self.cap("Dynamo's warning: a deleted item can come back", RED_M), 0.6),
         ])
+        self.steps("And the vector grows with every copy that takes writes. Dynamo cut its vectors at about ten entries. "
+                   "Next, we'll meet data types that merge themselves, with no code from you.", [
+            "the vector grows",
+            (lambda: [*self.cap("2. one counter for every copy that takes writes"), Indicate(vec_us, color=GOLD_M, scale_factor=1.1)], 0.7),
+            "about ten",
+            (lambda: self.cap("Dynamo cut them at about 10 entries"), 0.5),
+        ], after=0.4)
 
-        sib = {"eu": version("eu", 1, ["2290", "5310"], vline(2, 1)), "us": version("us", 1, ["2290", "4417"], vline(3, 0))}
-        sl = status("both kept, as siblings", GOLD_M)
-        self.steps("So neither may replace the other. Each replica keeps both, as siblings, and the next read returns both.", [
-            (lambda: [travel(sync, YELLOW_M, 0.7), travel(Line(sync.get_end(), sync.get_start()), YELLOW_M, 0.7)], 0.7),
-            (lambda: [Transform(v["eu"], version("eu", 0, ["2290", "4417"], vline(3, 0))),
-                      Transform(v["us"], version("us", 0, ["2290", "5310"], vline(2, 1))),
-                      *[FadeIn(sib[k], shift=0.15 * DOWN) for k in RP], Transform(conc, sl)], 0.8),
-            "the next read",
-            (lambda: [*[glow(v[k][0], GOLD_M, 1.03) for k in RP], *[glow(sib[k][0], GOLD_M, 1.03) for k in RP]], 0.9),
-        ])
-
-        merged = {k: version(k, 0, ["2290", "4417", "5310"], vline(4, 1, YELLOW_M), GREEN_M) for k in RP}
-        rM = VGroup(cell("merged", 0, 3, GREEN_M, False), cell("4", 1, 3, GREEN_M), cell("1", 2, 3, GREEN_M))
-        self.steps("Client A reads both, blocks all three cards, and writes back through EU with a vector that covers both: "
-                   "EU 4, US 1.", [
-            (lambda: [travel(Line(ca["eu"].get_end(), ca["eu"].get_start()), GOLD_M, 0.6)], 0.6),
-            (lambda: [Transform(cl["eu"], client("eu", "A merges"))], 0.5),
-            "and writes back",
-            (lambda: [travel(ca["eu"], GREEN_M, 0.6)], 0.6),
-            (lambda: [FadeOut(sib["eu"], shift=0.15 * UP), Transform(v["eu"], merged["eu"])], 0.8),
-            "EU 4",
-            (lambda: [FadeIn(rM, shift=0.1 * RIGHT), rA[1].animate.set_color(WHITE).scale(1 / 1.3),
-                      rB[2].animate.set_color(WHITE).scale(1 / 1.3), rA[2].animate.set_color(WHITE),
-                      rB[1].animate.set_color(WHITE)], 0.7),
-        ])
-
-        done = status("no write lost", GREEN_M)
-        self.steps("It's at least as big as both siblings on every counter, so it replaces them on both replicas. "
-                   "No write is lost.", [
-            (lambda: [glow(panel, GREEN_M, 1.03), Indicate(rM[1], color=GREEN_M), Indicate(rM[2], color=GREEN_M)], 0.9),
-            "so it replaces",
-            (lambda: [travel(sync, GREEN_M, 0.7)], 0.7),
-            (lambda: [FadeOut(sib["us"], shift=0.15 * UP), Transform(v["us"], merged["us"])], 0.8),
-            "No write",
-            (lambda: [Transform(conc, done)], 0.6),
-        ])
-
-        self.steps("One write may replace another only if it saw it. The version vector says whether it did, "
-                   "and when neither saw the other, keep both and merge.", [
-            (lambda: [glow(v["eu"][0], GREEN_M), glow(v["us"][0], GREEN_M)], 1.0),
-            "The version vector",
-            (lambda: [*[Indicate(v[k][2], color=YELLOW_M, scale_factor=1.1) for k in RP]], 1.0),
-            "keep both",
-            (lambda: [glow(panel, GOLD_M, 1.03)], 1.0),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 8: moral and a check ----------------
+        self.steps("So, which list should the shop keep? Not the later one. Keep a version only if it saw the other. "
+                   "If neither saw the other, keep both.", [
+            (lambda: [FadeOut(VGroup(ub, u_t, *u_cards, u_back, a_l, a_r)), *self.cap("which list should the shop keep?", WHITE)], 0.6),
+            "Not the later one",
+            (lambda: self.cap("not the later one", RED_M), 0.4),
+            "Keep a version",
+            (lambda: self.cap("replace a version only if the new one saw it", GREEN_M), 0.5),
+            "If neither",
+            (lambda: [*self.cap("neither saw the other: keep both", YELLOW_M), glow(boxes["eu"][0], YELLOW_M, 1.02),
+                      glow(boxes["us"][0], YELLOW_M, 1.02)], 0.8),
+        ], after=0.5)
+        new_mk = marks("eu", 4, 1).move_to([0, 0.4, 0])
+        new_lab = T("merged write, via EU", 22, GREEN_M).next_to(new_mk, UP, buff=0.2)
+        self.steps("One quick check. The program merges the siblings and writes the result through EU, with bookmarks 4 and 1. "
+                   "Does it replace both siblings? Pause and think.", [
+            (lambda: self.uncap(), 0.3),
+            "writes the result",
+            (lambda: [FadeIn(new_mk, shift=0.1 * UP), FadeIn(new_lab)], 0.7),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        chk_eu = M("4 ≥ 3,  1 ≥ 0", 26, GREEN_M).move_to([0, -0.6, 0])
+        chk_us = M("4 ≥ 2,  1 ≥ 1", 26, GREEN_M).move_to([0, -1.2, 0])
+        self.steps("Yes. Against EU's 3 and 0, it's ahead or equal on both. Against US's 2 and 1, the same. "
+                   "It has read everything both siblings had.", [
+            (lambda: self.uncap(), 0.3),
+            "Against EU's",
+            (lambda: [FadeIn(chk_eu, shift=0.1 * RIGHT), glow(boxes["eu"][0], TEAL_M, 1.02)], 0.6),
+            "Against US's",
+            (lambda: [FadeIn(chk_us, shift=0.1 * LEFT), glow(boxes["us"][0], GOLD_M, 1.02)], 0.6),
+            "It has read",
+            (lambda: [FadeOut(sib["eu"]), FadeOut(sib["us"]), *self.cap("it saw both siblings, so it replaces both", GREEN_M)], 0.6),
+        ], after=0.3)
+        self.play(*self.cap("keep a version only if the new one saw it", YELLOW_M, 30), run_time=0.7)
+        self.wait(2.0)
