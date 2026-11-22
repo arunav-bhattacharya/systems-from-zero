@@ -1,66 +1,48 @@
 from sfz import *
 
+# The letter A naming a book: Kokoro reads a capital A inside a sentence as the article "uh".
+SAY.insert(0, (r"(^|[.!?]\s+)?\bA\b(?!')", lambda m: m.group(0) if m.group(1) is not None else "eh"))
+SAY.insert(0, (r"\bS3-FIFO\b", "S three fife oh"))
+SAY.insert(0, (r"\bFIFO\b", "fife oh"))
+SAY.insert(0, (r"\bLFU\b", "L F U"))
 SAY.insert(0, (r"\bSIEVE\b", "sieve"))
+SAY.insert(0, (r"\bZipf\b", "zipf"))
 
-X0, DX, ROW_Y = -5.6, 1.6, 1.25       # eight slots, left to right
-SW, SH = 1.36, 0.8
-HAND_Y = 2.0
-STATUS_Y = 2.78
-TOP_Y = 3.25
-END_Y = 0.08
-# hit-ratio chart: time left to right, 0 to 100% bottom to top
-CX0, CX1, CY0, CH = -5.6, 6.0, -3.35, 2.4
-SCAN0, SCAN1 = -2.4, 2.8
-HOT = {"m-17", "m-42", "m-08", "m-93"}
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+TOP_Y, SHELF_Y, BW, BH, GAP = 3.05, 0.55, 1.15, 1.5, 0.25
+SLOT_X = [(-2.5 + k) * (BW + GAP) for k in range(6)]
+IN_X = SLOT_X[-1] + BW + GAP + 0.35          # where a new book waits
+HAND_Y = SHELF_Y + BH / 2 + 0.38
+END_Y, TICK_Y, CAP_Y, BAR_Y, BASE_Y = SHELF_Y - BH / 2 - 0.3, -1.75, -3.22, -2.72, -1.2
+POP = {"A", "B", "C"}
 
 
 def fillc(color, a=0.14):
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def glow(rect, color=YELLOW_M, s=1.06):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d, run_time=0.3), FadeIn(new, shift=0.1 * d))
 
 
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
+def outline(m, color=YELLOW_M, buff=0.08):
+    r = SurroundingRectangle(m, color=color, buff=buff, corner_radius=0.1, stroke_width=4).set_z_index(7)
+    return Succession(Create(r, run_time=0.35), FadeOut(r, run_time=0.45))
 
 
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
-
-
-def pos(i):
-    return np.array([X0 + i * DX, ROW_Y, 0])
-
-
-def kcolor(k):
-    return GOLD_M if k in HOT else (PURPLE_M if k.startswith("m-5") else GREY_B)
-
-
-def key_box(k, bit=None):
-    c = kcolor(k)
-    r = RoundedRectangle(corner_radius=0.1, width=SW, height=SH, stroke_color=c, stroke_width=3).set_fill(fillc(c), 1)
-    g = VGroup(r, M(k, 22, WHITE))
-    if bit is not None:
-        b = Square(0.24, stroke_color=GOLD_M, stroke_width=2).set_fill(GOLD_M, 1 if bit else 0)
-        b.move_to([0, -SH / 2 - 0.3, 0])
-        g.add(b)
+def book(name):
+    color = GOLD_M if name in POP else (PURPLE_M if name.startswith("S") else BLUE_M)
+    r = RoundedRectangle(corner_radius=0.08, width=BW, height=BH, stroke_color=color, stroke_width=3).set_fill(fillc(color, 0.2), 1)
+    t = T(name, 30, color).move_to(r.get_center() + [0, -0.15, 0]).set_z_index(3)
+    g = VGroup(r, t)
+    g.name_ = name
     return g
-
-
-def at(g, i):
-    return g.shift(pos(i) - g[0].get_center())
-
-
-def cy(p):
-    return CY0 + p * CH
 
 
 class Base(VoiceScene):
     def add_mobjects_from_animations(self, animations):
-        """Never re-add a group whose parts are already on screen (that would draw filled shapes over their labels)."""
         curr = self.get_mobject_family_members()
 
         def visit(a):
@@ -86,8 +68,6 @@ class Base(VoiceScene):
         return super().remove(*fam)
 
     def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -111,303 +91,382 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-class Row:
-    """Eight cache slots. LRU keeps them least recent to most recent; SIEVE keeps them oldest to newest,
-    each with a visited bit, and a hand that walks from oldest to newest."""
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color) if isinstance(s, str) else s, 13.0).move_to([0, CAP_Y, 0]).set_z_index(3)
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
 
-    def __init__(self, keys, bits=None):
-        self.order = list(keys)
-        self.bits = dict(zip(keys, bits)) if bits else None
-        self.mob = {k: at(key_box(k, self.bits[k] if bits else None), i) for i, k in enumerate(keys)}
-        self.hand = 0
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
 
-    def group(self):
-        return VGroup(*[self.mob[k] for k in self.order])
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
 
-    def _settle(self, skip=None):
-        return [self.mob[k].animate.shift(pos(i) - self.mob[k][0].get_center())
-                for i, k in enumerate(self.order) if k != skip and not np.allclose(self.mob[k][0].get_center(), pos(i))]
-
-    def lru_hit(self, k):
-        self.order.remove(k)
-        self.order.append(k)
-        m = self.mob[k]
-        return [m.animate(path_arc=-0.8).shift(pos(7) - m[0].get_center()), *self._settle(skip=k)]
-
-    def _evict(self, victim):
-        m = self.mob.pop(victim)
-        self.order.remove(victim)
-        return [m.animate.shift(0.7 * DOWN).set_opacity(0)]
-
-    def _insert(self, k, bit=None):
-        g = at(key_box(k, bit), 7)
-        self.mob[k] = g
-        self.order.append(k)
-        if self.bits is not None:
-            self.bits[k] = 0
-        return [FadeIn(g, shift=0.6 * LEFT)]
-
-    def lru_miss(self, k):
-        v = self.order[0]
-        return [*self._evict(v), *self._settle_after(v), *self._insert(k)]
-
-    def _settle_after(self, v):
-        return self._settle()
-
-    def set_bit(self, k, on):
-        self.bits[k] = 1 if on else 0
-        return self.mob[k][2].animate.set_fill(GOLD_M, 1 if on else 0)
-
-
-def hand_xy(i):
-    return [pos(i)[0], HAND_Y + 0.08, 0]
-
-
-class Sieve:
-    """SIEVE's logic runs when a step is planned; each step's visuals run when it plays and look keys up by name."""
-
-    def __init__(self, keys, bits, hand):
-        self.order = list(keys)
-        self.bits = dict(zip(keys, bits))
-        self.mob = {k: at(key_box(k, b), i) for i, (k, b) in enumerate(zip(keys, bits))}
-        self.hand = 0
-        self.hm = hand
-
-    def hit(self, k, rt=0.5):
-        self.bits[k] = 1
-        return [(lambda: [self.mob[k][2].animate.set_fill(GOLD_M, 1), glow(self.mob[k][0], GREEN_M)], rt)]
-
-    def miss(self, k, rt=0.6, step=0.28):
+    def drop(self, *keys):
         out = []
-        i = self.hand
-        while self.bits[self.order[i]]:
-            kk = self.order[i]
-            self.bits[kk] = 0
-            out.append((lambda kk=kk: [self.mob[kk][2].animate.set_fill(GOLD_M, 0), glow(self.mob[kk][0], GOLD_M, 1.04)], step))
-            i = (i + 1) % len(self.order)
-            out.append((lambda i=i: [self.hm.animate.move_to(hand_xy(i))], step))
-        victim = self.order.pop(i)
-        self.order.append(k)
-        self.bits[k] = 0
-        nxt = i if i < len(self.order) - 1 else 0
-        self.hand = nxt
-        new_order = list(self.order)
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
 
-        def ev():
-            m = self.mob.pop(victim)
-            g = at(key_box(k, 0), 7)
-            self.mob[k] = g
-            anims = [m.animate.shift(0.7 * DOWN).set_opacity(0)]
-            for j, kk in enumerate(new_order[:-1]):
-                c = self.mob[kk][0].get_center()
-                if not np.allclose(c, pos(j)):
-                    anims.append(self.mob[kk].animate.shift(pos(j) - c))
-            anims.append(FadeIn(g, shift=0.6 * LEFT))
-            if nxt != i:
-                anims.append(self.hm.animate.move_to(hand_xy(nxt)))
-            return anims
-        return out + [(lambda: [glow(self.mob[victim][0], RED_M, 1.04)], step), (ev, rt)]
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
 class CacheEviction(Base):
-    """cache-05, section 3: eight slots, four hot merchants take 9 requests in 10. LRU: a nightly report reads 1,000
-    merchants once each, ten for every fraud check; eight report keys flush the hot ones and the fraud check's hits fall
-    from 90% to 0 while it runs. SIEVE: one FIFO, a visited bit per key, a hand that clears bits and evicts the first
-    clear one; the hand parks among the report keys, the hot keys stay, hits stay at 88% (simulated)."""
+    """cache-05, section 3. The cache is full and a new key arrives: which one goes? The library's shelf and its
+    basement. FIFO, LRU, LFU as kinds of evidence. LRU on a shelf of six: a hit moves a book to the newest end; a
+    one-time scan pushes every popular book out. One-hit wonders (26% of keys in the median trace, 72% in a short
+    stretch). SIEVE: one FIFO list, a visited bit, a hand that spares visited books in place; predict the scan, and the
+    scan books evict each other. The lab's numbers (10,000 slots: LRU 26.1 → 29.0 with scans, SIEVE 21.6 → 21.6).
+    Guardrails, Java and Kotlin, the moral, and a check (where does a spared key end up?)."""
+
+    # ---------- the shelf ----------
+    def title(self, s, color=WHITE):
+        return self.put("title", T(s, 28, color).move_to([0, TOP_Y, 0]))
+
+    def tick(self, s, color=WHITE):
+        return self.put("tick", fit(T(s, 22, color), 13.0).move_to([0, TICK_Y, 0]))
+
+    def lay(self):
+        return [b.animate.move_to([SLOT_X[k], SHELF_Y, 0]) for k, b in enumerate(self.shelf)]
+
+    def bit(self, b, on):
+        key = id(b)
+        out = []
+        if on and key not in self.bits:
+            d = Dot(radius=0.11, color=GREEN_M).move_to(b.get_center() + [0, 0.45, 0]).set_z_index(5)
+            d.add_updater(lambda m, b=b: m.move_to(b.get_center() + [0, 0.45, 0]))
+            self.bits[key] = d
+            out.append(FadeIn(d, scale=0.5))
+        elif not on and key in self.bits:
+            d = self.bits.pop(key)
+            out.append(FadeOut(d, scale=0.5))
+        return out
+
+    def hit(self, name, lru=True):
+        """A request finds its book on the shelf: LRU moves it to the newest end; SIEVE sets its bit."""
+        b = next(x for x in self.shelf if x.name_ == name)
+        if lru:
+            self.shelf.remove(b)
+            self.shelf.append(b)
+            return [outline(b, GREEN_M, 0.05), *self.lay()]
+        return [outline(b, GREEN_M, 0.05), *self.bit(b, True)]
+
+    def arrive(self, name):
+        b = book(name).move_to([IN_X, SHELF_Y, 0])
+        self.incoming = b
+        return [FadeIn(b, shift=0.3 * LEFT)]
+
+    def evict(self, b):
+        self.shelf.remove(b)
+        out = [b.animate.move_to(b.get_center() + [0, -1.7, 0]).set_opacity(0), *self.bit(b, False)]
+        return out
+
+    def admit(self):
+        b = self.incoming
+        self.shelf.append(b)
+        self.incoming = None
+        return self.lay()
+
+    def hand_to(self, b, color=YELLOW_M):
+        x = b.get_center()[0] if not isinstance(b, (int, float)) else b
+        tri = Triangle(color=color, fill_opacity=1, stroke_width=0).scale(0.16).rotate(PI).move_to([x, HAND_Y, 0]).set_z_index(6)
+        if self.hand is None:
+            self.hand = tri
+            return [FadeIn(tri, shift=0.1 * DOWN)]
+        return [self.hand.animate.move_to([x, HAND_Y, 0])]
 
     def construct(self):
-        self.title_card("Cache eviction: LRU and SIEVE", "what a one-time scan does to the hot keys")
+        self.capm = None
+        self.lab = {}
+        self.bits = {}
+        self.hand = None
+        self.incoming = None
+        self.title_card("A scan that empties the shelf", "LRU, and SIEVE's visited bit")
 
-        lru = Row(["m-230", "m-17", "m-415", "m-42", "m-08", "m-602", "m-93", "m-777"])
-        self.steps("The fraud check caches merchant profiles, and the cache has room for eight. "
-                   "Traffic is skewed: nine requests in ten ask for one of four busy merchants.", [
-            (lambda: [LaggedStart(*[FadeIn(lru.mob[k], scale=0.9) for k in lru.order], lag_ratio=0.12)], 1.5),
-            "nine requests",
-            (lambda: [*[glow(lru.mob[k][0], GOLD_M) for k in lru.order if k in HOT]], 1.0),
+        start = ["D", "A", "E", "B", "F", "C"]
+        self.shelf = [book(n).move_to([x, SHELF_Y, 0]) for n, x in zip(start, SLOT_X)]
+        ends = VGroup(T("oldest", 20, GREY_B).move_to([SLOT_X[0], END_Y, 0]), T("newest", 20, GREY_B).move_to([SLOT_X[-1], END_Y, 0]))
+        base_l = T("basement", 20, GREY_B).move_to([-6.0, BASE_Y, 0])
+
+        # ---------------- scene 1: the question ----------------
+        self.steps("Picture a library with full shelves. A new book arrives, and one book has to go down to the basement. Which one?", [
+            (lambda: [LaggedStart(*[FadeIn(b, shift=0.1 * UP) for b in self.shelf], lag_ratio=0.1)], 1.0),
+            "A new book",
+            (lambda: self.arrive("G"), 0.5),
+            "the basement",
+            (lambda: [FadeIn(base_l)], 0.4),
+            "Which one",
+            (lambda: self.cap("the shelf is full: which book goes?", YELLOW_M), 0.5),
         ])
-
-        rule = left_at(T("LRU: evict the least recently used key", 22, WHITE), -6.6, TOP_Y)
-        e_l = T("least recent", 18, GREY_B).move_to([pos(0)[0], END_Y, 0])
-        e_r = T("most recent", 18, GREY_B).move_to([pos(7)[0], END_Y, 0])
-        self.steps("When it's full, a new key pushes one out. LRU evicts the key used least recently, "
-                   "the one at this end.", [
-            (lambda: [FadeIn(rule, shift=0.1 * DOWN)], 0.7),
-            "LRU evicts",
-            (lambda: [FadeIn(e_l), FadeIn(e_r)], 0.6),
-            "the one at",
-            (lambda: [glow(lru.mob[lru.order[0]][0], RED_M)], 0.9),
+        self.steps("A cache faces the same choice. It keeps copies of data close by in memory, and when memory is full, "
+                   "it has to guess which key it will need least soon, and throw that one out.", [
+            "A cache",
+            (lambda: self.cap("a cache: copies kept close by. Full memory: guess which key is needed least soon", WHITE), 0.6),
+            "throw that one out",
+            (lambda: [outline(VGroup(*self.shelf), GREY_B, 0.12)], 0.8),
         ])
+        self.steps("Every way of choosing, called an eviction policy, answers with a different kind of evidence about the past.", [
+            "eviction policy",
+            (lambda: self.cap("eviction policy: how the cache chooses, from evidence about the past", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("question")
 
-        st = {}
-
-        def status(s, color):
-            new = M(s, 22, color).move_to([0, STATUS_Y, 0])
-            if "s" in st:
-                old = st["s"]
-                st["s"] = new
-                return [FadeOut(old, shift=0.1 * UP), FadeIn(new, shift=0.1 * UP)]
-            st["s"] = new
-            return [FadeIn(new, shift=0.1 * UP)]
-
-        xax = Line([CX0, CY0, 0], [CX1, CY0, 0], stroke_width=2.5, color=GREY_B)
-        yax = Line([CX0, CY0, 0], [CX0, cy(1.05), 0], stroke_width=2.5, color=GREY_B)
-        tlab = right_at(T("time", 18, GREY_B), CX1, CY0 + 0.25)
-        before = Line([CX0, cy(0.9), 0], [SCAN0, cy(0.9), 0], stroke_width=4, color=WHITE)
-        b_lab = left_at(T("fraud check: 9 in 10 hit", 18, WHITE), CX0 + 0.15, cy(0.9) + 0.26)
-        self.steps("A hit moves a key to the recent end. A miss brings the new key in there, and the oldest drops out. "
-                   "So the busy merchants stay, and nine requests in ten hit.", [
-            (lambda: status("GET m-17: hit", GREEN_M), 0.5),
-            (lambda: lru.lru_hit("m-17"), 1.0),
-            "A miss",
-            (lambda: status("GET m-311: miss", RED_M), 0.5),
-            (lambda: lru.lru_miss("m-311"), 1.0),
-            "So the busy",
-            (lambda: [Create(xax), Create(yax), FadeIn(tlab)], 0.7),
-            (lambda: [Create(before), FadeIn(b_lab)], 0.8),
+        # ---------------- scene 2: FIFO, LRU, LFU ----------------
+        self.steps("FIFO, first in, first out, removes the book that arrived first, however often people read it.", [
+            (lambda: [*self.uncap(), *self.title("FIFO: the first to arrive goes", BLUE_M), FadeIn(ends)], 0.6),
+            "arrived first",
+            (lambda: [outline(self.shelf[0], RED_M, 0.06)], 0.8),
         ])
-
-        shade = Rectangle(width=SCAN1 - SCAN0, height=CH + 0.15, stroke_width=0).set_fill(PURPLE_M, 0.12)
-        shade.move_to([(SCAN0 + SCAN1) / 2, CY0 + (CH + 0.15) / 2, 0])
-        sh_lab = T("the report runs", 18, PURPLE_M).move_to([(SCAN0 + SCAN1) / 2, cy(1.05) + 0.25, 0])
-        cnt = {}
-
-        def counter(n):
-            new = right_at(T(f"report: {n:,} of 1,000 read", 20, PURPLE_M), 6.6, TOP_Y)
-            if "c" in cnt:
-                old = cnt["c"]
-                cnt["c"] = new
-                return [FadeOut(old), FadeIn(new)]
-            cnt["c"] = new
-            return [FadeIn(new, shift=0.1 * DOWN)]
-
-        self.steps("Then the nightly report reads all 1,000 merchants, each one once, ten for every request the fraud "
-                   "check makes.", [
-            (lambda: [*counter(0), FadeIn(shade), FadeIn(sh_lab)], 0.8),
-            "each one once",
-            (lambda: [glow(shade, PURPLE_M, 1.0)], 0.8),
+        self.steps("LRU, least recently used, removes the book nobody has opened for the longest. LFU removes the one opened the fewest times.", [
+            (lambda: self.title("LRU: the longest unopened goes", GOLD_M), 0.5),
+            "LFU",
+            (lambda: self.title("LFU: the least often opened goes", GREY_B), 0.5),
         ])
-
-        def scan(n, rt, f):
-            """The n-th report key (1-based) arrives: status, then the policy's own animation."""
-            k = f"m-{500 + n}"
-            return [(lambda: [*status(f"GET {k}: miss", PURPLE_M), *counter(n)], 0.3), (lambda: f(k), rt)]
-
-        self.steps("Each report key is new, so it misses, goes in at the recent end, and pushes the oldest key out.", [
-            *scan(1, 0.9, lru.lru_miss), *scan(2, 0.8, lru.lru_miss), *scan(3, 0.7, lru.lru_miss),
+        self.steps("LRU is the usual choice. Here's how it keeps its order. The shelf runs from oldest to newest. "
+                   "When someone reads a book, it moves to the newest end.", [
+            (lambda: self.title("LRU", GOLD_M), 0.4),
+            "oldest to newest",
+            (lambda: [outline(ends, GREY_B, 0.1)], 0.8),
+            "When someone reads",
+            (lambda: [*self.tick("read A: it moves to the newest end", GREEN_M), *self.hit("A")], 0.9),
+            (lambda: [*self.tick("read B", GREEN_M), *self.hit("B")], 0.8),
         ])
+        self.steps("And the book that goes is the one at the oldest end.", [
+            (lambda: [*self.tick("new book G: the oldest one goes", WHITE), *self.evict(self.shelf[0])], 0.7),
+            (lambda: self.admit(), 0.6),
+        ], after=0.3)
+        self.stamp("lru")
 
-        self.steps("Five report keys later, the busy merchants are gone. "
-                   "The cache is full of keys nobody will ask for again.", [
-            *scan(4, 0.5, lru.lru_miss), *scan(5, 0.5, lru.lru_miss), *scan(6, 0.5, lru.lru_miss),
-            *scan(7, 0.5, lru.lru_miss), *scan(8, 0.5, lru.lru_miss),
-            "The cache is full",
-            (lambda: [*[glow(lru.mob[k][0], PURPLE_M) for k in lru.order]], 0.9),
+        # ---------------- scene 3: the scan breaks LRU ----------------
+        self.steps("Now the three popular books, A, B and C, get read all day. Then, one night, a report reads every key once. "
+                   "That's called a scan.", [
+            (lambda: [*self.tick("A, B and C: read all day", GOLD_M), *self.hit("C"), ], 0.8),
+            (lambda: [*self.hit("A")], 0.6),
+            (lambda: [*self.hit("B")], 0.6),
+            "a report",
+            (lambda: [*self.title("a one-time scan: every key read once", PURPLE_M)], 0.5),
         ])
+        self.steps("Before you watch, guess. What does a scan do to an LRU shelf? Pause and guess.", [
+            (lambda: self.cap("a scan on an LRU shelf: what happens?  pause and guess", YELLOW_M), 0.6),
+        ], after=0)
+        self.countdown(3.0)
 
-        lru_d = VMobject(stroke_color=RED_M, stroke_width=4).set_points_as_corners(
-            [[SCAN0, cy(0.9), 0], [SCAN0 + 0.12, cy(0.0), 0], [SCAN1, cy(0.0), 0]])
-        lru_a = VMobject(stroke_color=RED_M, stroke_width=4).set_points_as_corners(
-            [[SCAN1, cy(0.0), 0], [SCAN1 + 0.3, cy(0.89), 0], [CX1, cy(0.89), 0]])
-        l_lab = T("LRU: 0 hits", 18, RED_M).move_to([(SCAN0 + SCAN1) / 2, cy(0.0) + 0.26, 0])
-        self.steps("So while the report runs, the fraud check misses every time. Its hits fall from nine in ten to "
-                   "none, and come back only when the report is done.", [
-            (lambda: status("GET m-17: miss", RED_M), 0.5),
-            "Its hits fall",
-            (lambda: [Create(lru_d)], 1.2),
-            (lambda: [FadeIn(l_lab)], 0.5),
-            "and come back",
-            (lambda: [Create(lru_a)], 0.9),
+        def scan_lru(k):
+            return [(lambda k=k: [*self.tick(f"scan book S{k}: read once, never again", PURPLE_M), *self.arrive(f"S{k}")], 0.35),
+                    (lambda: self.evict(self.shelf[0]), 0.35), (lambda: self.admit(), 0.35)]
+
+        self.steps("Each scan book arrives, looks like the newest thing on the shelf, and pushes the oldest one out. "
+                   "Six scan books later, every popular book is in the basement.", [
+            (lambda: self.uncap(), 0.3),
+            *[x for k in range(1, 7) for x in scan_lru(k)],
+            "every popular book",
+            (lambda: [*self.cap("the scan made every key look recent, and pushed the popular ones out", RED_M)], 0.6),
         ])
+        self.steps("Tomorrow, the first reader of A misses. Well, that's not the shelf we wanted.", [
+            (lambda: self.tick("read A: a miss", RED_M), 0.5),
+        ])
+        self.steps("LRU has a second cost. Every hit moves a key, and the list it moves on has a lock, so only one thread at a time "
+                   "can change it. Busy threads queue for it.", [
+            (lambda: self.cap("and every hit moves a key, under one lock: busy threads queue", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("scan")
 
-        # ---- SIEVE ---------------------------------------------------------------------------------------------
-        hand = VGroup(Triangle(color=WHITE, fill_opacity=1, stroke_width=0).scale(0.13).rotate(PI),
-                      T("hand", 18, WHITE))
-        hand[1].next_to(hand[0], UP, buff=0.08)
-        hand.move_to(hand_xy(0))
-        sv = Sieve(["m-17", "m-230", "m-42", "m-415", "m-08", "m-602", "m-93", "m-777"], [1, 0, 0, 0, 1, 0, 1, 0], hand)
-        rule2 = left_at(T("SIEVE: a visited bit per key, and a hand", 22, WHITE), -6.6, TOP_Y)
-        o_l = T("oldest", 18, GREY_B).move_to([pos(0)[0], END_Y, 0])
-        o_r = T("newest", 18, GREY_B).move_to([pos(7)[0], END_Y, 0])
-        leg = VGroup(Square(0.2, stroke_color=GOLD_M, stroke_width=2).set_fill(GOLD_M, 1), T("visited bit set", 18, GREY_B))
-        leg.arrange(RIGHT, buff=0.15).move_to([0, END_Y, 0])
-        self.steps("SIEVE keeps the keys in the order they arrived, and gives each one a visited bit. "
-                   "A hit sets the bit, and nothing moves.", [
-            (lambda: [FadeOut(lru.group()), FadeOut(st.pop("s")), FadeOut(cnt.pop("c")), FadeOut(rule), FadeOut(e_l),
-                      FadeOut(e_r), lru_d.animate.set_stroke(opacity=0.35), lru_a.animate.set_stroke(opacity=0.35),
-                      l_lab.animate.set_opacity(0.35)], 0.8),
-            (lambda: [FadeIn(rule2, shift=0.1 * DOWN), FadeIn(o_l), FadeIn(o_r),
-                      LaggedStart(*[FadeIn(sv.mob[k], scale=0.9) for k in sv.order], lag_ratio=0.1)], 1.4),
-            "and gives each",
-            (lambda: [FadeIn(leg)], 0.6),
+        # ---------------- scene 4: one-hit wonders ----------------
+        self.steps("How common are books read only once? A 2023 study looked at 6,594 recordings of the requests real caches received.", [
+            (lambda: [*self.drop("tick"), *self.uncap(), *self.title("one-hit wonders: keys asked for once, never again", PURPLE_M)], 0.6),
+            "6,594",
+            (lambda: self.cap("the S3-FIFO study (2023): 6,594 traces from real caches", WHITE), 0.6),
+        ])
+        self.steps("In the middle trace, 26 percent of keys were asked for once and never again. In a short stretch of a trace, 72 percent were. "
+                   "So the evidence says: drop new keys quickly, unless they prove themselves.", [
+            "26 percent",
+            (lambda: self.cap("median trace: 26% of keys are one-hit wonders.  a short stretch: 72%", WHITE), 0.6),
+            "So the evidence",
+            (lambda: self.cap("wanted: drop new keys quickly, unless they prove themselves", YELLOW_M), 0.6),
+        ], after=0.3)
+        self.stamp("wonders")
+
+        # ---------------- scene 5: SIEVE ----------------
+        reset = ["D", "A", "E", "B", "F", "C"]
+
+        def reset_shelf():
+            old = self.shelf
+            self.shelf = [book(n).move_to([x, SHELF_Y, 0]) for n, x in zip(reset, SLOT_X)]
+            return [FadeOut(VGroup(*old)), *[FadeIn(b) for b in self.shelf]]
+
+        self.steps("SIEVE, from 2024, keeps the books in arrival order, and gives each one a sticky dot. A read puts a dot on the book, "
+                   "and moves nothing.", [
+            (lambda: [*self.uncap(), *self.title("SIEVE: arrival order, and one visited dot per book", TEAL_M), *reset_shelf()], 0.8),
+            "A read puts",
+            (lambda: [*self.tick("read A, read B, read C: a dot each, nothing moves", GREEN_M), *self.hit("A", False)], 0.6),
+            (lambda: [*self.hit("B", False)], 0.5),
+            (lambda: [*self.hit("C", False)], 0.5),
+        ])
+        self.steps("To make room, a hand walks from the oldest book toward the newest. A book with a dot keeps its place, "
+                   "and loses its dot. The first book without a dot goes.", [
+            (lambda: [*self.tick("new book S1", PURPLE_M), *self.arrive("S1")], 0.5),
+            "a hand walks",
+            (lambda: self.hand_to(self.shelf[0]), 0.4),
+            "The first book without",
+            (lambda: [outline(self.shelf[0], RED_M, 0.05)], 0.5),
+            (lambda: [*self.evict(self.shelf[0]), *self.hand_to(SLOT_X[0] + 0.0)], 0.5),
+            (lambda: [*self.admit()], 0.5),
+        ])
+        self.steps("In code, that dot is one visited bit per key.", [
+            (lambda: self.cap("the dot = a visited bit; the hand = a pointer that walks the list", WHITE), 0.6),
+        ], after=0.3)
+
+        def sieve_step(name, spared, victim):
+            """The hand spares `spared` books (clearing dots), then evicts `victim`."""
+            out = [(lambda: [*self.tick(f"new book {name}", PURPLE_M), *self.arrive(name)], 0.4)]
+            for s in spared:
+                out.append((lambda s=s: [*self.hand_to(next(b for b in self.shelf if b.name_ == s)),
+                                         *self.bit(next(b for b in self.shelf if b.name_ == s), False)], 0.45))
+            out.append((lambda: [*self.hand_to(next(b for b in self.shelf if b.name_ == victim))], 0.35))
+            out.append((lambda: [*self.evict(next(b for b in self.shelf if b.name_ == victim))], 0.4))
+            out.append((lambda: [*self.admit()], 0.45))
+            return out
+
+        self.steps("Now run the scan. Pause and guess first: which books end up in the basement?", [
+            (lambda: self.cap("the scan on a SIEVE shelf: who goes?  pause and guess", YELLOW_M), 0.6),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("The hand spares A, clears its dot, and drops E. It spares B and drops F. It spares C, and drops S1, "
+                   "the first scan book. From then on, scan books push out scan books.", [
+            (lambda: self.uncap(), 0.2),
+            *sieve_step("S2", ["A"], "E"),
+            "It spares B",
+            *sieve_step("S3", ["B"], "F"),
+            "It spares C",
+            *sieve_step("S4", ["C"], "S1"),
+            "From then on",
+            *sieve_step("S5", [], "S2"),
+            *sieve_step("S6", [], "S3"),
+        ])
+        self.steps("Books A, B and C are still on the shelf, and their next reads put the dots back.", [
+            (lambda: [*self.cap("the popular books stay; one-time books leave first", GREEN_M)], 0.5),
+            "put the dots back",
+            (lambda: [*self.hit("A", False), *self.hit("B", False), *self.hit("C", False)], 0.7),
+        ], after=0.3)
+        self.stamp("sieve")
+
+        # ---------------- scene 6: the lab's numbers ----------------
+        shelf_g = VGroup(*self.shelf, ends, base_l)
+        rows = [("", "Zipf", "Zipf + scans"), ("FIFO", "29.8%", "32.2%"), ("LRU", "26.1%", "29.0%"), ("SIEVE", "21.6%", "21.6%")]
+        cols = [-3.0, 0.2, 3.4]
+        tbl = VGroup()
+        for r, row in enumerate(rows):
+            for c, s in enumerate(row):
+                color = GREY_B if r == 0 or c == 0 else WHITE
+                tbl.add(T(s, 26 if r else 22, color).move_to([cols[c], 1.4 - 0.75 * r, 0]))
+        rule = Line([-4.2, 1.05, 0], [4.6, 1.05, 0], stroke_width=1.5, color=GREY_C)
+        self.steps("The lesson's lab races all three on a million requests with Zipf traffic, the skewed kind where a few keys get "
+                   "most of the requests. The cache holds 10,000 keys, and we count misses, requests the cache can't answer.", [
+            (lambda: [*self.drop("tick"), FadeOut(shelf_g), *[FadeOut(d) for d in self.bits.values()], FadeOut(self.hand),
+                      *self.title("miss ratio, cache of 10,000 keys", WHITE)], 0.7),
+            "Zipf traffic",
+            (lambda: [FadeIn(rule), *[FadeIn(tbl[k]) for k in range(0, 3)]], 0.5),
+            "we count misses",
+            (lambda: [*[FadeIn(tbl[k]) for k in (3, 4, 6, 7, 9, 10)], *self.cap("miss: a request the cache can't answer", WHITE)], 0.7),
+        ])
+        self.steps("SIEVE misses least: 21.6 percent, against 26.1 for LRU. Then the lab mixes in scans. Pause and guess the last column.", [
+            "SIEVE misses least",
+            (lambda: [outline(VGroup(tbl[10], tbl[7]), TEAL_M, 0.1)], 0.8),
+            "Pause and guess",
+            (lambda: self.cap("with scans mixed in: guess the last column", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(2.5)
+        self.steps("FIFO rises to 32.2, and LRU to 29.0. SIEVE stays at 21.6. Scan keys arrive without a dot, "
+                   "so the hand drops them before any key that was read.", [
+            (lambda: [FadeIn(tbl[5]), tbl[5].animate.set_color(RED_M)], 0.5),
+            "LRU to 29.0",
+            (lambda: [FadeIn(tbl[8]), tbl[8].animate.set_color(RED_M)], 0.5),
+            "SIEVE stays",
+            (lambda: [FadeIn(tbl[11]), tbl[11].animate.set_color(GREEN_M)], 0.5),
+            "Scan keys arrive",
+            (lambda: self.cap("scan keys arrive without a dot: the hand drops them first", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("numbers")
+
+        # ---------------- scene 7: guardrails, and the code ----------------
+        self.steps("A few limits. With a cache of only 1,000 keys, the scans changed little for any policy. Every policy is a bet "
+                   "on the past, and your traffic decides which bet wins. And throwing keys away is right for a cache, "
+                   "and wrong for data you can't rebuild.", [
+            "1,000 keys",
+            (lambda: self.cap("cache of 1,000 keys: the scans changed little", WHITE), 0.5),
+            "a bet",
+            (lambda: self.cap("every policy is a bet on the past: your traffic decides", WHITE), 0.6),
+            "throwing keys away",
+            (lambda: self.cap("evicting is right for a cache, wrong for data you can't rebuild", YELLOW_M), 0.6),
+        ], after=0.3)
+        PX, PW, PY = [-3.32, 3.32], 6.3, 0.55
+        panels = [RoundedRectangle(corner_radius=0.12, width=PW, height=3.3, stroke_color=GREY_B, stroke_width=2).set_fill(BLACK, 1).move_to([x, PY, 0]) for x in PX]
+        heads = [T(s, 24, GREY_B).move_to([x, PY + 2.0, 0]) for s, x in zip(("Java", "Kotlin"), PX)]
+        java = ["// a hit: set the bit, move nothing", "node.visited = true;", "", "// the hand: spare, clear, walk on",
+                "while (o.visited) {", "    o.visited = false;", "    o = o.newer != null ? o.newer : tail;", "}"]
+        kot = ["// a hit: set the bit, move nothing", "it.visited = true", "", "// the hand: spare, clear, walk on",
+               "while (o.visited) {", "    o.visited = false", "    o = o.newer ?: tail!!", "}"]
+        CHW = M("x" * 20, 16).width / 20
+
+        def code(lines, x):
+            ms = []
+            for l in lines:
+                ind = len(l) - len(l.lstrip(" "))
+                m = M(l.strip() or "x", 16, GREY_B if l.strip().startswith("//") else WHITE)
+                if not l.strip():
+                    m.set_opacity(0)
+                ms.append((m, ind))
+            g = VGroup(*[m for m, _ in ms]).arrange(DOWN, aligned_edge=LEFT, buff=0.16)
+            for m, ind in ms:
+                m.shift(ind * CHW * RIGHT)
+            fit(g, PW - 0.6)
+            return g.move_to([x - PW / 2 + 0.3 + g.width / 2, PY, 0]).set_z_index(3)
+
+        cj, ck = code(java, PX[0]), code(kot, PX[1])
+        self.steps("Here's the heart of the lab's SIEVE, in Java and Kotlin. A hit sets one bit. The hand clears bits until it finds "
+                   "a key without one. Because a hit moves nothing, SIEVE ran at twice LRU's speed on 16 threads.", [
+            (lambda: [FadeOut(VGroup(tbl, rule)), *self.drop("title"), *[FadeIn(p) for p in panels], *[FadeIn(h) for h in heads]], 0.6),
             "A hit sets",
-            (lambda: status("GET m-42: hit", GREEN_M), 0.5),
-            *sv.hit("m-42", 0.8),
-        ])
-
-        m311 = sv.miss("m-311", rt=1.0, step=0.6)     # clear m-17, hand to 1, mark m-230, evict it
-        self.steps("To make room, a hand walks from the oldest key toward the newest. A key whose bit is set gets a "
-                   "second chance: the hand clears the bit and moves on.", [
-            (lambda: [FadeIn(hand, shift=0.1 * DOWN)], 0.6),
-            "A key whose bit",
-            (lambda: status("GET m-311: miss", RED_M), 0.4),
-            m311[0],
-            "and moves on",
-            m311[1],
-        ])
-
-        self.steps("The first key with a clear bit is evicted. The new key goes in at the newest end, "
-                   "with its bit clear.", [
-            m311[2],
-            "The new key",
-            m311[3],
-        ])
-
-        plan = []
-        for n in range(1, 5):
-            plan += [(lambda n=n: [*status(f"GET m-{500 + n}: miss", PURPLE_M), *counter(n)], 0.25)]
-            plan += sv.miss(f"m-{500 + n}", rt=0.5, step=0.22)
-        self.steps("Now run the report. The hand clears the busy merchants' bits as it passes, "
-                   "and evicts the keys nobody came back for.", [
+            (lambda: [FadeIn(VGroup(*cj[:2])), FadeIn(VGroup(*ck[:2]))], 0.5),
             "The hand clears",
-            *plan,
-        ])
+            (lambda: [FadeIn(VGroup(*cj[3:])), FadeIn(VGroup(*ck[3:]))], 0.6),
+            "twice LRU's speed",
+            (lambda: self.cap("a hit moves nothing: twice LRU's speed on 16 threads (the SIEVE paper)", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("code")
 
-        plan = []
-        for n in range(5, 9):
-            plan += [(lambda n=n: [*status(f"GET m-{500 + n}: miss", PURPLE_M), *counter(n)], 0.25)]
-            plan += sv.miss(f"m-{500 + n}", rt=0.45, step=0.2)
-        self.steps("Then it stops among the report keys. Each new report key evicts the one before it, "
-                   "and the hand never reaches the busy merchants.", [
-            (lambda: [glow(hand[0], PURPLE_M, 1.3)], 0.6),
-            "Each new",
-            *plan,
-            "and the hand never",
-            (lambda: [*[glow(sv.mob[k][0], GOLD_M) for k in ("m-17", "m-42", "m-08", "m-93")]], 0.9),
-        ])
-
-        sv_d = VMobject(stroke_color=GREEN_M, stroke_width=4).set_points_as_corners(
-            [[SCAN0, cy(0.9), 0], [SCAN0 + 0.12, cy(0.88), 0], [SCAN1, cy(0.88), 0], [SCAN1 + 0.3, cy(0.9), 0], [CX1, cy(0.9), 0]])
-        s_lab = T("SIEVE: 88% hit", 18, GREEN_M).move_to([(SCAN0 + SCAN1) / 2, cy(0.88) - 0.26, 0])
-        self.steps("Meanwhile the fraud check keeps asking for them, so their bits are set again, and they hit. "
-                   "Its hits stay near nine in ten.", [
-            (lambda: status("GET m-42: hit", GREEN_M), 0.4),
-            *sv.hit("m-42", 0.4),
-            (lambda: status("GET m-17: hit", GREEN_M), 0.4),
-            *sv.hit("m-17", 0.4),
-            (lambda: status("GET m-93: hit", GREEN_M), 0.4),
-            *sv.hit("m-93", 0.4),
-            "Its hits stay",
-            (lambda: [Create(sv_d)], 1.2),
-            (lambda: [FadeIn(s_lab)], 0.5),
-        ])
-
-        self.steps("A one-time scan makes every key look recent to LRU. SIEVE keeps the keys that were asked for again, "
-                   "so the scan passes through.", [
-            (lambda: [lru_d.animate.set_stroke(opacity=1), l_lab.animate.set_opacity(1)], 0.8),
-            "SIEVE keeps",
-            (lambda: [*[glow(sv.mob[k][0], GOLD_M) for k in ("m-17", "m-42", "m-08", "m-93")]], 1.0),
-            "so the scan",
-            (lambda: [sv_d.animate(rate_func=there_and_back).set_stroke(width=8)], 1.0),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 8: moral and check ----------------
+        self.shelf = [book(n).move_to([x, SHELF_Y, 0]) for n, x in zip(["A", "B", "C", "S4", "S5", "S6"], SLOT_X)]
+        self.bits = {}
+        self.hand = None
+        self.steps("So the moral of the story. LRU trusts the last read, so one scan can fool it. SIEVE asks a new key to prove "
+                   "itself once before it may stay.", [
+            (lambda: [FadeOut(VGroup(*panels, *heads, cj, ck)), *[FadeIn(b) for b in self.shelf], FadeIn(ends), FadeIn(base_l)], 0.7),
+            "LRU trusts",
+            (lambda: self.cap("LRU trusts the last read: one scan fools it", WHITE), 0.5),
+            "SIEVE asks",
+            (lambda: self.cap("SIEVE: a new key must be read again to stay", YELLOW_M), 0.5),
+        ], after=0.3)
+        self.steps("One quick check. The hand reaches B, and B has a dot. Where does B end up? Pause and think.", [
+            (lambda: [*self.bit(self.shelf[1], True), *self.hand_to(self.shelf[1]), *self.cap("B has a dot: where does it end up?  pause and think", YELLOW_M)], 0.7),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Right where it was. It loses its dot and keeps its place. LRU would have moved it; SIEVE never moves anything.", [
+            (lambda: [*self.bit(self.shelf[1], False), outline(self.shelf[1], GREEN_M, 0.06), *self.hand_to(self.shelf[2])], 0.7),
+            "LRU would have",
+            (lambda: self.cap("spared books stay in place; only the dot changes", WHITE), 0.6),
+        ], after=0.3)
+        self.play(*self.cap("drop new keys quickly, unless they prove themselves", YELLOW_M, 26), run_time=0.7)
+        self.wait(2.0)
