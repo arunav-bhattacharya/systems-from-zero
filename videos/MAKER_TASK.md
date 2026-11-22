@@ -30,6 +30,11 @@ file:class, lesson, section index); do them one after another.
    real mispronunciations with `SAY` rules at the top of your scene file, deleting the cached line before you
    re-render), and ffprobe, which must print `2560,1440`. Aim for 3 to 5 minutes; never pad.
 
+## Known pronunciation fix
+
+sfz.py turns "PostgreSQL" into "postgres", which the voice says as "POST-gurz". If your narration says PostgreSQL,
+copy the `post-gress` SAY rule from the top of `videos/scenes/hnsw_search.py` into your scene.
+
 ## Working alongside others
 
 Three other makers share this machine. Render one video at a time yourself, never two at once, and always draft

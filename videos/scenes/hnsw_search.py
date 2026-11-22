@@ -1,95 +1,31 @@
-import heapq
-
 from sfz import *
 
 SAY.insert(0, (r"\bHNSW\b", "H N S W"))
 SAY.insert(0, (r"\bpgvector\b", "P G vector"))
 SAY.insert(0, (r"\bef_search\b", "E F search"))
-SAY.insert(0, (r"\bef search\b", "E F search"))
+SAY.insert(0, (r"\bYashunin\b", "Yashoonin"))
+SAY.insert(0, (r"\b0\.8\.0\b", "zero point eight point zero"))
+# sfz says PostgreSQL as "postgres", which the voice reads as "POST-gurz" (Whisper hears "posters"); spell the vowel out
+SAY.insert(0, (r"\bPostgreSQL\b", "post-gress"))
 
-# ---- the data: 40 vectors in a plane, a three-layer graph, and a real search over it ------------------------------------
-SEED, QXY, N = 16, (0.2, -2.6), 40
-
-
-def build():
-    rng = np.random.default_rng(SEED)
-    pts = []
-    while len(pts) < N:
-        p = np.array([rng.uniform(-6.3, 1.5), rng.uniform(-3.1, 2.3)])
-        if all(np.linalg.norm(p - q) > 0.62 for q in pts):
-            pts.append(p)
-    P = np.array(pts)
-    near = lambda xy, c: min(c, key=lambda i: np.linalg.norm(P[i] - np.array(xy)))
-    L2 = [near(a, range(N)) for a in [(-5.6, 2.0), (-2.2, 0.2), (1.2, 1.9)]]
-    L1 = list(L2)
-    while len(L1) < 10:                          # spread out, like a random few
-        L1.append(max(range(N), key=lambda i: min(np.linalg.norm(P[i] - P[j]) for j in L1)))
-
-    def knn(nodes, k):
-        E = set()
-        for i in nodes:
-            for j in sorted([j for j in nodes if j != i], key=lambda j: np.linalg.norm(P[i] - P[j]))[:k]:
-                E.add((min(i, j), max(i, j)))
-        return E
-    E = {2: {(min(a, b), max(a, b)) for a in L2 for b in L2 if a != b}, 1: knn(L1, 3), 0: knn(range(N), 3)}
-    return P, L2, L1, E
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+BX0, BX1, BH = -5.0, 6.4, 0.8
+LY = {2: 2.05, 1: 0.75, 0: -0.55}                       # the three layers
+LAB_X = -5.85
+L2 = [120, 330, 570]                                      # the lesson's stepper, in its own x units
+L1 = [120, 220, 330, 440, 500, 570]
+L0 = [90, 120, 150, 190, 220, 260, 300, 330, 370, 400, 440, 470, 500, 530, 570, 610]
+LAYERS = {2: L2, 1: L1, 0: L0}
+QV = 515
+STRIP_Y, STRIP_T_Y, CNT_Y, BAR_Y, CAP_Y = -2.05, -1.55, -2.6, -2.95, -3.3
 
 
-P, L2, L1, E = build()
-Q = np.array(QXY)
+def X(v):
+    return BX0 + (v - 80) / 584 * (BX1 - BX0)
 
 
-def dist(i):
-    return float(np.linalg.norm(P[i] - Q))
-
-
-def nbrs(layer, i):
-    return sorted(b if a == i else a for a, b in E[layer] if i in (a, b))
-
-
-def search(ef):
-    """HNSW search: greedy (one candidate) in layers 2 and 1, a beam of ef in layer 0. Returns the results and a trace
-    of (layer, kind, node, neighbours whose distance was computed), plus how many distances it computed."""
-    trace, nd, cur = [], 1, L2[0]
-    for layer in (2, 1):
-        vis = {cur}
-        while True:
-            comp = [j for j in nbrs(layer, cur) if j not in vis]
-            vis |= set(comp)
-            nd += len(comp)
-            trace.append((layer, "look", cur, comp))
-            best = min([cur] + nbrs(layer, cur), key=dist)
-            if best == cur:
-                break
-            trace.append((layer, "move", best, []))
-            cur = best
-    vis = {cur}
-    C, W = [(dist(cur), cur)], [(-dist(cur), cur)]
-    while C:
-        dc, c = heapq.heappop(C)
-        if dc > -W[0][0]:
-            break
-        comp = [j for j in nbrs(0, c) if j not in vis]
-        vis |= set(comp)
-        nd += len(comp)
-        trace.append((0, "expand", c, comp))
-        for j in comp:
-            if len(W) < ef or dist(j) < -W[0][0]:
-                heapq.heappush(C, (dist(j), j))
-                heapq.heappush(W, (-dist(j), j))
-                if len(W) > ef:
-                    heapq.heappop(W)
-    return sorted([i for _, i in W], key=dist), trace, nd
-
-
-RES4, TR4, ND4 = search(4)
-RES6, TR6, ND6 = search(6)
-TRUE4 = sorted(range(N), key=dist)[:4]
-assert TR6[:len(TR4)] == TR4                    # the wider beam walks the same path, then keeps going
-
-PX = 2.45                                       # right panel, left edge
-LAYER_Y = {2: 2.35, 1: 1.8, 0: 1.25}
-LC = {2: PURPLE_M, 1: BLUE_M, 0: GREY_C}
+def P(layer, v):
+    return np.array([X(v), LY[layer], 0])
 
 
 class Base(VoiceScene):
@@ -145,258 +81,344 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
 
 def fillc(color, a=0.14):
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def pt(i):
-    return np.array([P[i][0], P[i][1], 0])
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def qpt():
-    return np.array([Q[0], Q[1], 0])
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def edges(layer, color, sw, opacity=1.0):
-    return VGroup(*[Line(pt(a), pt(b), stroke_width=sw, color=color).set_opacity(opacity) for a, b in sorted(E[layer])])
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def ring(i, color=YELLOW_M, r=0.17, sw=3.5):
-    return Circle(radius=r, color=color, stroke_width=sw).move_to(pt(i))
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
 
 
-def layer_bar(layer, on):
-    n = {2: 3, 1: 10, 0: 40}[layer]
-    c = LC[layer]
-    r = RoundedRectangle(corner_radius=0.08, width=4.0, height=0.44, stroke_color=c if on else GREY_D, stroke_width=2.5 if on else 1.5)
-    r.set_fill(fillc(c, 0.2) if on else BLACK, 1).move_to([PX + 2.0, LAYER_Y[layer], 0])
-    t = T(f"layer {layer}: {n} vectors", 20, WHITE if on else GREY_C).move_to(r)
-    return VGroup(r, t)
+def dot_run(a, b, color=YELLOW_M, rt=0.6):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    d = Dot(radius=0.08, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.12))
 
 
-def counter(n, label="distances computed", color=WHITE):
-    return left_at(T(f"{label}: {n}", 22, color), PX, 0.45)
 
 
-def note(lines, y, color=GREY_B, size=20):
-    g = VGroup(*[T(s, size, WHITE) for s in lines]).arrange(DOWN, buff=0.12, aligned_edge=LEFT)
-    r = RoundedRectangle(corner_radius=0.08, width=4.1, height=g.height + 0.32, stroke_color=color, stroke_width=2.5)
-    r.set_fill(fillc(color, 0.18), 1)
-    left_at(g, PX + 0.16, y)
-    r.move_to([PX + 2.05, y, 0])
-    return VGroup(r, g)
 
 
 class HnswSearch(Base):
-    """store-08, section 3: 40 dispute vectors in a plane (a stand-in for hundreds of dimensions). Exact search measures
-    all 40. HNSW links each vector to its nearest neighbours in layer 0, a spread-out 10 in layer 1 and 3 in layer 2. The
-    search starts at the top entry point, moves greedily, drops a layer when no neighbour is closer, and keeps a beam in
-    layer 0. The graph, the layers and every count on screen come from running that search on these points: a beam of 4
-    computes 17 distances and finds 3 of the true 4 nearest; a beam of 6 computes 22 and finds all 4. Then the lesson's
-    pgvector numbers: recall@10 0.89 at ef_search 10, 1.0 at 40; 654 pages against 2,138 for the exact scan."""
+    """store-08, section 3. Support wants past complaints that mean the same as a new one. Embeddings turn text into
+    vectors, close means similar; the exact search measures every vector (2,138 pages, 77 billion operations at 50
+    million). Driving to a friend's house: motorway, main road, streets. The lesson's stepper: 16 vectors in three
+    layers, entry 120 -> 330 -> 570 on layer 2, 500 on layer 1, a beam of 4 on layer 0; 10 distances instead of 16.
+    HNSW in pgvector (m 16, ef_search 40; 654 pages). Recall (0.89 at 10, 1.0 at 40). The filter trap (4 rows of 10)
+    and the iterative scan. Memory. Moral and a check."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color) if isinstance(s, str) else s, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def dist(self, n):
+        return self.put("dist", left_at(T(f"distances worked out: {n}", 22, WHITE), BX0, 2.88))
+
+    def count(self, s, color=WHITE):
+        return self.put("cnt", fit(T(s, 24, color), 13.0).move_to([0, CNT_Y, 0]))
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def state(self, layer, v, kind):
+        """Colour one vector: 'at' (where the search stands), 'seen' (looked at, left behind), 'ok' (in the answer)."""
+        d = self.dots[(layer, v)]
+        col = {"at": BLUE_M, "seen": GREY_D, "ok": GREEN_M, "plain": WHITE}[kind]
+        fillcol = {"at": fillc(BLUE_M, 0.6), "seen": BLACK, "ok": fillc(GREEN_M, 0.7), "plain": BLACK}[kind]
+        return d.animate.set_stroke(col, 3).set_fill(fillcol, 1)
+
+    def hop(self, layer, a, b, color=YELLOW_M, rt=0.5):
+        return dot_run(P(layer, a) + [0.12 if b > a else -0.12, 0, 0], P(layer, b) + [-0.12 if b > a else 0.12, 0, 0], color, rt)
 
     def construct(self):
-        self.title_card("HNSW: nearest neighbours by walking a graph", "a layered graph, searched from the top down")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Nearest by meaning", "walking a graph from the top layer down")
 
-        dots = VGroup(*[Dot(pt(i), radius=0.075, color=GREY_B) for i in range(N)])
-        qd = Dot(qpt(), radius=0.1, color=YELLOW_M)
-        ql = T("query", 20, YELLOW_M).next_to(qd, LEFT, buff=0.15)
-        cap = left_at(T("“charged twice for one bike rental”", 24, YELLOW_M), -6.5, 3.15)
-        sub = left_at(T("40 past disputes, drawn in 2 of their hundreds of dimensions", 20, GREY_B), PX, -0.35)
-        sub = VGroup(*[left_at(T(s, 20, GREY_B), PX, y) for s, y in
-                       [("40 past disputes, drawn in 2", -0.2), ("of their hundreds of dimensions", -0.55)]])
-        self.steps("A customer writes: charged twice for one bike rental. Support wants past disputes that mean the same. "
-                   "An embedding model turns each text into a vector, and similar meanings land close together.", [
-            (lambda: [FadeIn(cap, shift=0.1 * DOWN)], 0.8),
-            "An embedding model",
-            (lambda: [LaggedStart(*[FadeIn(d, scale=0.5) for d in dots], lag_ratio=0.04), FadeIn(sub)], 1.8),
-            "and similar meanings",
-            (lambda: [FadeIn(qd, scale=0.5), FadeIn(ql)], 0.7),
+        # ---------------- scene 1: the question ----------------
+        q = chip("charged twice for one bike rental", YELLOW_M, 26).move_to([0, 1.5, 0])
+        m = chip("duplicate charge, scooter hire", GREEN_M, 26).move_to([0, 0.1, 0])
+        self.steps("A customer writes to support: charged twice for one bike rental. "
+                   "Support wants past complaints like it, by meaning, not by shared words.", [
+            "A customer writes",
+            (lambda: [FadeIn(q, shift=0.1 * DOWN)], 0.6),
+            "by meaning",
+            (lambda: self.cap("find past complaints that mean the same thing", WHITE), 0.6),
         ])
+        self.steps("So duplicate charge, scooter hire should match, though it shares no word with the first. "
+                   "How does a database find complaints that mean the same thing, among millions, fast?", [
+            (lambda: [FadeIn(m, shift=0.1 * UP)], 0.6),
+            "shares no word",
+            (lambda: self.cap("not one word in common", WHITE), 0.5),
+            "among millions",
+            (lambda: self.cap("among millions, fast?", YELLOW_M), 0.5),
+        ], after=0.3)
 
-        rays = VGroup(*[Line(qpt(), pt(i), stroke_width=1.2, color=GOLD_M).set_opacity(0.6) for i in range(N)])
-        cnt = counter(40, "exact: distances computed", GOLD_M)
-        self.steps("The exact search measures the distance from the query to every vector: 40 here.", [
-            (lambda: [FadeOut(sub)], 0.4),
-            "measures the distance",
-            (lambda: [LaggedStart(*[Create(r) for r in rays], lag_ratio=0.03)], 1.8),
-            "40 here",
-            (lambda: [FadeIn(cnt, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 2: vectors, and the exact search ----------------
+        rng = np.random.default_rng(3)
+        pts = [np.array([x, y, 0]) for x, y in zip(rng.uniform(-6.0, 6.0, 46), rng.uniform(-2.0, 2.4, 46))]
+        qp = np.array([1.2, 0.5, 0])
+        pts = [p for p in pts if np.linalg.norm(p - qp) > 0.45]
+        near = sorted(range(len(pts)), key=lambda i: np.linalg.norm(pts[i] - qp))[:4]
+        scat = VGroup(*[Dot(p, radius=0.07, color=GREY_B) for p in pts])
+        qd = Dot(qp, radius=0.1, color=YELLOW_M).set_z_index(4)
+        self.steps("First, meaning has to become something a computer can measure. A model, a program trained on huge amounts of text, "
+                   "turns each text into a vector: a list of a few hundred to a few thousand numbers.", [
+            (lambda: [*self.uncap(), FadeOut(m), q.animate.scale(0.8).move_to([0, 3.15, 0])], 0.7),
+            "turns each text",
+            (lambda: [*self.cap(M("[0.12, -0.80, 0.33, ... ]   a few hundred to a few thousand numbers", 20, WHITE))], 0.6),
         ])
-
-        big = note(["50 million vectors of 1,536 numbers:", "77 billion multiply-adds a query"], -0.75, RED_M, 18)
-        self.steps("With 50 million vectors of 1,536 numbers, that's 77 billion multiply-adds a query.", [
-            (lambda: [FadeIn(big, shift=0.1 * UP)], 0.8),
+        self.steps("Texts with similar meanings land close together, like points on a map. Only this map has hundreds of directions "
+                   "instead of two. So finding similar complaints means finding the nearest points to the new one.", [
+            "land close together",
+            (lambda: [LaggedStart(*[FadeIn(d, scale=0.5) for d in scat], lag_ratio=0.03), FadeIn(qd, scale=0.5)], 1.2),
+            "hundreds of directions",
+            (lambda: self.cap("close together = similar meaning (the real map has hundreds of directions)", WHITE), 0.6),
+            "the nearest points",
+            (lambda: [*[scat[i].animate.set_color(GREEN_M).scale(1.4) for i in near]], 0.6),
+        ])
+        rays = VGroup(*[Line(qp, p, stroke_width=1.2, color=GREY_C) for p in pts])
+        self.steps("The plain way: measure the distance from the query to every vector, and keep the closest. In the lab, that's 100,000 "
+                   "vectors of 32 numbers, 2,138 pages, about 8 milliseconds.", [
+            "measure the distance",
+            (lambda: [LaggedStart(*[Create(r) for r in rays], lag_ratio=0.03)], 1.4),
+            "In the lab",
+            (lambda: self.count("exact search: 100,000 vectors of 32 numbers, 2,138 pages, about 8 ms"), 0.6),
+        ])
+        self.steps("Now picture 50 million complaints of 1,536 numbers each: 77 billion multiplications and additions for every question. "
+                   "And a sorted index can't help. It has one order, and this map has hundreds of directions.", [
             "77 billion",
-            (lambda: [glow(big[0], RED_M, 1.03)], 0.9),
-        ])
+            (lambda: self.count("50 million x 1,536 numbers: 77 billion operations per question", RED_M), 0.6),
+            "a sorted index",
+            (lambda: self.cap("a sorted index has one order; this map has hundreds of directions", WHITE), 0.6),
+        ], after=0.3)
 
-        # ---- the graph and its layers ------------------------------------------------------------------------------
-        e0, e1, e2 = edges(0, GREY_D, 1.6), edges(1, BLUE_M, 2.2), edges(2, PURPLE_M, 3)
-        for e in (e0, e1, e2):
-            e.set_z_index(-1)
-        bars = {k: layer_bar(k, False) for k in (2, 1, 0)}
-        self.steps("HNSW gives up exactness for speed. It links every vector to a few of its nearest neighbours, "
-                   "and searches by walking toward the query.", [
-            (lambda: [FadeOut(rays), FadeOut(cnt), FadeOut(big)], 0.6),
-            "It links",
-            (lambda: [LaggedStart(*[Create(l) for l in e0], lag_ratio=0.02)], 1.8),
-            (lambda: [FadeIn(bars[0]), Transform(bars[0], layer_bar(0, True))], 0.6),
+        # ---------------- scene 3: the drive ----------------
+        bands = {k: RoundedRectangle(corner_radius=0.12, width=BX1 - BX0, height=BH, stroke_color=GREY_C, stroke_width=2)
+                 .set_fill(fillc(GREY_B, 0.08), 1).move_to([(BX0 + BX1) / 2, LY[k], 0]) for k in LY}
+        names = {2: "motorway", 1: "main roads", 0: "streets"}
+        links = {k: VGroup(*[Line(P(k, a) + [0.1, 0, 0], P(k, b) + [-0.1, 0, 0], stroke_width=2, color=GREY_C)
+                             for a, b in zip(LAYERS[k], LAYERS[k][1:])]) for k in LY}
+        drops = VGroup(*[DashedLine(P(k, v) + [0, -0.1, 0], P(k - 1, v) + [0, 0.1, 0], dash_length=0.06, stroke_width=1.3, color=GREY_D)
+                         for k in (2, 1) for v in LAYERS[k]])
+        self.dots = {(k, v): Circle(radius=0.1, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1).move_to(P(k, v)).set_z_index(2)
+                     for k in LY for v in LAYERS[k]}
+        qdots = {k: Dot(P(k, QV) + [0, 0.22, 0], radius=0.07, color=YELLOW_M).set_z_index(4) for k in LY}
+        qlab = T("query", 18, YELLOW_M).move_to([X(QV), LY[2] + BH / 2 + 0.25, 0])
+        self.steps("So think how you drive to a friend's house in another city. Motorway first, with exits far apart, "
+                   "to the exit nearest their town. Then a main road. Then the streets, to the door.", [
+            (lambda: [FadeOut(VGroup(scat, qd, rays, q)), *self.drop("cnt"), *self.uncap()], 0.7),
+            "Motorway first",
+            (lambda: [FadeIn(bands[2]), *self.put("n2", T(names[2], 20, WHITE).move_to([LAB_X, LY[2], 0])),
+                      *[FadeIn(self.dots[(2, v)]) for v in L2], Create(links[2])], 0.8),
+            "Then a main road",
+            (lambda: [FadeIn(bands[1]), *self.put("n1", T(names[1], 20, WHITE).move_to([LAB_X, LY[1], 0])),
+                      *[FadeIn(self.dots[(1, v)]) for v in L1], Create(links[1])], 0.7),
+            "Then the streets",
+            (lambda: [FadeIn(bands[0]), *self.put("n0", T(names[0], 20, WHITE).move_to([LAB_X, LY[0], 0])),
+                      *[FadeIn(self.dots[(0, v)]) for v in L0], Create(links[0])], 0.7),
         ])
-
-        l1dots = VGroup(*[dots[i] for i in L1])
-        l2dots = VGroup(*[dots[i] for i in L2])
-        others1 = VGroup(*[dots[i] for i in range(N) if i not in L1])
-        others2 = VGroup(*[dots[i] for i in L1 if i not in L2])
-        self.steps("It also builds express lanes. A random few vectors sit in a layer above, with longer links, "
-                   "and fewer still in the top layer.", [
-            (lambda: [e0.animate.set_opacity(0.15), others1.animate.set_opacity(0.25), FadeIn(bars[1]), FadeIn(bars[2]),
-                      Transform(bars[0], layer_bar(0, False))], 0.8),
+        self.steps("Map it. Every vector is a house on the streets, linked to its nearest neighbours. A random few are also on main roads, "
+                   "and fewer still on the motorway, with longer links between them.", [
+            "Every vector",
+            (lambda: [LaggedStart(*[Indicate(self.dots[(0, v)], color=WHITE, scale_factor=1.5) for v in L0], lag_ratio=0.06)], 1.1),
             "A random few",
-            (lambda: [Transform(bars[1], layer_bar(1, True)), *[dots[i].animate.set_color(BLUE_M).scale(1.3) for i in L1],
-                      LaggedStart(*[Create(l) for l in e1], lag_ratio=0.08)], 1.4),
-            "and fewer still",
-            (lambda: [Transform(bars[1], layer_bar(1, False)), Transform(bars[2], layer_bar(2, True)),
-                      e1.animate.set_opacity(0.15), others2.animate.set_opacity(0.25),
-                      *[dots[i].animate.set_color(PURPLE_M).scale(1.3) for i in L2], *[Create(l) for l in e2]], 1.2),
+            (lambda: [Create(drops), *self.put("n1", T("layer 1", 20, WHITE).move_to([LAB_X, LY[1], 0])),
+                      *self.put("n0", T("layer 0", 20, WHITE).move_to([LAB_X, LY[0], 0]))], 0.8),
+            "fewer still",
+            (lambda: [*self.put("n2", T("layer 2", 20, WHITE).move_to([LAB_X, LY[2], 0])), Indicate(links[2], color=WHITE)], 0.8),
+        ], after=0.3)
+        self.stamp("layers")
+
+        # ---------------- scene 4: the walk (the stepper) ----------------
+        self.steps("Here's a small one, drawn in one direction so it fits: 16 vectors, three layers, and the query, the yellow dot.", [
+            (lambda: [*self.cap("16 vectors, drawn in one direction (real ones have hundreds)", WHITE)], 0.6),
+            "the query",
+            (lambda: [*[FadeIn(qdots[k], scale=0.5) for k in LY], FadeIn(qlab)], 0.6),
         ])
-
-        # ---- the search ----------------------------------------------------------------------------------------------
-        S = {"n": 1, "cnt": counter(1), "cur": ring(L2[0]), "seen": VGroup()}
-
-        def clear_seen():
-            old, S["seen"] = S["seen"], VGroup()
-            return [FadeOut(old)]
-
-        def bump(k):
-            S["n"] += k
-            old, S["cnt"] = S["cnt"], counter(S["n"])
-            return [FadeOut(old), FadeIn(S["cnt"])]
-
-        def look(layer, node, comp, color):
-            """Measure the distance from the query to each new neighbour: a flash along each link."""
-            an = []
-            for j in comp:
-                an.append(ShowPassingFlash(Line(pt(node), pt(j), stroke_width=5, color=GOLD_M), time_width=0.6))
-                m = ring(j, GOLD_M, 0.12, 2)
-                S["seen"].add(m)
-                an.append(FadeIn(m))
-            return an + bump(len(comp))
-
-        def move(node):
-            return [S["cur"].animate.move_to(pt(node))]
-
-        t4 = list(TR4)
-        entry = left_at(T("entry point", 20, PURPLE_M), pt(L2[0])[0] + 0.25, pt(L2[0])[1] + 0.3)
-        self.steps("The search starts at the entry point in the top layer. It measures its neighbours, "
-                   "and moves to the one closest to the query.", [
-            (lambda: [Create(S["cur"]), FadeIn(entry), FadeIn(S["cnt"])], 0.8),
-            "It measures",
-            (lambda: look(2, t4[0][2], t4[0][3], PURPLE_M), 1.0),
-            "and moves",
-            (lambda: [FadeOut(entry), *move(t4[1][2])], 0.9),
+        self.steps("The search starts at the single entry point on the motorway. It measures the distance to each neighbour, "
+                   "and moves to any that is closer. 330 is closer: move. Then 570, closer still.", [
+            (lambda: [*self.uncap(), self.state(2, 120, "at")], 0.6),
+            "measures the distance",
+            (lambda: [self.hop(2, 120, 330, WHITE, 0.6)], 0.7),
+            "330 is closer",
+            (lambda: [self.state(2, 120, "seen"), self.state(2, 330, "at"), *self.dist(2), links[2][0].animate.set_stroke(BLUE_M, 3)], 0.6),
+            "Then 570",
+            (lambda: [self.hop(2, 330, 570, WHITE, 0.5)], 0.6),
+            (lambda: [self.state(2, 330, "seen"), self.state(2, 570, "at"), *self.dist(3), links[2][1].animate.set_stroke(BLUE_M, 3)], 0.5),
         ])
-
-        def show_layer(k):
-            an = [*[Transform(bars[j], layer_bar(j, j == k)) for j in (2, 1, 0)]]
-            if k == 1:
-                an += [e2.animate.set_opacity(0.15), e1.animate.set_opacity(1), others2.animate.set_opacity(1)]
-            if k == 0:
-                an += [e1.animate.set_opacity(0.15), e0.animate.set_opacity(1), others1.animate.set_opacity(1)]
-            return an
-
-        self.steps("Nothing there is closer, so it drops a layer, at the same vector.", [
-            (lambda: [glow(S["cur"], YELLOW_M, 1.3)], 0.8),
-            "so it drops",
-            (lambda: show_layer(1), 1.0),
+        self.steps("From 570, no neighbour on this layer is closer. So it drops to the same vector, one layer down. "
+                   "There, 500 is closer: move. Nothing next to 500 is.", [
+            "So it drops",
+            (lambda: [self.state(2, 570, "seen"), dot_run(P(2, 570) + [0, -0.12, 0], P(1, 570) + [0, 0.12, 0], BLUE_M, 0.5)], 0.6),
+            (lambda: [self.state(1, 570, "at")], 0.3),
+            "500 is closer",
+            (lambda: [self.hop(1, 570, 500, WHITE, 0.4)], 0.5),
+            (lambda: [self.state(1, 570, "seen"), self.state(1, 500, "at"), links[1][4].animate.set_stroke(BLUE_M, 3)], 0.5),
+            "Nothing next to 500",
+            (lambda: [self.hop(1, 500, 440, WHITE, 0.4)], 0.5),
+            (lambda: [*self.dist(5)], 0.3),
         ])
-
-        lay1 = [x for x in t4 if x[0] == 1]
-        self.steps("Layer 1 has shorter links. Two moves bring the search into the query's neighbourhood.", [
-            (lambda: look(1, lay1[0][2], lay1[0][3], BLUE_M), 0.9),
-            "Two moves",
-            (lambda: move(lay1[1][2]), 0.7),
-            (lambda: look(1, lay1[2][2], lay1[2][3], BLUE_M), 0.9),
-            (lambda: move(lay1[3][2]), 0.7),
-        ])
-
-        exp4 = [x for x in t4 if x[0] == 0]
-        beam = left_at(T("beam: the 4 best so far", 20, TEAL_M), PX, -0.2)
-        self.steps("The bottom layer holds every vector. Here it keeps a beam of the four best so far, "
-                   "and expands the closest until nothing improves.", [
-            (lambda: show_layer(0), 1.0),
+        beam = [470, 500, 530, 570]
+        self.steps("On the streets, it stops taking the first better step, and keeps a beam: the 4 best vectors seen so far. "
+                   "It explores around them until nothing left can beat the worst one it holds.", [
+            (lambda: [self.state(1, 500, "seen"), dot_run(P(1, 500) + [0, -0.12, 0], P(0, 500) + [0, 0.12, 0], BLUE_M, 0.5)], 0.6),
+            (lambda: [self.state(0, 500, "at")], 0.3),
             "keeps a beam",
-            (lambda: [FadeIn(beam, shift=0.1 * UP)], 0.6),
-            "and expands",
-            *[(lambda x=x: [*move(x[2]), *(look(0, x[2], x[3], GREY_B) if x[3] else [])], 0.75) for x in exp4],
+            (lambda: [*self.cap("the beam: the 4 best vectors seen so far (ef = 4 here)", WHITE)], 0.5),
+            (lambda: [self.hop(0, 500, 470, WHITE, 0.35), self.hop(0, 500, 530, WHITE, 0.35)], 0.45),
+            (lambda: [self.state(0, 470, "at"), self.state(0, 530, "at")], 0.35),
+            "It explores",
+            (lambda: [self.hop(0, 470, 440, WHITE, 0.35), self.hop(0, 530, 570, WHITE, 0.35)], 0.45),
+            (lambda: [self.state(0, 440, "seen"), self.state(0, 570, "at")], 0.35),
+            (lambda: [self.hop(0, 570, 610, WHITE, 0.35)], 0.45),
+            (lambda: [self.state(0, 610, "seen"), *self.dist(10)], 0.35),
+            *[(lambda e=e: [links[0][L0.index(e)].animate.set_stroke(BLUE_M, 3)], 0.12) for e in (440, 470, 500, 530, 570)],
         ])
+        self.steps("The beam is the answer: the four closest vectors, found with 10 distance calculations, where measuring every vector takes 16.", [
+            (lambda: [*[self.state(0, v, "ok") for v in beam]], 0.6),
+            "10 distance",
+            (lambda: [Indicate(self.lab["dist"], color=GREEN_M, scale_factor=1.1)], 0.6),
+            "takes 16",
+            (lambda: self.cap("10 distances instead of 16; the gap grows with the data", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("walk")
 
-        found = VGroup(*[ring(i, GREEN_M, 0.17, 4) for i in RES4])
-        missed = [i for i in TRUE4 if i not in RES4][0]
-        extra = [i for i in RES4 if i not in TRUE4][0]
-        miss_r = DashedVMobject(Circle(radius=0.19, color=RED_M, stroke_width=3.5), num_dashes=12).move_to(pt(missed))
-        miss_l = left_at(T("dashed: the one it missed", 20, RED_M), PX, -1.05)
-        rc = left_at(T("found 3 of the true 4", 22, RED_M), PX, -0.65)
-        self.steps(f"It stops after 17 distances instead of 40. But one of the four it returns is not a true nearest "
-                   "neighbour. This closer one was never reached.", [
-            (lambda: [FadeOut(S["cur"]), *clear_seen(), *[Create(r) for r in found]], 0.9),
-            "But one",
-            (lambda: [Indicate(dots[extra], color=RED_M, scale_factor=2.5)], 0.8),
-            "This closer one",
-            (lambda: [Create(miss_r), FadeIn(miss_l), FadeIn(rc, shift=0.1 * UP)], 0.9),
+        # ---------------- scene 5: the name ----------------
+        self.steps("This is called HNSW, hierarchical navigable small world, from a 2016 paper by Malkov and Yashunin. "
+                   "pgvector, an add-on that stores vectors in PostgreSQL, builds it, with 16 links per vector and a beam of 40 by default.", [
+            (lambda: self.cap("HNSW: hierarchical navigable small world (Malkov and Yashunin, 2016)", WHITE), 0.6),
+            "pgvector",
+            (lambda: self.cap(M("pgvector defaults:  m = 16 links,  hnsw.ef_search = 40", 20, WHITE)), 0.6),
         ])
+        self.steps("In the lab, the walk read 654 pages, where measuring every vector read 2,138, and it answered in under a millisecond.", [
+            (lambda: self.count("HNSW: 654 pages, under 1 ms      exact: 2,138 pages, about 8 ms", GREEN_M), 0.6),
+        ], after=0.3)
 
-        more = [x for x in TR6[len(TR4):]]
-        S["cur"] = ring(exp4[-1][2])
-        found6 = VGroup(*[ring(i, GREEN_M, 0.17, 4) for i in RES6[:4]])
-        rc6 = left_at(T("found all 4", 22, GREEN_M), PX, -0.65)
-        beam6 = left_at(T("beam: the 6 best so far", 20, TEAL_M), PX, -0.2)
-        self.steps("Recall is the share of the true nearest neighbours a search returns. Widen the beam to six, "
-                   "and it keeps expanding a little longer. It finds all four, for 22 distances.", [
-            (lambda: [Indicate(rc, color=RED_M, scale_factor=1.0)], 0.8),
-            "Widen the beam",
-            (lambda: [FadeOut(found), FadeOut(miss_l), Transform(beam, beam6), Create(S["cur"])], 0.7),
-            *[(lambda x=x: [*move(x[2]), *(look(0, x[2], x[3], GREY_B) if x[3] else [])], 0.75) for x in more],
-            "It finds all four",
-            (lambda: [FadeOut(S["cur"]), *clear_seen(), FadeOut(miss_r), *[Create(r) for r in found6], Transform(rc, rc6)], 0.9),
+        # ---------------- scene 6: approximate ----------------
+        self.steps("That's great, but there's a catch in the word walk. The search only goes where links lead. "
+                   "A true neighbour behind a poor link can be missed.", [
+            (lambda: [*self.drop("cnt"), *self.cap("the walk only goes where links lead", WHITE)], 0.6),
+            "behind a poor link",
+            (lambda: self.cap("a true neighbour behind a poor link can be missed", RED_M), 0.6),
         ])
-        assert ND4 == 17 and ND6 == 22 and S["n"] == ND6
+        self.steps("The share of the true nearest neighbours that comes back is called recall. In the lab, with a beam of 10, "
+                   "the walk found 89 percent of the true top 10. With the default beam of 40, all of them. "
+                   "A bigger beam finds more, and does more work.", [
+            "is called recall",
+            (lambda: self.cap("recall: the share of the true nearest neighbours that comes back", WHITE), 0.6),
+            "with a beam of 10",
+            (lambda: self.count("beam 10: recall 0.89", RED_M), 0.5),
+            "With the default",
+            (lambda: self.count("beam 10: recall 0.89      beam 40: recall 1.00", WHITE), 0.5),
+            "A bigger beam",
+            (lambda: self.cap("a bigger beam: more found, more work", WHITE), 0.5),
+        ], after=0.3)
 
-        tab = VGroup(left_at(T("pgvector, 100,000 vectors", 20, GREY_B), PX, -1.2),
-                     left_at(M("ef_search  recall@10", 16, GREY_B), PX, -1.6),
-                     left_at(M("10         0.89", 16, RED_M), PX, -1.95),
-                     left_at(M("40         1.00", 16, GREEN_M), PX, -2.3),
-                     left_at(M("200        1.00", 16, GREEN_M), PX, -2.65),
-                     VGroup(left_at(T("pages read: 654 through the index,", 19, WHITE), PX, -3.0),
-                            left_at(T("2,138 for the exact scan", 19, WHITE), PX, -3.32)))
-        self.steps("In pgvector the beam is ef search, 40 by default. On the lesson's 100,000 vectors, a beam of 10 found "
-                   "89 percent of the true top ten, and 40 found them all, reading 654 pages to the exact scan's 2,138.", [
-            (lambda: [FadeIn(tab[0]), FadeIn(tab[1])], 0.7),
-            "a beam of 10",
-            (lambda: [FadeIn(tab[2], shift=0.1 * UP)], 0.6),
-            "and 40 found",
-            (lambda: [FadeIn(tab[3], shift=0.1 * UP), FadeIn(tab[4], shift=0.1 * UP)], 0.7),
-            "reading 654",
-            (lambda: [FadeIn(tab[5], shift=0.1 * UP)], 0.7),
+        # ---------------- scene 7: the filter trap ----------------
+        cands = VGroup(*[Square(0.2, stroke_color=TEAL_M, stroke_width=1.5).set_fill(fillc(TEAL_M, 0.5), 1)
+                         .move_to([BX0 + 0.14 + 0.2855 * i, STRIP_Y, 0]) for i in range(40)])
+        keep = [3, 15, 24, 36]
+        ctitle = T("the walk's 40 candidates (ef_search = 40)", 19, TEAL_M).move_to([(BX0 + BX1) / 2, STRIP_T_Y, 0])
+        self.steps("Now a trap. Support adds a filter that keeps about 1 complaint in 11, and asks for 10 results. "
+                   "How many come back? Pause and guess.", [
+            (lambda: [*self.drop("cnt"), *self.cap(M("... WHERE (1 row in 11 passes) ... LIMIT 10", 20, WHITE))], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("how many of 10 come back?  pause and guess", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("4, on average. pgvector applies the filter after the walk. The walk collected its 40 candidates, "
+                   "and the filter kept about 4. Nothing fails, and nothing warns you.", [
+            (lambda: [*self.uncap(), *self.count("asked for 10, got 4 on average", RED_M)], 0.6),
+            "The walk collected",
+            (lambda: [FadeIn(ctitle), LaggedStart(*[FadeIn(c, scale=0.5) for c in cands], lag_ratio=0.04)], 1.0),
+            "the filter kept",
+            (lambda: [*[cands[i].animate.set_fill(BLACK, 1).set_stroke(GREY_D) for i in range(40) if i not in keep],
+                      *[cands[i].animate.set_fill(GREEN_M, 0.8).set_stroke(GREEN_M) for i in keep]], 0.7),
+            "nothing warns you",
+            (lambda: [Indicate(self.lab["cnt"], color=RED_M, scale_factor=1.1)], 0.7),
         ])
+        self.steps("It's a sat-nav that finds 40 shops near you, throws away the closed ones, and proudly hands you 4. "
+                   "Since pgvector 0.8.0, an iterative scan keeps walking until enough rows pass: 10 of 10.", [
+            "Since pgvector",
+            (lambda: self.cap(M("SET hnsw.iterative_scan = relaxed_order", 20, WHITE)), 0.6),
+            "keeps walking",
+            (lambda: [*[self.hop(0, a, b, WHITE, 0.35) for a, b in ((570, 610), (470, 440))]], 0.5),
+            "10 of 10",
+            (lambda: self.count("iterative scan: 10 of 10", GREEN_M), 0.5),
+        ], after=0.3)
+        self.stamp("filter")
 
-        self.steps("Start at the sparse top, walk toward the query, and drop a layer each time you stop improving. "
-                   "A wider beam buys recall with more distances.", [
-            (lambda: [glow(bars[2][0], PURPLE_M, 1.03), *[Indicate(d, color=PURPLE_M, scale_factor=1.6) for d in l2dots]], 1.0),
-            "and drop a layer",
-            (lambda: [glow(bars[1][0], BLUE_M, 1.03)], 0.6),
-            (lambda: [glow(bars[0][0], GREY_B, 1.03)], 0.6),
-            "A wider beam",
-            (lambda: [*[glow(r, GREEN_M, 1.3) for r in found6], Indicate(tab[3], color=GREEN_M, scale_factor=1.0)], 1.0),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 8: memory ----------------
+        self.steps("And a cost: the index took 41 MB for 17 MB of vectors. Every hop jumps to a random place, "
+                   "so HNSW wants its whole graph in memory.", [
+            (lambda: [FadeOut(VGroup(cands, ctitle)), *self.count("the index: 41 MB, for 17 MB of vectors", WHITE)], 0.6),
+            "Every hop jumps",
+            (lambda: [self.hop(2, 120, 570, WHITE, 0.5), self.hop(1, 220, 500, WHITE, 0.5)], 0.6),
+            "whole graph in memory",
+            (lambda: self.cap("random jumps: HNSW wants the whole graph in memory", WHITE), 0.6),
+        ], after=0.3)
+
+        # ---------------- scene 9: the moral, and a check ----------------
+        self.steps("So the moral of the story: to find nearest by meaning, walk the graph, big jumps on top and small steps at the bottom, "
+                   "and keep a short list of the best. You trade a little recall for a lot of speed, so measure it.", [
+            (lambda: [*self.drop("cnt"), *self.cap("big jumps on top, small steps at the bottom, a short list of the best", YELLOW_M, 26)], 0.6),
+            "big jumps",
+            (lambda: [*[links[2][i].animate(rate_func=there_and_back).set_stroke(YELLOW_M, 5) for i in range(2)]], 0.7),
+            "small steps",
+            (lambda: [*[links[0][L0.index(e)].animate(rate_func=there_and_back).set_stroke(YELLOW_M, 5) for e in (440, 470, 500, 530, 570)]], 0.7),
+            "a little recall",
+            (lambda: self.cap("trade a little recall for a lot of speed, and measure it", YELLOW_M, 26), 0.6),
+        ], after=0.3)
+        self.steps("One quick check. Your search returns 89 percent of the true top 10. What do you turn up? Pause and think.", [
+            (lambda: [*self.uncap(), *self.count("recall 0.89", RED_M)], 0.5),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("The beam, ef_search. In the lab, raising it from 10 to 40 found all 10, for a little more work.", [
+            (lambda: [*self.uncap(), *self.count("hnsw.ef_search: 10 -> 40     recall 0.89 -> 1.00", GREEN_M)], 0.6),
+            "found all 10",
+            (lambda: [Indicate(self.lab["cnt"], color=GREEN_M, scale_factor=1.08)], 0.7),
+        ], after=0.3)
+        self.play(*self.cap("big jumps on top, small steps at the bottom, a short list of the best", YELLOW_M, 26), run_time=0.7)
+        self.wait(2.0)
