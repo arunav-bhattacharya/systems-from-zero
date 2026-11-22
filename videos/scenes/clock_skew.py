@@ -1,252 +1,469 @@
 from sfz import *
 
-# "pod A": Kokoro reads a capital A inside a sentence as the article "uh".
-SAY.insert(0, (r"(^|[.!?]\s+)?\bA\b(?!')", lambda m: m.group(0) if m.group(1) is not None else "eh"))
-SAY.insert(0, (r"\bNTP\b", "N T P"))
+# "pod A": Kokoro reads a lone capital A as the article "uh".
+SAY.insert(0, (r"\b([Pp])od A\b", r"\1od eh"))
 # "charj-i-back" otherwise.
 SAY.insert(0, (r"\bchargeback\b", "charge-back"))
 
-
-def _layer(m):
-    """Text above chips above arrows above boxes, so an opaque box never hides its own label."""
-    for x in m.get_family():
-        if isinstance(x, Text):
-            x.set_z_index(4)
-        elif isinstance(x, Arrow):
-            x.set_z_index(1)
-        elif isinstance(x, RoundedRectangle) and 0 < x.get_fill_opacity() < 0.5:
-            x.set_z_index(2)
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+PX, PW, PH = -4.9, 2.6, 0.95            # the two writers (tills, then pods)
+PA_Y, PB_Y = 2.6, 1.25
+SX, SY, SW, SH = 4.3, 1.9, 3.2, 2.3     # the store (the owner's book)
+CHX = -0.5                              # where a write appears
+TRUE_Y, STAMP_Y = -0.5, -1.8            # the two rulers
+RMIN, RMAX, RX0, RS = -12, 24, -4.3, 0.28   # ms around 10:00:00.000; x of RMIN; units per ms
+CAP_Y, BAR_Y = -3.25, -2.92
 
 
-def _defer_add(anim):
-    """Make each step that is not an introducer add its mobject when the step starts."""
-    if isinstance(anim, AnimationGroup):
-        for a in anim.animations:
-            _defer_add(a)
-        return
-    if anim.is_introducer() or anim.mobject is None:
-        return
-    orig = anim._setup_scene
-
-    def setup(scene, orig=orig, anim=anim):
-        orig(scene)
-        if scene is not None and anim.mobject not in scene.get_mobject_family_members():
-            scene.add(anim.mobject)
-    anim._setup_scene = setup
-
-
-class Layered(VoiceScene):
+class Base(VoiceScene):
     def add_mobjects_from_animations(self, animations):
-        """Manim adds every mobject of a Succession when the Succession starts, so a later step that moves or
-        transforms a mobject not yet on screen would show it too early. Add the first step's mobjects now and
-        each later step's when that step starts."""
+        """Never re-add a group whose parts are already on screen (that would draw filled shapes over their labels)."""
         curr = self.get_mobject_family_members()
 
-        def visit(a, first):
-            if isinstance(a, Succession):
-                for i, s in enumerate(a.animations):
-                    if first and i == 0:
-                        visit(s, True)
-                    else:
-                        _defer_add(s)
-                return
+        def visit(a):
             if isinstance(a, AnimationGroup):
                 for s in a.animations:
-                    visit(s, first)
+                    visit(s)
                 return
-            if a.is_introducer() or a.mobject is None:
+            if a.is_introducer() or a.mobject is None or a.mobject in curr:
                 return
-            if a.mobject not in curr:
-                self.add(a.mobject)
-                curr.extend(a.mobject.get_family())
+            fam = a.mobject.get_family()
+            if len(fam) > 1 and all(m in curr for m in fam[1:]):
+                return
+            self.add(a.mobject)
+            curr.extend(fam)
 
         for a in animations:
-            visit(a, True)
+            visit(a)
 
-    def play(self, *anims, **kw):
-        for a in anims:
-            _layer(a.mobject)
-            if getattr(a, "target_mobject", None) is not None:
-                _layer(a.target_mobject)
-        for m in self.mobjects:
-            _layer(m)
-        super().play(*anims, **kw)
-        for m in self.mobjects:
-            _layer(m)
+    def remove(self, *mobjects):
+        fam = []
+        for m in mobjects:
+            fam.extend(m.get_family())
+        return super().remove(*fam)
+
+    def steps(self, text, items, after=0.3):
+        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
+        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        path, dur = voice(text)
+        self._cue(text, dur)
+        self.add_sound(path)
+        t = 0.0
+        for it in items:
+            if isinstance(it, str):
+                target = dur * text.index(it) / len(text)
+                if target - t > 0.02:
+                    self.wait(target - t)
+                    t = target
+                continue
+            if isinstance(it, (int, float)):
+                self.wait(it)
+                t += it
+                continue
+            fn, rt = it
+            self.play(*fn(), run_time=rt)
+            t += rt
+        if dur - t > 0.02:
+            self.wait(dur - t)
+        if after:
+            self.wait(after)
+
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def gather(self, g):
+        """Make a group of parts already on screen into one object on screen, so it can be transformed as a whole."""
+        self.remove(*g.submobjects)
+        self.add(g)
+        return g
+
+    def col(self, c):
+        self.sil_col = c
+        return [Wait(0.01)]
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def flash(m, color=YELLOW_M, s=1.06):
-    """Pulse an opaque box and recolour its outline, so the label stays readable."""
-    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color)
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def flow(path, color=YELLOW_M, run_time=1.0):
-    """A dot that runs along an arrow, invisible until its turn, so it can sit inside a Succession."""
-    d = Dot(radius=0.08, color=color).move_to(path.get_start()).set_opacity(0)
-    line = Line(path.get_start(), path.get_end())
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, line, rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-A_C, B_C = BLUE_M, GOLD_M
-PX, PY = 4.9, 2.5                    # pods at (-PX, PY) and (PX, PY); the record between them
-COLS = [-5.2, -3.2, -1.3, 1.1, 4.0]  # table: true time, writer, value, stamp, result
-HY = 0.45                            # table header row
-ROWS = [-0.1, -0.65, -1.2, -1.75]
-AX_Y = -2.35                         # the true-time axis
-BAR_Y = {"a": -0.35, "b": -1.25}
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
+
+
+
+def pod(y, name, clock, color):
+    r = RoundedRectangle(corner_radius=0.14, width=PW, height=PH, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1)
+    r.move_to([PX, y, 0])
+    return VGroup(r, T(name, 26).move_to([PX, y + 0.17, 0]), T(clock, 17, GREY_B).move_to([PX, y - 0.22, 0]))
 
 
 def tx(ms):
-    """x on the true-time axis for ms after 10:00."""
-    return -4.9 + (ms + 30) * 0.15
+    return RX0 + RS * (ms - RMIN)
 
 
-def pod(x, label, color):
-    return box(label, color, w=2.6, h=0.9, size=28).move_to([x, PY, 0])
+def wchip(name, stamp, color):
+    t = VGroup(T(name, 22, color), M(stamp, 18, GREY_B)).arrange(RIGHT, buff=0.25)
+    r = RoundedRectangle(corner_radius=0.1, width=t.width + 0.4, height=0.55, stroke_color=color, stroke_width=2).set_fill(BLACK, 1)
+    return VGroup(r, t.move_to(r))
 
 
-def pod_sub(x, s, color=GREY_B):
-    return T(s, 20, color).move_to([x, PY - 0.78, 0])
-
-
-def record(value, stamp, vcol=WHITE):
-    v = M(value, 24, vcol).move_to([0, PY + (0.2 if stamp else 0), 0])
-    s = (M(f"stamp {stamp}", 20, GREY_B) if stamp else M(".", 20).set_opacity(0)).move_to([0, PY - 0.24, 0])
-    return VGroup(v, s)
-
-
-def row(i, true, who, value, stamp, result, rcol):
-    return VGroup(M(true, 20, GREY_B).move_to([COLS[0], ROWS[i], 0]), M(who, 20, A_C if who == "pod-a" else B_C).move_to([COLS[1], ROWS[i], 0]),
-                  M(value, 20).move_to([COLS[2], ROWS[i], 0]), M(stamp, 20).move_to([COLS[3], ROWS[i], 0]),
-                  T(result, 22, rcol).move_to([COLS[4], ROWS[i], 0]))
-
-
-class ClockSkew(Layered):
-    """dist-03: last write wins with pod-b's clock 15 ms behind drops the refund and the chargeback (the lesson's
-    LwwDemo trace), then a clock that reports an error bound and Spanner-style commit wait keeps the refund."""
+class ClockSkew(Base):
+    """dist-03, section 2. Two tills, one 15 s slow: the owner keeps the latest receipt and the return vanishes. Last
+    write wins with client stamps (Cassandra). pod-b 15 ms behind: captured kept, refunded dropped with an OK, settled
+    kept, chargeback dropped. Two rulers, true time and stamps. 5 ms loses nothing, 7 ms loses the refund: the skew only
+    has to beat the 6 ms gap between causally related writes. 4%, 14%, 50%; Jepsen's 285 of 1,009. Never let two
+    machines' clocks decide; keep every receipt. Moral, and a check (the fast clock wins)."""
 
     def construct(self):
-        self.title_card("Clocks you can't trust", "last write wins, then commit wait")
+        self.capm = None
+        self.lab = {}
+        self.title_card("The refund that came second", "and the clock that threw it away")
 
-        pa, pb = pod(-PX, "pod-a", A_C), pod(PX, "pod-b", B_C)
-        sa, sb = pod_sub(-PX, "clock exact"), pod_sub(PX, "clock 15 ms behind", GOLD_M)
-        rec = RoundedRectangle(corner_radius=0.14, width=3.4, height=1.1, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1)
-        rec.move_to([0, PY, 0])
-        rec_h = T("payment status", 22, GREY_B).next_to(rec, UP, buff=0.12)
-        val = record("(empty)", None, GREY_B)
-        rule = T("keeps the highest stamp", 20, GREY_B).move_to([0, PY - 0.82, 0])
-        wa = Arrow([-PX + 1.38, PY, 0], [-1.82, PY, 0], buff=0, stroke_width=3, color=A_C, max_tip_length_to_length_ratio=0.15)
-        wb = Arrow([PX - 1.38, PY, 0], [1.82, PY, 0], buff=0, stroke_width=3, color=B_C, max_tip_length_to_length_ratio=0.15)
-        rb = Arrow([1.82, PY, 0], [PX - 1.38, PY, 0], buff=0, stroke_width=3, color=GREY_B, max_tip_length_to_length_ratio=0.15)
+        # ---------------- scene 1: two tills ----------------
+        ta = pod(PA_Y, "till A", "clock right", BLUE_M)
+        tb = pod(PB_Y, "till B", "clock 15 s slow", GOLD_M)
+        store = RoundedRectangle(corner_radius=0.14, width=SW, height=SH, stroke_color=WHITE, stroke_width=3).set_fill(BLACK, 1).move_to([SX, SY, 0])
+        st_title = T("the owner's book", 22, GREY_B).move_to([SX, SY + 0.7, 0])
+        self.steps("Picture a shop with two tills. Each one prints the time on every receipt. Till B runs fifteen seconds slow, and nobody knows.", [
+            (lambda: [FadeIn(ta, shift=0.1 * RIGHT), FadeIn(tb, shift=0.1 * RIGHT)], 0.8),
+            "Till B runs",
+            (lambda: [glow(tb[0], GOLD_M)], 0.8),
+        ])
+        sale = wchip("jacket sold", "12:00:00", BLUE_M).move_to([CHX, PA_Y, 0])
+        ret = wchip("jacket returned", "11:59:55", GOLD_M).move_to([CHX, PB_Y, 0])
+        self.steps("A customer buys a jacket at till A. Ten seconds later, she returns it at till B.", [
+            "buys a jacket",
+            (lambda: [FadeIn(sale, shift=0.2 * RIGHT)], 0.6),
+            "Ten seconds later",
+            (lambda: [FadeIn(ret, shift=0.2 * RIGHT), *self.cap("till B: really 12:00:10, minus 15 s = 11:59:55", GOLD_M)], 0.6),
+        ])
+        val = T("jacket sold", 28, BLUE_M).move_to([SX, SY, 0])
+        self.steps("That evening, the owner keeps only the latest receipt for each item. "
+                   "By the printed times, the return came five seconds before the sale. So she keeps the sale.", [
+            (lambda: [FadeIn(store), FadeIn(st_title)], 0.6),
+            "By the printed",
+            (lambda: [*self.cap("11:59:55 is before 12:00:00", GOLD_M)], 0.5),
+            "So she keeps",
+            (lambda: [sale.animate.move_to([SX, SY - 0.05, 0]).set_opacity(0), FadeIn(val),
+                      ret.animate.set_opacity(0.25)], 0.8),
+        ])
+        self.steps("The books now say the jacket was never returned. Which receipt really came last? And why did a clock get to decide?", [
+            (lambda: [ret.animate.set_opacity(0), *self.cap("the return: gone", RED_M)], 0.7),
+            "Which receipt",
+            (lambda: [*self.cap("which receipt really came last?", WHITE, 28)], 0.5),
+        ])
+        self.remove(sale, ret)
 
-        self.beat("Two pods of the payment service write one payment's status to the same record. It keeps the write with the highest timestamp: last write wins.",
-                  Succession(AnimationGroup(FadeIn(pa, shift=0.2 * RIGHT), FadeIn(pb, shift=0.2 * LEFT), run_time=0.9),
-                             AnimationGroup(FadeIn(rec), FadeIn(rec_h), FadeIn(val), run_time=0.8), Wait(2.4),
-                             FadeIn(rule, shift=0.15 * UP, run_time=0.7)), run_time=8.0)
+        # ---------------- scene 2: last write wins ----------------
+        self.steps("It's tempting to trust printed times. Your phone always seems right. "
+                   "But right means within a few milliseconds, sometimes more. And computers do things a few milliseconds apart.", [
+            (lambda: [*self.cap("\"right\": within a few milliseconds, sometimes more", GREY_B)], 0.5),
+            "And computers",
+            (lambda: [*self.cap("computers do things a few milliseconds apart", YELLOW_M)], 0.5),
+        ])
+        self.steps("Many databases use the owner's rule. When two writes hit the same item, keep the one with the highest timestamp, "
+                   "and drop the other. It's called last write wins.", [
+            "keep the one",
+            (lambda: [glow(store, WHITE)], 0.8),
+            "last write wins",
+            (lambda: [*self.cap("last write wins: keep the highest stamp, drop the rest", WHITE)], 0.5),
+        ])
+        self.steps("Cassandra, a database that spreads data over many machines, takes those stamps from the program that sends the write, "
+                   "read from that machine's own clock.", [
+            "takes those stamps",
+            (lambda: [glow(ta[0], BLUE_M), glow(tb[0], GOLD_M)], 0.8),
+        ])
+        pa = pod(PA_Y, "pod-a", "clock exact", BLUE_M)
+        pb = pod(PB_Y, "pod-b", "clock 15 ms behind", GOLD_M)
+        st2 = T("payment status", 22, GREY_B).move_to(st_title)
+        self.steps("So here are our tills: two copies of the payments program, pod A and pod B. Each stamps its writes with its own clock, "
+                   "and pod B's clock is fifteen milliseconds behind. The owner's book is the store: one payment's status, and its stamp.", [
+            (lambda: [*self.uncap(), Transform(ta, pa), FadeOut(val)], 0.8),
+            "pod B's clock",
+            (lambda: [Transform(tb, pb)], 0.8),
+            "The owner's book",
+            (lambda: [Transform(st_title, st2)], 0.6),
+        ])
 
-        self.beat("Each pod stamps its writes with its own clock. pod A's is exact. pod B's is 15 milliseconds behind, and nobody knows.",
-                  Succession(Wait(1.6), FadeIn(sa, run_time=0.6), Wait(0.8), FadeIn(sb, run_time=0.6)), run_time=6.0)
+        # the two rulers
+        def ruler(y, name):
+            ln = Line([tx(RMIN), y, 0], [tx(RMAX), y, 0], stroke_width=2, color=GREY_C)
+            return VGroup(ln, right_at(T(name, 20, GREY_B), RX0 - 0.25, y))
 
-        hdr = VGroup(*[T(s, 20, GREY_B).move_to([x, HY, 0]) for s, x in zip(["true time", "writer", "value", "stamp", "result"], COLS)])
-        r1 = row(0, "10:00:00.002", "pod-a", "captured", "10:00:00.002", "kept", GREEN_M)
-        r2 = row(1, "10:00:00.008", "pod-b", "refunded", "09:59:59.993", "dropped, still OK", RED_M)
-        self.beat("At two milliseconds past ten, pod A writes captured. The record is empty, so it keeps it.",
-                  Succession(FadeIn(hdr, run_time=0.6), Wait(0.8), GrowArrow(wa, run_time=0.5), flow(wa, A_C, 0.5),
-                             AnimationGroup(Transform(val, record("captured", "10:00:00.002")), FadeIn(r1[:4]), run_time=0.8),
-                             Wait(0.8), FadeIn(r1[4], run_time=0.5)), run_time=5.4)
+        r_true, r_st = ruler(TRUE_Y, "true time"), ruler(STAMP_Y, "stamp")
+        ticks = VGroup(*[VGroup(Line([tx(m), STAMP_Y - 0.08, 0], [tx(m), STAMP_Y + 0.08, 0], stroke_width=2, color=GREY_C),
+                                M(lbl, 15, GREY_B).move_to([tx(m), STAMP_Y - 0.33, 0]))
+                         for m, lbl in [(-10, "09:59:59.990"), (0, "10:00:00.000"), (10, ".010"), (20, ".020")]])
+        zero = DashedLine([tx(0), TRUE_Y + 0.15, 0], [tx(0), STAMP_Y + 0.12, 0], dash_length=0.06, stroke_width=1.2, color=GREY_D)
+        self.steps("Let's draw two lines. On top, true time, in thousandths of a second around ten o'clock. Underneath, the stamp each write carries.", [
+            "On top",
+            (lambda: [Create(r_true[0]), FadeIn(r_true[1])], 0.6),
+            "Underneath",
+            (lambda: [Create(r_st[0]), FadeIn(r_st[1]), FadeIn(ticks), Create(zero)], 0.8),
+        ])
 
-        self.beat("pod B reads captured, then writes refunded 6 milliseconds later. Its write really came second.",
-                  Succession(AnimationGroup(FadeOut(wa), GrowArrow(rb), run_time=0.5), flow(rb, GREY_B, 0.6), Wait(1.0),
-                             AnimationGroup(FadeOut(rb), GrowArrow(wb), run_time=0.5), flow(wb, B_C, 0.5),
-                             FadeIn(r2[:3], run_time=0.6)), run_time=7.0)
+        # ---------------- scene 3: the trace ----------------
+        self.value = None
 
-        self.beat("But pod B's clock says 7 milliseconds before ten. That stamp is lower, "
-                  "so the record drops the refund, and still says OK.",
-                  Succession(FadeIn(r2[3], run_time=0.6), Indicate(r2[3], color=RED_M, run_time=1.0), Wait(1.2),
-                             AnimationGroup(flash(rec, RED_M), Indicate(val[1], color=RED_M), run_time=1.0), Wait(0.6),
-                             FadeIn(r2[4], run_time=0.5)), run_time=6.6)
+        def set_value(name, stamp, color):
+            v = VGroup(T(name, 30, color), M(stamp, 20, GREY_B)).arrange(DOWN, buff=0.2).move_to([SX, SY - 0.2, 0])
+            old, self.value = self.value, v
+            return [swap(old, v)]
 
-        r3 = row(2, "10:00:00.014", "pod-a", "settled", "10:00:00.014", "kept", GREEN_M)
-        r4 = row(3, "10:00:00.020", "pod-b", "chargeback", "10:00:00.005", "dropped, still OK", RED_M)
-        self.beat("It keeps happening. pod A's settled is kept, and pod B's chargeback is dropped. "
-                  "Four OKs, two writes gone, and no error anywhere.",
-                  Succession(AnimationGroup(FadeOut(wb), GrowArrow(wa), run_time=0.5), flow(wa, A_C, 0.4),
-                             AnimationGroup(Transform(val, record("settled", "10:00:00.014")), FadeIn(r3), run_time=0.7), Wait(0.6),
-                             AnimationGroup(FadeOut(wa), GrowArrow(wb), run_time=0.5), flow(wb, B_C, 0.4),
-                             AnimationGroup(FadeIn(r4), flash(rec, RED_M), run_time=0.8), Wait(1.4),
-                             AnimationGroup(Indicate(r2[2], color=RED_M), Indicate(r4[2], color=RED_M), run_time=1.0)),
-                  run_time=8.4)
+        def send(chip, y):
+            return chip.animate.move_to([SX - SW / 2 - chip.width / 2 - 0.15, y, 0])
 
-        stats = M("skew 5 ms: 0%   10 ms: 4%   20 ms: 14%   100 ms: 50% lost", 20, GREY_B).move_to([0, -2.95, 0])
-        gap = T("gap between dependent writes: 6 ms", 22, YELLOW_M).move_to([0, -2.45, 0])
-        self.beat("The skew only has to beat the 6 milliseconds between dependent writes. With 100 milliseconds of skew, half of all writes are lost.",
-                  Succession(AnimationGroup(FadeOut(wb), FadeIn(gap, shift=0.15 * UP), run_time=0.8), Wait(3.6),
-                             FadeIn(stats, shift=0.15 * UP, run_time=0.8)), run_time=8.6)
+        def ok_back(y):
+            o = T("OK", 22, GREEN_M).move_to([SX - SW / 2 - 0.4, (y + SY) / 2, 0])
+            return Succession(FadeIn(o, run_time=0.1), o.animate(run_time=0.7).move_to([PX + PW / 2 + 0.35, y, 0]), FadeOut(o, run_time=0.2))
 
-        # ---- a clock that admits its error ------------------------------------------------------------------
-        table = VGroup(hdr, r1, r2, r3, r4, gap, stats)
-        self.beat("Better NTP shrinks the skew, but never to zero. Google's Spanner uses a clock that admits its error instead.",
-                  Succession(Wait(2.6), AnimationGroup(FadeOut(table), Transform(val, record("(empty)", None, GREY_B)), run_time=0.9)),
-                  run_time=6.4)
+        def mark(ms, y, color, name=None, up=True):
+            d = Dot(radius=0.09, color=color).move_to([tx(ms), y, 0])
+            if name is None:
+                return d
+            lab = T(name, 17, color).move_to([tx(ms), y + (0.3 if up else -0.3), 0])
+            return VGroup(d, lab)
 
-        axis = Line([tx(-30), AX_Y, 0], [tx(45), AX_Y, 0], stroke_width=2, color=GREY_B)
-        ticks = VGroup(*[Line([tx(m), AX_Y - 0.08, 0], [tx(m), AX_Y + 0.08, 0], stroke_width=2, color=GREY_B) for m in range(-30, 41, 10)])
-        nums = VGroup(*[M(str(m), 18, GREY_B).move_to([tx(m), AX_Y - 0.33, 0]) for m in range(-30, 41, 10)])
-        cap = T("true time, ms after 10:00", 20, GREY_B).move_to([tx(10), AX_Y - 0.78, 0])
-        t = ValueTracker(2)
+        def link(t_ms, s_ms, color):
+            return DashedLine([tx(t_ms), TRUE_Y - 0.1, 0], [tx(s_ms), STAMP_Y + 0.1, 0], dash_length=0.06, stroke_width=1.5, color=color)
 
-        def bar(key, offset, bound, color):
-            def make():
-                now = t.get_value() + offset
-                lo, hi = now - bound, now + bound
-                r = Line([tx(lo), BAR_Y[key], 0], [tx(hi), BAR_Y[key], 0], stroke_width=12, color=color)
-                r.set_stroke(opacity=0.55)
-                d = Dot([tx(now), BAR_Y[key], 0], radius=0.07, color=WHITE)
-                return VGroup(r, d)
-            return always_redraw(make)
+        c1 = wchip("captured", "10:00:00.002", BLUE_M).move_to([CHX, PA_Y, 0])
+        m1 = mark(2, TRUE_Y, BLUE_M, "captured")
+        s1 = mark(2, STAMP_Y, BLUE_M)
+        l1 = link(2, 2, BLUE_M)
+        self.steps("pod A writes captured: the money has moved. Its stamp is two thousandths past ten. "
+                   "The store is empty, so it keeps it, and says OK.", [
+            (lambda: [FadeIn(c1, shift=0.2 * RIGHT), FadeIn(m1, scale=0.6)], 0.6),
+            "Its stamp",
+            (lambda: [Create(l1), FadeIn(s1, scale=0.6)], 0.6),
+            "so it keeps",
+            (lambda: [send(c1, PA_Y)], 0.6),
+            (lambda: [FadeOut(c1), *set_value("captured", "10:00:00.002", BLUE_M)], 0.5),
+            "says OK",
+            (lambda: [ok_back(PA_Y)], 1.0),
+        ])
+        self.stamp("captured")
+        m2 = mark(8, TRUE_Y, GOLD_M, "refunded")
+        self.steps("pod B reads the status, sees captured, and six thousandths later writes refunded. "
+                   "This write was decided after seeing the first one. So it's later by cause, and later in real time.", [
+            "reads the status",
+            (lambda: [Indicate(self.value, color=GOLD_M)], 0.6),
+            "writes refunded",
+            (lambda: [FadeIn(m2, scale=0.6)], 0.5),
+            (lambda: [*self.cap("6 ms after captured, and because of it", GOLD_M)], 0.5),
+        ])
+        c2 = wchip("refunded", "09:59:59.993", GOLD_M).move_to([CHX, PB_Y, 0])
+        s2 = mark(-7, STAMP_Y, GOLD_M)
+        l2 = link(8, -7, GOLD_M)
+        self.steps("But pod B's clock is fifteen behind, so its stamp says seven thousandths before ten.", [
+            (lambda: [FadeIn(c2, shift=0.2 * RIGHT), *self.uncap()], 0.6),
+            "its stamp",
+            (lambda: [Create(l2), FadeIn(s2, scale=0.6)], 0.8),
+        ])
+        self.steps("The store compares the stamps. What does it keep, and what does it tell pod B? Pause and guess.", [
+            (lambda: [send(c2, PB_Y)], 0.7),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        lost2 = tick(False, 0.13).move_to(s2.get_center() + 0.7 * DOWN)
+        self.steps("It keeps captured, and drops the refund. And it tells pod B: OK.", [
+            (lambda: [*self.uncap(), *self.cap("09:59:59.993 is lower than 10:00:00.002: dropped", RED_M)], 0.5),
+            "drops the refund",
+            (lambda: [c2.animate.set_opacity(0), s2.animate.set_color(RED_M), Create(lost2), Indicate(self.value, color=BLUE_M)], 0.8),
+            "tells pod B",
+            (lambda: [ok_back(PB_Y)], 1.0),
+        ])
+        self.remove(c2)
+        self.steps("Very polite. The refund was confirmed, it's gone, and nothing logged an error.", [
+            (lambda: [*self.cap("confirmed, and gone; no error anywhere", RED_M)], 0.5),
+        ])
+        c3 = wchip("settled", "10:00:00.014", BLUE_M).move_to([CHX, PA_Y, 0])
+        m3, s3, l3 = mark(14, TRUE_Y, BLUE_M, "settled"), mark(14, STAMP_Y, BLUE_M), link(14, 14, BLUE_M)
+        self.steps("pod A writes settled: paid out to the shop. Stamp, fourteen past. Higher than two, so it's kept.", [
+            (lambda: [*self.uncap(), FadeIn(c3, shift=0.2 * RIGHT), FadeIn(m3, scale=0.6)], 0.6),
+            "Stamp",
+            (lambda: [Create(l3), FadeIn(s3, scale=0.6)], 0.5),
+            "so it's kept",
+            (lambda: [send(c3, PA_Y)], 0.5),
+            (lambda: [FadeOut(c3), *set_value("settled", "10:00:00.014", BLUE_M), ok_back(PA_Y)], 1.0),
+        ])
+        c4 = wchip("chargeback", "10:00:00.005", GOLD_M).move_to([CHX, PB_Y, 0])
+        m4, s4, l4 = mark(20, TRUE_Y, GOLD_M, "chargeback"), mark(5, STAMP_Y, GOLD_M), link(20, 5, GOLD_M)
+        lost4 = tick(False, 0.13).move_to(s4.get_center() + 0.7 * DOWN)
+        self.steps("pod B writes chargeback: the customer's bank took the money back. Its stamp, five past. "
+                   "Lower than fourteen. Dropped, and OK again.", [
+            (lambda: [FadeIn(c4, shift=0.2 * RIGHT), FadeIn(m4, scale=0.6)], 0.6),
+            "Its stamp",
+            (lambda: [Create(l4), FadeIn(s4, scale=0.6)], 0.6),
+            "Lower than",
+            (lambda: [send(c4, PB_Y)], 0.6),
+            "Dropped",
+            (lambda: [c4.animate.set_opacity(0), s4.animate.set_color(RED_M), Create(lost4)], 0.5),
+            (lambda: [ok_back(PB_Y)], 1.0),
+        ])
+        self.remove(c4)
+        self.stamp("four")
+        self.steps("Four writes, four OKs, two gone. Look at the two lines. In true time, the writes take turns. "
+                   "By the stamps, every pod B write slides fifteen thousandths to the left, behind the pod A write it followed.", [
+            (lambda: [*self.cap("4 writes, 4 OKs, 2 gone", RED_M, 28)], 0.5),
+            "In true time",
+            (lambda: [Indicate(VGroup(m1, m2, m3, m4), color=WHITE, scale_factor=1.1)], 0.9),
+            "slides fifteen",
+            (lambda: [glow(l2, RED_M, 1.0), glow(l4, RED_M, 1.0)], 1.0),
+        ])
+        self.steps("And pod B keeps losing like this, until its clock passes the highest stamp pod A wrote.", [
+            (lambda: [*self.cap("pod B loses until its clock passes pod A's highest stamp", GOLD_M)], 0.5),
+        ])
 
-        bar_a, bar_b = bar("a", 0, 1, A_C), bar("b", -15, 16, B_C)
-        lab_a = M("pod-a", 20, A_C).move_to([-6.05, BAR_Y["a"], 0])
-        lab_b = M("pod-b", 20, B_C).move_to([-6.05, BAR_Y["b"], 0])
-        truth = always_redraw(lambda: DashedLine([tx(t.get_value()), AX_Y + 0.12, 0], [tx(t.get_value()), 0.15, 0],
-                                                 dash_length=0.07, stroke_width=2, color=YELLOW_M))
-        e_l = T("earliest", 20, B_C).move_to([tx(-13 - 16), BAR_Y["b"] - 0.38, 0])
-        l_l = T("latest", 20, B_C).next_to([tx(-13 + 16), BAR_Y["b"], 0], RIGHT, buff=0.22)
-        self.beat("It returns an interval, earliest to latest, that contains the true time. "
-                  "pod A's error bound is 1 millisecond. pod B's is 16.",
-                  Succession(AnimationGroup(Create(axis), FadeIn(ticks), FadeIn(nums), FadeIn(cap), FadeIn(truth), run_time=1.0),
-                             AnimationGroup(FadeIn(lab_a), FadeIn(bar_a), FadeIn(lab_b), FadeIn(bar_b), run_time=0.8),
-                             FadeIn(e_l, run_time=0.4), FadeIn(l_l, run_time=0.4), Wait(1.6),
-                             AnimationGroup(Transform(sa, pod_sub(-PX, "clock exact, bound 1 ms")), Transform(sb, pod_sub(PX, "15 ms behind, bound 16 ms", GOLD_M)),
-                                            run_time=0.8)), run_time=7.6)
+        # ---------------- scene 4: how much skew? ----------------
+        sk = T("clock 15 ms behind", 17, GREY_B).move_to(tb[2])
+        self.remove(tb[2])
+        self.add(sk)
+        self.sk = sk
 
-        st_a = DashedLine([tx(3), AX_Y + 0.12, 0], [tx(3), 0.15, 0], dash_length=0.07, stroke_width=3, color=A_C)
-        st_a_l = M("stamp 3", 18, A_C).move_to([tx(3), 0.42, 0])
-        ok_a = T("OK after 2 ms", 22, GREEN_M).move_to([-PX, PY - 1.25, 0])
-        self.beat("To commit, pod A stamps captured with latest: 3 milliseconds past ten. "
-                  "Then it waits until earliest passes the stamp, and only then says OK. That's commit wait.",
-                  Succession(AnimationGroup(FadeOut(e_l), FadeOut(l_l), run_time=0.4), Wait(1.0),
-                             AnimationGroup(Create(st_a), FadeIn(st_a_l), Transform(val, record("captured", "10:00:00.003")), run_time=0.8),
-                             Wait(1.8), t.animate(rate_func=linear, run_time=1.8).set_value(4.2), FadeIn(ok_a, shift=0.15 * UP, run_time=0.5)),
-                  run_time=9.0)
+        def skew(ms, ok2, ok4):
+            new = T(f"clock {ms} ms behind", 17, YELLOW_M).move_to([PX, PB_Y - 0.22, 0])
+            old, self.sk = self.sk, new
+            st2_, st4_ = 8 - ms, 20 - ms
+            out = [swap(old, new),
+                   s2.animate.move_to([tx(st2_), STAMP_Y, 0]).set_color(GREEN_M if ok2 else RED_M),
+                   s4.animate.move_to([tx(st4_), STAMP_Y, 0]).set_color(GREEN_M if ok4 else RED_M),
+                   Transform(l2, link(8, st2_, GOLD_M)), Transform(l4, link(20, st4_, GOLD_M)),
+                   lost2.animate.move_to([tx(st2_), STAMP_Y - 0.7, 0]).set_opacity(0 if ok2 else 1),
+                   lost4.animate.move_to([tx(st4_), STAMP_Y - 0.7, 0]).set_opacity(0 if ok4 else 1)]
+            return out
 
-        st_b = DashedLine([tx(11), AX_Y + 0.12, 0], [tx(11), 0.5, 0], dash_length=0.07, stroke_width=3, color=B_C)
-        st_b_l = M("stamp 11", 18, B_C).move_to([tx(11), 0.77, 0])
-        self.beat("Now the stamp is in the past on every honest clock. pod B writes refunded at 10 past ten, "
-                  "and its latest is 11, higher than 3. The refund is kept.",
-                  Succession(Indicate(st_a_l, color=A_C, run_time=0.9), Wait(0.8), t.animate(rate_func=linear, run_time=1.6).set_value(10),
-                             Wait(0.6), AnimationGroup(Create(st_b), FadeIn(st_b_l), run_time=0.8), Wait(0.8),
-                             AnimationGroup(Transform(val, record("refunded", "10:00:00.011")), flash(rec, GREEN_M), run_time=0.9)),
-                  run_time=8.4)
+        self.steps("You might think: fifteen thousandths is a big error, so better clocks fix this. Let's test that. "
+                   "Shrink pod B's error to five.", [
+            (lambda: [*self.cap("better clocks fix this?", PURPLE_M, 28)], 0.5),
+            "Shrink",
+            (lambda: skew(5, True, True), 1.2),
+        ])
+        self.steps("Now the refund's stamp is three past, above captured's two. Kept. Nothing lost.", [
+            (lambda: [*self.cap("5 ms behind: refunded .003 > captured .002: kept", GREEN_M)], 0.5),
+            "Nothing lost",
+            (lambda: [Indicate(s2, color=GREEN_M, scale_factor=1.6), Indicate(s4, color=GREEN_M, scale_factor=1.6)], 0.8),
+        ])
+        self.steps("Now seven. The stamp is one past. Below two. Lost again.", [
+            (lambda: skew(7, False, False), 1.2),
+            "Lost again",
+            (lambda: [*self.cap("7 ms behind: refunded .001 < captured .002: lost", RED_M)], 0.5),
+        ])
+        self.stamp("seven")
+        gap = VGroup(Line([tx(2), TRUE_Y + 0.62, 0], [tx(8), TRUE_Y + 0.62, 0], stroke_width=3, color=YELLOW_M),
+                     T("6 ms", 18, YELLOW_M).move_to([tx(5), TRUE_Y + 0.88, 0]))
+        self.steps("So the skew doesn't need to be big. It only has to be bigger than the gap between two writes "
+                   "where the second was decided after seeing the first. Writes like that are called causally related. Here the gap is six thousandths.", [
+            "bigger than the gap",
+            (lambda: [Create(gap[0]), FadeIn(gap[1])], 0.6),
+            "causally related",
+            (lambda: [*self.cap("causally related: the second write was decided after seeing the first", WHITE)], 0.5),
+        ])
+        self.steps("Add some thinking time between the writes, and the lab counts the damage. Ten milliseconds of skew loses four percent "
+                   "of confirmed writes. Twenty loses fourteen percent. A hundred or more loses half.", [
+            (lambda: [*self.cap("skew 10 ms: 4% of confirmed writes lost", GOLD_M)], 0.5),
+            "Twenty",
+            (lambda: [*self.cap("skew 10 ms: 4%.   20 ms: 14%", GOLD_M)], 0.5),
+            "A hundred",
+            (lambda: [*self.cap("skew 10 ms: 4%.   20 ms: 14%.   100 ms or more: 50%", RED_M)], 0.5),
+        ])
+        self.steps("Why stop at half? By then every pod B write that follows a pod A write is lost, and every pod A write survives. "
+                   "And over the internet, clock errors of ten to twenty milliseconds are ordinary.", [
+            "every pod B write",
+            (lambda: [Indicate(VGroup(s2, s4), color=RED_M, scale_factor=1.5)], 0.8),
+            "over the internet",
+            (lambda: [*self.cap("over the internet, clocks 10 to 20 ms off are ordinary", WHITE)], 0.5),
+        ])
+        self.steps("It happened for real. In 2013, Kyle Kingsbury tested Cassandra with writers that took turns behind a perfect lock. "
+                   "It still lost 285 of 1,009 confirmed writes, about twenty-eight percent. The stamps, not the lock, decided which write survived.", [
+            "It still lost",
+            (lambda: [*self.cap("Jepsen, 2013: 285 of 1,009 confirmed writes lost, about 28%", RED_M)], 0.5),
+        ])
 
-        ok_b = T("OK after 32 ms", 22, GREEN_M).move_to([PX, PY - 1.25, 0])
-        self.beat("The price is the wait: about twice the bound, on every commit. pod B waits 32 milliseconds before its OK.",
-                  Succession(t.animate(rate_func=linear, run_time=3.0).set_value(42.2), FadeIn(ok_b, shift=0.15 * UP, run_time=0.5),
-                             Wait(0.5), Indicate(ok_b, color=GOLD_M, run_time=1.0)), run_time=6.6)
+        # ---------------- scene 5: the rule, and the fix ----------------
+        self.steps("So here's the rule. Never let two machines' clocks decide which write wins.", [
+            (lambda: [*self.cap("never let two machines' clocks decide which write wins", YELLOW_M, 28)], 0.6),
+        ], after=0.6)
+        rows = VGroup(*[T(n, 20, c) for n, c in
+                        [("captured", BLUE_M), ("refunded", GOLD_M), ("settled", BLUE_M), ("chargeback", GOLD_M)]])
+        rows.arrange(DOWN, buff=0.1).move_to([SX, SY - 0.38, 0])
+        self.steps("Better clocks shrink the window. They don't close it. The fixes stop comparing stamps from different machines. "
+                   "Back in the shop: keep every receipt, not just the latest.", [
+            "Back in the shop",
+            (lambda: [*self.cap("keep every receipt, not just the latest", GREEN_M, 28), *([FadeOut(self.value)] if self.value else []),
+                      Transform(st_title, T("every status change", 22, GREY_B).move_to(st_title))], 0.6),
+            (lambda: [LaggedStart(*[FadeIn(r, shift=0.1 * DOWN) for r in rows], lag_ratio=0.3)], 1.2),
+        ])
+        self.value = None
+        self.steps("In a database, that's one new row for each status change, never overwritten, and you read them all. "
+                   "Or you make the order explicit, with a write that applies only if the value is still the one you read. Later lessons build those.", [
+            (lambda: [*self.cap("one row per change, never overwritten; read them all", WHITE)], 0.5),
+            "Or you make",
+            (lambda: [*self.cap("or: a write that applies only if the value is still the one you read", WHITE)], 0.5),
+        ])
 
-        self.beat("Last write wins trusts two machines' clocks to agree. To order writes safely, don't compare them, "
-                  "or wait out their error.",
-                  Succession(Wait(1.6), AnimationGroup(flash(pa, A_C), flash(pb, B_C), run_time=1.2), Wait(1.0),
-                             AnimationGroup(Indicate(ok_a, color=GREEN_M), Indicate(ok_b, color=GREEN_M), run_time=1.2)), run_time=6.6)
-        self.wait(0.6)
+        # ---------------- scene 6: the moral, and a check ----------------
+        self.steps("So, which receipt came last? The clock never knew. It only knew what it printed. "
+                   "Two clocks can't put two machines' writes in order, so don't ask them to.", [
+            (lambda: [*self.cap("which receipt came last?", WHITE, 28)], 0.5),
+            "The clock never",
+            (lambda: [glow(tb[0], GOLD_M)], 0.8),
+            "Two clocks",
+            (lambda: [*self.cap("two clocks can't order two machines' writes", YELLOW_M, 28)], 0.5),
+        ])
+        self.steps("One quick check. Flip it. Pod B's clock now runs fifteen milliseconds ahead. Whose writes get lost? Pause and think.", [
+            (lambda: [*self.uncap(), *self.put("flip", T("clock 15 ms ahead", 17, YELLOW_M).move_to([PX, PB_Y - 0.22, 0])),
+                      FadeOut(self.sk)], 0.6),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Pod A's. Last write wins always favours the fast clock. The slow one loses, and nobody gets an error.", [
+            (lambda: [*self.uncap(), glow(ta[0], RED_M)], 0.8),
+            "always favours",
+            (lambda: [*self.cap("last write wins favours the fast clock; the slow one loses, silently", YELLOW_M)], 0.5),
+        ])
+        self.wait(2.0)

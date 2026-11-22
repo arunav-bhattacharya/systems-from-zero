@@ -1,137 +1,349 @@
 WEBVTT
 
 1
-00:00:02.700 --> 00:00:08.595
-Two pods can each start the nightly settlement batch, which builds the payout file for the bank.
+00:00:02.700 --> 00:00:06.969
+Every night, the payments company pays each shop what it took that day.
 
 2
-00:00:08.595 --> 00:00:11.481
-If both run it, every merchant gets paid twice.
+00:00:06.969 --> 00:00:12.441
+One job builds the payout file, the list that tells the bank how much to send to each shop.
 
 3
-00:00:11.700 --> 00:00:13.881
-So they take a lock in Redis.
+00:00:12.733 --> 00:00:14.405
+It must run exactly once.
 
 4
-00:00:13.881 --> 00:00:17.943
-Pod A sends a SET command with two options, NX and PX.
+00:00:14.405 --> 00:00:17.281
+Run it twice, and every shop is paid twice.
 
 5
-00:00:18.167 --> 00:00:21.851
-NX means: only set the key if it doesn't exist yet.
+00:00:17.281 --> 00:00:23.100
+The job runs on three servers, so that one dying on the night doesn't stop the payouts.
 
 6
-00:00:21.851 --> 00:00:24.452
-The key is free, so A gets the lock.
+00:00:23.367 --> 00:00:25.284
+So, the tempting fix: a lock.
 
 7
-00:00:24.667 --> 00:00:25.813
-PX sets a lease.
+00:00:25.284 --> 00:00:30.839
+Before it starts, a server takes a lock that only one may hold, and the others wait.
 
 8
-00:00:25.813 --> 00:00:32.979
-Redis deletes the key by itself after 30 seconds, so a pod that crashes can't hold the lock forever.
+00:00:30.839 --> 00:00:35.269
+We keep it in Redis, a fast store that all three servers can reach.
 
 9
-00:00:33.200 --> 00:00:35.189
-Pod B sends the same command.
+00:00:35.533 --> 00:00:39.100
+Inside one program, nobody can take a lock away from you.
 
 10
-00:00:35.189 --> 00:00:38.824
-The key already exists, so B gets nothing, and waits.
+00:00:39.100 --> 00:00:45.357
+But a lock shared by three servers has to run out, or a dead holder would block the payouts forever.
 
 11
-00:00:39.033 --> 00:00:40.133
-Now A freezes.
+00:00:45.357 --> 00:00:48.673
+So this one is a lease, with a deadline: ten seconds.
 
 12
-00:00:40.133 --> 00:00:45.397
-A 35-second garbage collection pause halts every thread in its JVM.
+00:00:48.967 --> 00:00:50.231
+Watch one night.
 
 13
-00:00:45.397 --> 00:00:48.461
-Pod A has no idea that time is passing.
+00:00:50.231 --> 00:00:52.127
+Server A takes the lock.
 
 14
-00:00:48.667 --> 00:00:49.902
-30 seconds go by.
+00:00:52.127 --> 00:00:54.576
+Server B tries, and is refused.
 
 15
-00:00:49.902 --> 00:00:53.245
-The lease runs out, and Redis deletes the key.
+00:00:54.833 --> 00:00:59.521
+Then A's program freezes, for fifteen seconds, while it cleans up its memory.
 
 16
-00:00:53.245 --> 00:00:56.516
-As far as Redis knows, nobody holds the lock.
+00:00:59.521 --> 00:01:03.721
+Every part of it stops, including the part that would renew the lock.
 
 17
-00:00:57.033 --> 00:00:59.308
-B asks again and gets the lock.
+00:01:03.967 --> 00:01:08.521
+After ten seconds, Redis deletes the lock, exactly as asked.
 
 18
-00:00:59.308 --> 00:01:01.143
-B writes the payout file.
+00:01:08.521 --> 00:01:09.356
+B takes it.
 
 19
-00:01:01.367 --> 00:01:02.404
-Then A wakes up.
+00:01:09.600 --> 00:01:12.188
+B builds the payout file, and writes it.
 
 20
-00:01:02.404 --> 00:01:04.869
-From where A stands, nothing happened.
+00:01:12.467 --> 00:01:13.533
+Then A wakes up.
 
 21
-00:01:04.869 --> 00:01:09.280
-It still thinks it holds the lock, so it writes the payout file too.
+00:01:13.533 --> 00:01:20.267
+It carries on from where it stopped, and writes its file: built before B's run, and missing 12 shops.
 
 22
-00:01:09.500 --> 00:01:11.077
-A lease can't prevent this.
+00:01:20.533 --> 00:01:22.187
+From A's side, it blinked.
 
 23
-00:01:11.077 --> 00:01:15.807
-Checking the lock first doesn't help: the pause can strike right after the check.
+00:01:22.187 --> 00:01:24.540
+And no check inside A can catch this.
 
 24
-00:01:16.033 --> 00:01:17.783
-The fix is a fencing token.
+00:01:24.540 --> 00:01:27.593
+We saw that the freeze can land after any check.
 
 25
-00:01:17.783 --> 00:01:24.132
-The script that takes the lock also adds one to a counter in Redis, and hands back the new number.
+00:01:27.867 --> 00:01:32.232
+So if A can't know it's late, someone else has to refuse its write.
 
 26
-00:01:24.333 --> 00:01:25.338
-Run it again.
+00:01:32.232 --> 00:01:33.600
+Who sees every write?
 
 27
-00:01:25.338 --> 00:01:28.970
-Pod A gets the lock with token 33, then pauses.
+00:01:33.600 --> 00:01:36.207
+Only the thing being written: the store.
 
 28
-00:01:28.970 --> 00:01:33.143
-The lease runs out, and B gets the lock with token 34.
+00:01:36.467 --> 00:01:39.414
+Picture the deli counter at a supermarket.
 
 29
-00:01:33.367 --> 00:01:39.920
-Every write carries its token, and the store remembers the highest token it has accepted.
+00:01:39.414 --> 00:01:40.958
+You pull a ticket: 33.
 
 30
-00:01:39.920 --> 00:01:41.172
-B writes with 34.
+00:01:40.958 --> 00:01:42.712
+The next person pulls 34.
 
 31
-00:01:41.172 --> 00:01:41.835
-Accepted.
+00:01:42.712 --> 00:01:51.555
+Once the counter has served 34, someone who turns up late holding 33 is sent away, however sure they are that it's their turn.
 
 32
-00:01:42.067 --> 00:01:49.433
-When A wakes up and writes with 33, the store sees that 33 is lower than 34, and refuses the write.
+00:01:51.767 --> 00:01:52.230
+Map it.
 
 33
-00:01:49.633 --> 00:01:51.426
-The lock alone is not enough.
+00:01:52.230 --> 00:01:56.403
+The ticket is a number the lock hands out with each new holder.
 
 34
-00:01:51.426 --> 00:01:55.876
-The store has to check the token and refuse any write with an older one.
+00:01:56.403 --> 00:01:58.059
+The counter is the store.
+
+35
+00:01:58.333 --> 00:02:01.231
+Let's play the night again, with numbers.
+
+36
+00:02:01.231 --> 00:02:03.492
+Next to the lock sits a counter.
+
+37
+00:02:03.492 --> 00:02:04.269
+It's at 32.
+
+38
+00:02:04.269 --> 00:02:08.792
+The store remembers the highest number it has accepted: also 32.
+
+39
+00:02:09.033 --> 00:02:14.432
+Server A takes the lock, and in the same step the counter goes up by one.
+
+40
+00:02:14.432 --> 00:02:15.763
+It holds token 33.
+
+41
+00:02:15.763 --> 00:02:19.165
+B's attempt is refused, and uses up no number.
+
+42
+00:02:19.400 --> 00:02:20.696
+Server A freezes.
+
+43
+00:02:20.696 --> 00:02:25.728
+Ten seconds later the lock is gone, and B takes it, with token 34.
+
+44
+00:02:26.000 --> 00:02:28.602
+B writes its file with fence 34.
+
+45
+00:02:28.602 --> 00:02:30.146
+The store compares.
+
+46
+00:02:30.146 --> 00:02:35.919
+34 is at least the 32 it has seen, so it accepts, and now remembers 34.
+
+47
+00:02:36.167 --> 00:02:39.785
+Now A wakes up and writes its file, with fence 33.
+
+48
+00:02:39.785 --> 00:02:41.450
+What does the store do?
+
+49
+00:02:41.450 --> 00:02:42.608
+Pause and guess.
+
+50
+00:02:45.800 --> 00:02:46.897
+It refuses.
+
+51
+00:02:46.897 --> 00:02:50.788
+33 is below the 34 it already accepted.
+
+52
+00:02:50.788 --> 00:02:52.284
+B's file stays.
+
+53
+00:02:52.533 --> 00:02:54.863
+However sure A is that it's its turn.
+
+54
+00:02:54.863 --> 00:03:00.845
+That number is called a fencing token: it fences out every holder older than the newest writer.
+
+55
+00:03:01.100 --> 00:03:03.120
+Here the deli picture breaks.
+
+56
+00:03:03.120 --> 00:03:08.065
+The deli calls each number itself, so it knows when 34 is being served.
+
+57
+00:03:08.065 --> 00:03:11.199
+The store learns about 34 only when B writes.
+
+58
+00:03:11.199 --> 00:03:15.377
+Had A woken up before that, its 33 would have been accepted.
+
+59
+00:03:15.633 --> 00:03:16.697
+And that's fine.
+
+60
+00:03:16.697 --> 00:03:23.412
+Fencing only refuses a holder once a newer one has written, which is exactly the case that does harm.
+
+61
+00:03:23.700 --> 00:03:24.751
+How is it built?
+
+62
+00:03:24.751 --> 00:03:31.189
+In Redis, the counter is one command, increment, run in the same small script that takes the lock.
+
+63
+00:03:31.189 --> 00:03:34.408
+So a number is handed out exactly when a lock is.
+
+64
+00:03:34.667 --> 00:03:39.604
+The store's side is the half people miss, because it isn't lock code at all.
+
+65
+00:03:39.604 --> 00:03:47.400
+In a database table, the write gets one extra condition: change the row only if its stored fence is no larger than mine.
+
+66
+00:03:47.400 --> 00:03:50.388
+Zero rows changed means: you're a late holder.
+
+67
+00:03:50.633 --> 00:03:51.826
+Now the fine print.
+
+68
+00:03:51.826 --> 00:03:59.927
+The counter must never go backwards, so it gets no deadline, and it must live where it can't be thrown away when memory fills up.
+
+69
+00:04:00.200 --> 00:04:02.934
+And it's only as safe as that one Redis server.
+
+70
+00:04:02.934 --> 00:04:10.496
+If the server dies before its last increments were copied to its spare, a new holder can get a number that was already handed out.
+
+71
+00:04:10.767 --> 00:04:21.483
+That's why the numbers are safer in etcd or ZooKeeper, two systems built so a group of servers agrees on every change, and both already keep a number like this.
+
+72
+00:04:21.767 --> 00:04:24.089
+And ask one question about any lock.
+
+73
+00:04:24.089 --> 00:04:28.154
+Is it for efficiency, so two servers don't waste the same work?
+
+74
+00:04:28.154 --> 00:04:29.897
+A single Redis key will do.
+
+75
+00:04:29.897 --> 00:04:34.155
+Or is it for correctness, where a double run pays the shops twice?
+
+76
+00:04:34.155 --> 00:04:36.413
+Then the store itself has to check.
+
+77
+00:04:36.700 --> 00:04:37.628
+So, the moral.
+
+78
+00:04:37.628 --> 00:04:41.539
+A lock keeps holders apart only while every lease is alive.
+
+79
+00:04:41.539 --> 00:04:45.915
+The token keeps them apart at the one place that sees every write.
+
+80
+00:04:46.400 --> 00:04:47.758
+One quick check.
+
+81
+00:04:47.758 --> 00:04:49.964
+The store has accepted 34.
+
+82
+00:04:49.964 --> 00:04:52.679
+A server shows up with token 35.
+
+83
+00:04:52.679 --> 00:04:54.206
+Accept, or refuse?
+
+84
+00:04:54.206 --> 00:04:55.564
+Pause and think.
+
+85
+00:04:58.800 --> 00:04:59.340
+Accept.
+
+86
+00:04:59.340 --> 00:05:02.814
+35 is newer than anything the store has seen.
+
+87
+00:05:02.814 --> 00:05:06.905
+It's the next holder, and the store now remembers 35.
