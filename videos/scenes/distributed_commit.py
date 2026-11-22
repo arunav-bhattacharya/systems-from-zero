@@ -1,20 +1,8 @@
 from sfz import *
 
-SAY.insert(0, (r"\bA-1001\b", "A ten oh one"))
-SAY.insert(0, (r"\bM-2001\b", "M twenty oh one"))
+SAY.insert(0, (r"\baudit-0\b", "audit zero"))
 SAY.insert(0, (r"\bCockroachDB\b", "cockroach D B"))
-SAY.insert(0, (r"\bT1\b", "T one"))
-
-RC = {1: np.array([-3.85, 1.0, 0]), 2: np.array([3.85, 1.0, 0])}
-RW, RH = 5.5, 3.0
-DATA_Y, REC_Y, RAFT_Y = 1.72, 0.92, 0.02
-AX_Y = -2.7
-
-
-def ax(t):
-    """x on the timestamp axis for t milliseconds."""
-    return -6.0 + 0.02 * t
-
+SAY.insert(0, (r"\b20\.00\b", "twenty"))
 
 class Base(VoiceScene):
     def add_mobjects_from_animations(self, animations):
@@ -69,226 +57,300 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
+
+
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+
+SX, AX, BY = -4.2, 4.2, 2.05             # settle (writer) and audit-0 (reader)
+BW, BH = 3.4, 1.05
+AXY = -0.35                              # the timestamp axis
+TS0, TS1 = -5, 25
+
+
+def xs(ts):
+    return -6.0 + (ts - TS0) * 12.0 / (TS1 - TS0)
+
 
 def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def glow(rect, color=YELLOW_M, s=1.05):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+class Who:
+    def __init__(self, x, name, sub, color):
+        self.c = np.array([x, BY, 0])
+        self.color = color
+        self.r = RoundedRectangle(corner_radius=0.12, width=BW, height=BH, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1).move_to(self.c)
+        self.n = self.name_t(name)
+        self.s = self.sub_t(sub)
 
+    def name_t(self, s):
+        return T(s, 26, WHITE).move_to(self.c + UP * 0.2)
 
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
+    def sub_t(self, s, color=GREY_B):
+        return fit(T(s, 20, color), BW - 0.3).move_to(self.c + DOWN * 0.24)
 
+    @property
+    def g(self):
+        return VGroup(self.r, self.n, self.s)
 
-def rng(k, title):
-    c = RC[k]
-    r = RoundedRectangle(corner_radius=0.16, width=RW, height=RH, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1)
-    r.move_to(c)
-    t = left_at(T(title, 21, GREY_B), c[0] - RW / 2 + 0.3, c[1] + RH / 2 - 0.32)
-    return VGroup(r, t)
+    def rename(self, name, sub):
+        nn, ns = self.name_t(name), self.sub_t(sub)
+        on, os_ = self.n, self.s
+        self.n, self.s = nn, ns
+        return [swap(on, nn), swap(os_, ns)]
 
-
-def row(k, key, val, color=WHITE):
-    c = RC[k]
-    x0 = c[0] - RW / 2 + 0.35
-    return VGroup(left_at(M(key, 22, GREY_A), x0, DATA_Y), left_at(M(val, 22, color), x0 + 1.25, DATA_Y))
-
-
-def intent(k, s, color=GOLD_M):
-    c = RC[k]
-    return chip(s, color, 18).move_to([c[0] + 1.2, DATA_Y, 0])
-
-
-def replicas(k):
-    c = RC[k]
-    out = VGroup()
-    for i, name in enumerate(["leader", "replica", "replica"]):
-        col = BLUE_M if i == 0 else GREY_B
-        b = RoundedRectangle(corner_radius=0.08, width=1.35, height=0.44, stroke_color=col, stroke_width=2.2)
-        b.set_fill(fillc(col), 1).move_to([c[0] + (i - 1) * 1.6, RAFT_Y, 0])
-        out.add(VGroup(b, T(name, 17, WHITE if i == 0 else GREY_B).move_to(b)))
-    return out
-
-
-def record(s, color=GREY_B):
-    return mbox(s, color, h=0.5, size=17).move_to([RC[1][0], REC_Y, 0])
-
-
-def replicate(reps, color=GOLD_M, rt=0.6):
-    """Dots from the leader to both replicas, and acks back."""
-    L = reps[0][0]
-    out = []
-    for f in (reps[1][0], reps[2][0]):
-        out.append(travel(Line(L.get_right() if f.get_center()[0] > L.get_center()[0] else L.get_left(),
-                               f.get_left()), color, rt))
-    return out
-
-
-def status(s, color=GREY_B, y=-1.35, size=21):
-    return T(s, size, color).move_to([0, y, 0])
+    def sub(self, s, color=GREY_B):
+        ns = self.sub_t(s, color)
+        old, self.s = self.s, ns
+        return [swap(old, ns)]
 
 
 class DistributedCommit(Base):
-    """cons-06, sections 0 and 3: a transfer of 100 from A-1001 (range 1) to M-2001 (range 2), each range its own Raft
-    group. Separate writes lose money on a crash; instead T1 writes intents at timestamp 100 that point at a transaction
-    record in range 1, and commits by flipping that record (one Raft write). An auditor whose clock runs 120 ms slow
-    reads at 30, finds M-2001's value at 100 inside its uncertainty interval (max offset 500 ms) and restarts above it."""
+    """cons-06, section 3: CockroachDB's uncertain reader. The branch picture (clerks stamping slips by their own
+    clocks; an auditor). The lab's TRUST_CLOCK run: settle 10 ms fast commits batch 1 at 10, the client hears "paid" at
+    8 ms; audit-0, 10 ms slow, reads at -1 and misses it. The RESTART run: the read's window reaches 19, batch 1 (10) is
+    inside it, the audit restarts at 10 and sees payouts = 1 (4 ms instead of 2). Max offset (500 ms, 250 for multi-region;
+    nodes off by 80% shut down), the name, intents and parallel commits, the moral and a check."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, 3.3, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def bot(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, -3.3, 0])
+        old, self.botm = self.botm, new
+        return [swap(old, new)]
+
+    def unbot(self):
+        old, self.botm = self.botm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def countdown(self, secs=3.0):
+        p = np.array([0, -2.55, 0])
+        bar = Line(p + LEFT * 1.1, p + RIGHT * 1.1, stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def truth(self, s):
+        return self.put("true", T(s, 22, YELLOW_M).move_to([0, BY, 0]))
+
+    def marker(self, key, ts, label, color, y):
+        x = xs(ts)
+        c = chip(label, color, 24).move_to([x, y, 0])
+        ln = DashedLine([x, c.get_bottom()[1] - 0.05, 0], [x, AXY + 0.08, 0], dash_length=0.06, stroke_width=2, color=color)
+        c[0].set_fill(fillc(color, 0.18), 1)
+        g = VGroup(ln, c)
+        old = self.lab.get(key)
+        self.lab[key] = g
+        ln.set_z_index(2)
+        c.set_z_index(4)
+        return [swap(old, g)]
+
+    def window(self, lo, hi, color=TEAL_M, label=None):
+        band = Rectangle(width=xs(hi) - xs(lo), height=0.22, stroke_color=color, stroke_width=2).set_fill(color, 0.3)
+        band.move_to([(xs(lo) + xs(hi)) / 2, AXY - 0.55, 0])
+        g = VGroup(band)
+        if label:
+            g.add(T(label, 22, color).move_to([(xs(lo) + xs(hi)) / 2, AXY - 0.98, 0]))
+        return self.put("win", g)
+
+    def reads(self, s, color):
+        return self.put("reads", T(s, 24, color).move_to([0, -2.05, 0]))
 
     def construct(self):
-        self.title_card("Distributed commit", "one record decides, and a reader that isn't sure restarts")
+        self.capm = None
+        self.botm = None
+        self.lab = {}
+        self.title_card("The reader who isn't sure", "clocks that disagree, and a read that starts over")
 
-        r1, r2 = rng(1, "range 1: accounts"), rng(2, "range 2: merchants")
-        a = row(1, "A-1001", "400")
-        m = row(2, "M-2001", "0")
-        gw = mbox("transfer T1: 100 from A-1001 to M-2001", WHITE, h=0.52, size=19).move_to([0, 3.15, 0])
-        self.steps("A transfer moves 100 from A-1001 to merchant M-2001. The two rows live in different ranges, on different machines.", [
-            (lambda: [FadeIn(gw, shift=0.1 * DOWN)], 0.7),
-            "The two rows",
-            (lambda: [FadeIn(r1), FadeIn(r2)], 0.8),
-            (lambda: [FadeIn(a), FadeIn(m)], 0.7),
+        # ---------------- scene 1: the question ----------------
+        self.steps("Picture paying a friend back. You send 20.00, your app says Sent, and you text them: done. They open "
+                   "their app a second later, and the money isn't there. Then it appears.", [
+            (lambda: self.cap("you: Sent", GREEN_M, 28), 0.5),
+            "They open",
+            (lambda: self.cap("you: Sent        your friend, a second later: nothing yet", WHITE, 28), 0.6),
+            "Then it appears",
+            (lambda: self.cap("you: Sent        your friend, a second later: 20.00", WHITE, 28), 0.5),
         ])
+        self.steps("For a moment, their app showed a world where you hadn't paid. How does a database spread over many "
+                   "machines end up showing that? Hold that question.", [
+            "How does",
+            (lambda: self.bot("how does a database on many machines show a world where you hadn't paid?", YELLOW_M), 0.6),
+        ], after=0.3)
 
-        tot = status("A-1001 + M-2001 = 400")
-        lost = status("A-1001 + M-2001 = 300: 100 vanished", RED_M)
-        crash = tick(False, 0.22).next_to(gw, RIGHT, buff=0.2)
-        self.steps("The simplest plan writes each row on its own. Debit A-1001, crash before the credit, and 100 has vanished.", [
-            (lambda: [FadeIn(tot)], 0.5),
-            "Debit A-1001",
-            (lambda: [travel(Line(gw.get_bottom() + 1.6 * LEFT, a[1].get_top()), WHITE, 0.6)], 0.7),
-            (lambda: [Transform(a[1], row(1, "A-1001", "300", RED_M)[1])], 0.5),
-            "crash before",
-            (lambda: [Create(crash), gw[0].animate.set_stroke(RED_M)], 0.6),
-            "and 100",
-            (lambda: [Transform(tot, lost)], 0.6),
+        # ---------------- scene 2: the branches ----------------
+        W = Who(SX, "branch clerk", "clock: a little fast", GREEN_M)
+        R = Who(AX, "auditor", "clock: a little slow", BLUE_M)
+        self.steps("Think of bank branches in different towns. Each clerk stamps deposit slips with the branch's own wall "
+                   "clock. An auditor notes the time the audit starts, and counts every slip stamped before it.", [
+            (lambda: [*self.unbot(), *self.cap("bank branches, each with its own clock", WHITE)], 0.5),
+            "Each clerk",
+            (lambda: [FadeIn(W.g)], 0.5),
+            "An auditor",
+            (lambda: [FadeIn(R.g)], 0.5),
         ])
+        self.steps("If the clocks agree, that works. But clocks never quite agree. A slip stamped by a fast clock can look "
+                   "newer than an audit that really started after it.", [
+            "But clocks",
+            (lambda: [Indicate(W.s, color=GREEN_M), Indicate(R.s, color=BLUE_M)], 0.8),
+            "A slip stamped",
+            (lambda: self.bot("a fast clock's slip can look newer than a later audit", WHITE), 0.6),
+        ], after=0.3)
 
-        rep1, rep2 = replicas(1), replicas(2)
-        self.steps("So start again. Each range is copied to three servers by its own Raft group, with its own leader.", [
-            (lambda: [FadeOut(tot), FadeOut(crash), gw[0].animate.set_stroke(WHITE),
-                      Transform(a[1], row(1, "A-1001", "400")[1])], 0.8),
-            "Each range",
-            (lambda: [LaggedStart(*[FadeIn(x, shift=0.1 * UP) for x in [*rep1, *rep2]], lag_ratio=0.12)], 1.2),
-            "with its own leader",
-            (lambda: [glow(rep1[0][0], BLUE_M, 1.08), glow(rep2[0][0], BLUE_M, 1.08)], 0.8),
+        # ---------------- scene 3: trust the clocks, in the lab ----------------
+        axis = Line([xs(TS0), AXY, 0], [xs(TS1), AXY, 0], stroke_width=2.5, color=GREY_B)
+        ticks = VGroup(*[VGroup(Line([xs(t), AXY - 0.08, 0], [xs(t), AXY + 0.08, 0], stroke_width=2, color=GREY_B),
+                                T(str(t), 22, GREY_B).move_to([xs(t), AXY - 0.3, 0])) for t in range(-5, 26, 5)])
+        alab = T("timestamp (ms)", 20, GREY_B).move_to([xs(TS1) - 0.8, AXY - 0.62, 0])
+        self.steps("Now the lab's version. Two servers: settle pays batch 1 of the nightly payout, and its clock runs ten "
+                   "milliseconds fast. audit-0 runs an audit, a report that checks the books, and its clock runs ten "
+                   "milliseconds slow.", [
+            (lambda: [*self.unbot(), *self.cap("the lab: two servers, clocks 10 ms apart from true time", WHITE)], 0.5),
+            "settle pays",
+            (lambda: W.rename("settle", "clock: 10 ms fast"), 0.6),
+            "audit-0 runs",
+            (lambda: R.rename("audit-0", "clock: 10 ms slow"), 0.6),
+            "milliseconds slow",
+            (lambda: [Create(axis), FadeIn(ticks), FadeIn(alab)], 0.8),
         ])
-
-        rec = record("T1 record: PENDING")
-        ts = T("timestamp 100", 20, GOLD_M).next_to(gw, DOWN, buff=0.12)
-        self.steps("The transfer takes a timestamp, 100, and a transaction record in range 1, marked pending.", [
-            (lambda: [FadeIn(ts, shift=0.1 * DOWN)], 0.6),
-            "and a transaction record",
-            (lambda: [FadeIn(rec, scale=0.9)], 0.7),
-            "marked pending",
-            (lambda: [glow(rec[0], GREY_A, 1.06)], 0.6),
+        self.steps("Settle commits batch 1 at timestamp 10, its own clock reading. At 8 milliseconds of true time, the "
+                   "client hears: paid.", [
+            (lambda: [*self.truth("true time: 0"), *self.marker("batch", 10, "batch 1 @ 10", GREEN_M, 0.35)], 0.6),
+            "At 8",
+            (lambda: [*self.truth("true time: 8 ms"), *W.sub("client told: paid", GREEN_M)], 0.6),
         ])
-
-        i1, i2 = intent(1, "intent: 300, see T1"), intent(2, "intent: 100, see T1")
-        pt1 = DashedLine(i1.get_bottom() + 0.04 * DOWN, rec.get_top() + np.array([1.2, 0.04, 0]), dash_length=0.07,
-                         stroke_width=2, color=GOLD_M)
-        py = 0.52
-        pt2 = DashedVMobject(VMobject().set_points_as_corners([i2.get_bottom() + 0.04 * DOWN, [i2.get_center()[0], py, 0],
-                                                               [rec.get_right()[0] - 0.3, py, 0], [rec.get_right()[0] - 0.3, rec.get_bottom()[1] - 0.04, 0]]),
-                             num_dashes=90).set_stroke(GOLD_M, 2)
-        self.steps("Then it writes intents: provisional values that point at that record. Each range's Raft group copies its own.", [
-            (lambda: [travel(Line(gw.get_bottom() + 1.6 * LEFT, i1.get_top()), GOLD_M, 0.6),
-                      travel(Line(gw.get_bottom() + 1.6 * RIGHT, i2.get_top()), GOLD_M, 0.6)], 0.7),
-            (lambda: [FadeIn(i1, scale=0.9), FadeIn(i2, scale=0.9)], 0.6),
-            "that point at",
-            (lambda: [Create(pt1), Create(pt2)], 0.8),
-            "Each range's Raft",
-            (lambda: [*replicate(rep1), *replicate(rep2)], 0.8),
-            (lambda: [*replicate(rep1, GREEN_M), *replicate(rep2, GREEN_M)], 0.6),
+        self.steps("One millisecond later, the audit starts. Its clock reads minus 1, so it reads everything stamped up "
+                   "to minus 1. Batch 1, stamped 10, looks like the future. The audit reads payouts: zero.", [
+            (lambda: [*self.truth("true time: 9 ms"), *R.sub("audit starts", BLUE_M)], 0.5),
+            "Its clock reads",
+            (lambda: self.marker("read", -1, "read @ -1", BLUE_M, 1.05), 0.6),
+            "looks like the future",
+            (lambda: [Indicate(self.lab["batch"][1], color=GREY_B, scale_factor=1.1)], 0.7),
+            "payouts: zero",
+            (lambda: self.reads("audit reads payouts = 0", RED_M), 0.5),
         ])
+        self.steps("Well. The batch was paid before the audit began, and the audit missed it. That's your friend's empty "
+                   "app, with timestamps.", [
+            (lambda: self.bot("paid before the audit began, and the audit missed it", RED_M), 0.6),
+        ], after=0.3)
+        self.stamp("stale")
 
-        rec2 = record("T1 record: COMMITTED at 100", GREEN_M)
-        self.steps("To commit, the gateway flips one thing, the record, from pending to committed. That's a single Raft write.", [
-            (lambda: [travel(Line(gw.get_bottom() + 1.6 * LEFT, rec.get_top() + 0.4 * UP), GREEN_M, 0.6)], 0.7),
-            "from pending",
-            (lambda: [Transform(rec, rec2)], 0.8),
-            "That's a single",
-            (lambda: [*replicate(rep1, GREEN_M, 0.7)], 0.8),
-            (lambda: [glow(rec[0], GREEN_M, 1.06)], 0.6),
+        # ---------------- scene 4: the wish ----------------
+        self.steps("There are fixes that make every writer pay. A head office can hand out every stamp by phone, or every "
+                   "clerk can wait out the clock's error before saying done. But what if writers don't wait at all, and "
+                   "the reader handles the doubt?", [
+            (lambda: [*self.unbot(), *self.cap("fixes that make every writer pay: a head office, or waiting out the error", WHITE)], 0.6),
+            "But what if",
+            (lambda: self.cap("wanted: writers never wait; the reader handles the doubt", YELLOW_M), 0.6),
+        ], after=0.3)
+
+        # ---------------- scene 5: the bound, the window, predict ----------------
+        self.steps("That's what CockroachDB does, a SQL database that runs on ordinary servers with ordinary clocks. "
+                   "It promises a bound on how far any two clocks may disagree.", [
+            (lambda: [*self.drop("reads"), *self.cap("CockroachDB: ordinary servers, a promised bound on clock error", TEAL_M)], 0.6),
         ])
-
-        self.steps("Both intents now count as committed, though nobody touched them. They're cleaned up later.", [
-            (lambda: [i1[0].animate.set_stroke(GREEN_M).set_fill(GREEN_M, 0.18), i2[0].animate.set_stroke(GREEN_M).set_fill(GREEN_M, 0.18),
-                      pt1.animate.set_color(GREEN_M), pt2.animate.set_color(GREEN_M)], 0.8),
-            "They're cleaned up",
-            (lambda: [FadeOut(i1), FadeOut(i2), FadeOut(pt1), FadeOut(pt2), Transform(a[1], row(1, "A-1001", "300", GREEN_M)[1]),
-                      Transform(m[1], row(2, "M-2001", "100", GREEN_M)[1])], 0.8),
+        self.steps("So a reader at timestamp T knows that anything stamped above T plus that bound was written after it "
+                   "began. Anything in between is uncertain: it may have committed first, on a server whose clock runs "
+                   "ahead. In the lab the bound is 20 milliseconds, so the audit's window runs from minus 1 up to 19.", [
+            "anything stamped above",
+            (lambda: self.bot("above T + bound: surely written after the read began", WHITE), 0.6),
+            "Anything in between",
+            (lambda: self.bot("between T and T + bound: can't tell", TEAL_M), 0.6),
+            "so the audit's window",
+            (lambda: self.window(-1, 19, TEAL_M, "uncertain: -1 to 19"), 0.7),
         ])
-
-        decide = status("one record decides: both rows, or neither", GREEN_M)
-        self.steps("Had the gateway crashed before the flip, both intents would be thrown away. One record decides.", [
-            (lambda: [glow(rec[0], GREY_A, 1.06)], 0.8),
-            "One record decides",
-            (lambda: [FadeIn(decide, shift=0.1 * UP)], 0.7),
-        ])
-
-        # ---- a reader with a slow clock -----------------------------------------------------------------------------------
-        aud = mbox("auditor: clock 120 ms slow", TEAL_M, h=0.5, size=18).move_to([3.85, -1.35, 0])
-        axis = Line([ax(0), AX_Y, 0], [ax(600), AX_Y, 0], stroke_width=2.5, color=GREY_B)
-        axl = T("timestamp, ms", 17, GREY_C).move_to([ax(600) - 0.6, AX_Y - 0.32, 0])
-        rmark = Line([ax(30), AX_Y - 0.2, 0], [ax(30), AX_Y + 0.2, 0], stroke_width=4, color=TEAL_M)
-        rlab = T("reads at 30", 18, TEAL_M).move_to([ax(30) + 0.15, AX_Y - 0.42, 0])
-        self.steps("Right after the commit, an auditor starts on a server whose clock runs 120 ms slow. It reads at timestamp 30.", [
-            (lambda: [FadeOut(decide), FadeIn(aud, shift=0.1 * UP)], 0.7),
-            "It reads at",
-            (lambda: [Create(axis), FadeIn(axl)], 0.7),
-            (lambda: [Create(rmark), FadeIn(rlab)], 0.6),
-        ])
-
-        vmark = Line([ax(100), AX_Y - 0.2, 0], [ax(100), AX_Y + 0.2, 0], stroke_width=4, color=GOLD_M)
-        vlab = T("M-2001 = 100, written at 100", 18, GOLD_M).move_to([ax(100) + 0.55, AX_Y + 0.45, 0])
-        q = T("in its future?", 20, GREY_A).move_to([ax(100) + 3.6, AX_Y + 0.45, 0])
-        self.steps("It finds M-2001's new value, written at 100. At 30, that looks like the future. Skip it, and the audit misses the transfer.", [
-            (lambda: [travel(Line(aud.get_top(), RC[2] + np.array([0, -RH / 2, 0])), TEAL_M, 0.6)], 0.7),
-            (lambda: [Create(vmark), FadeIn(vlab)], 0.6),
-            "that looks like",
-            (lambda: [FadeIn(q)], 0.5),
-            "Skip it",
-            (lambda: [q.animate.set_color(RED_M), Transform(m[1], row(2, "M-2001", "0?", RED_M)[1])], 0.7),
-        ])
-
-        band = Rectangle(width=ax(530) - ax(30), height=0.42, stroke_width=0).set_fill(TEAL_M, 0.22)
-        band.move_to([(ax(30) + ax(530)) / 2, AX_Y, 0])
-        blab = T("uncertain: 30 to 530", 18, TEAL_M).move_to([ax(400), AX_Y + 0.45, 0])
-        self.steps("But CockroachDB allows clocks to differ by up to 500 milliseconds, the max offset. "
-                   "So a value written between 30 and 530 may have committed before the read began.", [
-            (lambda: [FadeOut(q), Transform(m[1], row(2, "M-2001", "100", GREEN_M)[1])], 0.6),
-            "So a value",
-            (lambda: [FadeIn(band), FadeIn(blab)], 0.9),
-            "may have committed",
-            (lambda: [glow(vmark, GOLD_M, 1.0)], 0.6),
-        ])
-
-        rmark2 = Line([ax(101), AX_Y - 0.2, 0], [ax(101), AX_Y + 0.2, 0], stroke_width=4, color=GREEN_M)
-        rlab2 = T("restarts at 101: sees M-2001 = 100", 18, GREEN_M).move_to([ax(101) + 1.75, AX_Y - 0.42, 0])
-        self.steps("The auditor can't skip an uncertain value. It moves its timestamp past 100 and restarts, and sees the transfer.", [
-            (lambda: [glow(aud[0], TEAL_M, 1.05)], 0.6),
+        self.steps("Batch 1 is stamped 10. Inside the window, or outside? And what should the audit do? Pause and guess.", [
+            (lambda: [*self.unbot(), *self.cap("batch 1 at 10: inside the window? what should the audit do?  pause and guess", YELLOW_M)], 0.6),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Inside. The audit can't tell whether that payment came before it or after, so it can't skip it. It "
+                   "moves its own read timestamp up to 10, and reads again: payouts 1, ledger 1. One restart.", [
+            (lambda: [Indicate(self.lab["batch"][1], color=TEAL_M, scale_factor=1.15)], 0.7),
             "It moves",
-            (lambda: [Transform(rmark, rmark2), FadeOut(rlab)], 0.9),
-            "and sees",
-            (lambda: [FadeIn(rlab2), travel(Line(aud.get_top(), RC[2] + np.array([0, -RH / 2, 0])), GREEN_M, 0.6),
-                      glow(m[1], GREEN_M, 1.15)], 0.8),
+            (lambda: [*self.marker("read", 10, "read @ 10", BLUE_M, 1.0), *R.sub("restarts at 10", BLUE_M)], 0.7),
+            "payouts 1",
+            (lambda: self.reads("audit reads payouts = 1, ledger = 1", GREEN_M), 0.5),
         ])
+        self.steps("The audit took 4 milliseconds instead of 2, and the writer still answered at 8. It's the auditor who "
+                   "finds a slip stamped just after the audit began, and starts over to count it in.", [
+            (lambda: self.bot("the writer: 8 ms, no wait      the audit: 4 ms instead of 2", WHITE), 0.6),
+            "It's the auditor",
+            (lambda: self.cap("the auditor starts over and counts the slip in", WHITE), 0.6),
+        ], after=0.3)
+        self.stamp("restart")
 
-        self.steps("Had it met a pending intent, it would wait on the record instead. It never guesses.", [
-            (lambda: [glow(rec[0], GREY_A, 1.06)], 0.8),
-            "never guesses",
-            (lambda: [glow(aud[0], TEAL_M, 1.05)], 0.7),
+        # ---------------- scene 6: the names ----------------
+        self.steps("That window is called the uncertainty interval, and the bound is the max offset. The top of the "
+                   "window stays put when the read moves up, so the restarts must end.", [
+            (lambda: [*self.unbot(), *self.cap("the window: the uncertainty interval      the bound: the max offset", TEAL_M)], 0.6),
+            "The top of the",
+            (lambda: [Indicate(self.lab["win"], color=TEAL_M, scale_factor=1.04)], 0.8),
         ])
+        self.steps("The writes themselves go in as intents, provisional values, plus one transaction record that says "
+                   "commit or abort. With parallel commits, the transaction counts as done once every intent has "
+                   "reached agreement: one round instead of two.", [
+            (lambda: self.bot("writes: intents + one transaction record", WHITE), 0.6),
+            "With parallel commits",
+            (lambda: self.bot("parallel commits: done when every intent is agreed, one round instead of two", WHITE), 0.6),
+        ], after=0.3)
 
-        self.steps("Intents on every range, one replicated record that decides, and readers that wait or restart instead of guessing.", [
-            (lambda: [glow(r1[0], GOLD_M, 1.02), glow(r2[0], GOLD_M, 1.02)], 0.9),
-            "one replicated record",
-            (lambda: [glow(rec[0], GREEN_M, 1.08)], 0.8),
-            "and readers",
-            (lambda: [glow(band, TEAL_M, 1.0), glow(aud[0], TEAL_M, 1.05)], 0.9),
+        # ---------------- scene 7: the guardrail ----------------
+        self.steps("Now, the fine print. The max offset is 500 milliseconds by default, and 250 is suggested for clusters "
+                   "spread over several regions. The bound has to hold, so a server whose clock is off from at least half "
+                   "the others by 80% of it shuts itself down, rather than give wrong answers.", [
+            (lambda: [*self.unbot(), *self.cap("max offset: 500 ms by default, 250 suggested across regions", WHITE)], 0.6),
+            "The bound has to hold",
+            (lambda: self.bot("a clock off by 80% of the bound: that server shuts itself down", RED_M), 0.6),
         ])
-        self.wait(0.6)
+        self.steps("If clocks drift past it anyway, real-time order can break. And here the branch picture breaks too. "
+                   "Clerks would recount for seconds. Servers do it for milliseconds, thousands of times a second, so "
+                   "clock error becomes a cost you can measure, paid by reads of recently written keys.", [
+            (lambda: self.bot("clocks past the bound: real-time order can break", RED_M), 0.6),
+            "Servers do it",
+            (lambda: self.bot("restarts cost reads of keys written within the last max offset", WHITE), 0.6),
+        ], after=0.3)
+
+        # ---------------- scene 8: the moral, and a check ----------------
+        self.steps("So the moral of the story: the bound on the clock's error, not the clock's reading, sets the price. "
+                   "Know your bound.", [
+            (lambda: [*self.unbot(), *self.cap("the bound on the error, not the reading, sets the price", YELLOW_M, 28)], 0.6),
+            "Know your bound",
+            (lambda: self.bot("know your bound", YELLOW_M, 28), 0.5),
+        ], after=0.3)
+        self.steps("One quick check. The audit reads at minus 1 again, with its window up to 19. Suppose batch 1 were "
+                   "stamped 23 instead. Restart, or not? Pause and think.", [
+            (lambda: [*self.unbot(), *self.drop("reads"), *self.marker("read", -1, "read @ -1", BLUE_M, 1.05),
+                      *self.marker("batch", 23, "batch 1 @ 23", GREEN_M, 0.35), *R.sub("audit starts", BLUE_M),
+                      *self.cap("batch 1 at 23: restart, or not?  pause and think", YELLOW_M)], 0.7),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("No restart. 23 is above the window's top, so it was surely written after the audit began. The audit "
+                   "can skip it with a clear conscience.", [
+            (lambda: [Indicate(self.lab["batch"][1], color=GREEN_M, scale_factor=1.15)], 0.7),
+            "surely written after",
+            (lambda: self.bot("above the window: surely later, safe to skip", GREEN_M), 0.6),
+        ], after=0.3)
+        self.play(*self.cap("only the uncertain values cost a restart", YELLOW_M, 28), run_time=0.7)
+        self.wait(2.0)
