@@ -1,260 +1,538 @@
 from sfz import *
 
-# The charge id from the history, said as letters and a number.
-SAY.insert(0, (r"\bch_1\b", "C H one"))
-# Kokoro says "IDE-mpotency" (no vowel after the d); spell out "eye-dem-potency".
-SAY.insert(0, (r"\bidempotency\b", "eye-dem-potency"))
+
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CD_X0, CD_X1, CD_TOP, CD_BOT = -6.5, -3.0, 2.5, -1.5      # the workflow code: the instruction sheet
+CD_CX = (CD_X0 + CD_X1) / 2
+CODE = ["charge(...)", "reserve(...)", "sleep(24 h)", "ship(...)", "return SHIPPED"]
+CODE_Y = [1.45, 0.85, 0.25, -0.35, -0.95]
+HS_X0, HS_X1, HS_TOP, HS_BOT = -2.6, 1.9, 2.5, -2.3       # the event history: the notebook
+HS_CX = (HS_X0 + HS_X1) / 2
+EV_Y = [1.55 - 0.45 * i for i in range(8)]
+RC_X, RC_W = 4.4, 3.4                                     # right column: workers and the bank
+W_Y = {"w1": 1.85, "w2": 0.55, "bank": -1.25}
+W_H = {"w1": 1.0, "w2": 1.0, "bank": 1.1}
+CAP_Y, BAR_Y = -3.25, -2.85
 
 
-def _layer(m):
-    """Text above chips above arrows above boxes, so an opaque box never hides its own label."""
-    for x in m.get_family():
-        if isinstance(x, Text):
-            x.set_z_index(4)
-        elif isinstance(x, Arrow):
-            x.set_z_index(1)
-        elif isinstance(x, RoundedRectangle) and 0 < x.get_fill_opacity() < 0.5:
-            x.set_z_index(2)
-
-
-def _defer_add(anim):
-    """Make each step that is not an introducer add its mobject when the step starts."""
-    if isinstance(anim, AnimationGroup):
-        for a in anim.animations:
-            _defer_add(a)
-        return
-    if anim.is_introducer() or anim.mobject is None:
-        return
-    orig = anim._setup_scene
-
-    def setup(scene, orig=orig, anim=anim):
-        orig(scene)
-        if scene is not None and anim.mobject not in scene.get_mobject_family_members():
-            scene.add(anim.mobject)
-    anim._setup_scene = setup
-
-
-class Layered(VoiceScene):
+class Base(VoiceScene):
     def add_mobjects_from_animations(self, animations):
-        """Manim adds every mobject of a Succession when the Succession starts, so a later step that moves or
-        transforms a mobject not yet on screen would show it too early. Add the first step's mobjects now and
-        each later step's when that step starts."""
+        """Never re-add a group whose parts are already on screen (that would draw filled shapes over their labels)."""
         curr = self.get_mobject_family_members()
 
-        def visit(a, first):
-            if isinstance(a, Succession):
-                for i, s in enumerate(a.animations):
-                    if first and i == 0:
-                        visit(s, True)
-                    else:
-                        _defer_add(s)
-                return
+        def visit(a):
             if isinstance(a, AnimationGroup):
                 for s in a.animations:
-                    visit(s, first)
+                    visit(s)
                 return
-            if a.is_introducer() or a.mobject is None:
+            if a.is_introducer() or a.mobject is None or a.mobject in curr:
                 return
-            if a.mobject not in curr:
-                self.add(a.mobject)
-                curr.extend(a.mobject.get_family())
+            fam = a.mobject.get_family()
+            if len(fam) > 1 and all(m in curr for m in fam[1:]):
+                return
+            self.add(a.mobject)
+            curr.extend(fam)
 
         for a in animations:
-            visit(a, True)
+            visit(a)
 
-    def play(self, *anims, **kw):
-        for a in anims:
-            _layer(a.mobject)
-            if getattr(a, "target_mobject", None) is not None:
-                _layer(a.target_mobject)
-        for m in self.mobjects:
-            _layer(m)
-        super().play(*anims, **kw)
-        for m in self.mobjects:
-            _layer(m)
+    def remove(self, *mobjects):
+        fam = []
+        for m in mobjects:
+            fam.extend(m.get_family())
+        return super().remove(*fam)
+
+    def steps(self, text, items, after=0.3):
+        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
+        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        path, dur = voice(text)
+        self._cue(text, dur)
+        self.add_sound(path)
+        t = 0.0
+        for it in items:
+            if isinstance(it, str):
+                target = dur * text.index(it) / len(text)
+                if target - t > 0.02:
+                    self.wait(target - t)
+                    t = target
+                continue
+            if isinstance(it, (int, float)):
+                self.wait(it)
+                t += it
+                continue
+            fn, rt = it
+            self.play(*fn(), run_time=rt)
+            t += rt
+        if dur - t > 0.02:
+            self.wait(dur - t)
+        if after:
+            self.wait(after)
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def flash(m, color=YELLOW_M, s=1.06):
-    """Pulse an opaque box and recolour its outline, so the label stays readable."""
-    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color)
+def fillc(color, a=0.14):
+    if ManimColor(color).to_hex().upper() == "#FFFFFF":
+        return BLACK
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def flow(path, color=YELLOW_M, run_time=1.0):
-    """A dot that runs along a line, invisible until its turn, so it can sit inside a Succession."""
-    d = Dot(radius=0.08, color=color).move_to(path.get_start()).set_opacity(0)
-    line = Line(path.get_start(), path.get_end())
-    return Succession(d.animate(run_time=0.05).set_opacity(1), MoveAlongPath(d, line, rate_func=smooth, run_time=run_time),
-                      FadeOut(d, run_time=0.15))
+def glow(m, color=YELLOW_M, s=1.03):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-CODE = ["charge(...)", "reserve(...)", "sleep(24 h)", "ship(...)", "return SHIPPED"]
-CODE_X, CODE_Y = -5.85, [1.8, 1.25, 0.7, 0.15, -0.4]
-EVENTS = ["1  Charge scheduled", "2  Charge done: ch_1", "3  Reserve scheduled", "4  Reserve done: res_1",
-          "5  Timer started: 24 h", "6  Timer fired", "7  Ship scheduled", "8  Ship done: trk_1"]
-EV_X, EV_Y = -2.5, [1.9 - 0.42 * k for k in range(8)]
-WX = 4.75
-W1Y, W2Y, BKY = 1.8, 0.35, -1.25
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def panel(x0, x1, top, bot, color):
+    return RoundedRectangle(corner_radius=0.14, width=x1 - x0, height=top - bot, stroke_color=color, stroke_width=3).set_fill(
+        fillc(color), 1).move_to([(x0 + x1) / 2, (top + bot) / 2, 0])
 
 
 def code_line(i, color=WHITE):
-    return M(CODE[i], 20, color).move_to([0, CODE_Y[i], 0]).align_to([CODE_X, 0, 0], LEFT)
+    return left_at(M(CODE[i], 22, color), CD_X0 + 0.35, CODE_Y[i])
 
 
-def event(k, color=WHITE):
-    return M(EVENTS[k], 20, color).move_to([0, EV_Y[k], 0]).align_to([EV_X, 0, 0], LEFT)
+def cursor(i):
+    return RoundedRectangle(corner_radius=0.08, width=CD_X1 - CD_X0 - 0.3, height=0.48, stroke_color=YELLOW_M, stroke_width=4).move_to(
+        [CD_CX, CODE_Y[i], 0])
 
 
-def wbox(y, label, color):
-    r = RoundedRectangle(corner_radius=0.14, width=2.6, height=1.0, stroke_color=color, stroke_width=3)
-    return r.set_fill(BLACK, opacity=1).move_to([WX, y, 0])
+def event(i, s, color=WHITE):
+    return VGroup(T(str(i + 1), 18, GREY_B).move_to([HS_X0 + 0.32, EV_Y[i], 0]), left_at(M(s, 19, color), HS_X0 + 0.62, EV_Y[i]))
 
 
-def wname(y, s, color=WHITE):
-    return T(s, 26, color).move_to([WX, y + 0.2, 0])
+def rbox(k, color):
+    return RoundedRectangle(corner_radius=0.12, width=RC_W, height=W_H[k], stroke_color=color, stroke_width=3).set_fill(
+        fillc(color), 1).move_to([RC_X, W_Y[k], 0])
 
 
-def wstat(y, s, color=GREY_B):
-    return T(s, 20, color).move_to([WX, y - 0.24, 0])
+def rname(k, s):
+    return T(s, 24).move_to([RC_X, W_Y[k] + 0.2, 0])
 
 
-def cursor(i, color=YELLOW_M):
-    return Triangle(fill_color=color, fill_opacity=1, stroke_width=0).scale(0.09).rotate(-PI / 2).move_to([CODE_X - 0.28, CODE_Y[i], 0])
+def rstat(k, s, color=GREY_B):
+    return T(s, 18, color).move_to([RC_X, W_Y[k] - 0.22, 0])
 
 
-class DurableReplay(Layered):
-    """enc-05: a durable workflow records each step in the server's event history, its worker dies during the
-    24-hour sleep, and another worker replays the code against the history without charging the card again;
-    then why the charge activity still needs an idempotency key. Events and ids follow the lesson's stepper."""
+def path_dot(pts, color=YELLOW_M, rt=0.7):
+    path = VMobject().set_points_as_corners([np.array(p) for p in pts])
+    d = Dot(radius=0.08, color=color).move_to(pts[0])
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, path, rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.15))
+
+
+def w_to_bank(k="w1", color=YELLOW_M, back=False):
+    """A dot from a worker round the right edge to the bank (or back)."""
+    x0, xr = RC_X + RC_W / 2, RC_X + RC_W / 2 + 0.25
+    pts = [[x0, W_Y[k], 0], [xr, W_Y[k], 0], [xr, W_Y["bank"], 0], [x0, W_Y["bank"], 0]]
+    return path_dot(pts[::-1] if back else pts, color)
+
+
+def w_to_hist(k="w1", color=YELLOW_M, back=False):
+    pts = [[RC_X - RC_W / 2 - 0.05, W_Y[k], 0], [HS_X1 + 0.05, W_Y[k], 0]]
+    return path_dot(pts[::-1] if back else pts, color, 0.5)
+
+
+def hist_to_bank(color=YELLOW_M, back=False):
+    pts = [[HS_X1 + 0.05, W_Y["bank"], 0], [RC_X - RC_W / 2 - 0.05, W_Y["bank"], 0]]
+    return path_dot(pts[::-1] if back else pts, color, 0.5)
+
+
+def ev_to_code(e, c, color=GREEN_M):
+    pts = [[HS_X0 + 0.1, EV_Y[e], 0], [CD_X1 - 0.1, CODE_Y[c], 0]]
+    return path_dot(pts, color, 0.55)
+
+
+class DurableReplay(Base):
+    """enc-05, section 2. An order (charge, reserve, sleep 24 h, ship) whose program restarts after the charge. Running
+    it again from the top charges twice. The shop's instruction sheet and notebook, handed over at a change of shift.
+    Durable execution: workflow, activities, event history (Temporal). Worker-1 writes events 1 to 5 and is killed;
+    worker-2 replays: charge and reserve come from the history, the sleep returns, ship runs for real. The demo:
+    worker-2 ran charge=0 reserve=0 ship=1, cards charged: 1. Three rules (the notebook breaks at the gap), a check."""
+
+    def cap(self, s, color=GREY_B, size=24, mono=False):
+        new = (M if mono else T)(s, size, color).move_to([0, CAP_Y, 0])
+        fit(new, 13.0)
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def stat(self, k, s, color=GREY_B):
+        new = rstat(k, s, color)
+        old, self.st[k] = self.st.get(k), new
+        return [swap(old, new)]
+
+    def unstat(self, k):
+        old, self.st[k] = self.st.get(k), None
+        return [FadeOut(old)] if old is not None else []
+
+    def name(self, k, s):
+        new = rname(k, s)
+        old, self.nm[k] = self.nm.get(k), new
+        return [swap(old, new)]
+
+    def ev(self, i, s, color=WHITE):
+        new = event(i, s, color)
+        old, self.evs[i] = self.evs[i], new
+        return [swap(old, new, RIGHT)]
+
+    def cur(self, i):
+        if self.curm is None:
+            self.curm = cursor(i)
+            return [Create(self.curm)]
+        return [self.curm.animate.move_to(cursor(i))]
+
+    def uncur(self):
+        old, self.curm = self.curm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def charged(self, n, color=WHITE):
+        return self.stat("bank", f"cards charged: {n}", color)
 
     def construct(self):
-        self.title_card("Durable execution", "record every step, then replay")
+        self.capm = self.curm = None
+        self.st, self.nm = {}, {}
+        self.evs = [None] * 8
+        self.title_card("Write it down, then replay", "how a program carries on after a crash")
 
-        code_r = RoundedRectangle(corner_radius=0.14, width=3.35, height=3.0, stroke_color=GREY_D, stroke_width=2)
-        code_r.set_fill(BLACK, 1).move_to([-4.78, 0.7, 0])
-        code_t = T("workflow code", 22, GREY_B).move_to([-4.78, 2.58, 0])
-        code = VGroup(*[code_line(i) for i in range(5)])
+        # ---------------- scene 1: processing, forever ----------------
+        page = VGroup(RoundedRectangle(corner_radius=0.12, width=3.4, height=1.3, stroke_color=GREY_B, stroke_width=2.5).set_fill(BLACK, 1),
+                      VGroup(T("your order", 22, GREY_B), T("Processing...", 30)).arrange(DOWN, buff=0.15))
+        page[1].move_to(page[0])
+        page.move_to([HS_CX, 0.6, 0])
+        self.steps("Picture ordering a book online. That evening, your banking app shows the money gone. "
+                   "A week later, there's no parcel, and the order page still says: Processing.", [
+            "your banking app",
+            (lambda: [*self.cap("your bank: the money is gone", WHITE)], 0.6),
+            "A week later",
+            (lambda: [FadeIn(page, shift=0.1 * UP)], 0.8),
+            "still says",
+            (lambda: [Indicate(page[1][1], color=WHITE, scale_factor=1.1)], 0.9),
+        ])
+        code_box = VGroup(panel(CD_X0, CD_X1, CD_TOP, CD_BOT, WHITE), T("the order's code", 22, GREY_B).move_to([CD_CX, CD_TOP - 0.35, 0]))
+        lines = [code_line(i) for i in range(5)]
+        w1 = rbox("w1", TEAL_M)
+        bank = rbox("bank", GOLD_M)
+        self.steps("Behind that page, the shop's program had a few jobs. Charge your card. Set a copy of the book aside in the warehouse. "
+                   "Wait a day, then book a courier. In code, that's a few lines, run one after another.", [
+            (lambda: [*self.uncap(), FadeIn(code_box)], 0.6),
+            "Charge your card",
+            (lambda: [FadeIn(lines[0], shift=0.1 * RIGHT)], 0.4),
+            "Set a copy",
+            (lambda: [FadeIn(lines[1], shift=0.1 * RIGHT)], 0.4),
+            "Wait a day",
+            (lambda: [FadeIn(lines[2], shift=0.1 * RIGHT)], 0.4),
+            "book a courier",
+            (lambda: [FadeIn(lines[3], shift=0.1 * RIGHT), FadeIn(lines[4], shift=0.1 * RIGHT)], 0.4),
+            "In code",
+            (lambda: [FadeIn(w1), *self.name("w1", "the shop's program"), *self.stat("w1", "running"),
+                      FadeIn(bank), *self.name("bank", "the bank"), *self.charged(0)], 0.7),
+        ])
+        self.steps("It charged the card. Then its computer restarted for an update.", [
+            (lambda: self.cur(0), 0.4),
+            (lambda: [w_to_bank()], 0.8),
+            (lambda: self.charged(1), 0.4),
+            (lambda: self.cur(1), 0.4),
+            "restarted",
+            (lambda: [w1.animate.set_stroke(RED_M), *self.stat("w1", "restarted", RED_M)], 0.6),
+        ])
+        self.steps("Everything the program held in memory, including which line it had reached, was gone. "
+                   "Nothing will ever come back for the other jobs.", [
+            "including which line",
+            (lambda: [Indicate(self.curm, color=RED_M), *self.cap("memory wiped: which line it had reached, gone", RED_M)], 0.8),
+            (lambda: self.uncur(), 0.6),
+            "Nothing will",
+            (lambda: [*[l.animate.set_opacity(0.35) for l in lines[1:4]]], 0.8),
+        ])
+        qm = T("?", 56, YELLOW_M).move_to([HS_CX, -1.0, 0])
+        self.steps("So here's the question. After a crash, how does a program carry on from where it stopped?", [
+            (lambda: [FadeIn(qm, scale=0.6), *self.cap("after a crash: carry on from where it stopped?", YELLOW_M)], 0.7),
+        ])
 
-        self.beat("An order takes three calls: charge the card, reserve the item, and ship it. "
-                  "If the process dies in between, the card is charged and nothing else happens.",
-                  Succession(AnimationGroup(FadeIn(code_r), FadeIn(code_t), run_time=0.6),
-                             LaggedStart(*[FadeIn(c, shift=0.15 * RIGHT) for c in code], lag_ratio=0.3, run_time=2.4), Wait(1.6),
-                             AnimationGroup(Indicate(code[0], color=RED_M), code[1:].animate.set_opacity(0.35), run_time=1.2)),
-                  run_time=7.4)
+        # ---------------- scene 2: run it from the top? ----------------
+        self.steps("The tempting fix: when the program starts again, run the order from the top. Each step worked the first time, "
+                   "so it feels safe. Let's try it. Charge... and the bank charges the card a second time.", [
+            (lambda: [FadeOut(qm), FadeOut(page), *[l.animate.set_opacity(1) for l in lines[1:4]],
+                      w1.animate.set_stroke(TEAL_M), *self.stat("w1", "started again"), *self.cap("run it again from the top?", PURPLE_M)], 0.7),
+            "Let's try it",
+            (lambda: self.cur(0), 0.4),
+            "the bank charges",
+            (lambda: [w_to_bank(color=PURPLE_M)], 0.8),
+            (lambda: [*self.charged(2, RED_M), glow(bank, RED_M)], 0.6),
+        ])
+        self.steps("Two charges, and still no book. That's a bookshop with a very odd business model.", [
+            (lambda: self.cap("two charges, and still no book", RED_M), 0.6),
+        ], after=0.5)
+        self.steps("What we want is the same plain lines of code, and a program that remembers what it already did, even when its memory is wiped.", [
+            (lambda: [*self.uncur(), *self.charged(1), *self.stat("w1", "running")], 0.6),
+            "the same plain",
+            (lambda: [glow(code_box[0], WHITE, 1.02)], 0.8),
+            "remembers",
+            (lambda: self.cap("same code, and a program that remembers what it already did", YELLOW_M), 0.6),
+        ])
 
-        hist_r = RoundedRectangle(corner_radius=0.14, width=4.15, height=3.65, stroke_color=GREY_D, stroke_width=2)
-        hist_r.set_fill(BLACK, 1).move_to([-0.675, 0.425, 0])
-        hist_t = T("event history (server)", 22, GREY_B).move_to([-0.675, 2.58, 0])
-        w1, w2 = wbox(W1Y, "worker-1", BLUE_M), wbox(W2Y, "worker-2", GREY_D)
-        w1n, w2n = wname(W1Y, "worker-1"), wname(W2Y, "worker-2", GREY_B)
-        w1s, w2s = wstat(W1Y, "running the order"), wstat(W2Y, "not started")
-        bank = wbox(BKY, "bank", GOLD_M)
-        bank_n = wname(BKY, "bank")
-        bank_c = wstat(BKY, "cards charged: 0", GREY_B)
-        l1 = DashedLine([1.45, W1Y, 0], [WX - 1.35, W1Y, 0], dash_length=0.08, stroke_width=2, color=GREY_D)
-        l2 = DashedLine([1.45, W2Y, 0], [WX - 1.35, W2Y, 0], dash_length=0.08, stroke_width=2, color=GREY_D)
-        lb = Arrow([1.45, BKY, 0], [WX - 1.38, BKY, 0], buff=0, stroke_width=3, color=GREY_D, max_tip_length_to_length_ratio=0.12)
-        cur = cursor(0)
-        self.beat("Durable execution keeps this code and makes it survive the crash. "
-                  "A server keeps an event history for every run.",
-                  Succession(AnimationGroup(code[1:].animate.set_opacity(1), run_time=0.6),
-                             AnimationGroup(FadeIn(VGroup(w1, w1n, w1s)), FadeIn(VGroup(w2, w2n, w2s)), FadeIn(VGroup(bank, bank_n, bank_c)),
-                                            run_time=1.0), Wait(1.4),
-                             AnimationGroup(FadeIn(hist_r), FadeIn(hist_t), run_time=0.8),
-                             AnimationGroup(Create(l1), Create(l2), GrowArrow(lb), run_time=0.8)), run_time=6.6)
+        # ---------------- scene 3: the shop's notebook ----------------
+        hist = VGroup(panel(HS_X0, HS_X1, HS_TOP, HS_BOT, BLUE_M), T("notebook", 22, BLUE_M).move_to([HS_CX, HS_TOP - 0.35, 0]))
+        w2 = rbox("w2", TEAL_M)
+        r_sheet = T("instruction sheet", 20, GREY_B).move_to([CD_CX, CD_BOT - 0.33, 0])
+        r_book = T("notebook", 20, GREY_B).move_to([HS_CX, HS_BOT - 0.33, 0])
+        r_shift = T("workers on shifts", 20, GREY_B).move_to([RC_X, W_Y["w1"] + 0.82, 0])
+        hand = [left_at(T("10:02  charged the card: ch_1", 20, BLUE_M, slant=ITALIC), HS_X0 + 0.3, EV_Y[0]),
+                left_at(T("set the book aside: res_1", 20, BLUE_M, slant=ITALIC), HS_X0 + 0.3, EV_Y[1])]
+        self.steps("Picture a shop with workers on shifts. Each order has an instruction sheet, and a notebook beside it.", [
+            (lambda: [*self.uncap(), FadeIn(w2), *self.name("w1", "worker 1"), *self.stat("w1", "on shift"),
+                      *self.name("w2", "worker 2"), *self.stat("w2", "next shift"), FadeIn(r_shift)], 0.8),
+            "an instruction sheet",
+            (lambda: [FadeIn(r_sheet), glow(code_box[0], WHITE, 1.02)], 0.6),
+            "a notebook",
+            (lambda: [FadeIn(hist), FadeIn(r_book)], 0.7),
+        ])
+        self.steps("The first worker does a step, then writes it in the notebook: ten oh two, charged the card, here's the receipt. "
+                   "Sets the book aside, and writes that down too.", [
+            (lambda: self.cur(0), 0.4),
+            (lambda: [w_to_bank()], 0.7),
+            "writes it in",
+            (lambda: [Write(hand[0])], 0.9),
+            "Sets the book",
+            (lambda: self.cur(1), 0.4),
+            "writes that",
+            (lambda: [Write(hand[1])], 0.8),
+        ])
+        ticks = [tick(True, 0.13).move_to([CD_X1 - 0.35, CODE_Y[i], 0]) for i in range(2)]
+        self.steps("At the change of shift, the next worker has never seen this order. So they read the sheet from the top, with the notebook open.", [
+            (lambda: [*self.uncur(), *self.stat("w1", "gone home"), w1.animate.set_opacity(0.4),
+                      *self.stat("w2", "on shift", WHITE)], 0.7),
+            "read the sheet",
+            (lambda: self.cur(0), 0.5),
+            "notebook open",
+            (lambda: [glow(hist[0], BLUE_M, 1.02)], 0.8),
+        ])
+        self.steps("Every step the notebook shows, they skip, and use the result written there. They start work at the first step with no entry.", [
+            (lambda: [ev_to_code(0, 0, BLUE_M), Create(ticks[0])], 0.6),
+            (lambda: self.cur(1), 0.4),
+            (lambda: [ev_to_code(1, 1, BLUE_M), Create(ticks[1])], 0.6),
+            "They start work",
+            (lambda: self.cur(2), 0.5),
+            (lambda: [glow(self.curm, GREEN_M, 1.05), *self.cap("start at the first step with no entry", GREEN_M)], 0.8),
+        ])
 
-        ev = [event(k) for k in range(8)]
-        cmd = Line([WX - 1.35, W1Y, 0], [1.45, W1Y, 0])
-        self.beat("When worker 1 reaches charge, it doesn't call the bank itself. The server records that the charge is scheduled, "
-                  "and an activity worker calls the bank.",
-                  Succession(FadeIn(cur, run_time=0.4), Indicate(code[0], color=YELLOW_M, run_time=0.9), Wait(1.4),
-                             flow(cmd, BLUE_M, 0.7), FadeIn(ev[0], shift=0.15 * RIGHT, run_time=0.5), Wait(1.0),
-                             flow(lb, GOLD_M, 0.6),
-                             AnimationGroup(Transform(bank_c, wstat(BKY, "cards charged: 1", GOLD_M)), flash(bank, GOLD_M), run_time=0.7)),
-                  run_time=8.6)
+        # ---------------- scene 4: name the parts ----------------
+        h_title = T("event history (server)", 22, BLUE_M).move_to(hist[1])
+        c_title = T("workflow code", 22, GREY_B).move_to(code_box[1])
+        self.steps("In software, this idea is called durable execution. Durable means it lasts through a crash.", [
+            (lambda: [*self.uncap(), *self.uncur(), FadeOut(VGroup(*ticks)), FadeOut(hand[0]), FadeOut(hand[1]),
+                      w1.animate.set_opacity(1), w1.animate.set_stroke(TEAL_M), *self.unstat("w1"), *self.unstat("w2")], 0.7),
+            "durable execution",
+            (lambda: self.cap("durable execution: it lasts through a crash", YELLOW_M), 0.6),
+        ])
+        acts = [0, 1, 3]
+        self.steps("The sheet is your code, called the workflow: the part that decides what happens next. "
+                   "The steps that touch the outside world, charge, reserve and ship, are called activities.", [
+            "called the workflow",
+            (lambda: [swap(code_box[1], c_title), swap(r_sheet, T("the workflow", 20, WHITE).move_to(r_sheet))], 0.7),
+            "are called activities",
+            (lambda: [*[lines[i].animate.set_color(GOLD_M) for i in acts], *self.cap("activities: the steps that touch the outside world", GOLD_M)], 0.8),
+        ])
+        r_book2 = T("each line: an event", 20, WHITE).move_to(r_book)
+        self.steps("The notebook is the event history, and each line in it is an event. And the workers are your programs.", [
+            (lambda: [swap(hist[1], h_title)], 0.6),
+            "each line in it",
+            (lambda: [swap(r_book, r_book2)], 0.6),
+            "the workers are",
+            (lambda: [*self.name("w1", "worker-1"), *self.name("w2", "worker-2"),
+                      swap(r_shift, T("workers: your programs", 20, GREY_B).move_to(r_shift))], 0.7),
+        ])
+        self.steps("Temporal is one well-known engine that works this way: a free program that keeps the history of every workflow, "
+                   "on a server, in a database of its own.", [
+            (lambda: self.cap("Temporal: a free program that keeps the history of every workflow", WHITE), 0.6),
+            "on a server",
+            (lambda: [glow(hist[0], BLUE_M, 1.02)], 0.8),
+        ])
 
-        self.beat("The result, charge ch_1, goes into the history. Reserve works the same way.",
-                  Succession(FadeIn(ev[1], shift=0.15 * RIGHT, run_time=0.6), Wait(1.4),
-                             AnimationGroup(cur.animate.move_to(cursor(1)), run_time=0.4), flow(cmd, BLUE_M, 0.5),
-                             FadeIn(ev[2], shift=0.15 * RIGHT, run_time=0.4), FadeIn(ev[3], shift=0.15 * RIGHT, run_time=0.4)),
-                  run_time=5.4)
+        # ---------------- scene 5: worker-1 writes it down ----------------
+        self.steps("Watch worker-1 run the order. At charge, Temporal's library, the part of Temporal inside your program, "
+                   "doesn't call the bank itself. It asks the server to schedule the charge. The server writes: Charge scheduled.", [
+            (lambda: [*self.uncap(), FadeOut(r_book2), *self.charged(0), *self.stat("w1", "running the order", WHITE)], 0.6),
+            "At charge",
+            (lambda: self.cur(0), 0.4),
+            "doesn't call",
+            (lambda: [*self.cap("the library doesn't call the bank itself", WHITE)], 0.5),
+            "It asks",
+            (lambda: [w_to_hist()], 0.6),
+            "Charge scheduled",
+            (lambda: self.ev(0, "Charge scheduled"), 0.5),
+        ])
+        self.steps("The bank charges the card, and the server writes: Charge done, with the receipt.", [
+            (lambda: [hist_to_bank()], 0.6),
+            (lambda: self.charged(1), 0.4),
+            "the server writes",
+            (lambda: [hist_to_bank(GREEN_M, back=True)], 0.5),
+            (lambda: self.ev(1, "Charge done: ch_1", GREEN_M), 0.5),
+        ])
+        self.steps("Reserve goes the same way: scheduled, then done. Then the sleep for a day becomes a timer. The server writes: Timer started.", [
+            (lambda: [*self.uncap(), *self.cur(1), w_to_hist()], 0.6),
+            "scheduled",
+            (lambda: self.ev(2, "Reserve scheduled"), 0.4),
+            "then done",
+            (lambda: self.ev(3, "Reserve done: res_1", GREEN_M), 0.4),
+            "Then the sleep",
+            (lambda: [*self.cur(2), w_to_hist()], 0.6),
+            "Timer started",
+            (lambda: self.ev(4, "Timer started: 24 h"), 0.4),
+        ])
+        self.steps("No thread, no path of work in your program, waits a whole day.", [
+            (lambda: [*self.stat("w1", "free for other work"), *self.cap("no thread waits a whole day", WHITE)], 0.6),
+        ])
+        self.steps("Now we kill worker-1. Everything it held in memory about this order is gone. The history is untouched.", [
+            (lambda: [*self.uncap(), w1.animate.set_stroke(RED_M), *self.stat("w1", "killed", RED_M)], 0.6),
+            "Everything it held",
+            (lambda: [*self.uncur(), w1.animate.set_opacity(0.4)], 0.6),
+            "The history",
+            (lambda: [glow(hist[0], BLUE_M, 1.02)], 0.8),
+        ])
 
-        self.beat("The workflow then sleeps for 24 hours. That becomes a timer in the server, so no thread waits for a day.",
-                  Succession(AnimationGroup(cur.animate.move_to(cursor(2)), run_time=0.4), Wait(1.4), flow(cmd, BLUE_M, 0.5),
-                             FadeIn(ev[4], shift=0.15 * RIGHT, run_time=0.5), Wait(0.8),
-                             Transform(w1s, wstat(W1Y, "idle"), run_time=0.5)), run_time=6.0)
+        # ---------------- scene 6: a guess ----------------
+        qb = T("?", 40, YELLOW_M).move_to([RC_X + RC_W / 2 - 0.3, W_Y["bank"] + 0.2, 0])
+        self.steps("A day later, the timer fires, and the server hands the order to worker-2, which has never seen it. "
+                   "So who calls the bank this time? Pause and guess.", [
+            (lambda: self.ev(5, "Timer fired"), 0.5),
+            "hands the order",
+            (lambda: [w_to_hist("w2", back=True), *self.stat("w2", "gets the task", WHITE)], 0.6),
+            "who calls the bank",
+            (lambda: [FadeIn(qb, scale=0.6)], 0.5),
+            "Pause and guess",
+            (lambda: self.cap("pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
 
-        self.beat("Now a deploy kills worker 1. Everything it held in memory is gone, but the history is safe in the server.",
-                  Succession(AnimationGroup(w1.animate.set_stroke(RED_M), Transform(w1s, wstat(W1Y, "killed", RED_M)), FadeOut(cur),
-                                            run_time=0.8),
-                             Wait(2.4), AnimationGroup(flash(hist_r, GREEN_M, 1.02), run_time=1.2)), run_time=6.2)
+        # ---------------- scene 7: replay ----------------
+        self.steps("Worker-2 runs the code from the first line. Wait, from the top? That's the fix that charged twice. Here's the difference.", [
+            (lambda: [*self.uncap(), FadeOut(qb), *self.stat("w2", "replaying", WHITE)], 0.5),
+            (lambda: self.cur(0), 0.5),
+            "Wait, from the top",
+            (lambda: self.cap("from the top? that's the fix that charged twice...", PURPLE_M), 0.6),
+        ])
+        self.steps("At charge, the library finds Charge done in the history, and hands back the receipt at once. The bank isn't called.", [
+            (lambda: [*self.uncap(), Indicate(self.evs[1], color=GREEN_M, scale_factor=1.06)], 0.8),
+            "hands back",
+            (lambda: [ev_to_code(1, 0)], 0.6),
+            "The bank isn't",
+            (lambda: [glow(bank, GREEN_M), *self.cap("the bank isn't called", GREEN_M)], 0.8),
+        ])
+        self.steps("Reserve: its result comes from the history too. And the sleep returns at once, because its timer already fired.", [
+            (lambda: [*self.uncap(), *self.cur(1)], 0.4),
+            (lambda: [ev_to_code(3, 1)], 0.6),
+            "And the sleep",
+            (lambda: self.cur(2), 0.4),
+            (lambda: [ev_to_code(5, 2)], 0.6),
+        ])
+        self.steps("Then the code reaches ship. There's no event for it. So this time, the library schedules it for real. Ship done.", [
+            (lambda: self.cur(3), 0.4),
+            "no event",
+            (lambda: [Indicate(VGroup(*[e for e in self.evs if e is not None]), color=BLUE_M, scale_factor=1.0)], 0.6),
+            "for real",
+            (lambda: [w_to_hist("w2")], 0.5),
+            (lambda: self.ev(6, "Ship scheduled"), 0.4),
+            "Ship done",
+            (lambda: self.ev(7, "Ship done: trk_1", GREEN_M), 0.4),
+        ])
+        self.steps("The order returns: SHIPPED.", [
+            (lambda: [*self.cur(4), lines[4].animate.set_color(GREEN_M)], 0.6),
+        ])
+        self.steps("The lesson's demo prints the same. Worker-2 ran charge zero times, reserve zero times, ship once. Cards charged: one.", [
+            (lambda: [*self.uncur(), *self.cap("worker-2 ran charge=0 reserve=0 ship=1     cards charged: 1", WHITE, 22, mono=True)], 0.7),
+            "Cards charged",
+            (lambda: [glow(bank, GREEN_M), Indicate(self.st["bank"], color=GREEN_M)], 0.8),
+        ])
+        self.steps("Running the code again against its history is called replay.", [
+            (lambda: [*self.cap("replay: run the code again against its history", YELLOW_M), *self.stat("w2", "done", GREEN_M)], 0.6),
+        ])
+        self.steps("A colleague who reads the notes before touching anything. Every shop could use one.", [
+            (lambda: [glow(w2, TEAL_M)], 0.8),
+        ], after=0.5)
 
-        cur2 = cursor(0, TEAL_M)
-        cmd2 = Line([WX - 1.35, W2Y, 0], [1.45, W2Y, 0])
-        self.beat("A day later the timer fires, and worker 2 gets the task. "
-                  "It has never seen this order, so it runs the workflow from the first line.",
-                  Succession(FadeIn(ev[5], shift=0.15 * RIGHT, run_time=0.5), Wait(0.8),
-                             AnimationGroup(w2.animate.set_stroke(TEAL_M), w2n.animate.set_color(WHITE),
-                                            Transform(w2s, wstat(W2Y, "replaying", TEAL_M)), Transform(w1s, wstat(W1Y, "gone", RED_M)),
-                                            run_time=0.8), Wait(2.4), FadeIn(cur2, run_time=0.5)), run_time=7.4)
+        # ---------------- scene 8: three things to keep in mind ----------------
+        self.steps("Three things to keep in mind. One: the workflow code never touches the outside world itself. "
+                   "It runs again on every replay, so a bank call written straight into it would run again too.", [
+            (lambda: self.cap("1. the workflow code never touches the outside world itself", WHITE), 0.6),
+            "It runs again",
+            (lambda: [glow(code_box[0], WHITE, 1.02)], 0.8),
+            "a bank call",
+            (lambda: self.cap("it runs again on every replay: only activities call out", WHITE), 0.6),
+        ])
+        self.steps("Two: a healthy worker rarely replays. It keeps recent orders in memory, and the server sends its next task back to it. "
+                   "Replay is for when a worker dies.", [
+            (lambda: self.cap("2. a healthy worker rarely replays: replay is for when one dies", WHITE), 0.6),
+            "sends its next task",
+            (lambda: [w_to_hist("w2", back=True)], 0.6),
+        ])
+        gap = VGroup(DashedVMobject(RoundedRectangle(corner_radius=0.08, width=HS_X1 - HS_X0 - 0.3, height=0.42, stroke_color=RED_M,
+                                                     stroke_width=3), num_dashes=40)).move_to([HS_CX, EV_Y[1], 0])
+        self.steps("Three: here's where the notebook breaks. A worker who charged the card, and died before writing it down, leaves no trace. "
+                   "So the next one charges again.", [
+            (lambda: self.cap("3. where the notebook breaks", RED_M), 0.6),
+            "A worker who charged",
+            (lambda: [hist_to_bank(), self.evs[1].animate.set_opacity(0.15), Create(gap)], 0.7),
+            "leaves no trace",
+            (lambda: self.cap("charged, but not written down yet: no trace", RED_M), 0.6),
+            "charges again",
+            (lambda: [hist_to_bank(RED_M), *self.charged(2, RED_M)], 0.7),
+        ])
+        self.steps("That's why each step still needs a key, so the bank can spot a repeat.", [
+            (lambda: self.cap("so each step still needs a key, and the bank spots the repeat", YELLOW_M), 0.6),
+            "spot a repeat",
+            (lambda: [*self.charged(1, WHITE), self.evs[1].animate.set_opacity(1), FadeOut(gap)], 0.7),
+        ])
 
-        hl = lambda k: SurroundingRectangle(ev[k], color=TEAL_M, buff=0.07, corner_radius=0.06, stroke_width=2.5)
-        h2 = hl(1)
-        self.beat("At charge, the history already holds the result. So it returns ch_1 at once, and the bank is not called again.",
-                  Succession(Indicate(code[0], color=TEAL_M, run_time=0.8), Create(h2, run_time=0.6), Wait(1.6),
-                             AnimationGroup(code[0].animate.set_color(TEAL_M), run_time=0.5), Wait(0.8),
-                             Indicate(bank_c, color=GOLD_M, run_time=1.0)), run_time=6.8)
-
-        h4, h6 = hl(3), hl(5)
-        self.beat("Reserve and sleep replay the same way. This is replay: run the code again, "
-                  "and answer each finished step from the history.",
-                  Succession(AnimationGroup(cur2.animate.move_to(cursor(1, TEAL_M)), ReplacementTransform(h2, h4),
-                                            code[1].animate.set_color(TEAL_M), run_time=0.8), Wait(0.5),
-                             AnimationGroup(cur2.animate.move_to(cursor(2, TEAL_M)), ReplacementTransform(h4, h6),
-                                            code[2].animate.set_color(TEAL_M), run_time=0.8), Wait(1.0),
-                             FadeOut(h6, run_time=0.4)), run_time=7.4)
-
-        self.beat("At ship, the history runs out, so this time the activity really runs. "
-                  "One charge, one reservation, one parcel.",
-                  Succession(AnimationGroup(cur2.animate.move_to(cursor(3, TEAL_M)), run_time=0.4), Wait(1.4),
-                             flow(cmd2, TEAL_M, 0.5), FadeIn(ev[6], shift=0.15 * RIGHT, run_time=0.4),
-                             FadeIn(ev[7], shift=0.15 * RIGHT, run_time=0.4),
-                             AnimationGroup(cur2.animate.move_to(cursor(4, TEAL_M)), Transform(w2s, wstat(W2Y, "done", GREEN_M)),
-                                            run_time=0.5), Wait(0.6), code[4].animate(run_time=0.9).set_color(GREEN_M)), run_time=7.0)
-
-        # ---- the gap: a charge whose result never got recorded ---------------------------------------------
-        a1n, a2n = wname(W1Y, "attempt 1"), wname(W2Y, "attempt 2")
-        self.beat("One gap is left. Suppose the worker charges the card, then dies before it reports back. "
-                  "The server never records the result.",
-                  Succession(AnimationGroup(FadeOut(VGroup(*ev[1:])), FadeOut(cur2), code.animate.set_color(WHITE).set_opacity(0.35),
-                                            Transform(w1n, a1n), Transform(w1s, wstat(W1Y, "running charge")), w1.animate.set_stroke(BLUE_M),
-                                            Transform(w2n, a2n), Transform(w2s, wstat(W2Y, "not started")), w2.animate.set_stroke(GREY_D),
-                                            Transform(bank_c, wstat(BKY, "cards charged: 0", GREY_B)), run_time=1.0),
-                             Wait(0.8), flow(lb, GOLD_M, 0.6),
-                             AnimationGroup(Transform(bank_c, wstat(BKY, "cards charged: 1", GOLD_M)), flash(bank, GOLD_M), run_time=0.6),
-                             Wait(0.4), AnimationGroup(w1.animate.set_stroke(RED_M), Transform(w1s, wstat(W1Y, "died, no report", RED_M)),
-                                                       run_time=0.6), Wait(1.0), Indicate(ev[0], color=RED_M, run_time=1.0)),
-                  run_time=8.0)
-
-        alo = T("activities run at least once", 24, GOLD_M).move_to([-2.4, -2.6, 0])
-        self.beat("After a timeout, the server runs the charge again, and the bank charges the card a second time. "
-                  "Activities run at least once.",
-                  Succession(Wait(0.8), AnimationGroup(w2.animate.set_stroke(BLUE_M), w2n.animate.set_color(WHITE),
-                                                       Transform(w2s, wstat(W2Y, "running charge")), run_time=0.6),
-                             flow(lb, GOLD_M, 0.6),
-                             AnimationGroup(Transform(bank_c, wstat(BKY, "cards charged: 2", RED_M)), flash(bank, RED_M), run_time=0.7),
-                             Wait(1.6), FadeIn(alo, shift=0.15 * UP, run_time=0.7)), run_time=8.0)
-
-        key = chip("key: order-42/charge", YELLOW_M, 20, mono=True).move_to([WX - 0.35, -2.6, 0])
-        kl = T("the key turns a retry into a replay", 24, GREEN_M).move_to([-2.4, -3.2, 0])
-        self.beat("Give the charge an idempotency key built from the workflow id: order-42 slash charge. Every retry sends the same key, so the bank returns the first charge.",
-                  Succession(AnimationGroup(Transform(bank_c, wstat(BKY, "cards charged: 1", GOLD_M)), run_time=0.5), Wait(0.6),
-                             FadeIn(key, shift=0.2 * UP, run_time=0.7), Wait(2.6), flow(lb, GOLD_M, 0.6),
-                             AnimationGroup(flash(bank, GREEN_M), Transform(bank_c, wstat(BKY, "cards charged: 1", GREEN_M)),
-                                            Transform(w2s, wstat(W2Y, "got ch_1", GREEN_M)), run_time=0.7),
-                             AnimationGroup(FadeIn(ev[1], shift=0.15 * RIGHT), FadeIn(kl, shift=0.15 * UP), run_time=0.7)),
-                  run_time=9.4)
-
-        self.beat("The engine records each step once. The bank still needs the key.",
-                  Succession(Wait(0.4), flash(hist_r, TEAL_M, 1.02), Wait(0.4), Circumscribe(key, color=YELLOW_M, buff=0.08)),
-                  run_time=3.6)
-        self.wait(0.6)
+        # ---------------- scene 9: moral and check ----------------
+        self.steps("So how does a program carry on after a crash? It doesn't remember. It writes every step down outside itself.", [
+            (lambda: self.cap("carry on after a crash?", WHITE), 0.5),
+            "It doesn't remember",
+            (lambda: [glow(w2, GREY_B)], 0.7),
+            "It writes every",
+            (lambda: [glow(hist[0], BLUE_M, 1.02), *self.cap("write every step down outside the program", BLUE_M)], 0.8),
+        ])
+        self.steps("Then any worker can replay the code against those notes: finished steps hand back their recorded answers, "
+                   "and real work starts at the first step with no entry.", [
+            (lambda: self.cap("then replay: finished steps hand back their answers", YELLOW_M), 0.6),
+            "finished steps",
+            (lambda: [LaggedStart(ev_to_code(1, 0), ev_to_code(3, 1), ev_to_code(5, 2), lag_ratio=0.4)], 1.2),
+            "real work starts",
+            (lambda: self.cap("real work starts at the first step with no entry", GREEN_M), 0.6),
+        ], after=0.5)
+        self.steps("One quick check. Suppose worker-1 dies right after Reserve done, before the sleep starts. Worker-2 replays. "
+                   "What's the first thing it does for real? Pause and think.", [
+            (lambda: [*self.uncap(), *[FadeOut(self.evs[i]) for i in range(4, 8)], lines[4].animate.set_color(WHITE),
+                      *self.stat("w2", "replaying", WHITE)], 0.7),
+            "right after Reserve done",
+            (lambda: [Indicate(self.evs[3], color=GREEN_M, scale_factor=1.06)], 0.8),
+            "Pause and think",
+            (lambda: self.cap("pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        for i in range(4, 8):
+            self.evs[i] = None
+        self.countdown(3.0)
+        self.steps("It starts the timer. Charge and reserve come from the history, and the sleep is the first step with no entry.", [
+            (lambda: [*self.uncap(), *self.cur(0), ev_to_code(1, 0)], 0.6),
+            (lambda: [*self.cur(1), ev_to_code(3, 1)], 0.6),
+            (lambda: [*self.cur(2), w_to_hist("w2")], 0.6),
+            (lambda: self.ev(4, "Timer started: 24 h", GREEN_M), 0.5),
+            "Charge and reserve",
+            (lambda: self.cap("charge, reserve: from the history.   sleep: the first step with no entry", GREEN_M), 0.6),
+        ], after=0.3)
+        self.play(*self.cap("write every step down, then replay", YELLOW_M), run_time=0.7)
+        self.wait(2.0)
