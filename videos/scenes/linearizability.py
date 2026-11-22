@@ -1,19 +1,17 @@
 from sfz import *
 
-# a capital A naming a reader is read as the article "uh"
-SAY.insert(0, (r"(^|[.!?]\s+)?\bA\b(?!')", lambda m: m.group(0) if m.group(1) is not None else "eh"))
-SAY.insert(0, (r"\b([Rr])eader A\b", r"\1eader eh"))
-SAY.insert(0, (r"\bR([123])\b", r"R \1"))
+SAY.insert(0, (r"\b(\d+)\.00\b", r"\1"))
+SAY.insert(0, (r"\bHerlihy\b", "Her-lee-hee"))
+SAY.insert(0, (r"\b1990\b", "nineteen ninety"))
 
-W_C, RD_C = GOLD_M, BLUE_M
-X0, X1 = -3.9, 5.7                  # the time axis, left and right ends
-LX = -4.35                          # row labels end here
-RY1 = {"capture": 1.75, "ledger": 0.85, "fraud": -0.05, "email": -0.95}
-AX1 = -1.85                         # part 1 axis (0 to 60 ms)
-RY2 = [2.4, 1.5, 0.6, -0.3, -1.2, -2.1]
-AX2 = -2.8                          # part 2 axis (0 to 90 ms)
-BH = 0.6                            # bar height
-REG = np.array([0, 2.95, 0])
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+CAP_Y, BAR_Y = -3.1, -2.7
+X0, SC = -3.6, 0.15                      # time 0 ms at X0, 0.15 units per ms (60 ms -> 5.4)
+NAME_X = -6.4
+ROW = {"capture": 1.9, "ledger": 0.8, "fraud": -0.3, "email": -1.4}
+NAMES = {"capture": "capture", "ledger": "ledger", "fraud": "fraud checker", "email": "email"}
+AX_Y = -2.15
+REPLAY_Y = 2.95
 
 
 class Base(VoiceScene):
@@ -43,9 +41,7 @@ class Base(VoiceScene):
             fam.extend(m.get_family())
         return super().remove(*fam)
 
-    def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+    def steps(self, text, items, after=0.3):
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -69,247 +65,337 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 12.6).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
 
-def tx(ms, span):
-    return X0 + (X1 - X0) * ms / span
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
 
-
-def seg(t0, t1, y, span, color, label="", lcol=WHITE, size=20, fill=0.16):
-    """One bar on the timeline, from t0 to t1 ms, with its label in the middle."""
-    w = tx(t1, span) - tx(t0, span)
-    r = RoundedRectangle(corner_radius=min(0.1, w / 2.01), width=w, height=BH, stroke_color=color, stroke_width=2.5)
-    r.set_fill(interpolate_color(ManimColor("#000000"), ManimColor(color), fill), opacity=1)
-    r.move_to([(tx(t0, span) + tx(t1, span)) / 2, y, 0])
-    t = T(label, size, lcol).move_to(r.get_center()) if label else VMobject()
-    return VGroup(r, t)
-
-
-def rlabel(s, y, color=GREY_B):
-    t = T(s, 24, color)
-    return t.move_to([LX - t.width / 2, y, 0])
+    def countdown(self, secs=3.0, y=BAR_Y):
+        bar = Line([-1.0, y, 0], [1.0, y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
 
 
-def axis(span, y, step):
-    line = Line([X0, y, 0], [X1, y, 0], stroke_width=2, color=GREY_B)
-    ticks = VGroup(*[Line([tx(m, span), y - 0.07, 0], [tx(m, span), y + 0.07, 0], stroke_width=2, color=GREY_B)
-                     for m in range(0, span + 1, step)])
-    nums = VGroup(*[M(str(m), 18, GREY_B).move_to([tx(m, span), y - 0.3, 0]) for m in range(0, span + 1, step)])
-    unit = T("ms", 20, GREY_B).move_to([X1 + 0.5, y - 0.3, 0])
-    return VGroup(line, ticks, nums, unit)
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def register(value, color=WHITE):
-    r = RoundedRectangle(corner_radius=0.12, width=4.4, height=0.75, stroke_color=WHITE, stroke_width=2.5).set_fill(BLACK, 1)
-    r.move_to(REG)
-    k = T("status", 24, GREY_B).move_to(REG + LEFT * 1.25)
-    v = T(value, 28, color).move_to(REG + RIGHT * 0.55)
-    return VGroup(r, k, v)
+def glow(m, color=YELLOW_M, s=1.05):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def point(ms, y, span, color=YELLOW_M):
-    """A linearization point: a dot on the bar's lower edge."""
-    return Dot([tx(ms, span), y - BH / 2, 0], radius=0.085, color=color)
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def replica(y, switch, span=90):
-    """A replica's value over time: 8 until `switch` ms, then 9."""
-    if switch >= span:
-        return VGroup(seg(0, span, y, span, GREY_B, "8", GREY_B, 22, 0.08), seg(span - 0.5, span, y, span, W_C, "9", WHITE, 22).set_opacity(0))
-    a = seg(0, switch, y, span, GREY_B, "8", GREY_B, 22, 0.08)
-    b = seg(switch, span, y, span, W_C, "9", WHITE, 22)
-    return VGroup(a, b)
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def x(t):
+    return X0 + t * SC
+
+
+def opbar(who, t0, t1, label, color):
+    y = ROW[who]
+    w = (t1 - t0) * SC
+    r = RoundedRectangle(corner_radius=0.08, width=w, height=0.48, stroke_color=color, stroke_width=2.5)
+    r.set_fill(fillc(color, 0.22), 1).move_to([x(t0) + w / 2, y, 0])
+    return VGroup(r, fit(M(label, 20), w - 0.15).move_to(r))
+
+
+def point(who, t, color=YELLOW_M):
+    """A chosen instant: a yellow tick through the bar, with its time above."""
+    y = ROW[who]
+    ln = VGroup(Line([x(t), y + 0.26, 0], [x(t), y + 0.4, 0], stroke_width=5, color=color),
+                Line([x(t), y - 0.4, 0], [x(t), y - 0.26, 0], stroke_width=5, color=color))
+    lab = M(str(t), 18, color).move_to([x(t), y + 0.56, 0])
+    return VGroup(ln, lab)
+
+
+def board(status, color):
+    r = RoundedRectangle(corner_radius=0.12, width=7.0, height=1.7, stroke_color=GREY_B, stroke_width=3).set_fill("#0d0f12", 1)
+    head = T("departures", 20, GREY_B).move_to(r.get_top() + 0.3 * DOWN)
+    train = M("08:15  Riverside", 26)
+    train.move_to(r.get_center() + 0.25 * DOWN).align_to(r, LEFT).shift(0.45 * RIGHT)
+    st = M(status, 26, color).move_to(r.get_center() + 0.25 * DOWN + 2.3 * RIGHT)
+    return VGroup(r, head, train, st)
+
+
+def replay_chip(s, color=WHITE):
+    return chip(s, color, 20, mono=True)
 
 
 class Linearizability(Base):
-    """cons-02: the stepper's register history (a 60 ms capture write, reads by ledger, fraud and email), placing
-    linearization points, the stale read that breaks it, then the lesson's quorum race (w = 2, r = 2) and ABD's fix."""
+    """cons-02, section 0. A café owner's phone says a payment arrived; her list says it hasn't. What does "behave like
+    one copy" demand? A station's departure board flips at one instant and never back (the analogy). The lesson's
+    stepper: capture writes status 2 over 0-60 ms; the ledger (5-15) reads -, the fraud checker (20-30) reads 2, the
+    email program (40-50) reads -. Pick one instant per bar: ledger 10, write 18, fraud 25, and email fails. The second
+    channel, the linearization with email reading 2 (10, 18, 25, 45), the names (Herlihy and Wing, 1990), what
+    "seems" allows, locality, the moral, and an overlap check."""
 
     def construct(self):
-        self.title_card("Linearizability", "one copy, one timeline")
+        self.capm = None
+        self.title_card("One copy, one timeline", "what linearizable demands")
 
-        reg = register("authorized", GREY_B)
-        self.steps("A payment's status is one value that several services read and write. It says authorized.", [
-            (lambda: [FadeIn(reg, shift=0.15 * DOWN)], 1.0),
+        # ---------------- scene 1: the café owner ----------------
+        note = chip("Payment received: 30.00", GREEN_M, 26).move_to([0, 2.3, 0])
+        lst = RoundedRectangle(corner_radius=0.12, width=5.0, height=2.3, stroke_color=GREY_B, stroke_width=2.5).set_fill("#0d0f12", 1)
+        lst.move_to([0, -0.2, 0])
+        lhead = T("payments", 22, GREY_B).move_to(lst.get_top() + 0.32 * DOWN)
+        empty = T("(not here yet)", 22, RED_M).move_to(lst.get_center() + 0.1 * DOWN)
+        row = M("30.00   received", 24, GREEN_M).move_to(lst.get_center() + 0.1 * DOWN)
+        self.steps("A café owner's phone buzzes: payment received, 30.00.", [
+            (lambda: [FadeIn(note, shift=0.2 * DOWN)], 0.6),
+            (lambda: [Wiggle(note, scale_value=1.05)], 0.7),
+        ])
+        self.steps("She opens the payments app to look at it, and the payment isn't in the list. She pulls down to refresh, and there it is.", [
+            (lambda: [FadeIn(VGroup(lst, lhead), shift=0.1 * UP)], 0.6),
+            "isn't in the list",
+            (lambda: [FadeIn(empty)], 0.5),
+            "She pulls down",
+            (lambda: [swap(empty, row, DOWN)], 0.7),
+        ])
+        self.steps("The message was sent after the payment was saved. The list read a copy that hadn't caught up yet.", [
+            (lambda: [glow(note[0], GREEN_M)], 0.7),
+            "The list read",
+            (lambda: [*self.cap("the list read a copy that hadn't caught up yet", WHITE)], 0.5),
+        ])
+        self.steps("It's easy to shrug. A second later, everything agreed. But if the app had used that list to decide whether "
+                   "the payment could be refunded, a second is plenty of time to decide wrong.", [
+            "But if the app",
+            (lambda: self.cap("a refund decided from that list: a second is plenty to decide wrong", RED_M), 0.6),
+        ])
+        self.steps("The usual cure is to make the copies behave like one. So what exactly does one copy demand?", [
+            (lambda: self.cap("behave like one copy: what exactly does that demand?", YELLOW_M), 0.6),
         ])
 
-        ax = axis(60, AX1, 10)
-        lab = {k: rlabel(k, y) for k, y in RY1.items()}
-        wbar = seg(0, 60, RY1["capture"], 60, W_C, "write captured")
-        self.steps("The capture service writes captured. That takes 60 milliseconds, drawn here as a bar on a timeline.", [
-            (lambda: [FadeIn(lab["capture"])], 0.6),
-            "That takes",
-            (lambda: [Create(ax[0]), FadeIn(ax[1:])], 1.0),
-            "drawn here",
-            (lambda: [GrowFromEdge(wbar, LEFT)], 1.2),
+        # ---------------- scene 2: the departure board ----------------
+        bd = board("on time", GREEN_M).move_to([0, 0.6, 0])
+        bd_b = M("boarding", 26, GOLD_M).move_to(bd[3])
+        self.steps("Picture the departure board at a station. One board. At some instant, your train's line flips from on time to boarding.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(note, lst, lhead, row))], 0.6),
+            "Picture the",
+            (lambda: [FadeIn(bd, shift=0.1 * UP)], 0.7),
+            "flips from",
+            (lambda: [swap(bd[3], bd_b, DOWN)], 0.6),
+        ])
+        bd.submobjects[3] = bd_b
+        b4 = T("looked before the flip: on time", 22, GREEN_M).move_to([-3.3, -1.0, 0])
+        b5 = T("after: boarding", 22, GOLD_M).move_to([3.3, -1.0, 0])
+        self.steps("Anyone who looks before the flip sees on time. Anyone after, boarding. If you glance up right while it changes, "
+                   "you get one or the other, never half.", [
+            (lambda: [FadeIn(b4, shift=0.1 * UP)], 0.5),
+            "Anyone after",
+            (lambda: [FadeIn(b5, shift=0.1 * UP)], 0.5),
+            "one or the other",
+            (lambda: self.cap("glance during the change: one or the other, never half"), 0.5),
+        ])
+        self.steps("And once anybody has seen boarding, nobody who looks later can see on time. A board doesn't flip back.", [
+            (lambda: [glow(bd[0], GOLD_M), *self.cap("once anyone has seen boarding, nobody later sees on time", WHITE)], 0.8),
+        ])
+        self.steps("Map it. The board is one copy. The flip is the instant a write takes effect. And each glance is a read.", [
+            (lambda: self.cap("board  =  one copy"), 0.4),
+            "The flip",
+            (lambda: self.cap("the flip  =  the instant a write takes effect"), 0.4),
+            "each glance",
+            (lambda: self.cap("a glance  =  a read"), 0.4),
         ])
 
-        led = seg(5, 15, RY1["ledger"], 60, RD_C)
-        led_v = T("authorized", 20, GREY_B).move_to(led[0])
-        fr = seg(20, 30, RY1["fraud"], 60, RD_C)
-        fr_v = T("captured", 20).move_to(fr[0])
-        self.steps("Meanwhile, ledger reads from 5 to 15 milliseconds and gets authorized. Fraud reads from 20 to 30 and gets captured.", [
-            (lambda: [FadeIn(lab["ledger"]), GrowFromEdge(led, LEFT)], 0.8),
-            "and gets authorized",
-            (lambda: [FadeIn(led_v)], 0.5),
-            "Fraud reads",
-            (lambda: [FadeIn(lab["fraud"]), GrowFromEdge(fr, LEFT)], 0.8),
-            "and gets captured",
-            (lambda: [FadeIn(fr_v)], 0.5),
+        # ---------------- scene 3: four programs, one value ----------------
+        names = {k: left_at(T(NAMES[k], 22, GREY_B), NAME_X, ROW[k]) for k in ROW}
+        lanes = {k: Line([x(0) - 0.2, ROW[k], 0], [x(60) + 0.2, ROW[k], 0], stroke_width=1.2, color=GREY_D) for k in ROW}
+        axis = VGroup(Line([x(0), AX_Y, 0], [x(60), AX_Y, 0], stroke_width=2, color=GREY_C))
+        for t in range(0, 61, 10):
+            axis.add(Line([x(t), AX_Y - 0.07, 0], [x(t), AX_Y + 0.07, 0], stroke_width=2, color=GREY_C))
+            axis.add(M(f"{t}" + (" ms" if t == 60 else ""), 18, GREY_B).move_to([x(t) + (0.2 if t == 60 else 0), AX_Y - 0.3, 0]))
+        cap_b = opbar("capture", 0, 60, "w status = 2", GOLD_M)
+        st_key = VGroup(M("1 = authorized", 20, GREY_B), M("2 = captured", 20, GOLD_M)).arrange(DOWN, aligned_edge=LEFT, buff=0.15)
+        st_key.move_to([0, 0.6, 0])
+        self.steps("Now four programs and one value. The payments app keeps each payment's status as a number. "
+                   "1 means authorized, the money set aside. 2 means captured, the money moved to the shop.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(bd, b4, b5))], 0.6),
+            "keeps each payment's",
+            (lambda: [FadeIn(st_key[0], shift=0.1 * UP)], 0.5),
+            "2 means",
+            (lambda: [FadeIn(st_key[1], shift=0.1 * UP)], 0.5),
+        ])
+        self.steps("The capture program writes status 2, and the write takes 60 milliseconds from request to answer. "
+                   "A value you can read and write like this is called a register.", [
+            (lambda: [FadeOut(st_key), FadeIn(names["capture"]), Create(lanes["capture"]), Create(axis)], 0.7),
+            "writes status 2",
+            (lambda: [GrowFromEdge(cap_b, LEFT)], 1.2),
+            "called a register",
+            (lambda: self.cap("register: a value you can read and write", WHITE), 0.5),
+        ])
+        bars = {"ledger": opbar("ledger", 5, 15, "r: -", BLUE_M), "fraud": opbar("fraud", 20, 30, "r: 2", BLUE_M),
+                "email": opbar("email", 40, 50, "r: -", BLUE_M)}
+        self.steps("Meanwhile, three programs read the status. The ledger, which keeps the books. The fraud checker. "
+                   "And the email program, which sends receipts. Each bar runs from when the request is sent to when the answer comes back.", [
+            (lambda: [*self.uncap()], 0.3),
+            "The ledger",
+            (lambda: [FadeIn(names["ledger"]), Create(lanes["ledger"]), FadeIn(bars["ledger"])], 0.5),
+            "The fraud checker",
+            (lambda: [FadeIn(names["fraud"]), Create(lanes["fraud"]), FadeIn(bars["fraud"])], 0.5),
+            "And the email",
+            (lambda: [FadeIn(names["email"]), Create(lanes["email"]), FadeIn(bars["email"])], 0.5),
+            "Each bar runs",
+            (lambda: [*self.cap("each bar: from request sent to answer received"), glow(bars["fraud"][0], WHITE, 1.08)], 0.7),
         ])
 
-        ask = T("pick one instant inside each bar where it took effect", 22, YELLOW_M).move_to([0.6, -2.85, 0])
-        self.steps("Is that allowed? Linearizability says yes, if you can pick one instant inside each bar where the operation took effect.", [
-            "Linearizability",
-            (lambda: [FadeIn(ask, shift=0.15 * UP)], 0.8),
-            "inside each bar",
-            (lambda: [flash(wbar), flash(led), flash(fr)], 1.0),
+        # ---------------- scene 4: the rule ----------------
+        self.steps("Here's the board's rule, written for bars. Pick one instant inside each bar where the operation really happened. "
+                   "Then replay those instants, in order, on one plain copy. Every answer has to match.", [
+            (lambda: self.cap("pick one instant inside each bar", WHITE), 0.5),
+            "Then replay",
+            (lambda: self.cap("replay the instants, in order, on one plain copy: every answer must match", WHITE), 0.5),
         ])
-
-        p_led, p_w, p_fr = point(10, RY1["ledger"], 60), point(18, RY1["capture"], 60), point(25, RY1["fraud"], 60)
-        clock = ValueTracker(0)
-        cur = always_redraw(lambda: Triangle(fill_color=YELLOW_M, fill_opacity=1, stroke_width=0).scale(0.11).rotate(PI)
-                            .move_to([tx(clock.get_value(), 60), AX1 + 0.2, 0]))
-        replay = T("replay on one copy", 22, YELLOW_M).move_to([0.6, -2.85, 0])
-        self.steps("Ledger at 10, the write at 18, fraud at 25. Replayed in that order on one copy, each read gets the answer it got.", [
-            (lambda: [FadeIn(p_led, scale=0.5)], 0.5),
-            "the write at 18",
-            (lambda: [FadeIn(p_w, scale=0.5)], 0.5),
-            "fraud at 25",
-            (lambda: [FadeIn(p_fr, scale=0.5)], 0.5),
-            "Replayed",
-            (lambda: [FadeIn(cur), ReplacementTransform(ask, replay)], 0.5),
-            (lambda: [clock.animate(rate_func=linear).set_value(10)], 0.6),
-            (lambda: [Indicate(led_v, color=GREEN_M), Indicate(reg[2], color=GREEN_M), led[0].animate.set_stroke(GREEN_M)], 0.8),
-            (lambda: [clock.animate(rate_func=linear).set_value(18)], 0.5),
-            (lambda: [Transform(reg, register("captured", WHITE))], 0.6),
-            (lambda: [clock.animate(rate_func=linear).set_value(25)], 0.5),
-            (lambda: [Indicate(fr_v, color=GREEN_M), Indicate(reg[2], color=GREEN_M), fr[0].animate.set_stroke(GREEN_M)], 0.8),
+        pts = {}
+        rp = [replay_chip("ledger @10: -", BLUE_M), replay_chip("write @18", GOLD_M), replay_chip("fraud @25: 2", BLUE_M),
+              replay_chip("email @45: ?", BLUE_M)]
+        rp_lab = T("one copy, in order:", 20, GREY_B)
+        rp_row = VGroup(rp_lab, *rp).arrange(RIGHT, buff=0.25).move_to([0.2, REPLAY_Y, 0])
+        fit(rp_row, 12.6)
+        self.steps("The ledger, from 5 to 15, got the old status. The dash means old. Fine: put its instant at 10, and the write's instant later.", [
+            (lambda: [*self.cap("-  :  the old status"), glow(bars["ledger"][0], BLUE_M, 1.1)], 0.7),
+            "put its instant",
+            (lambda: [FadeIn(pts.setdefault("ledger", point("ledger", 10)), scale=0.6), FadeIn(rp_lab), FadeIn(rp[0], shift=0.1 * DOWN)], 0.6),
         ])
-
-        em = seg(40, 50, RY1["email"], 60, RD_C)
-        em_v = T("authorized", 20, GREY_B).move_to(em[0])
-        self.steps("Then email reads from 40 to 50, and gets authorized.", [
-            (lambda: [FadeIn(lab["email"]), GrowFromEdge(em, LEFT)], 0.8),
-            "and gets",
-            (lambda: [FadeIn(em_v)], 0.5),
+        self.steps("The fraud checker, from 20 to 30, got 2. So the write's instant must come before the fraud check's. "
+                   "Put the write at 18, and the fraud check at 25.", [
+            (lambda: [glow(bars["fraud"][0], BLUE_M, 1.1)], 0.6),
+            "Put the write",
+            (lambda: [FadeIn(pts.setdefault("capture", point("capture", 18)), scale=0.6), FadeIn(rp[1], shift=0.1 * DOWN)], 0.5),
+            "and the fraud",
+            (lambda: [FadeIn(pts.setdefault("fraud", point("fraud", 25)), scale=0.6), FadeIn(rp[2], shift=0.1 * DOWN)], 0.5),
         ])
-
-        p_em = point(45, RY1["email"], 60, RED_M)
-        no = tick(False, 0.22).move_to([tx(53.5, 60), RY1["email"], 0])
-        self.steps("Its instant must be after 40, when fraud has already seen captured. One copy would say captured. No choice works.", [
-            (lambda: [clock.animate(rate_func=linear).set_value(45), FadeIn(p_em, scale=0.5)], 1.0),
-            "when fraud",
-            (lambda: [Indicate(fr_v, color=YELLOW_M)], 0.9),
-            "One copy",
-            (lambda: [Indicate(reg[2], color=YELLOW_M)], 0.9),
+        self.steps("The capture program hasn't heard back yet. That doesn't matter.", [
+            (lambda: [Indicate(cap_b[0], color=GOLD_M, scale_factor=1.03), *self.cap("the write's answer comes at 60: its instant can be earlier")], 0.8),
+        ])
+        span = Rectangle(width=10 * SC, height=0.62, stroke_width=0).set_fill(YELLOW_M, 0.18).move_to([x(45), ROW["email"], 0])
+        self.steps("Now the email program, from 40 to 50, got the old status. Can we place its instant? Pause and guess.", [
+            (lambda: [*self.uncap(), glow(bars["email"][0], BLUE_M, 1.1), FadeIn(rp[3], shift=0.1 * DOWN)], 0.7),
+            "Can we place",
+            (lambda: [FadeIn(span)], 0.5),
+            "Pause and guess",
+            (lambda: self.cap("can the email's instant go anywhere?   pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        fail = replay_chip("email: no fit", RED_M)
+        fail.move_to(rp[3]).align_to(rp[3], LEFT)
+        self.steps("No. Its instant must be after 40, so it's after the write. One copy would answer 2 there. "
+                   "No choice of instants works. This history isn't linearizable.", [
+            (lambda: [*self.uncap(), Indicate(axis, color=YELLOW_M, scale_factor=1.0)], 0.5),
+            "after the write",
+            (lambda: [glow(pts["capture"][0], YELLOW_M, 1.2)], 0.5),
+            "One copy would",
+            (lambda: [FadeOut(rp[3]), FadeIn(fail), bars["email"][0].animate.set_stroke(RED_M)], 0.6),
             "No choice",
-            (lambda: [Create(no), em[0].animate.set_stroke(RED_M), em_v.animate.set_color(RED_M)], 0.8),
+            (lambda: self.cap("no choice of instants works: not linearizable", RED_M), 0.5),
+        ])
+        self.steps("Once any read has returned the new value, every read that starts later must return it too.", [
+            (lambda: [glow(bars["fraud"][0], GOLD_M, 1.08), *self.cap("once any read returns the new value, every later read must too", YELLOW_M)], 0.9),
         ])
 
-        rule = T("once a read has seen the new value, every read that starts later must too", 22, WHITE).move_to([0.4, -2.85, 0])
-        fit(rule, 12.4)
-        self.steps("That history isn't linearizable. Once any read has returned the new value, every read that starts later must return it too.", [
-            (lambda: [FadeOut(cur), FadeOut(replay)], 0.5),
-            "Once any read",
-            (lambda: [FadeIn(rule, shift=0.15 * UP)], 0.9),
-            "every read that starts later",
-            (lambda: [flash(em, RED_M, 1.06)], 1.0),
+        # ---------------- scene 5: the second channel ----------------
+        self.steps("You might be thinking: the fraud checker and the email program run on different computers. "
+                   "If they never talk, who would ever notice?", [
+            (lambda: self.cap("different computers: who would ever notice?", PURPLE_M), 0.5),
+        ])
+        ch = Arrow(bars["fraud"][0].get_bottom() + 0.05 * DOWN, bars["email"][0].get_top() + 0.05 * UP,
+                   buff=0.05, stroke_width=4, color=GREEN_M, max_tip_length_to_length_ratio=0.15)
+        chl = T("\"captured!\"", 20, GREEN_M).next_to(ch, RIGHT, buff=0.15)
+        self.steps("Any second channel notices. The fraud checker announces: captured. The email program reacts, and reads the old status. "
+                   "That's the café owner's buzz, and her empty list.", [
+            "The fraud checker announces",
+            (lambda: [GrowArrow(ch), FadeIn(chl)], 0.7),
+            "and reads the old",
+            (lambda: [Indicate(bars["email"], color=RED_M, scale_factor=1.08)], 0.7),
+            "That's the café",
+            (lambda: self.cap("the buzz was the second channel; the list was the stale read", WHITE), 0.5),
+        ])
+        self.steps("It's a friend texting: we're boarding! while the board in front of you still says on time. One of you is about to miss a train. "
+                   "So the order that matters is real time, because any message between programs can expose it.", [
+            "So the order",
+            (lambda: self.cap("the order that matters: real time", YELLOW_M), 0.6),
         ])
 
-        # ---- a quorum store -----------------------------------------------------------------------------------
-        part1 = VGroup(wbar, led, led_v, fr, fr_v, em, em_v, p_led, p_w, p_fr, p_em, no, rule, *lab.values())
-        ax2 = axis(90, AX2, 10)
-        names = ["writer", "R1", "R2", "R3", "reader A", "reader B"]
-        lab2 = [rlabel(n, y) for n, y in zip(names, RY2)]
-        reps = [replica(RY2[i + 1], 90) for i in range(3)]
-        rule2 = T("every write and every read waits for 2 of the 3 copies", 22, GREY_B).move_to([0.6, 3.2, 0])
-        self.steps("Now a store with three copies, each holding 8. Every write and every read waits for two of the three.", [
-            (lambda: [FadeOut(part1), FadeOut(reg)], 0.8),
-            (lambda: [ReplacementTransform(ax[0], ax2[0]), FadeOut(ax[1:]), FadeIn(ax2[1:])], 0.8),
-            "three copies",
-            (lambda: [*[FadeIn(lab2[i + 1]) for i in range(3)], *[GrowFromEdge(reps[i][0], LEFT) for i in range(3)]], 1.0),
-            (lambda: [*[FadeIn(reps[i][1]) for i in range(3)]], 0.05),
-            "Every write",
-            (lambda: [FadeIn(rule2, shift=0.15 * DOWN)], 0.8),
+        # ---------------- scene 6: the good history, and the names ----------------
+        email2 = opbar("email", 40, 50, "r: 2", BLUE_M)
+        ok_chip = replay_chip("email @45: 2", GREEN_M).move_to(fail)
+        self.steps("Had the email program read 2, the instants would be: the ledger at 10, the write at 18, the fraud check at 25, "
+                   "and the email at 45. Each inside its own bar.", [
+            (lambda: [*self.uncap(), FadeOut(ch), FadeOut(chl), FadeOut(span), swap(bars["email"], email2)], 0.7),
+            "the email at 45",
+            (lambda: [FadeIn(pts.setdefault("email", point("email", 45)), scale=0.6), swap(fail, ok_chip)], 0.6),
+        ])
+        bars["email"] = email2
+        self.steps("Replay them on one copy, and every answer matches.", [
+            (lambda: [LaggedStart(*[Indicate(c, color=GREEN_M, scale_factor=1.08) for c in (rp[0], rp[1], rp[2], ok_chip)], lag_ratio=0.3)], 1.2),
+        ])
+        self.steps("That order is called a linearization, and each chosen instant is a linearization point. "
+                   "A history that has one is linearizable. Maurice Herlihy and Jeannette Wing gave this exact rule in 1990.", [
+            (lambda: self.cap("that order: a linearization", WHITE, 28), 0.5),
+            "each chosen instant",
+            (lambda: [*self.cap("each chosen instant: a linearization point", YELLOW_M, 28),
+                      *[glow(p[0], YELLOW_M, 1.2) for p in pts.values()]], 0.8),
+            "Maurice Herlihy",
+            (lambda: self.cap("linearizable (Herlihy and Wing, 1990)", WHITE, 28), 0.5),
         ])
 
-        wr = seg(0, 90, RY2[0], 90, W_C, "write 9, waiting for 2 of 3 to confirm")
-        self.steps("A writer sends 9. It reaches R1 at 10 milliseconds, but R2 and R3 only at 70 and 75. Until then, the write isn't finished.", [
-            (lambda: [FadeIn(lab2[0]), GrowFromEdge(wr, LEFT)], 1.0),
-            "It reaches R1",
-            (lambda: [Transform(reps[0], replica(RY2[1], 10))], 0.8),
-            "R2 and R3",
-            (lambda: [Transform(reps[1], replica(RY2[2], 70)), Transform(reps[2], replica(RY2[3], 75))], 0.9),
-            "Until then",
-            (lambda: [flash(wr)], 1.0),
+        # ---------------- scene 7: the guardrails ----------------
+        self.steps("Two things to keep straight. The instant is a thought experiment. The store never reports it. "
+                   "We only ask whether some choice works.", [
+            (lambda: self.cap("the instant is a thought experiment: the store never reports it"), 0.6),
+        ])
+        self.steps("And the word seems carries the weight. Inside, a store may hold writes back, copy them, retry them. "
+                   "What it may not do is let any client see something one copy couldn't have produced.", [
+            (lambda: self.cap("inside: anything goes (hold back, copy, retry)"), 0.5),
+            "What it may not",
+            (lambda: self.cap("outside: nothing one copy couldn't have produced", YELLOW_M), 0.5),
+        ])
+        self.steps("One gift from the proof: the rule works value by value. If the operations on each value pass, the whole history passes, "
+                   "so a checker can take each value on its own. And sending each write to every copy, sooner or later, doesn't give you this rule.", [
+            (lambda: self.cap("local: check each value on its own"), 0.5),
+            "And sending",
+            (lambda: self.cap("\"every copy gets the write, sooner or later\" is not this rule", RED_M), 0.5),
         ])
 
-        ra = seg(20, 40, RY2[4], 90, RD_C)
-        ra_v = T("returns 9", 20).move_to(ra[0])
-        da = [point(30, RY2[1], 90, GREEN_M), point(30, RY2[2], 90, GREEN_M)]
-        self.steps("Reader A asks from 20 to 40 milliseconds. R1 and R2 answer first, with 9 and 8. It returns the newer one, 9.", [
-            (lambda: [FadeIn(lab2[4]), GrowFromEdge(ra, LEFT)], 0.9),
-            "R1 and R2",
-            (lambda: [FadeIn(da[0], scale=0.5), FadeIn(da[1], scale=0.5)], 0.6),
-            "with 9 and 8",
-            (lambda: [Indicate(reps[0][1][1], color=GREEN_M), Indicate(reps[1][0][1], color=GREEN_M)], 0.9),
-            "It returns",
-            (lambda: [FadeIn(ra_v), ra[0].animate.set_stroke(GREEN_M)], 0.6),
+        # ---------------- scene 8: moral and check ----------------
+        self.steps("So: one copy, one timeline. Every operation lands at one instant inside its bar, and once anyone sees the new value, "
+                   "nobody who starts later sees the old one.", [
+            (lambda: self.cap("one copy, one timeline", YELLOW_M, 32), 0.6),
+            "Every operation",
+            (lambda: [LaggedStart(*[glow(p[0], YELLOW_M, 1.2) for p in pts.values()], lag_ratio=0.2)], 1.0),
         ])
-
-        rb = seg(48, 68, RY2[5], 90, RD_C)
-        rb_v = T("returns 8", 20).move_to(rb[0])
-        db = [point(58, RY2[2], 90, RED_M), point(58, RY2[3], 90, RED_M)]
-        self.steps("Reader B starts at 48, after A has finished. R2 and R3 answer first, both still 8. B returns 8.", [
-            (lambda: [FadeIn(lab2[5]), GrowFromEdge(rb, LEFT)], 0.9),
-            "R2 and R3",
-            (lambda: [FadeIn(db[0], scale=0.5), FadeIn(db[1], scale=0.5)], 0.6),
-            "both still 8",
-            (lambda: [Indicate(reps[1][0][1], color=RED_M), Indicate(reps[2][0][1], color=RED_M)], 0.9),
-            "B returns",
-            (lambda: [FadeIn(rb_v), rb[0].animate.set_stroke(RED_M), rb_v.animate.set_color(RED_M)], 0.6),
-        ])
-
-        gap = DashedLine([tx(40, 90), RY2[4] - BH / 2, 0], [tx(40, 90), RY2[5] - BH / 2, 0], dash_length=0.06,
-                         stroke_width=2.5, color=YELLOW_M)
-        back = T("went back in time", 20, RED_M)
-        back.move_to([tx(68, 90) + 0.35 + back.width / 2, RY2[5], 0])
-        rule3 = T("2 of 3 overlap, but only for writes that have finished", 22, GREY_B).move_to([0.6, 3.2, 0])
-        self.steps("B started after A finished, yet saw an older value. Two of three overlap only for writes that have finished.", [
-            (lambda: [Create(gap)], 0.7),
-            "yet saw",
-            (lambda: [FadeIn(back)], 0.7),
-            "Two of three",
-            (lambda: [ReplacementTransform(rule2, rule3)], 0.8),
-            "that have finished",
-            (lambda: [flash(wr, RED_M)], 1.0),
-        ])
-
-        ra2 = seg(20, 60, RY2[4], 90, GREEN_M, "reads 9, writes it back")
-        rb2v = T("returns 9", 20).move_to(rb[0])
-        db2 = [point(58, RY2[2], 90, GREEN_M), point(58, RY2[3], 90, GREEN_M)]
-        rule4 = T("fix: a read writes what it saw back to 2 of 3 before it answers", 22, GREEN_M).move_to([0.6, 3.2, 0])
-        self.steps("The fix: before reader A answers, it writes 9 back to two replicas. Every later read then finds it, at the price of a second round trip.", [
-            (lambda: [FadeOut(gap), FadeOut(back), ReplacementTransform(rule3, rule4)], 0.8),
-            "before reader A",
-            (lambda: [ReplacementTransform(ra, ra2), FadeOut(ra_v)], 1.0),
-            "it writes 9 back",
-            (lambda: [Transform(reps[1], replica(RY2[2], 50)), Transform(reps[2], replica(RY2[3], 50))], 0.9),
-            "Every later read",
-            (lambda: [Transform(db[0], db2[0]), Transform(db[1], db2[1]), Transform(rb_v, rb2v), rb[0].animate.set_stroke(GREEN_M)], 0.9),
-            "a second round trip",
-            (lambda: [flash(ra2, GREEN_M, 1.04)], 1.0),
-        ])
-
-        self.steps("Linearizable means one copy, one timeline. Once anyone has seen a value, nobody who asks later sees an older one.", [
-            "Once anyone",
-            (lambda: [Indicate(ra2[1], color=GREEN_M)], 1.0),
-            "nobody who asks later",
-            (lambda: [Indicate(rb_v, color=GREEN_M)], 1.0),
-        ])
-        self.wait(0.6)
-
-
-def flash(m, color=YELLOW_M, s=1.04):
-    """Pulse a bar and recolour its outline, so its label stays readable."""
-    return m[0].animate(rate_func=there_and_back).scale(s).set_stroke(color=color)
+        email3 = opbar("email", 22, 32, "r: -", BLUE_M)
+        self.steps("One quick check. Suppose the email's read had run from 22 to 32, overlapping the fraud check, and returned the old status. "
+                   "Allowed? Pause and think.", [
+            (lambda: [*self.uncap(), FadeOut(pts["email"]), FadeOut(VGroup(*rp, rp_lab, ok_chip)), swap(bars["email"], email3)], 0.8),
+            "Allowed",
+            (lambda: self.cap("email 22 to 32, reads -: allowed?   pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        bars["email"] = email3
+        self.countdown(3.0)
+        new_pts = [point("email", 23), point("capture", 24), point("fraud", 26)]
+        rp2 = VGroup(T("one copy, in order:", 20, GREY_B), replay_chip("ledger @10: -", BLUE_M), replay_chip("email @23: -", BLUE_M),
+                     replay_chip("write @24", GOLD_M), replay_chip("fraud @26: 2", BLUE_M)).arrange(RIGHT, buff=0.25).move_to([0.2, REPLAY_Y, 0])
+        fit(rp2, 12.6)
+        self.steps("Yes. Put the email at 23, the write at 24, and the fraud check at 26. A read that overlaps the change may see either side.", [
+            (lambda: [*self.uncap(), FadeOut(pts["capture"]), FadeOut(pts["fraud"])], 0.4),
+            "Put the email",
+            (lambda: [FadeIn(new_pts[0], scale=0.6)], 0.4),
+            "the write at 24",
+            (lambda: [FadeIn(new_pts[1], scale=0.6)], 0.4),
+            "the fraud check",
+            (lambda: [FadeIn(new_pts[2], scale=0.6), FadeIn(rp2, shift=0.1 * DOWN)], 0.6),
+            "A read that overlaps",
+            (lambda: self.cap("overlapping the change: either side is fine", GREEN_M, 28), 0.5),
+        ], after=0.3)
+        self.wait(2.0)
