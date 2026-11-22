@@ -1,37 +1,39 @@
 from sfz import *
 
-FIELDS = ["id", "merchant", "currency", "amount", "created"]
-FW = [0.62, 0.8, 0.8, 0.95, 0.85]
-ROWS = [["p1", "m42", "EUR", "1,250", "10:00"], ["p2", "m7", "EUR", "300", "10:00"],
-        ["p3", "m42", "GBP", "8,900", "10:01"], ["p4", "m19", "EUR", "450", "10:01"]]
-X0, GAP, CH = -5.0, 0.07, 0.42
-YR = [2.95, 2.45, 1.75, 1.25]                 # row store: two pages of two rows
-YC = [3.1, 2.55, 2.0, 1.45, 0.9]             # column store: one strip per field
-MX, MSC = 0.6, 4.8 / 66                      # meter: left edge, units per MB
+# Currency codes are said as the money they stand for; captions keep the codes.
+SAY.insert(0, (r"\bEUR\b", "euro"))
+SAY.insert(0, (r"\bGBP\b", "pound"))
+SAY.insert(0, (r"\bSEK\b", "krona"))
+SAY.insert(0, (r"\bUSD\b", "dollar"))
+SAY.insert(0, (r"\bgzip\b", "G zip"))
+
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+FIELDS = ["id", "shop", "currency", "status", "amount", "time"]
+SHELF_Y, BW, BH = 3.22, 1.22, 0.56
+SHELF_X = [-3.4 + 1.36 * i for i in range(6)]
+TAG_Y = SHELF_Y - BH / 2 - 0.2
+X0, PITCH, CW, CH = -6.35, 0.93, 0.85, 0.5         # the chunk: twelve cells per row
+YA, YB = 1.75, 0.45                                # top row: plain; bottom row: encoded
+SZ_X = 4.98                                        # each row's size, at its right end
+CARD_C, CARD_W, CARD_H = np.array([4.95, -1.2, 0]), 3.2, 2.0   # the key on the cover, lower right
+YL, YL2 = -0.85, -1.45                             # the lower band, left of the card
+BAR_Y, CAP_Y = -2.75, -3.25
+
 CUR = ["EUR", "EUR", "EUR", "GBP", "EUR", "USD", "EUR", "EUR", "SEK", "EUR", "GBP", "EUR"]
-CODE = {"EUR": 0, "GBP": 1, "SEK": 2, "USD": 3}
-KX, KS, KW = -6.3, 0.76, 0.7                 # chunk cells: first x, step, width
-YK, YCODE, YDICT, YRLE = -0.85, -1.55, -2.25, -2.95
-SX = 3.3                                     # size labels in the lower band
-ZX, ZS, ZW, ZY = -6.3, 1.78, 1.65, -1.3      # zone map chunks
-ZONES = [("Oct 1", "5"), ("Oct 6", "10"), ("Oct 11", "15"), ("Oct 16", "20"), ("Oct 21", "25"), ("Oct 26", "31")]
+KEY = ["EUR", "GBP", "SEK", "USD"]
+CODE = [KEY.index(c) for c in CUR]
+BITS = [format(c, "02b") for c in CODE]
+AMT = [1250, 300, 8900, 450, 2100, 760, 300, 5400, 990, 3300, 610, 1800]
+BASE = min(AMT)
+FIRST = {v: CUR.index(v) for v in KEY}             # where each distinct value first appears
 
 
-def fillc(color, a=0.14):
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+def cx(i):
+    return X0 + CW / 2 + PITCH * i
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+def n(v):
+    return f"{v:,}"
 
 
 class Base(VoiceScene):
@@ -79,6 +81,9 @@ class Base(VoiceScene):
                 self.wait(it)
                 t += it
                 continue
+            if callable(it):
+                it()
+                continue
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
@@ -87,205 +92,500 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
-
-def cell_x(j):
-    return X0 + sum(FW[:j]) + GAP * j + FW[j] / 2
-
-
-def col_x(j, i):
-    return X0 + i * (FW[j] + GAP) + FW[j] / 2
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
 
-def kx(i):
-    return KX + i * KS + KW / 2
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def meter(label, mb, y, color, val):
-    lab = left_at(T(label, 18, GREY_B), MX, y + 0.33)
-    bar = Rectangle(width=max(0.05, mb * MSC), height=0.32, stroke_width=0).set_fill(color, 0.9)
-    bar.move_to([MX + bar.width / 2, y, 0])
-    v = left_at(T(val, 20, color), MX + bar.width + 0.15, y)
-    return lab, bar, v
+def glow(m, color=YELLOW_M, s=1.04):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def zone(k, lo, hi, color=WHITE):
-    x = ZX + k * ZS + ZW / 2
-    r = RoundedRectangle(corner_radius=0.1, width=ZW, height=0.85, stroke_color=color, stroke_width=2.5)
-    r.set_fill(BLACK, 1).move_to([x, ZY, 0])
-    return VGroup(r, T(f"chunk {k + 1}", 16, GREY_B).move_to([x, ZY + 0.2, 0]),
-                  T(f"{lo} to {hi}", 18, color).move_to([x, ZY - 0.17, 0]))
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def verdict(k, s, color):
-    return T(s, 18, color).move_to([ZX + k * ZS + ZW / 2, ZY - 0.72, 0])
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
+
+
+def dot_run(a, b, color=YELLOW_M, rt=0.6):
+    a, b = np.array(a, dtype=float), np.array(b, dtype=float)
+    d = Dot(radius=0.07, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.1))
+
+
+def cell(x, y, txt, color, w=CW, size=17):
+    r = RoundedRectangle(corner_radius=0.07, width=w, height=CH, stroke_color=color, stroke_width=2.2).set_fill(fillc(color), 1).move_to([x, y, 0])
+    return VGroup(r, M(txt, size).move_to([x, y, 0]))
+
+
+def retext(c, txt, size=17, color=WHITE):
+    return Transform(c[1], M(txt, size, color).move_to(c[0]))
+
+
+def recolor(c, color):
+    return c[0].animate.set_stroke(color).set_fill(fillc(color), 1)
+
+
+def bar(x0, y, length, color, h=0.3):
+    return Rectangle(width=max(length, 0.04), height=h, stroke_width=0).set_fill(color, 0.85).move_to([x0 + max(length, 0.04) / 2, y, 0])
 
 
 class ColumnCompression(Base):
-    """store-11, sections 0 to 2: sum(amount) on a million payments reads 8,404 pages (66 MB) in a row store and one
-    8 MB array in a column store. A 12-value currency chunk: 84 bytes plain; dictionary (28 bytes) plus 2-bit codes
-    (3 bytes) = 31; sorted, 4 runs. DuckDB keeps the whole table in 5.5 MB. Zone maps: six created_at chunks, a query
-    for Oct 15 decodes 1; shuffled, every chunk spans Oct 1 to 31 and nothing is skipped."""
+    """store-11, section 1. The shoebox of receipts cut into strips, one binder per detail. The currency binder:
+    four values, a million strips. Plain: 84 bytes for twelve, 7 MB for a million. Zip it? Unzip 256 KB to read one
+    value. A key on the cover (dictionary: 0 EUR, 1 GBP, 2 SEK, 3 USD; code < 1 means before GBP). Paper doesn't shrink,
+    bits do: 2 bits a code, 3 bytes, 31 with the key, 250 KB a million (bit-packing). Amounts minus 300: 8,600 in 14
+    bits, 40 bytes against 96 (frame of reference). Sorted: four runs (run-length). Runs on unsorted amounts: 144 bytes,
+    so try each and keep the smallest; DuckDB 5.5 MB against PostgreSQL's 66. Why squeeze: 28 times fewer bytes to
+    move. The moral, and a check (status sorted by status: runs)."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color) if isinstance(s, str) else s, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def rowlab(self, key, s, y, color=GREY_B):
+        return self.put(key, left_at(T(s, 19, color), X0, y + 0.52))
+
+    def size(self, key, s, y, color=WHITE):
+        return self.put(key, left_at(T(s, 22, color), SZ_X, y))
+
+    def countdown(self, secs=3.0):
+        b = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(b), run_time=0.25)
+        self.play(Uncreate(b), run_time=secs, rate_func=linear)
+
+    def row(self, y, texts, color, size=17):
+        return VGroup(*[cell(cx(i), y, t, color, size=size) for i, t in enumerate(texts)])
 
     def construct(self):
-        self.title_card("Column stores and compression", "read one field, small, and only where it can match")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Four currencies, a million rows", "how one column squeezes small")
 
-        cells = [[mbox(ROWS[i][j], GREY_B, w=FW[j], h=CH, size=15).move_to([cell_x(j), YR[i], 0]) for j in range(5)]
-                 for i in range(4)]
-        rowg = [VGroup(*cells[i]) for i in range(4)]
-        pages = [SurroundingRectangle(VGroup(rowg[0], rowg[1]), color=WHITE, buff=0.12, corner_radius=0.1, stroke_width=2),
-                 SurroundingRectangle(VGroup(rowg[2], rowg[3]), color=WHITE, buff=0.12, corner_radius=0.1, stroke_width=2)]
-        plab = [right_at(T(f"page {k + 1}", 17, GREY_B), pages[k].get_left()[0] - 0.15, pages[k].get_center()[1]) for k in range(2)]
-        self.steps("A finance query sums the amounts of a million payments. "
-                   "In a row store, each page holds whole rows, one after another.", [
-            "In a row store",
-            (lambda: [Create(pages[0]), Create(pages[1]), FadeIn(plab[0]), FadeIn(plab[1])], 0.7),
-            (lambda: [LaggedStart(*[FadeIn(r, shift=0.15 * RIGHT) for r in rowg], lag_ratio=0.3)], 1.4),
-        ])
+        # ---- the pieces ----
+        shelf = [VGroup(RoundedRectangle(corner_radius=0.1, width=BW, height=BH, stroke_color=BLUE_M, stroke_width=2.5)
+                        .set_fill(fillc(BLUE_M), 1).move_to([x, SHELF_Y, 0]), T(f, 18).move_to([x, SHELF_Y, 0]))
+                 for f, x in zip(FIELDS, SHELF_X)]
+        RC = np.array([0, 0.05, 0])
+        rcard = RoundedRectangle(corner_radius=0.12, width=4.3, height=3.5, stroke_color=GREY_B, stroke_width=2.5).set_fill("#141414", 1).move_to(RC)
+        stack = VGroup(*[rcard.copy().set_stroke(GREY_D).set_fill("#0c0c0c", 1).shift([0.14 * k, 0.14 * k, 0]) for k in (3, 2, 1)])
+        rtitle = T("receipt", 20, GREY_B).move_to(RC + [0, 1.42, 0])
+        RV = ["p1", "m42", "EUR", "settled", "1,250", "10:00:02"]
+        RY = [0.95 - 0.47 * i for i in range(6)]
+        rlines = [VGroup(left_at(T(f, 20, GREY_B), -1.85, y), right_at(M(v, 20), 1.85, y)) for f, v, y in zip(FIELDS, RV, RY)]
+        strips = [RoundedRectangle(corner_radius=0.08, width=3.95, height=0.4, stroke_color=BLUE_M, stroke_width=2).move_to([0, y, 0])
+                  for y in RY]
+        box_lab = T("a shoebox: one receipt per payment", 20, GREY_B).move_to([0, -2.2, 0])
 
-        l1, b1, v1 = meter("row store: sum(amount) reads every page", 66, 2.7, RED_M, "66 MB")
-        self.steps("The amounts are spread through every page, so the scan reads all of them: "
-                   "8,404 pages, 66 megabytes, for one field.", [
-            (lambda: [*[cells[i][3][0].animate.set_stroke(GOLD_M, width=4) for i in range(4)],
-                      *[cells[i][3][1].animate.set_color(GOLD_M) for i in range(4)]], 0.8),
-            "so the scan reads",
-            (lambda: [glow(pages[0], RED_M, 1.02)], 0.6),
-            (lambda: [glow(pages[1], RED_M, 1.02)], 0.6),
-            "8,404 pages",
-            (lambda: [FadeIn(l1), GrowFromEdge(b1, LEFT), FadeIn(v1)], 1.0),
+        # ---------------- scene 1: the binders ----------------
+        self.steps("Picture a café owner with a shoebox of paper receipts, one for every card payment. "
+                   "Each receipt has an id, the shop, the currency, a status, the amount and the time.", [
+            (lambda: [FadeIn(stack, lag_ratio=0.2), FadeIn(rcard), FadeIn(rtitle), FadeIn(box_lab)], 0.9),
+            "Each receipt",
+            (lambda: [LaggedStart(*[FadeIn(l, shift=0.05 * RIGHT) for l in rlines], lag_ratio=0.25)], 1.6),
         ])
+        pieces = [VGroup(s, l) for s, l in zip(strips, rlines)]
+        self.steps("To add up the amounts, she used to read every receipt. So she cut each one into strips, one per detail, "
+                   "and filed them in six binders, in the same order. Now the total needs one binder.", [
+            "read every receipt",
+            (lambda: [LaggedStart(*[glow(c, YELLOW_M, 1.02) for c in [*stack, rcard]], lag_ratio=0.2)], 1.0),
+            "cut each one",
+            (lambda: [LaggedStart(*[Create(s) for s in strips], lag_ratio=0.12)], 0.9),
+            "filed them",
+            (lambda: [FadeOut(VGroup(stack, rcard, rtitle, box_lab)),
+                      LaggedStart(*[Succession(p.animate(run_time=0.55).scale(0.3).move_to([SHELF_X[i], SHELF_Y, 0]),
+                                               FadeOut(p, run_time=0.1)) for i, p in enumerate(pieces)], lag_ratio=0.15),
+                      LaggedStart(*[FadeIn(b, run_time=0.3) for b in shelf], lag_ratio=0.17)], 1.5),
+            "the total needs",
+            (lambda: [glow(shelf[4][0], YELLOW_M, 1.08)], 0.7),
+        ])
+        rowA = self.row(YA, CUR, BLUE_M)
+        qm = T("?", 44, YELLOW_M).move_to([SZ_X + 0.4, YA, 0])
+        self.steps("But open the currency binder, and look. EUR, EUR, EUR, GBP, EUR. A million strips, and only four "
+                   "different values on them. So how small can a column like this get? Hold that question.", [
+            (lambda: [glow(shelf[2][0], YELLOW_M, 1.08)], 0.6),
+            "EUR, EUR",
+            (lambda: [LaggedStart(*[AnimationGroup(dot_run([SHELF_X[2], SHELF_Y - BH / 2, 0], [cx(i), YA + CH / 2, 0], BLUE_M, 0.4),
+                                                   FadeIn(c, run_time=0.4)) for i, c in enumerate(rowA)], lag_ratio=0.12),
+                      *self.rowlab("lA", "currency: one chunk, 12 values in row order", YA)], 1.8),
+            "only four",
+            (lambda: [LaggedStart(*[glow(rowA[FIRST[v]][0], YELLOW_M, 1.15) for v in KEY], lag_ratio=0.25)], 1.0),
+            "how small",
+            (lambda: [FadeIn(qm, scale=0.6), *self.cap("how small can a column like this get?", WHITE)], 0.6),
+        ], after=0.3)
+        self.stamp("binders")
 
-        flab = [right_at(T(FIELDS[j], 18, GREY_B), X0 - 0.15, YC[j]) for j in range(5)]
-        self.steps("A column store turns the table on its side. Each field gets its own array, in row order, "
-                   "so row three is position three in every array.", [
-            (lambda: [FadeOut(pages[0]), FadeOut(pages[1]), FadeOut(plab[0]), FadeOut(plab[1])], 0.5),
-            (lambda: [LaggedStart(*[cells[i][j].animate.move_to([col_x(j, i), YC[j], 0]) for j in range(5) for i in range(4)],
-                                  lag_ratio=0.04)], 2.2),
-            "Each field",
-            (lambda: [*[FadeIn(f, shift=0.1 * RIGHT) for f in flab]], 0.6),
-            "so row three",
-            (lambda: [*[glow(cells[2][j][0], YELLOW_M, 1.08) for j in range(5)]], 1.0),
+        # ---------------- scene 2: the plain way ----------------
+        BX = [X0 + 0.21 + 0.46 * k for k in range(7)]
+        bytes7 = VGroup(*[VGroup(Square(0.42, stroke_color=GREY_B if k < 4 else WHITE, stroke_width=2).set_fill(fillc(GREY_B if k < 4 else BLUE_M), 1)
+                                 .move_to([BX[k], YL, 0]), M(["", "", "", "3", "E", "U", "R"][k], 18).move_to([BX[k], YL, 0])) for k in range(7)])
+        lenlab = T("4-byte length", 17, GREY_B).move_to([(BX[0] + BX[3]) / 2, YL2, 0])
+        txtlab = T("3 bytes of text", 17, WHITE).move_to([(BX[4] + BX[6]) / 2, YL2, 0])
+        eq7 = left_at(T("= 7 bytes", 22), BX[6] + 0.45, YL)
+        self.steps("Take twelve strips, one chunk of the column. Space is counted in bytes, and a byte holds about one letter. "
+                   "Stored plainly, each value is a 4-byte length, then 3 bytes of text: 84 bytes for twelve.", [
+            (lambda: [FadeOut(qm), *self.uncap()], 0.4),
+            "Stored plainly",
+            (lambda: [glow(rowA[0][0], YELLOW_M, 1.15), TransformFromCopy(rowA[0], bytes7)], 0.9),
+            "a 4-byte length",
+            (lambda: [FadeIn(lenlab)], 0.4),
+            "3 bytes of text",
+            (lambda: [FadeIn(txtlab), FadeIn(eq7)], 0.5),
+            "84 bytes",
+            (lambda: [*self.size("szA", "84 bytes", YA), *self.cap("12 values x 7 bytes = 84 bytes", WHITE)], 0.5),
         ])
+        self.steps("A million take 7 MB, for four different values. Write E U R by hand a million times, and by strip four "
+                   "hundred you'd invent a shorthand. That's the wish: a shorthand that's quick to read back.", [
+            (lambda: self.cap("a million rows: 7 MB, for 4 different values", WHITE), 0.6),
+            "Write E U R",
+            (lambda: [LaggedStart(*[glow(rowA[i][0], RED_M, 1.1) for i in range(12) if CUR[i] == "EUR"], lag_ratio=0.1)], 1.2),
+            "That's the wish",
+            (lambda: [FadeOut(VGroup(bytes7, lenlab, txtlab, eq7)), *self.cap("wanted: a shorthand that's quick to read back", YELLOW_M)], 0.6),
+        ], after=0.3)
 
-        l2, b2, v2 = meter("column store: one array", 8, 1.85, GREEN_M, "8 MB")
-        amt = SurroundingRectangle(VGroup(*[cells[i][3] for i in range(4)]), color=GOLD_M, buff=0.08, corner_radius=0.08,
-                                   stroke_width=3)
-        self.steps("Now the sum reads one array: a million amounts, 8 megabytes.", [
-            (lambda: [Create(amt), *[cells[i][j].animate.set_opacity(0.45) for i in range(4) for j in (0, 1, 2, 4)]], 0.8),
-            "a million",
-            (lambda: [FadeIn(l2), GrowFromEdge(b2, LEFT), FadeIn(v2)], 0.9),
+        # ---------------- scene 3: zip it? ----------------
+        bag = RoundedRectangle(corner_radius=0.2, width=12 * PITCH + 0.2, height=CH + 0.16, stroke_color=PURPLE_M, stroke_width=3) \
+            .set_fill(interpolate_color(ManimColor("#000000"), ManimColor(PURPLE_M), 0.45), 1).move_to([(cx(0) + cx(11)) / 2, YA, 0]).set_z_index(4)
+        bagt = T("zipped", 22, WHITE).move_to(bag).set_z_index(5)
+        ptr = Arrow([cx(5), YL + 0.2, 0], [cx(5), YA - CH / 2 - 0.25, 0], buff=0, stroke_width=4, color=YELLOW_M,
+                    max_tip_length_to_length_ratio=0.12)
+        ptrl = T("read one value", 19, YELLOW_M).move_to([cx(5), YL - 0.15, 0])
+        nozip = tick(False, 0.3).move_to([SZ_X + 0.75, YA, 0]).set_z_index(6)
+        self.steps("The first idea most of us have: zip it, the way you zip files before you email them. It does shrink.", [
+            (lambda: [*self.cap("the first idea: zip it", PURPLE_M)], 0.5),
+            "zip it",
+            (lambda: [FadeIn(bag, scale=1.05), FadeIn(bagt), *self.drop("szA")], 0.8),
+            "It does shrink",
+            (lambda: self.size("szA", "smaller", YA, PURPLE_M), 0.5),
         ])
+        self.steps("But every scan then pays to unzip whatever it touches, and to read one value, you unzip the whole block "
+                   "around it, about 256 KB.", [
+            "to read one value",
+            (lambda: [GrowArrow(ptr), FadeIn(ptrl)], 0.6),
+            "the whole block",
+            (lambda: [glow(bag, YELLOW_M, 1.02)], 0.8),
+            "about 256 KB",
+            (lambda: self.cap("to read one value: unzip the whole block, about 256 KB", WHITE), 0.6),
+        ])
+        self.steps("It's a vacuum-packed binder: small on the shelf, but you cut open the bag to read one strip.", [
+            "you cut open",
+            (lambda: [*self.drop("szA"), Create(nozip)], 0.5),
+            (lambda: [FadeOut(VGroup(bag, bagt, ptr, ptrl, nozip)), *self.size("szA", "84 bytes", YA)], 0.7),
+        ], after=0.3)
+        self.stamp("zip")
 
-        # ---- compression: one chunk of the currency column --------------------------------------------------------
-        cur_box = SurroundingRectangle(VGroup(*[cells[i][2] for i in range(4)]), color=BLUE_M, buff=0.08, corner_radius=0.08,
-                                       stroke_width=3)
-        ktitle = left_at(T("currency: one chunk of 12 values", 18, GREY_B), KX, -0.3)
-        kc = [mbox(c, BLUE_M, w=KW, h=0.44, size=15).move_to([kx(i), YK, 0]) for i, c in enumerate(CUR)]
-        s1 = left_at(T("plain: 84 bytes", 20, WHITE), SX, YK)
-        self.steps("And neighbours in a column look alike. Here are twelve currencies: four different strings, "
-                   "stored in full, 84 bytes.", [
-            (lambda: [FadeOut(amt), *[cells[i][j].animate.set_opacity(1) for i in range(4) for j in (0, 1, 4)],
-                      *[cells[i][3].animate.set_opacity(0.45) for i in range(4)], Create(cur_box)], 0.8),
-            "Here are twelve",
-            (lambda: [FadeIn(ktitle), LaggedStart(*[FadeIn(c, shift=0.2 * DOWN) for c in kc], lag_ratio=0.06)], 1.3),
-            "stored in full",
-            (lambda: [FadeIn(s1, shift=0.1 * LEFT)], 0.6),
+        # ---------------- scene 4: a key on the cover ----------------
+        card = RoundedRectangle(corner_radius=0.14, width=CARD_W, height=CARD_H, stroke_color=GOLD_M, stroke_width=3) \
+            .set_fill(fillc(GOLD_M), 1).move_to(CARD_C)
+        card_t = T("the key on the cover", 18, GOLD_M).move_to(CARD_C + [0, 0.66, 0])
+        entries = [M(f"{k} = {v}", 20).move_to(CARD_C + [0.8 * (1 if k % 2 else -1), 0.05 - 0.55 * (k // 2), 0]) for k, v in enumerate(KEY)]
+        rowB = self.row(YB, [str(c) for c in CODE], GOLD_M)
+        self.steps("So back to the shorthand. On the binder's cover, the owner writes a key, in alphabetical order: "
+                   "0 is EUR, 1 is GBP, 2 is SEK, and 3 is USD.", [
+            (lambda: [*self.uncap(), FadeIn(card), FadeIn(card_t)], 0.7),
+            "0 is EUR",
+            *[x for k, v in enumerate(KEY) for x in (f"{k} is {v}", (lambda v=v, k=k: [TransformFromCopy(rowA[FIRST[v]], entries[k])], 0.5))],
         ])
+        self.steps("Now each strip holds one small number instead of a word.", [
+            (lambda: [LaggedStart(*[FadeIn(c, shift=0.15 * DOWN) for c in rowB], lag_ratio=0.1),
+                      *self.rowlab("lB", "codes: each value's place in the key", YB, GOLD_M)], 1.5),
+        ])
+        self.steps("Let's map it. The key on the cover is the dictionary. The number on a strip is a code: its value's place "
+                   "in the key. This is called dictionary encoding.", [
+            "The key on the cover",
+            (lambda: [glow(card, GOLD_M, 1.03), *self.cap("the key on the cover = the dictionary", GOLD_M)], 0.7),
+            "The number on a strip",
+            (lambda: [LaggedStart(*[glow(c[0], GOLD_M, 1.12) for c in rowB], lag_ratio=0.05),
+                      *self.cap("the number on a strip = a code", GOLD_M)], 1.0),
+            "dictionary encoding",
+            (lambda: self.cap("dictionary encoding: each value once, in a sorted key; a small code per row", WHITE), 0.6),
+        ])
+        self.steps("And since the key is sorted, a test like currency before GBP becomes code below 1, right on the codes.", [
+            "currency before GBP",
+            (lambda: [*self.cap(M("currency < 'GBP'   is   code < 1", 22, YELLOW_M))], 0.5),
+            "code below 1",
+            (lambda: [*[glow(rowA[i][0], YELLOW_M, 1.12) for i in range(12) if CODE[i] == 0],
+                      *[glow(rowB[i][0], YELLOW_M, 1.12) for i in range(12) if CODE[i] == 0], glow(card, YELLOW_M, 1.02)], 0.9),
+        ], after=0.3)
+        self.stamp("dictionary")
 
-        dlab = left_at(T("dictionary:", 18, GREY_B), KX, YDICT)
-        dct = VGroup(*[chip(f"{v} = {k}", TEAL_M, 17, mono=True) for k, v in CODE.items()]).arrange(RIGHT, buff=0.2)
-        left_at(dct, dlab.get_right()[0] + 0.25, YDICT)
-        codes = [mbox(str(CODE[c]), TEAL_M, w=KW, h=0.44, size=17).move_to([kx(i), YCODE, 0]) for i, c in enumerate(CUR)]
-        self.steps("Dictionary encoding stores each string once, and replaces every value by its number in the list.", [
-            (lambda: [FadeIn(dlab), LaggedStart(*[FadeIn(c, shift=0.1 * UP) for c in dct], lag_ratio=0.2)], 1.2),
-            "and replaces",
-            (lambda: [LaggedStart(*[TransformFromCopy(kc[i], codes[i]) for i in range(12)], lag_ratio=0.06)], 1.6),
+        # ---------------- scene 5: paper doesn't shrink ----------------
+        bitnote = left_at(T("a bit: a single 0 or 1.   8 bits = 1 byte", 21), X0, YL)
+        twobits = left_at(M("0 to 3 fits in 2 bits:   00  01  10  11", 20, GOLD_M), X0, YL2)
+        BXS = [X0 + 0.11 + 0.22 * k for k in range(24)]
+        bitsq = [Square(0.22, stroke_color=GREEN_M, stroke_width=1.5).set_fill(fillc(GREEN_M, 0.25), 1).move_to([BXS[k], YL, 0]) for k in range(24)]
+        bitd = [M(BITS[k // 2][k % 2], 14).move_to([BXS[k], YL, 0]) for k in range(24)]
+        braces = VGroup(*[Brace(VGroup(*bitsq[8 * b:8 * b + 8]), DOWN, buff=0.08, color=GREY_B) for b in range(3)])
+        blabs = VGroup(*[T(f"byte {b + 1}", 16, GREY_B).next_to(braces[b], DOWN, buff=0.08) for b in range(3)])
+        packed = left_at(T("24 bits = 3 bytes", 22, GREEN_M), BXS[-1] + 0.4, YL)
+        self.steps("Here the binders stop being a good picture. A paper strip with a 0 on it is just as thick as one that "
+                   "says EUR. Paper doesn't shrink, but bits do.", [
+            (lambda: self.cap("where the binders stop working: paper doesn't shrink, bits do", WHITE), 0.6),
+            "just as thick",
+            (lambda: [glow(rowB[0][0], RED_M, 1.15), glow(rowA[0][0], RED_M, 1.15)], 0.8),
         ])
+        self.steps("A bit is a single 0 or 1, and 8 bits make a byte. Our codes only go up to 3, and 3 fits in 2 bits.", [
+            (lambda: [FadeIn(bitnote)], 0.5),
+            "Our codes",
+            (lambda: [glow(rowB[5][0], GOLD_M, 1.15)], 0.6),
+            "fits in 2 bits",
+            (lambda: [FadeIn(twobits)], 0.5),
+        ])
+        self.steps("So how many bytes do the twelve codes take now? Pause and guess.", [
+            (lambda: self.cap("how many bytes for the twelve codes?  pause and guess", YELLOW_M), 0.6),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Two bits each, written back to back: 24 bits, which is 3 bytes.", [
+            (lambda: [*self.uncap(), FadeOut(bitnote), FadeOut(twobits), *[retext(c, b) for c, b in zip(rowB, BITS)]], 0.6),
+            "written back to back",
+            (lambda: [LaggedStart(*[TransformFromCopy(rowB[i], VGroup(bitsq[2 * i], bitsq[2 * i + 1], bitd[2 * i], bitd[2 * i + 1]))
+                                    for i in range(12)], lag_ratio=0.08)], 1.4),
+            "which is 3 bytes",
+            (lambda: [FadeIn(braces), FadeIn(blabs), FadeIn(packed)], 0.6),
+        ])
+        self.steps("With the key, the chunk takes 31 bytes instead of 84. A million currencies take 250 KB instead of 7 MB. "
+                   "Storing each number in the fewest bits that hold the largest one is called bit-packing.", [
+            "With the key",
+            (lambda: [glow(card, GOLD_M, 1.03), *self.size("szB", "31 bytes", YB, GREEN_M),
+                      *self.cap("key 28 bytes + codes 3 bytes = 31 bytes, against 84", GREEN_M)], 0.7),
+            "A million currencies",
+            (lambda: self.cap("a million currencies: 250 KB instead of 7 MB", WHITE), 0.6),
+            "is called bit-packing",
+            (lambda: self.cap("bit-packing: each number in the fewest bits that hold the largest", GREEN_M), 0.6),
+        ], after=0.4)
+        self.stamp("bitpacked")
+        bitsbar = VGroup(*bitsq, *bitd, braces, blabs, packed)
 
-        bits = [M(f"{CODE[c]:02b}", 17, TEAL_M).move_to([kx(i), YCODE, 0]) for i, c in enumerate(CUR)]
-        s2 = left_at(T("codes, 2 bits each: 3 bytes", 20, TEAL_M), SX, YCODE)
-        s3 = left_at(T("dictionary: 28 bytes", 20, TEAL_M), SX, YDICT)
-        tot = left_at(T("together 31 bytes, was 84", 20, GREEN_M), SX, YRLE)
-        self.steps("The numbers only go up to three, so two bits hold each one. "
-                   "The whole chunk shrinks from 84 bytes to 31.", [
-            "so two bits",
-            (lambda: [*[Transform(codes[i][1], bits[i]) for i in range(12)]], 0.9),
-            (lambda: [FadeIn(s2, shift=0.1 * LEFT)], 0.6),
-            "The whole chunk",
-            (lambda: [FadeIn(s3, shift=0.1 * LEFT)], 0.5),
-            (lambda: [FadeIn(tot, shift=0.1 * LEFT), s1.animate.set_color(GREY_B)], 0.7),
+        # ---------------- scene 6: numbers too ----------------
+        hdr_t = T("the chunk's header", 18, GOLD_M).move_to(CARD_C + [0, 0.66, 0])
+        base_e = M(f"base = {BASE}", 24).move_to(CARD_C + [0, -0.2, 0])
+        SEGW = 0.44
+        SX = [X0 + SEGW / 2 + SEGW * k for k in range(12)]
+        segs = [VGroup(Rectangle(width=SEGW, height=0.32, stroke_color=GREEN_M, stroke_width=1.5).set_fill(fillc(GREEN_M, 0.25), 1)
+                       .move_to([SX[k], YL, 0]), M("14", 14).move_to([SX[k], YL, 0])) for k in range(12)]
+        seg_t = left_at(T("12 x 14 bits = 168 bits", 22, GREEN_M), SX[-1] + SEGW / 2 + 0.3, YL)
+        words = left_at(T("in 3 words of 8 bytes, plus a 16-byte header: 40 bytes", 20, GREEN_M), X0, YL2)
+        self.steps("Numbers get the same trick. Twelve amounts, in cents, each in an 8-byte slot built for numbers with "
+                   "nineteen digits: 96 bytes.", [
+            (lambda: [*self.uncap(), FadeOut(bitsbar), *self.drop("szB", "lB"), FadeOut(rowB), glow(shelf[4][0], YELLOW_M, 1.08),
+                      FadeOut(VGroup(card, card_t, *entries))], 0.7),
+            "Twelve amounts",
+            (lambda: [*[retext(c, n(a)) for c, a in zip(rowA, AMT)], *self.rowlab("lA", "amount, in cents: 12 values, 8 bytes each", YA),
+                      *self.size("szA", "96 bytes", YA)], 0.8),
+            "an 8-byte slot",
+            (lambda: self.cap("each 8-byte slot is built for numbers with 19 digits", WHITE), 0.6),
         ])
+        rowB2 = self.row(YB, [n(a - BASE) for a in AMT], GOLD_M)
+        big = AMT.index(max(AMT))
+        self.steps("First, subtract the chunk's smallest amount, 300, from every value. Now the largest left is 8,600, "
+                   "and that fits in 14 bits.", [
+            "the chunk's smallest",
+            (lambda: [*[glow(rowA[i][0], YELLOW_M, 1.15) for i in range(12) if AMT[i] == BASE], FadeIn(card), FadeIn(hdr_t), FadeIn(base_e)], 0.7),
+            "from every value",
+            (lambda: [LaggedStart(*[FadeIn(c, shift=0.15 * DOWN) for c in rowB2], lag_ratio=0.08),
+                      *self.rowlab("lB", "minus the smallest, 300", YB, GOLD_M)], 1.3),
+            "the largest left",
+            (lambda: [glow(rowB2[big][0], YELLOW_M, 1.2)], 0.6),
+            "fits in 14 bits",
+            (lambda: self.cap("8,600 fits in 14 bits (14 bits hold up to 16,383)", WHITE), 0.6),
+        ])
+        self.steps("Twelve values take 168 bits. In three 8-byte words, plus a small header that remembers the 300, "
+                   "that's 40 bytes instead of 96. Taking off a base like this is called a frame of reference.", [
+            (lambda: [LaggedStart(*[TransformFromCopy(rowB2[i], segs[i]) for i in range(12)], lag_ratio=0.07)], 1.2),
+            (lambda: [FadeIn(seg_t)], 0.4),
+            "In three 8-byte words",
+            (lambda: [FadeIn(words), glow(card, GOLD_M, 1.03)], 0.6),
+            "40 bytes",
+            (lambda: self.size("szB", "40 bytes", YB, GREEN_M), 0.5),
+            "a frame of reference",
+            (lambda: self.cap("frame of reference: subtract the chunk's smallest value first", GREEN_M), 0.6),
+        ], after=0.3)
+        self.stamp("frame")
 
-        rlab = left_at(T("sorted:", 18, GREY_B), KX, YRLE)
-        runs = VGroup(*[chip(f"{k} x {n}", PURPLE_M, 17, mono=True) for k, n in (("EUR", 8), ("GBP", 2), ("SEK", 1), ("USD", 1))])
-        runs.arrange(RIGHT, buff=0.2)
-        left_at(runs, rlab.get_right()[0] + 0.25, YRLE)
-        rn = left_at(T("4 runs", 20, PURPLE_M), runs.get_right()[0] + 0.3, YRLE)
-        self.steps("When equal values sit together, run-length encoding does even better. "
-                   "Sorted by currency, the twelve values are four runs.", [
-            (lambda: [*[glow(kc[i][0], PURPLE_M, 1.1) for i in (0, 1, 2)]], 0.9),
-            "Sorted by currency",
-            (lambda: [FadeIn(rlab), LaggedStart(*[FadeIn(r, shift=0.1 * UP) for r in runs], lag_ratio=0.25)], 1.2),
-            (lambda: [FadeIn(rn)], 0.5),
+        # ---------------- scene 7: runs ----------------
+        rowA3 = self.row(YA, CUR, BLUE_M)
+        rowB3 = self.row(YB, [str(c) for c in CODE], GOLD_M)
+        order = sorted(range(12), key=lambda i: CODE[i])          # stable: row order inside each currency
+        pos = {i: p for p, i in enumerate(order)}
+        runs = [(k, [p for p in range(12) if CODE[order[p]] == k]) for k in range(4)]
+        runcells = [cell((cx(ps[0]) + cx(ps[-1])) / 2, YB, f"{k} x {len(ps)}", GOLD_M, w=cx(ps[-1]) - cx(ps[0]) + CW, size=16) for k, ps in runs]
+        self.steps("One more shorthand. If the table were sorted by currency, equal codes would sit together: eight zeros, "
+                   "two ones, one two and one three.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(*segs, seg_t, words, rowB2, hdr_t, base_e, rowA)), *self.drop("szB", "szA", "lA", "lB")], 0.5),
+            (lambda: [FadeIn(rowA3), FadeIn(rowB3), FadeIn(card_t), *[FadeIn(e) for e in entries],
+                      *self.rowlab("lA", "currency: 12 values in row order", YA), *self.rowlab("lB", "codes", YB, GOLD_M),
+                      *self.size("szA", "84 bytes", YA)], 0.5),
+            "If the table were sorted",
+            (lambda: [*[rowA3[i].animate.move_to([cx(pos[i]), YA, 0]) for i in range(12)],
+                      *[rowB3[i].animate.move_to([cx(pos[i]), YB, 0]) for i in range(12)],
+                      *self.rowlab("lA", "currency: the same 12, sorted", YA)], 1.4),
+            "eight zeros",
+            (lambda: [*[glow(rowB3[order[p]][0], YELLOW_M, 1.12) for p in runs[0][1]]], 0.6),
         ])
+        self.steps("Write each run once, with its length. Four runs. That's run-length encoding. It shines on sorted columns.", [
+            (lambda: [LaggedStart(*[Transform(VGroup(*[rowB3[order[p]] for p in ps]), runcells[k].copy()) for k, ps in runs],
+                                  lag_ratio=0.3), *self.rowlab("lB", "runs: (code, how many in a row)", YB, GOLD_M)], 1.4),
+            lambda: (self.remove(rowB3), self.add(*runcells)),
+            "Four runs",
+            (lambda: self.size("szB", "4 runs", YB, GREEN_M), 0.5),
+            "run-length encoding",
+            (lambda: self.cap("run-length encoding: each run once, with its length", GREEN_M), 0.6),
+        ])
+        self.stamp("runs")
 
-        l3, b3, v3 = meter("DuckDB, the whole table, compressed", 5.5, 1.0, TEAL_M, "5.5 MB")
-        self.steps("No encoding wins everywhere, so the engine tries several on each chunk and keeps the smallest. "
-                   "DuckDB stores the whole table in 5.5 megabytes.", [
-            (lambda: [glow(s2, YELLOW_M, 1.05)], 0.8),
-            "and keeps the smallest",
-            (lambda: [tot.animate(rate_func=there_and_back).scale(1.12)], 0.8),
-            "DuckDB stores",
-            (lambda: [FadeIn(l3), GrowFromEdge(b3, LEFT), FadeIn(v3)], 1.0),
+        # ---------------- scene 8: none wins everywhere ----------------
+        rowA4 = self.row(YA, [n(a) for a in AMT], BLUE_M)
+        rowB4 = self.row(YB, [n(a) for a in AMT], RED_M)
+        self.steps("So should every column use runs? Try it on our twelve amounts, which aren't sorted. Smaller than plain, "
+                   "or bigger? Pause and guess.", [
+            (lambda: [*self.uncap(), FadeOut(VGroup(rowA3, *runcells, card_t, *entries)), *self.drop("szB", "szA", "lA", "lB")], 0.5),
+            (lambda: [FadeIn(rowA4), FadeIn(hdr_t), FadeIn(base_e),
+                      *self.rowlab("lA", "plain: 12 amounts in cents, in row order", YA), *self.size("szA", "96 bytes", YA)], 0.5),
+            "Try it",
+            (lambda: [FadeIn(rowB4), *self.rowlab("lB", "run-length: 12 runs, each of length 1", YB, RED_M)], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("smaller than plain, or bigger?  pause and guess", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        chips = VGroup(chip("run-length: 144 bytes", RED_M, 22), chip("plain: 96 bytes", WHITE, 22),
+                       chip("bit-packed: 40 bytes", GREEN_M, 22)).arrange(RIGHT, buff=0.45).move_to([0, YL, 0])
+        self.steps("Bigger. Twelve runs of length one, at 12 bytes each: 144 bytes, against 96 plain. Not much of a run.", [
+            (lambda: [*self.uncap(), *self.size("szB", "144 bytes", YB, RED_M), FadeOut(VGroup(card, hdr_t, base_e))], 0.5),
+            "144 bytes",
+            (lambda: [FadeIn(chips[0], shift=0.1 * UP), *self.cap("12 runs x (8-byte value + 4-byte length) = 144 bytes", WHITE)], 0.4),
+            "against 96",
+            (lambda: [FadeIn(chips[1], shift=0.1 * UP)], 0.4),
+            "Not much",
+            (lambda: [LaggedStart(*[glow(c[0], RED_M, 1.1) for c in rowB4], lag_ratio=0.05)], 0.9),
         ])
+        self.steps("So no encoding wins everywhere. For each chunk, the engine tries them all and keeps the smallest: here, "
+                   "bit-packing, at 40 bytes.", [
+            (lambda: self.cap("no encoding wins everywhere", WHITE), 0.5),
+            "the engine tries",
+            (lambda: [FadeIn(chips[2], shift=0.1 * UP)], 0.4),
+            "keeps the smallest",
+            (lambda: [chips[0].animate.fade(0.65), chips[1].animate.fade(0.65), glow(chips[2][0], GREEN_M, 1.06),
+                      *self.cap("for each chunk: try every encoding, keep the smallest", GREEN_M)], 0.7),
+        ])
+        tags = [T("bit-packed" if f in ("id", "shop", "amount", "time") else "dictionary", 15,
+                  GREEN_M if f in ("id", "shop", "amount", "time") else GOLD_M).move_to([x, TAG_Y, 0]) for f, x in zip(FIELDS, SHELF_X)]
+        PGL, PGX = -2.1, -1.9
+        pgb, ddb = bar(PGX, YL, 7.0, RED_M), bar(PGX, YL2, 7.0 * 5.5 / 66, GREEN_M)
+        pgl, ddl = right_at(T("PostgreSQL, whole rows", 20), PGL, YL), right_at(T("DuckDB, by column", 20), PGL, YL2)
+        pgv = left_at(T("66 MB", 20, RED_M), PGX + 7.15, YL)
+        ddv = left_at(T("5.5 MB", 20, GREEN_M), PGX + 7.0 * 5.5 / 66 + 0.15, YL2)
+        self.steps("DuckDB, a free database built for reports, does this chunk by chunk. On the lesson's million payments, it "
+                   "bit-packed the numbers and gave the text a dictionary: 5.5 MB in all.", [
+            (lambda: [*self.uncap(), FadeOut(chips)], 0.4),
+            "bit-packed the numbers",
+            (lambda: [LaggedStart(*[FadeIn(t, shift=0.05 * DOWN) for t in tags], lag_ratio=0.12)], 1.0),
+            "5.5 MB",
+            (lambda: [FadeIn(ddl), GrowFromEdge(ddb, LEFT), FadeIn(ddv)], 0.6),
+        ])
+        self.steps("PostgreSQL, a free database that keeps whole rows together, needs 66.", [
+            (lambda: [FadeIn(pgl), GrowFromEdge(pgb, LEFT), FadeIn(pgv)], 0.9),
+        ], after=0.3)
+        self.stamp("choose")
 
-        # ---- zone maps on created_at ------------------------------------------------------------------------------
-        cre_box = SurroundingRectangle(VGroup(*[cells[i][4] for i in range(4)]), color=GOLD_M, buff=0.08, corner_radius=0.08,
-                                       stroke_width=3)
-        ztitle = left_at(T("created_at: six chunks, each with its min and max", 18, GREY_B), ZX, -0.3)
-        zs = [zone(k, *ZONES[k]) for k in range(6)]
-        comp = VGroup(ktitle, *kc, *codes, s1, s2, s3, tot, dlab, dct, rlab, runs, rn)
-        self.steps("Skipping is cheaper still. When the engine writes a chunk, it notes the smallest and largest value. "
-                   "That pair is a zone map.", [
-            (lambda: [FadeOut(comp), FadeOut(cur_box), *[cells[i][2].animate.set_opacity(0.45) for i in range(4)],
-                      *[cells[i][4].animate.set_opacity(1) for i in range(4)], Create(cre_box)], 0.9),
-            "When the engine",
-            (lambda: [FadeIn(ztitle), LaggedStart(*[FadeIn(z, shift=0.15 * DOWN) for z in zs], lag_ratio=0.15)], 1.4),
-            "That pair",
-            (lambda: [*[z[2].animate(rate_func=there_and_back).set_color(GOLD_M) for z in zs]], 1.0),
+        # ---------------- scene 9: why squeeze at all? ----------------
+        pl, cl = right_at(T("currency, plain", 20), PGL, YL), right_at(T("currency, codes", 20), PGL, YL2)
+        plb, clb = bar(PGX, YL, 7.0, RED_M), bar(PGX, YL2, 7.0 * 0.25 / 7, GREEN_M)
+        plv = left_at(T("7 MB", 20, RED_M), PGX + 7.15, YL)
+        clv = left_at(T("250 KB", 20, GREEN_M), PGX + 0.4, YL2)
+        self.steps("Disks are cheap, so why squeeze at all? Because a scan spends most of its time moving bytes, from the disk "
+                   "to memory and on to the processor.", [
+            (lambda: [*self.cap("disks are cheap: why squeeze at all?", WHITE), FadeOut(VGroup(rowA4, rowB4)),
+                      *self.drop("szA", "szB", "lA", "lB")], 0.5),
+            "moving bytes",
+            (lambda: [ReplacementTransform(pgl, pl), ReplacementTransform(ddl, cl), ReplacementTransform(pgb, plb),
+                      ReplacementTransform(ddb, clb), ReplacementTransform(pgv, plv), ReplacementTransform(ddv, clv),
+                      *self.cap("a scan's time goes on moving bytes: disk to memory to processor", WHITE)], 0.8),
+            "to memory",
+            (lambda: [dot_run([PGX, YL, 0], [PGX + 7.0, YL, 0], YELLOW_M, 2.0),
+                      Succession(Wait(0.1), dot_run([PGX, YL2, 0], [PGX + 0.25, YL2, 0], YELLOW_M, 0.2))], 2.1),
         ])
+        self.steps("250 KB is about 28 times less to move than 7 MB, and undoing a 2-bit code takes a few simple steps.", [
+            (lambda: [glow(clb, GREEN_M, 1.2), *self.cap("250 KB instead of 7 MB: about 28 times fewer bytes to move", GREEN_M)], 0.7),
+            "undoing a 2-bit code",
+            (lambda: self.cap("undoing a 2-bit code: a few simple steps", WHITE), 0.6),
+        ], after=0.3)
 
-        q = chip("WHERE day = Oct 15", GOLD_M, 18).move_to([4.95, -0.3, 0])
-        vs = [verdict(k, "decode" if k == 2 else "skip", GOLD_M if k == 2 else GREY_B) for k in range(6)]
-        res = left_at(T("decoded: 1 chunk of 6", 20, GREEN_M), ZX, -2.75)
-        demo = left_at(T("in the DuckDB demo: 2 row groups of 9", 18, GREY_B), ZX, -3.2)
-        self.steps("A query wants October fifteenth. Five chunks can't hold that day, so the scan skips them unread, "
-                   "and decodes one.", [
-            (lambda: [FadeIn(q, shift=0.1 * LEFT)], 0.6),
-            "Five chunks",
-            (lambda: [*[zs[k].animate.set_opacity(0.3) for k in (0, 1, 3, 4, 5)], *[FadeIn(vs[k]) for k in (0, 1, 3, 4, 5)]], 1.0),
-            "and decodes one",
-            (lambda: [zs[2][0].animate.set_stroke(GOLD_M, width=4), FadeIn(vs[2]), FadeIn(res), FadeIn(demo)], 0.8),
+        # ---------------- scene 10: the moral, and a check ----------------
+        self.steps("So, how small can a column get? As small as its values are alike.", [
+            (lambda: [FadeOut(VGroup(pl, cl, plb, clb, plv, clv)), *self.cap("how small can a column get?", WHITE)], 0.6),
+            "As small as",
+            (lambda: self.cap("as small as its values are alike", YELLOW_M, 26), 0.6),
         ])
-
-        zs2 = [zone(k, "Oct 1", "31", RED_M) for k in range(6)]
-        vs2 = [verdict(k, "decode", RED_M) for k in range(6)]
-        res2 = left_at(T("decoded: 6 chunks of 6", 20, RED_M), ZX, -2.75)
-        self.steps("That only works because payments arrive in time order. "
-                   "Shuffle the rows, and every chunk spans the whole month: nothing is skipped.", [
-            (lambda: [glow(cre_box, GOLD_M, 1.03)], 0.9),
-            "Shuffle the rows",
-            (lambda: [*[Transform(zs[k], zs2[k]) for k in range(6)]], 1.2),
-            "nothing is skipped",
-            (lambda: [*[Transform(vs[k], vs2[k]) for k in range(6)], Transform(res, res2), FadeOut(demo)], 0.9),
+        m1 = chip("each value once, in a key", GOLD_M, 20)
+        m2 = chip("each number in the fewest bits", GREEN_M, 20)
+        m3 = chip("a run once, with its length", GOLD_M, 20)
+        moral = VGroup(m1, m2, m3).arrange(DOWN, buff=0.12, aligned_edge=LEFT)
+        left_at(moral, X0, 0.35)
+        self.steps("Write each different value once, in a key. Store each number in the fewest bits. Write a run once, with "
+                   "its length. Then try them all and keep the smallest.", [
+            (lambda: [FadeIn(m1, shift=0.1 * UP), FadeIn(card), FadeIn(card_t), *[FadeIn(e) for e in entries]], 0.5),
+            (lambda: [glow(card, GOLD_M, 1.03)], 0.6),
+            "Store each number",
+            (lambda: [FadeIn(m2, shift=0.1 * UP)], 0.5),
+            "Write a run",
+            (lambda: [FadeIn(m3, shift=0.1 * UP)], 0.5),
+            "Then try them all",
+            (lambda: self.cap("then try them all, and keep the smallest", YELLOW_M, 26), 0.6),
+        ], after=0.3)
+        run1 = cell((cx(0) + cx(11)) / 2, YB, "0 x 12", GOLD_M, w=cx(11) - cx(0) + CW, size=20)
+        rowS = self.row(YA, ["0"] * 12, GOLD_M)
+        self.steps("One quick check. Ten million payments, sorted by status, which has three values. Which shorthand stores "
+                   "the status column smallest? Pause and think.", [
+            (lambda: [*self.uncap(), FadeOut(moral), FadeOut(VGroup(card, card_t, *entries)), glow(shelf[3][0], YELLOW_M, 1.08),
+                      *self.rowlab("lA", "status codes: one chunk of 10 million payments sorted by status (3 values)", YA, WHITE)], 0.8),
+            "Which shorthand",
+            (lambda: [LaggedStart(*[FadeIn(c, shift=0.1 * DOWN) for c in rowS], lag_ratio=0.06)], 0.8),
+            "Pause and think",
+            (lambda: self.cap("which shorthand stores it smallest?  pause and think", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Runs. Sorted by status, almost every chunk holds one status: a single run, one value and one count. "
+                   "Bit-packed codes would still cost 2 bits a row, 2.5 MB.", [
+            (lambda: [*self.uncap(), FadeIn(run1, shift=0.1 * DOWN), *self.rowlab("lB", "run-length: one run per chunk", YB, GREEN_M)], 0.6),
+            "a single run",
+            (lambda: [glow(run1[0], GREEN_M, 1.03), *self.size("szB", "1 run", YB, GREEN_M),
+                      *self.cap("a run: one value + one count, however long the chunk", GREEN_M)], 0.7),
+            "Bit-packed codes",
+            (lambda: self.cap("bit-packed codes: 2 bits a row = 2.5 MB for 10 million rows", WHITE), 0.6),
         ])
-
-        self.steps("A column store reads one field, compressed, and only from the chunks that can match.", [
-            (lambda: [*[Transform(zs[k], zone(k, *ZONES[k])) for k in range(6)],
-                      *[Transform(vs[k], verdict(k, "decode" if k == 2 else "skip", GOLD_M if k == 2 else GREY_B)) for k in range(6)],
-                      Transform(res, left_at(T("decoded: 1 chunk of 6", 20, GREEN_M), ZX, -2.75))], 1.0),
-            "compressed",
-            (lambda: [glow(b3, TEAL_M, 1.1)], 0.8),
-            "only from",
-            (lambda: [*[zs[k].animate.set_opacity(0.3) for k in (0, 1, 3, 4, 5)], zs[2][0].animate.set_stroke(GOLD_M, width=4)], 0.8),
-        ])
-        self.wait(0.6)
+        self.steps("Each chunk also notes its smallest and largest value, so a scan can skip it unread. That's next.", [
+            (lambda: self.cap("next: each chunk's smallest and largest value lets a scan skip it", WHITE), 0.6),
+        ], after=0.3)
+        self.play(*self.cap("values that look alike squeeze small: try each shorthand, keep the smallest", YELLOW_M, 26), run_time=0.7)
+        self.wait(2.0)

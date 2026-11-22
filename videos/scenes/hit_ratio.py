@@ -1,31 +1,16 @@
 from sfz import *
 
-PY = 2.5                               # the request path: fraud check, Redis, database
-SX, CX, DX = -5.0, -0.3, 4.7
-ROWS = [-0.3, -1.2, -2.1]              # 90%, 99%, 99.9%
-LB0, LS = -4.6, 3.0                    # latency bars: left edge, units per ms
-QB0, QS = 1.8, 3.0                     # database bars: left edge, units per 10,000 queries a second
-BH = 0.42
-KX0, KW = -4.6, 10.0                   # keys and lookups bars: left edge, width for 100%
-KY, RY = 0.85, -1.65
+SAY.insert(0, (r"(\d)%", r"\1 percent"))
 
-def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
-    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
-
-
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
-
-
-def left_at(m, x, y):
-    return m.move_to([x + m.width / 2, y, 0])
-
-
-def right_at(m, x, y):
-    return m.move_to([x - m.width / 2, y, 0])
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+FX, FW, FLOW_Y = [-4.6, 0.0, 4.6], 3.2, 2.85        # program -> cache (the jug) -> database (the storeroom)
+GX0, GY0, GP = -6.1, 1.4, 0.36                      # 100 lookups: a 10 x 10 grid of dots
+TCOL, THEAD, TROW = [-0.9, 2.0, 5.0], 1.55, [0.95, 0.35, -0.25]   # the results table
+MATH_X, MATH_Y1, MATH_Y2 = -1.7, -1.05, -1.6
+PAYY = [1.2, 0.5, -0.2, -0.9]                       # four payments of 30 lookups
+CODE_Y = -1.45
+BAR_Y, CAP_Y = -2.75, -3.25
+MISS = sorted(np.random.default_rng(11).choice(100, 10, replace=False).tolist(), key=lambda i: (i * 37) % 100)
 
 
 class Base(VoiceScene):
@@ -73,227 +58,325 @@ class Base(VoiceScene):
                 self.wait(it)
                 t += it
                 continue
+            if callable(it):
+                it()
+                continue
             fn, rt = it
             self.play(*fn(), run_time=rt)
             t += rt
-        if t > dur + 0.1:
-            print(f"WARNING: steps {t:.1f}s longer than line {dur:.1f}s: {text[:50]}")
         if dur - t > 0.02:
             self.wait(dur - t)
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
 
-def arr(a, b, color=GREY_B, sw=2.5):
+
+def fillc(color, a=0.14):
+    return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
+
+
+def glow(m, color=YELLOW_M, s=1.04):
+    """Pulse an outline (Indicate would flood a filled box and hide its label)."""
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+
+
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
+
+
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
+
+
+def right_at(m, x, y):
+    return m.move_to([x - m.width / 2, y, 0])
+
+
+def dot_run(a, b, color=YELLOW_M, rt=0.6):
     a, b = np.array(a, dtype=float), np.array(b, dtype=float)
-    n = np.linalg.norm(b - a)
-    return Arrow(a, b, buff=0.04, stroke_width=sw, color=color, max_tip_length_to_length_ratio=0.2 / n,
-                 max_stroke_width_to_length_ratio=20)
+    d = Dot(radius=0.07, color=color).move_to(a).set_z_index(6)
+    return Succession(FadeIn(d, run_time=0.05), MoveAlongPath(d, Line(a, b), rate_func=smooth, run_time=rt), FadeOut(d, run_time=0.1))
 
 
-
-
-def node(x, title, sub, color=WHITE, w=2.8):
-    r = RoundedRectangle(corner_radius=0.14, width=w, height=0.95, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1)
-    r.move_to([x, PY, 0])
-    return VGroup(r, T(title, 24).move_to([x, PY + 0.18, 0]), T(sub, 16, GREY_B).move_to([x, PY - 0.22, 0]))
-
-
-def lat_row(k, h, label):
-    y = ROWS[k]
-    hw, mw = h * 0.5 * LS, (1 - h) * 10 * LS
-    g = Rectangle(width=hw, height=BH, stroke_width=0).set_fill(GREEN_M, 0.55).move_to([LB0 + hw / 2, y, 0])
-    m = Rectangle(width=max(mw, 0.02), height=BH, stroke_width=0).set_fill(RED_M, 0.7).move_to([LB0 + hw + max(mw, 0.02) / 2, y, 0])
-    n = left_at(T(label, 20), LB0 + hw + max(mw, 0.02) + 0.15, y)
-    return g, m, n
-
-
-def q_row(k, q, label):
-    y = ROWS[k]
-    w = max(QS * q / 10000, 0.02)
-    b = Rectangle(width=w, height=BH, stroke_width=0).set_fill(RED_M, 0.7).move_to([QB0 + w / 2, y, 0])
-    return b, right_at(T(label, 20), 6.5, y)
-
-
-def band(kfrac, rfrac, color=GOLD_M):
-    """The share of keys a cache holds (top bar) and the share of lookups they get (bottom bar)."""
-    kw, rw = max(KW * kfrac, 0.06), KW * rfrac
-    sk = Rectangle(width=kw, height=0.5, stroke_width=0).set_fill(color, 0.8).move_to([KX0 + kw / 2, KY, 0])
-    sr = Rectangle(width=rw, height=0.5, stroke_width=0).set_fill(color, 0.8).move_to([KX0 + rw / 2, RY, 0])
-    fan = Polygon([KX0, KY - 0.25, 0], [KX0 + kw, KY - 0.25, 0], [KX0 + rw, RY + 0.25, 0], [KX0, RY + 0.25, 0],
-                  stroke_width=0).set_fill(color, 0.22)
-    return VGroup(fan, sk, sr)
 
 
 class HitRatio(Base):
-    """cache-01, section 2 (with sections 0 and 1): a fraud check does 100,000 merchant lookups a second; Redis answers
-    in 0.5 ms, the database in 10 ms. Average = h × 0.5 + (1 − h) × 10: 1.45 ms and 10,000 queries a second at 90%,
-    0.595 ms and 1,000 at 99%, 0.51 ms and 100 at 99.9%. Uniform popularity: 10% of a million merchants catch 10%.
-    Zipf with α = 1: the top 1,000 (0.1%) get 52% of lookups and the top 10% get 84%."""
+    """cache-01, section 2. The barista's jug and the storeroom. A cache that goes from 90 to 99 lookups in 100: nine
+    points? Map: jug = cache, storeroom = database, hit and miss; Redis 0.5 ms, database 10 ms, 100,000 lookups a
+    second. 90%: 1.45 ms and 10,000 a second. Predict 99%: 1,000 a second, 0.595 ms. Count the misses: hit ratio and
+    miss ratio; 99.9%: 0.5095 ms and 100. Thirty lookups a payment: 0.99^30 = 74%. The formulas in Java and Kotlin.
+    The moral, and a check (95% to 99%: five times fewer)."""
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color) if isinstance(s, str) else s, 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        mob.set_z_index(3)
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for k in keys:
+            m = self.lab.pop(k, None)
+            if m is not None:
+                out.append(FadeOut(m))
+        return out
+
+    def countdown(self, secs=3.0):
+        b = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(b), run_time=0.25)
+        self.play(Uncreate(b), run_time=secs, rate_func=linear)
+
+    def flab(self, k, title, sub, color=WHITE):
+        g = VGroup(T(title, 20, color), T(sub, 17, GREY_B)).arrange(DOWN, buff=0.08).move_to([FX[k], FLOW_Y, 0])
+        fit(g, FW - 0.25)
+        return self.put(f"f{k}", g)
+
+    def math(self, a, b=None, color=WHITE):
+        out = self.put("m1", left_at(T(a, 22, color), MATH_X, MATH_Y1))
+        if b is not None:
+            out += self.put("m2", left_at(T(b, 22, color), MATH_X, MATH_Y2))
+        return out
+
+    def trow(self, r, vals, color=WHITE):
+        g = VGroup(*[T(v, 22, color).move_to([x, TROW[r], 0]) for v, x in zip(vals, TCOL)])
+        return self.put(f"r{r}", g)
+
+    def paint(self, idx, color, op=1.0):
+        return [self.dots[i].animate.set_fill(color, op) for i in idx]
 
     def construct(self):
-        self.title_card("Hit ratios", "why 90% to 99% hits is ten times better, and why a small cache can get there")
+        self.capm = None
+        self.lab = {}
+        self.title_card("Nine points, or ten times?", "why 99% hits is ten times better than 90%")
 
-        # ---- 1. fast and slow --------------------------------------------------------------------------------------
-        svc = node(SX, "fraud check", "100,000 lookups a second", w=3.2)
-        db = node(DX, "database", "10 ms a lookup", BLUE_M)
-        red = node(CX, "Redis", "0.5 ms a lookup", GREEN_M, w=3.0)
-        direct = arr([SX + 1.65, PY, 0], [DX - 1.45, PY, 0])
-        a1 = arr([SX + 1.65, PY, 0], [CX - 1.55, PY, 0])
-        a2 = arr([CX + 1.55, PY, 0], [DX - 1.45, PY, 0])
-        self.steps("A fraud check looks up the merchant on every card payment, 100,000 times a second. The database "
-                   "answers in 10 milliseconds. Redis, a cache in memory one hop away, answers in half a millisecond.", [
-            (lambda: [FadeIn(svc, shift=0.1 * UP)], 0.7),
-            "The database",
-            (lambda: [FadeIn(db, shift=0.1 * UP), GrowArrow(direct)], 0.8),
-            (lambda: [travel(direct, BLUE_M, 1.2)], 1.2),
-            "Redis",
-            (lambda: [FadeIn(red, scale=0.95)], 0.7),
-            (lambda: [ReplacementTransform(direct, VGroup(a1, a2))], 0.5),
-            "answers in half",
-            (lambda: [travel(a1, GREEN_M, 0.5)], 0.5),
-            (lambda: [travel(Line(a1.get_end(), a1.get_start()), GREEN_M, 0.5)], 0.5),
+        boxes = [RoundedRectangle(corner_radius=0.14, width=FW, height=0.8, stroke_color=c, stroke_width=3).set_fill(fillc(c), 1)
+                 .move_to([x, FLOW_Y, 0]) for x, c in zip(FX, [GREY_B, TEAL_M, RED_M])]
+        a1 = Arrow([FX[0] + FW / 2, FLOW_Y, 0], [FX[1] - FW / 2, FLOW_Y, 0], buff=0.08, stroke_width=3, color=GREY_B, max_tip_length_to_length_ratio=0.15)
+        a2 = Arrow([FX[1] + FW / 2, FLOW_Y, 0], [FX[2] - FW / 2, FLOW_Y, 0], buff=0.08, stroke_width=3, color=GREY_B, max_tip_length_to_length_ratio=0.15)
+        P0, P1, P2 = [np.array([x, FLOW_Y - 0.55, 0]) for x in FX]
+
+        def hit_run(rt=0.5):
+            return Succession(dot_run(P0, P1, GREEN_M, rt), dot_run(P1, P0, GREEN_M, rt))
+
+        def miss_run(rt=0.6):
+            return Succession(dot_run(P0, P1, RED_M, rt * 0.6), dot_run(P1, P2, RED_M, rt * 1.6), dot_run(P2, P0, RED_M, rt * 2.2))
+
+        # ---------------- scene 1: the jug, and the question ----------------
+        self.steps("Picture a busy café. The barista makes a latte every thirty seconds, and never walks to the storeroom for milk.", [
+            (lambda: [FadeIn(boxes[0]), *self.flab(0, "the barista", "a latte every 30 seconds")], 0.7),
+            "never walks",
+            (lambda: [FadeIn(boxes[2]), GrowArrow(a2), *self.flab(2, "the storeroom", "at the back")], 0.7),
         ])
-
-        # ---- 2. hits and misses ------------------------------------------------------------------------------------
-        hit_l = T("hit", 19, GREEN_M).move_to([(SX + CX) / 2 + 0.2, PY + 0.4, 0])
-        miss_l = T("miss", 19, RED_M).move_to([(CX + DX) / 2 + 0.1, PY + 0.4, 0])
-
-        def hit(d=0.0):
-            return Succession(Wait(d), travel(a1, GREEN_M, 0.45), travel(Line(a1.get_end(), a1.get_start()), GREEN_M, 0.45))
-
-        def miss(d=0.0):
-            return Succession(Wait(d), travel(a1, RED_M, 0.4), travel(a2, RED_M, 0.45),
-                              travel(Line(a2.get_end(), a2.get_start()), RED_M, 0.45),
-                              travel(Line(a1.get_end(), a1.get_start()), RED_M, 0.4))
-
-        self.steps("But Redis holds only some merchants. If it has the one you ask for, that's a hit. "
-                   "If not, it's a miss, and the lookup goes on to the database.", [
-            (lambda: [glow(red[0], GREEN_M)], 0.8),
-            "that's a hit",
-            (lambda: [FadeIn(hit_l), hit(), hit(0.35)], 1.3),
-            "If not",
-            (lambda: [FadeIn(miss_l), miss()], 1.8),
+        self.steps("A jug sits on the counter, and she goes to the back only when it runs out. Walking takes far longer than pouring.", [
+            (lambda: [FadeIn(boxes[1]), GrowArrow(a1), *self.flab(1, "the jug of milk", "on the counter")], 0.7),
+            "only when it runs out",
+            (lambda: [hit_run(0.35)], 0.8),
+            "Walking takes",
+            (lambda: [miss_run(0.7)], 3.1),
         ])
-
-        # ---- 3. the formula -----------------------------------------------------------------------------------------
-        f = VGroup(T("average  =", 26), T("hit ratio × 0.5 ms", 26, GREEN_M), T("+", 26), T("miss ratio × 10 ms", 26, RED_M))
-        f.arrange(RIGHT, buff=0.25).move_to([0, 1.3, 0])
-        self.steps("So the average lookup costs the hit ratio times half a millisecond, plus the miss ratio times 10.", [
-            (lambda: [FadeIn(f[0])], 0.5),
-            "the hit ratio",
-            (lambda: [FadeIn(f[1], shift=0.1 * UP)], 0.6),
-            "plus the miss",
-            (lambda: [FadeIn(f[2]), FadeIn(f[3], shift=0.1 * UP)], 0.6),
+        self.steps("The payments program behind the card reader has the same choice. For every tap, it needs the shop's details "
+                   "from a database on another computer. So it keeps a copy close by.", [
+            (lambda: self.flab(0, "payments program", "every card tap"), 0.6),
+            "from a database",
+            (lambda: self.flab(2, "database", "on another computer"), 0.6),
+            "a copy close by",
+            (lambda: self.flab(1, "a copy close by", "the shop's details"), 0.6),
         ])
+        self.steps("Say that copy answers 90 lookups in 100, and someone tunes it to 99. Nine points better. Is that a small win, "
+                   "or a big one? Hold that thought.", [
+            (lambda: self.cap("the copy answers 90 lookups in 100 ... then 99 in 100", WHITE), 0.6),
+            "Nine points",
+            (lambda: self.cap("nine points better: a small win, or a big one?", YELLOW_M), 0.6),
+        ], after=0.3)
 
-        # ---- 4. 90% -------------------------------------------------------------------------------------------------
-        hl = T("average latency", 19, GREY_B).move_to([LB0 + 2.2, 0.42, 0])
-        hq = T("database queries a second", 19, GREY_B).move_to([QB0 + 2.35, 0.42, 0])
-        labs = [left_at(T(t, 22), -6.45, ROWS[k]) for k, t in enumerate(["90%", "99%", "99.9%"])]
-        g1, m1, n1 = lat_row(0, 0.9, "1.45 ms")
-        gt = T("0.45", 17).move_to(g1)
-        mt = T("1.0 ms from the misses", 17).move_to(m1)
-        self.steps("At 90% hits, the hits add 0.45 milliseconds, and the misses add a whole millisecond. "
-                   "One lookup in ten costs more than the other nine together.", [
-            (lambda: [FadeIn(hl), FadeIn(labs[0])], 0.5),
-            (lambda: [GrowFromEdge(g1, LEFT), FadeIn(gt)], 0.7),
-            "and the misses",
-            (lambda: [GrowFromEdge(m1, LEFT), FadeIn(mt)], 0.9),
-            (lambda: [FadeIn(n1)], 0.4),
-            "One lookup",
-            (lambda: [Indicate(mt, color=RED_M, scale_factor=1.1)], 0.9),
+        # ---------------- scene 2: map it ----------------
+        self.steps("Let's map the café. The jug is the cache: a small, fast store of copies. The storeroom is the database.", [
+            (lambda: [*self.uncap(), glow(boxes[1], TEAL_M, 1.03), *self.cap("the jug = the cache: a small, fast store of copies", TEAL_M)], 0.7),
+            "The storeroom",
+            (lambda: [glow(boxes[2], RED_M, 1.03), *self.cap("the storeroom = the database", RED_M)], 0.6),
         ])
+        self.steps("A lookup the jug can answer is a hit. One that sends you to the back is a miss.", [
+            (lambda: [hit_run(0.4), *self.cap("a hit: answered by the cache", GREEN_M)], 0.9),
+            "a miss",
+            (lambda: [miss_run(0.5), *self.cap("a miss: on to the database", RED_M)], 2.2),
+        ])
+        self.steps("Here the cache is Redis, a program that holds data in memory and hands it out over the network.", [
+            (lambda: self.flab(1, "Redis, the cache", "data in memory, over the network"), 0.7),
+        ])
+        self.steps("Round numbers, made up for teaching: a lookup takes half a millisecond from Redis, and 10 milliseconds from a "
+                   "busy database. At the busiest hour, there are 100,000 lookups a second.", [
+            (lambda: self.cap("round numbers, made up for teaching", GREY_B), 0.5),
+            "half a millisecond",
+            (lambda: self.flab(1, "Redis cache", "0.5 ms a lookup", TEAL_M), 0.6),
+            "10 milliseconds",
+            (lambda: self.flab(2, "database", "10 ms a lookup", RED_M), 0.6),
+            "100,000 lookups",
+            (lambda: self.flab(0, "payments program", "100,000 lookups a second"), 0.6),
+        ], after=0.3)
 
-        qb1, qn1 = q_row(0, 10000, "10,000")
-        self.steps("And every miss is a query, so the database gets 10,000 a second.", [
-            (lambda: [FadeIn(hq)], 0.5),
-            "so the database",
-            (lambda: [GrowFromEdge(qb1, LEFT), FadeIn(qn1), miss()], 1.6),
+        # ---------------- scene 3: ninety in a hundred ----------------
+        self.dots = [Dot(radius=0.11, color=GREEN_M).move_to([GX0 + GP * (i % 10), GY0 - GP * (i // 10), 0]) for i in range(100)]
+        glab = T("100 lookups", 20, GREY_B).move_to([GX0 + GP * 4.5, GY0 + 0.42, 0])
+        head = VGroup(*[T(h, 19, GREY_B).move_to([x, THEAD, 0]) for h, x in zip(["hit ratio", "average lookup", "database load"], TCOL)])
+        hline = Line([TCOL[0] - 0.9, THEAD - 0.28, 0], [6.45, THEAD - 0.28, 0], stroke_width=1.5, color=GREY_C)
+        self.steps("Take 100 lookups at 90% hits. Ninety pour from the jug. Ten walk to the storeroom.", [
+            (lambda: [*self.uncap(), FadeIn(glab), FadeIn(head), Create(hline)], 0.5),
+            "Ninety pour",
+            (lambda: [LaggedStart(*[FadeIn(d, scale=0.5) for d in self.dots], lag_ratio=0.01)], 1.0),
+            "Ten walk",
+            (lambda: self.paint(MISS, RED_M), 0.6),
+            (lambda: [LaggedStart(*[Indicate(self.dots[i], color=RED_M, scale_factor=1.6) for i in MISS], lag_ratio=0.1)], 0.8),
         ])
+        self.steps("The average lookup is 0.9 times 0.5, plus 0.1 times 10: 1.45 milliseconds.", [
+            (lambda: self.math("average: 0.9 x 0.5 + 0.1 x 10 = 1.45 ms"), 0.6),
+        ])
+        self.steps("And the database gets the misses: 10% of 100,000, so 10,000 queries a second.", [
+            (lambda: [*self.math("average: 0.9 x 0.5 + 0.1 x 10 = 1.45 ms", "database: 0.1 x 100,000 = 10,000 a second"),
+                      *[Indicate(self.dots[i], color=RED_M, scale_factor=1.5) for i in MISS]], 0.7),
+            "10,000 queries",
+            (lambda: self.trow(0, ["90%", "1.45 ms", "10,000 a second"]), 0.6),
+        ], after=0.3)
 
-        # ---- 5. 99% -----------------------------------------------------------------------------------------------------
-        g2, m2, n2 = lat_row(1, 0.99, "0.595 ms")
-        qb2, qn2 = q_row(1, 1000, "1,000")
-        self.steps("Now 99%. It looks like nine points more, but it's ten times fewer misses: 1,000 queries a second, "
-                   "and the average falls to 0.6 milliseconds.", [
-            (lambda: [FadeIn(labs[1]), FadeOut(gt), FadeOut(mt)], 0.5),
-            "ten times fewer",
-            (lambda: [GrowFromEdge(qb2, LEFT), FadeIn(qn2)], 0.8),
-            "and the average",
-            (lambda: [GrowFromEdge(g2, LEFT)], 0.5),
-            (lambda: [GrowFromEdge(m2, LEFT), FadeIn(n2)], 0.5),
+        # ---------------- scene 4: predict 99% ----------------
+        self.steps("Now 99% hits. Before we count, how many queries reach the database each second? Pause and guess.", [
+            (lambda: [*self.drop("m1", "m2"), *self.cap("99% hits: how many database queries a second?  pause and guess", YELLOW_M)], 0.6),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("1,000. Ten times fewer: one red dot in a hundred, instead of ten.", [
+            (lambda: [*self.uncap(), *self.paint(MISS[1:], GREEN_M)], 0.8),
+            (lambda: [*self.math("database: 0.01 x 100,000 = 1,000 a second", None, WHITE), Indicate(self.dots[MISS[0]], color=RED_M, scale_factor=1.8)], 0.6),
+            "Ten times fewer",
+            (lambda: self.cap("ten times fewer: 1 miss in 100, instead of 10", WHITE), 0.6),
         ])
+        self.steps("And the average drops to 0.595 milliseconds, more than twice as fast.", [
+            (lambda: [*self.math("average: 0.99 x 0.5 + 0.01 x 10 = 0.595 ms", "database: 0.01 x 100,000 = 1,000 a second"),
+                      *self.trow(1, ["99%", "0.595 ms", "1,000 a second"])], 0.7),
+        ], after=0.3)
 
-        # ---- 6. 99.9% ---------------------------------------------------------------------------------------------------
-        g3, m3, n3 = lat_row(2, 0.999, "0.51 ms")
-        qb3, qn3 = q_row(2, 100, "100")
-        rule = T("judge a cache by its misses", 22, GOLD_M).move_to([0, -2.95, 0])
-        self.steps("At 99.9%, the average barely moves: it's already close to Redis's own half millisecond. "
-                   "But the database load drops tenfold again. So judge a cache by its misses.", [
-            (lambda: [FadeIn(labs[2]), GrowFromEdge(g3, LEFT)], 0.6),
-            (lambda: [GrowFromEdge(m3, LEFT), FadeIn(n3)], 0.4),
-            "But the database",
-            (lambda: [GrowFromEdge(qb3, LEFT), FadeIn(qn3)], 0.6),
-            (lambda: [Indicate(qn1, color=RED_M), Indicate(qn2, color=RED_M), Indicate(qn3, color=RED_M)], 1.0),
-            "So judge",
-            (lambda: [FadeIn(rule, shift=0.1 * UP)], 0.6),
+        # ---------------- scene 5: count the misses ----------------
+        self.steps("So where did nine points come from? We counted the hits, and 90 and 99 look close.", [
+            (lambda: [*self.drop("m1", "m2"), *self.cap("nine points: that's counting the hits", PURPLE_M)], 0.6),
+            "We counted the hits",
+            (lambda: [LaggedStart(*[Indicate(self.dots[i], color=GREEN_M, scale_factor=1.3) for i in range(100) if i not in MISS[:1]], lag_ratio=0.005)], 1.0),
         ])
+        self.steps("But the database never sees a hit. It sees only the misses, and 10 misses against 1 is ten times the load.", [
+            "never sees a hit",
+            (lambda: [*[self.dots[i].animate.set_fill(GREEN_M, 0.25) for i in range(100) if i != MISS[0]], glow(boxes[2], RED_M, 1.03)], 0.7),
+            "10 misses against 1",
+            (lambda: [*self.cap("10 misses against 1: ten times the load", RED_M),
+                      Indicate(self.lab["r0"][2], color=RED_M), Indicate(self.lab["r1"][2], color=RED_M)], 0.8),
+        ])
+        self.steps("The share of hits is the hit ratio, and what's left is the miss ratio. 98% hits and 2% misses describe the same "
+                   "cache. Only the second tells you what the database sees.", [
+            (lambda: self.math("hit ratio h = hits / all lookups", "miss ratio = 1 - h", WHITE), 0.6),
+            "98% hits",
+            (lambda: self.cap("98% hits = 2% misses: the same cache", WHITE), 0.6),
+            "Only the second",
+            (lambda: self.cap("only the misses reach the database", RED_M), 0.6),
+        ])
+        self.steps("Ninety-nine percent sounds like top marks, but the database only marks the one percent.", [
+            (lambda: [Indicate(self.dots[MISS[0]], color=RED_M, scale_factor=2.0)], 0.9),
+        ], after=0.2)
+        tiny = T("99.9%: 1 miss in 1,000", 19, RED_M).move_to([GX0 + GP * 4.5, GY0 - GP * 9 - 0.45, 0])
+        self.steps("Push on to 99.9%. The average hardly moves, 0.5095 milliseconds, because it's already close to the cache's own "
+                   "half a millisecond.", [
+            (lambda: [*self.uncap(), self.dots[MISS[0]].animate.scale(0.4), FadeIn(tiny), *[d.animate.set_fill(GREEN_M, 1) for d in self.dots if d is not self.dots[MISS[0]]],
+                      *self.math("average: 0.999 x 0.5 + 0.001 x 10 = 0.5095 ms", "database: 0.001 x 100,000 = 100 a second")], 0.8),
+            "The average hardly",
+            (lambda: [*self.trow(2, ["99.9%", "0.5095 ms", "100 a second"]), *self.cap("the average: close to the cache's own 0.5 ms", WHITE)], 0.6),
+            (lambda: [LaggedStart(*[Indicate(self.lab[f"r{r}"][1], color=YELLOW_M) for r in range(3)], lag_ratio=0.3)], 0.9),
+        ])
+        self.steps("But the database load falls tenfold again: 100 a second.", [
+            (lambda: [*self.cap("the database: 10,000, then 1,000, then 100 a second", RED_M),
+                      LaggedStart(*[Indicate(self.lab[f"r{r}"][2], color=RED_M) for r in range(3)], lag_ratio=0.3)], 1.0),
+        ], after=0.4)
+        self.stamp("table")
 
-        # ---- 7. what if every key were equally popular -------------------------------------------------------------------
-        phaseA = VGroup(f, hl, hq, *labs, g1, m1, n1, g2, m2, n2, g3, m3, n3, qb1, qn1, qb2, qn2, qb3, qn3, rule)
-        kbar = Rectangle(width=KW, height=0.5, stroke_color=GREY_B, stroke_width=2).move_to([KX0 + KW / 2, KY, 0])
-        rbar = Rectangle(width=KW, height=0.5, stroke_color=GREY_B, stroke_width=2).move_to([KX0 + KW / 2, RY, 0])
-        kl = right_at(T("merchants", 20, GREY_B), KX0 - 0.2, KY)
-        rl = right_at(T("lookups", 20, GREY_B), KX0 - 0.2, RY)
-        kin = T("1,000,000 merchants", 17, GREY_B).move_to([KX0 + 7.0, KY, 0])
-        rin = right_at(T("all lookups", 17, GREY_B), KX0 + KW - 0.12, RY)
-        uni = band(0.1, 0.1)
-        ukl = left_at(T("the cache holds 10%", 20, GOLD_M), KX0, KY + 0.5)
-        url = left_at(T("10% of lookups hit", 20, GOLD_M), KX0, RY - 0.5)
-        self.steps("How does a small cache reach 99%? If all million merchants were equally popular, a cache holding "
-                   "a tenth of them would hit a tenth of the time.", [
-            (lambda: [FadeOut(phaseA)], 0.7),
-            (lambda: [Create(kbar), Create(rbar), FadeIn(kl), FadeIn(rl), FadeIn(kin), FadeIn(rin)], 0.9),
-            "a cache holding",
-            (lambda: [FadeIn(uni[1]), FadeIn(ukl), Transform(red[2], T("holds 100,000 merchants", 16, GREY_B).move_to(red[2]))], 0.6),
-            "would hit",
-            (lambda: [FadeIn(uni[0]), FadeIn(uni[2]), FadeIn(url)], 0.8),
+        # ---------------- scene 6: thirty lookups ----------------
+        sq = [[Rectangle(width=0.1, height=0.3, stroke_width=0).set_fill(GREEN_M, 1).move_to([GX0 - 0.05 + 0.118 * k, PAYY[p], 0]) for k in range(30)] for p in range(4)]
+        sq[2][17].set_fill(RED_M, 1)
+        plabs = [T(f"payment {p + 1}", 16, GREY_B).move_to([GX0 + 1.7, PAYY[p] + 0.3, 0]) for p in range(4)]
+        self.steps("One more trap. A card payment doesn't make one lookup. Say it makes 30, each with 99% hits.", [
+            (lambda: [*self.uncap(), *self.drop("m1", "m2"), FadeOut(VGroup(*self.dots, tiny, glab))], 0.6),
+            "Say it makes 30",
+            (lambda: [LaggedStart(*[FadeIn(VGroup(plabs[p], *sq[p])) for p in range(4)], lag_ratio=0.25),
+                      *self.cap("one payment: 30 lookups, each 99% hits", WHITE)], 1.0),
         ])
+        self.steps("All 30 hit only 74% of the time: 0.99 multiplied by itself 30 times.", [
+            (lambda: self.math("all 30 hit:  0.99^30 = 0.74", None, WHITE), 0.6),
+        ])
+        self.steps("So about one payment in four waits for at least one slow read. A cache with a great average still leaves many "
+                   "requests slow.", [
+            (lambda: [Indicate(sq[2][17], color=RED_M, scale_factor=2.5), *self.math("all 30 hit:  0.99^30 = 0.74", "about 1 payment in 4 meets a miss", WHITE)], 0.8),
+            "A cache with",
+            (lambda: self.cap("a great average still leaves many requests slow", YELLOW_M), 0.6),
+        ], after=0.3)
 
-        # ---- 8. skew ----------------------------------------------------------------------------------------------------
-        c1 = chip("a supermarket chain: thousands of payments a minute", GOLD_M, 18).move_to([-1.9, (KY + RY) / 2, 0])
-        c2 = chip("a bike repair shop: 2 a day", GREY_B, 18).move_to([3.6, (KY + RY) / 2, 0])
-        self.steps("But real traffic is skewed. A supermarket chain pays thousands of times a minute. "
-                   "A bike repair shop, twice a day.", [
-            (lambda: [uni.animate.set_opacity(0), FadeOut(ukl), FadeOut(url)], 0.6),
-            "A supermarket",
-            (lambda: [FadeIn(c1, shift=0.1 * DOWN)], 0.6),
-            "A bike repair",
-            (lambda: [FadeIn(c2, shift=0.1 * DOWN)], 0.6),
-        ])
+        # ---------------- scene 7: the formulas as code ----------------
+        JAVA = ["double avgMs = h * hitMs + (1 - h) * missMs;", "double dbPerSec = (1 - h) * lookupsPerSec;"]
+        KOT = ["val avgMs = h * hitMs + (1 - h) * missMs", "val dbPerSec = (1 - h) * lookupsPerSec"]
 
-        # ---- 9. a few hot keys get most lookups -------------------------------------------------------------------------
-        tkl = left_at(T("the top 1,000 merchants: 0.1%", 20, GOLD_M), KX0, KY + 0.5)
-        trl = right_at(T("52% of lookups", 20, GOLD_M), KX0 + 5.2, RY - 0.5)
-        tkl2 = left_at(T("the top 10% of merchants", 20, GOLD_M), KX0, KY + 0.5)
-        trl2 = right_at(T("84% of lookups", 20, GOLD_M), KX0 + 8.4, RY - 0.5)
-        self.steps("With a common amount of skew, the top 1,000 merchants, a tenth of a percent, get half of all lookups. "
-                   "The top 10% get 84%.", [
-            (lambda: [FadeOut(c1), FadeOut(c2), Transform(red[2], T("holds 1,000 merchants", 16, GREY_B).move_to(red[2]))], 0.6),
-            "the top 1,000",
-            (lambda: [Transform(uni[1], band(0.001, 0.52)[1]), FadeIn(tkl)], 0.6),
-            "get half",
-            (lambda: [Transform(uni[0], band(0.001, 0.52)[0]), Transform(uni[2], band(0.001, 0.52)[2]), FadeIn(trl)], 1.0),
-            "The top 10%",
-            (lambda: [Transform(uni, band(0.1, 0.84)), Transform(tkl, tkl2), Transform(trl, trl2)], 1.0),
+        def panel(x0, x1, title, lines):
+            r = RoundedRectangle(corner_radius=0.12, width=x1 - x0, height=1.45, stroke_color=GREY_B, stroke_width=2).set_fill("#111111", 1) \
+                .move_to([(x0 + x1) / 2, CODE_Y, 0])
+            t = left_at(T(title, 17, GREY_B), x0 + 0.2, CODE_Y + 0.48)
+            ls = [left_at(M(s, 15), x0 + 0.2, CODE_Y + 0.05 - 0.42 * k) for k, s in enumerate(lines)]
+            for l in ls:
+                fit(l, x1 - x0 - 0.35)
+                left_at(l, x0 + 0.2, l.get_center()[1])
+            return VGroup(r, t, *ls)
+        pj = panel(-6.45, -0.12, "Java", JAVA)
+        pk = panel(0.12, 6.45, "Kotlin", KOT)
+        self.steps("Here are the two formulas as code, in Java and Kotlin.", [
+            (lambda: [*self.uncap(), *self.drop("m1", "m2"), FadeOut(VGroup(*plabs, *[s for row in sq for s in row]))], 0.5),
+            (lambda: [FadeIn(pj, shift=0.1 * UP), FadeIn(pk, shift=0.1 * UP)], 0.7),
         ])
+        self.steps("The average is h times the hit time, plus one minus h, times the miss time. The database's load is one minus h, "
+                   "times the lookups.", [
+            (lambda: [Indicate(pj[2], color=YELLOW_M, scale_factor=1.04), Indicate(pk[2], color=YELLOW_M, scale_factor=1.04),
+                      LaggedStart(*[Indicate(self.lab[f"r{r}"][1], color=YELLOW_M) for r in range(3)], lag_ratio=0.2)], 1.2),
+            "The database's load",
+            (lambda: [Indicate(pj[3], color=RED_M, scale_factor=1.04), Indicate(pk[3], color=RED_M, scale_factor=1.04),
+                      LaggedStart(*[Indicate(self.lab[f"r{r}"][2], color=RED_M) for r in range(3)], lag_ratio=0.2)], 1.2),
+        ], after=0.3)
+        self.stamp("code")
 
-        # ---- 10. the sentence to keep -------------------------------------------------------------------------------------
-        self.steps("A small cache works because a few keys are hot. Then count its misses: from 90 to 99% hits, "
-                   "the slow trips fall tenfold.", [
-            (lambda: [glow(red[0], GREEN_M)], 0.8),
-            "Then count",
-            (lambda: [miss(), hit(0.2), hit(0.6), hit(1.0)], 1.9),
-        ])
-        self.wait(0.6)
+        # ---------------- scene 8: the moral, and a check ----------------
+        self.steps("So, nine points: small win or big? Big. Ninety to ninety-nine is ten times fewer misses, and the misses are what "
+                   "the database pays for. Count the misses, not the hits.", [
+            (lambda: [FadeOut(pj), FadeOut(pk), *self.cap("nine points: small win or big?", WHITE)], 0.6),
+            "Big.",
+            (lambda: [*self.cap("big: ten times fewer misses", GREEN_M, 26), Indicate(self.lab["r0"][2], color=RED_M), Indicate(self.lab["r1"][2], color=RED_M)], 0.8),
+            "Count the misses",
+            (lambda: self.cap("count the misses, not the hits", YELLOW_M, 26), 0.6),
+        ], after=0.3)
+        CHK = MISS[:5]
+        for d in self.dots:
+            d.set_fill(GREEN_M, 1).scale_to_fit_width(0.22)
+        for i in CHK:
+            self.dots[i].set_fill(RED_M, 1)
+        glab2 = T("95% hits: 100 lookups", 20, GREY_B).move_to(glab)
+        self.steps("One quick check. A cache goes from 95% hits to 99%. How many times fewer requests reach the database? Pause and think.", [
+            (lambda: [*self.uncap(), FadeIn(glab2), LaggedStart(*[FadeIn(d, scale=0.5) for d in self.dots], lag_ratio=0.008)], 1.0),
+            "Pause and think",
+            (lambda: self.cap("95% → 99%: how many times fewer database requests?  pause and think", YELLOW_M), 0.5),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Misses drop from 5 in 100 to 1 in 100: five times fewer.", [
+            (lambda: [*self.uncap(), *self.paint(CHK[1:], GREEN_M), *self.math("misses: 5 in 100 → 1 in 100", "five times fewer requests reach the database", GREEN_M)], 0.8),
+        ], after=0.3)
+        self.play(*self.cap("the database feels only the misses: count them", YELLOW_M, 26), run_time=0.7)
+        self.wait(2.0)
