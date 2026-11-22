@@ -8,6 +8,9 @@
 // and answers with the right type. Posters (.jpg) and captions (.vtt) are small and stay in web/video/, so
 // captions come from the site's own origin, which <track> needs.
 
+// A remade video replaces its release file under the same URL, so never let Cloudflare cache GitHub's answer
+// (it cached an old redirect once and kept serving the replaced file).
+const NO_CACHE = { cacheTtl: -1 };
 const RELEASE = "https://github.com/arunav-bhattacharya/systems-from-zero/releases/download/videos/";
 
 export default {
@@ -25,14 +28,14 @@ export default {
     // MP4. Ask for one byte to learn the size, then turn the suffix into an explicit range.
     const suffix = /^bytes=-(\d+)$/.exec((range || "").trim());
     if (suffix) {
-      const probe = await fetch(RELEASE + name, { headers: { Range: "bytes=0-0" }, redirect: "follow" });
+      const probe = await fetch(RELEASE + name, { headers: { Range: "bytes=0-0" }, redirect: "follow", cf: NO_CACHE });
       const total = Number((probe.headers.get("Content-Range") || "").split("/")[1]);
       if (!total) return new Response("Video unavailable", { status: 502 });
       range = `bytes=${Math.max(0, total - Number(suffix[1]))}-${total - 1}`;
     }
     if (range) upstreamHeaders["Range"] = range;
     // GitHub redirects to a signed storage URL that changes on every request, so there's nothing to cache by URL.
-    const upstream = await fetch(RELEASE + name, { method: request.method, headers: upstreamHeaders, redirect: "follow" });
+    const upstream = await fetch(RELEASE + name, { method: request.method, headers: upstreamHeaders, redirect: "follow", cf: NO_CACHE });
     if (upstream.status === 416) {
       const h = { "Accept-Ranges": "bytes" };
       if (upstream.headers.get("Content-Range")) h["Content-Range"] = upstream.headers.get("Content-Range");
