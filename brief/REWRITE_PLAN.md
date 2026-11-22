@@ -116,3 +116,11 @@ site/worker.js; Cloudflare holds no videos. Check live byte sizes after shipping
 Pending: 94 videos. Makers follow `videos/MAKER_TASK.md`. Round 1 running: graph-hops (finish) + hnsw-search
 (verify) + store-09, store-10; store-11..13 + cache-01; cache-02..05; cache-06..09. The 60% weekly stop still
 applies: at 60%, ship what's finished and stop until the next reset.
+
+## Done (2026-11-22)
+
+All 158 lessons, 17 track pages and 140 videos are rewritten or remade for complete newcomers and live. Every
+video is 2560x1440, served from the GitHub release `videos` through site/worker.js, and checked live against its
+committed file. Weekly usage at the finish: 27%.
+Known leftover: videos made before the "post-gress" SAY rule may say PostgreSQL as "POST-gurz" (list below the
+heading in the session log; re-render those scenes with the rule to fix).
