@@ -110,3 +110,9 @@ Resume after the weekly reset (2026-11-21 21:00 UTC), in this order:
 Ship with the clean-worktree script: it uploads each shipped mp4 to the GitHub release `videos` (--clobber) and
 deploys the rest. Since 2026-11-17 the repo is public and every MP4 is served from that release through
 site/worker.js; Cloudflare holds no videos. Check live byte sizes after shipping.
+
+## Resumed after the reset (2026-11-22, weekly usage 5%)
+
+Pending: 94 videos. Makers follow `videos/MAKER_TASK.md`. Round 1 running: graph-hops (finish) + hnsw-search
+(verify) + store-09, store-10; store-11..13 + cache-01; cache-02..05; cache-06..09. The 60% weekly stop still
+applies: at 60%, ship what's finished and stop until the next reset.
