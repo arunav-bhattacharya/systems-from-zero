@@ -1,13 +1,22 @@
 from sfz import *
 
-SAY.insert(0, (r"\b3\.0\b", "three point oh"))
+SAY.insert(0, (r"\bpay-(\d+)", r"pay \1"))
+SAY.insert(0, (r"\bTimeoutException\b", "timeout exception"))
+SAY.insert(0, (r"\backs=all\b", "acks equals all"))
+SAY.insert(0, (r"\backs=1\b", "acks equals one"))
+SAY.insert(0, (r"\benable\.idempotence\b", "enable dot idempotence"))
+SAY.insert(0, (r"\bsend\(\)", "send"))
 
-PX, PY, PW, PH = -4.6, 1.1, 3.4, 2.4        # the producer
-LX, LY, LW, LH = 4.2, 1.1, 3.8, 2.4         # the partition leader
-REQ, ANS = PY + 0.55, PY - 0.55                      # request lane and answer lane
-XL, XR = PX + PW / 2 + 0.15, LX - LW / 2 - 0.15
-GY, GX0, GP = -1.8, -4.9, 1.4              # the log: row, x of offset 13, pitch
-VY = -3.0                                 # verdicts
+# ---- the one picture (frame about 14.2 x 8; everything stays 0.5 inside) ----
+P_C = np.array([-4.9, 1.75, 0])
+L_C = np.array([4.9, 1.75, 0])
+BW, BH = 3.2, 1.9
+REQ_Y, ANS_Y = 2.15, 1.3
+X0, X1 = P_C[0] + BW / 2, L_C[0] - BW / 2
+LOG_Y, OFF_Y, LOGLAB_Y, NOTE_Y, BAR_Y, CAP_Y = -0.6, 0.0, -1.25, -1.85, -2.78, -3.27
+OFFS = list(range(14, 22))
+CW = 1.45
+CX = {o: -5.8 + CW / 2 + CW * k for k, o in enumerate(OFFS)}
 
 
 class Base(VoiceScene):
@@ -38,8 +47,8 @@ class Base(VoiceScene):
         return super().remove(*fam)
 
     def steps(self, text, items, after=0.25):
-        """Speak one line and play steps one after another inside it. A step is (fn, run_time), built just before
-        it plays; a number waits that long; a string waits until about where that phrase is spoken."""
+        """Speak one line and play steps inside it. A step is (fn, run_time), built just before it plays; a number
+        waits that long; a string waits until about where that phrase is spoken."""
         path, dur = voice(text)
         self._cue(text, dur)
         self.add_sound(path)
@@ -63,239 +72,452 @@ class Base(VoiceScene):
         if after:
             self.wait(after)
 
+    def stamp(self, name):
+        print(f"STAMP {name} {self.renderer.time:.1f}")
+
+    def countdown(self, secs=3.0):
+        bar = Line([-1.0, BAR_Y, 0], [1.0, BAR_Y, 0], stroke_width=5, color=YELLOW_M)
+        self.play(Create(bar), run_time=0.25)
+        self.play(Uncreate(bar), run_time=secs, rate_func=linear)
+
+    def cap(self, s, color=GREY_B, size=24):
+        new = fit(T(s, size, color), 13.0).move_to([0, CAP_Y, 0])
+        old, self.capm = self.capm, new
+        return [swap(old, new)]
+
+    def uncap(self):
+        old, self.capm = self.capm, None
+        return [FadeOut(old)] if old is not None else []
+
+    def put(self, key, mob, d=UP):
+        old = self.lab.get(key)
+        self.lab[key] = mob
+        return [swap(old, mob, d)]
+
+    def drop(self, *keys):
+        out = []
+        for key in keys:
+            old = self.lab.pop(key, None)
+            if old is not None:
+                out.append(FadeOut(old))
+        return out
+
 
 def fillc(color, a=0.14):
-    if ManimColor(color).to_hex().upper() == "#FFFFFF":
-        return BLACK
     return interpolate_color(ManimColor("#000000"), ManimColor(color), a)
 
 
-def glow(rect, color=YELLOW_M, s=1.04):
-    """Pulse a filled box's outline (Indicate would flood its fill and hide the label)."""
-    return rect.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
+def glow(m, color=YELLOW_M, s=1.03):
+    return m.animate(rate_func=there_and_back).scale(s).set_stroke(color=color, width=6)
 
 
-def gx(k):
-    return GX0 + GP * (k - 13)
+def swap(old, new, d=UP):
+    if old is None:
+        return FadeIn(new, shift=0.1 * d)
+    return Succession(FadeOut(old, shift=0.1 * d), FadeIn(new, shift=0.1 * d))
 
 
-def cell(k, name, color=GREY_B):
-    r = RoundedRectangle(corner_radius=0.08, width=1.25, height=0.6, stroke_color=color, stroke_width=2.5)
-    r.set_fill(fillc(color, 0.2), 1).move_to([gx(k), GY, 0])
-    return VGroup(r, T(name, 19).move_to([gx(k), GY, 0]))
+def left_at(m, x, y):
+    return m.move_to([x + m.width / 2, y, 0])
 
 
-def empty(k):
-    return DashedVMobject(RoundedRectangle(corner_radius=0.08, width=1.25, height=0.6, stroke_color=GREY_D, stroke_width=2),
-                          num_dashes=24).move_to([gx(k), GY, 0])
+def rbox(w, h, color, c):
+    return RoundedRectangle(corner_radius=0.14, width=w, height=h, stroke_color=color, stroke_width=3).set_fill(fillc(color), 1).move_to(c)
 
 
-def msg(text, color, x, y):
-    t = T(text, 19)
-    r = RoundedRectangle(corner_radius=0.08, width=t.width + 0.36, height=0.48, stroke_color=color, stroke_width=2.5)
-    r.set_fill(fillc(color, 0.25), 1)
-    return VGroup(r, t).move_to([x, y, 0]).set_z_index(4)
+def rec(text, color=WHITE, size=17):
+    t = M(text, size, color)
+    r = RoundedRectangle(corner_radius=0.08, width=t.width + 0.3, height=0.42, stroke_color=color, stroke_width=2).set_fill(BLACK, 1)
+    return VGroup(r, t.move_to(r)).set_z_index(5)
 
 
-def req(text, color=GOLD_M):
-    m = msg(text, color, 0, REQ)
-    return m.move_to([XL + m.width / 2 + 0.05, REQ, 0])
+def harrow(x0, x1, y, color=GREY_C):
+    return Arrow([x0, y, 0], [x1, y, 0], buff=0, stroke_width=2.5, color=color, max_tip_length_to_length_ratio=0.03)
 
 
-def ans(text, color=GREEN_M):
-    m = msg(text, color, 0, ANS)
-    return m.move_to([XR - m.width / 2 - 0.05, ANS, 0])
+def cell(o):
+    return Rectangle(width=CW - 0.1, height=0.56, stroke_color=GREY_C, stroke_width=2).set_fill(BLACK, 1).move_to([CX[o], LOG_Y, 0])
 
 
-def pline(s, y, color=GREY_B, size=19):
-    return T(s, size, color).move_to([PX, y, 0])
+def code_panel(title, lines, x):
+    r = RoundedRectangle(corner_radius=0.14, width=6.5, height=3.4, stroke_color=GREY_B, stroke_width=2.5).set_fill("#0b0d10", 1)
+    r.move_to([x, 0.55, 0])
+    head = left_at(T(title, 22, GREY_B), x - 3.0, 1.9)
+    rows = VGroup()
+    for k, s in enumerate(lines):
+        col = GREY_B if s.strip().startswith("//") else WHITE
+        ind = (len(s) - len(s.lstrip())) * M("x" * 40, 16).width / 40
+        rows.add(left_at(M(s.strip() if s.strip() else " ", 16, col), x - 3.0 + ind, 1.35 - 0.42 * k))
+    return VGroup(r, head, rows).set_z_index(10)
 
 
-def lline(s, y, color=GREY_B, size=19):
-    return T(s, size, color).move_to([LX, y, 0])
-
-
-def cross(p):
-    return tick(False, 0.22).move_to(p)
+JAVA = ["var props = new Properties();",
+        "// say it by name",
+        "props.put(\"enable.idempotence\", \"true\");",
+        "props.put(\"acks\", \"all\");",
+        "var producer =",
+        "    new KafkaProducer<String, String>(props);"]
+KOTLIN = ["val props = Properties().apply {",
+          "    // say it by name",
+          "    put(\"enable.idempotence\", \"true\")",
+          "    put(\"acks\", \"all\")",
+          "}",
+          "val producer =",
+          "    KafkaProducer<String, String>(props)"]
 
 
 class IdempotentProducer(Base):
-    """msg-06, section 3: the leader appends pay-16 at offset 16 and the answer is lost; after request.timeout.ms the
-    producer retries and, without idempotence, pay-16 is written again at 17. With idempotence the producer has id 5 and
-    numbers records per partition: the leader writes seq 16, remembers next = 17, recognises the retry among its last
-    five batches, writes nothing and answers offset 16. With five requests in flight, pay-17 times out and pay-18 arrives
-    first: the leader expects 17, refuses 18 (OUT_OF_ORDER_SEQUENCE_NUMBER), and the producer resends 17, then 18."""
+    """msg-06, section 3. The train-tunnel message sent twice. The producer sends pay-16, the leader writes it at
+    offset 16, the answer is lost, the retry is written again at 17. With five requests in flight a retried pay-17
+    lands after pay-18. The friend who keeps a note per sender: a name and a number on every message. The idempotent
+    producer: producer id 5, sequence numbers, the leader remembers the last five batches; a retry of 16 writes
+    nothing and answers offset 16; 18 before 17 is refused (OUT_OF_ORDER_SEQUENCE_NUMBER). Requirements and the silent
+    trap; the limit (your own second send()). Code in Java and Kotlin, the moral, a check."""
+
+    # --- state helpers ---
+    def ptext(self, title, alias=None, state=None, scolor=GREY_B):
+        out = self.put("pt", T(title, 26).move_to(P_C + 0.45 * UP))
+        out += self.put("pa", T(alias, 16, GREY_B).move_to(P_C + 0.08 * UP)) if alias else self.drop("pa")
+        out += self.put("ps", fit(M(state, 17, scolor), BW - 0.3).move_to(P_C + 0.42 * DOWN)) if state else self.drop("ps")
+        return out
+
+    def ltext(self, title, alias=None, state=None, scolor=GREY_B):
+        out = self.put("lt", T(title, 26).move_to(L_C + 0.45 * UP))
+        out += self.put("la", T(alias, 16, GREY_B).move_to(L_C + 0.08 * UP)) if alias else self.drop("la")
+        out += self.put("ls", fit(M(state, 17, scolor), BW - 0.3).move_to(L_C + 0.42 * DOWN)) if state else self.drop("ls")
+        return out
+
+    def lstate(self, state, color=GREY_B):
+        return self.put("ls", fit(M(state, 17, color), BW - 0.3).move_to(L_C + 0.42 * DOWN))
+
+    def pstate(self, state, color=GREY_B):
+        return self.put("ps", fit(M(state, 17, color), BW - 0.3).move_to(P_C + 0.42 * DOWN))
+
+    def write(self, o, text, color=WHITE):
+        m = rec(text, color, 16).move_to([CX[o], LOG_Y, 0])
+        return self.put(f"c{o}", m, DOWN)
+
+    def clear_log(self, frm=14):
+        return self.drop(*[f"c{o}" for o in OFFS if o >= frm])
+
+    def req(self, text, color=WHITE, to_log=None, frac=1.0, lost=False, log_text=None):
+        """A request chip travels producer to leader (part way if frac < 1); if to_log, the leader writes log_text
+        (default: the chip's first word) at that offset."""
+        m = rec(text, color).move_to([X0 + 0.2 + rec(text).width / 2, REQ_Y, 0])
+        end = [X1 - 0.2 - m.width / 2 if frac >= 1 else 0, REQ_Y, 0]
+        seq = [FadeIn(m, run_time=0.1), m.animate(run_time=0.7, rate_func=smooth).move_to(end)]
+        if lost:
+            seq += [FadeOut(m, scale=1.6, run_time=0.25)]
+        elif to_log is not None:
+            key = f"c{to_log}"
+            old = self.lab.get(key)
+            new = rec(log_text or text.split()[0], color, 16).move_to([CX[to_log], LOG_Y, 0])
+            self.lab[key] = new
+            land = [FadeOut(m, target_position=new.get_center(), run_time=0.5), FadeIn(new, run_time=0.5)]
+            if old is not None:
+                land.append(FadeOut(old, run_time=0.3))
+            seq += [AnimationGroup(*land)]
+        else:
+            seq += [FadeOut(m, run_time=0.15)]
+        return [Succession(*seq)]
+
+    def ans(self, text, color=GREEN_M, lost=False):
+        m = rec(text, color).move_to([X1 - 0.7, ANS_Y, 0])
+        frac = 0.5 if lost else 1.0
+        end = [X1 - 0.7 - frac * (X1 - X0 - 1.4), ANS_Y, 0]
+        seq = [FadeIn(m, run_time=0.1), m.animate(run_time=0.7, rate_func=smooth).move_to(end),
+               FadeOut(m, scale=1.6 if lost else 1.0, run_time=0.25)]
+        return [Succession(*seq)]
+
+    def lost_mark(self, y=ANS_Y, text="answer lost"):
+        x = tick(False, 0.15).move_to([0, y, 0])
+        lab = T(text, 18, RED_M).move_to([0, y - 0.38, 0])
+        return self.put("lost", VGroup(x, lab))
+
+    def settle(self):
+        """Hand chips that landed in the log over to the log's labels (they were added by req())."""
+        for m in self.flying:
+            if m in self.mobjects:
+                self.remove(m)
+        self.flying = []
 
     def construct(self):
-        self.title_card("The idempotent producer", "a lost answer, a retry, and a leader that spots it")
+        self.capm = None
+        self.lab, self.flying = {}, []
+        self.title_card("Did that payment go twice?", "retries, duplicates, and the idempotent producer")
 
-        pbox = RoundedRectangle(corner_radius=0.16, width=PW, height=PH, stroke_color=WHITE, stroke_width=2.5).set_fill(BLACK, 1)
-        pbox.move_to([PX, PY, 0])
-        lbox = RoundedRectangle(corner_radius=0.16, width=LW, height=LH, stroke_color=BLUE_M, stroke_width=2.5)
-        lbox.set_fill(fillc(BLUE_M, 0.1), 1).move_to([LX, LY, 0])
-        ptit = T("producer", 24).move_to([PX, PY + 0.82, 0])
-        ltit = T("partition leader", 24, BLUE_M).move_to([LX, LY + 0.82, 0])
-        rq = Arrow([XL, REQ, 0], [XR, REQ, 0], buff=0, stroke_width=2.5, color=GREY_D, max_tip_length_to_length_ratio=0.04)
-        an = Arrow([XR, ANS, 0], [XL, ANS, 0], buff=0, stroke_width=2.5, color=GREY_D, max_tip_length_to_length_ratio=0.04)
-        rql = T("requests", 17, GREY_C).move_to([(XL + XR) / 2, REQ + 0.52, 0])
-        anl = T("answers", 17, GREY_C).move_to([(XL + XR) / 2, ANS - 0.52, 0])
-        glab = T("partition 0, the log", 19, GREY_B).move_to([gx(13) - 0.62, GY + 0.62, 0], aligned_edge=LEFT)
-        cells = {k: cell(k, f"pay-{k}") for k in (13, 14, 15)}
-        slots = {k: empty(k) for k in range(16, 21)}
-        offs = VGroup(*[M(str(k), 16, GREY_C).move_to([gx(k), GY - 0.5, 0]) for k in range(13, 21)])
-        p16 = req("pay-16")
-        self.steps("The payment service sends pay-16 to the partition's leader, the broker that appends it to the log.", [
-            (lambda: [FadeIn(pbox), FadeIn(ptit), FadeIn(lbox), FadeIn(ltit)], 0.8),
-            (lambda: [GrowArrow(rq), GrowArrow(an), FadeIn(rql), FadeIn(anl)], 0.6),
-            "the broker",
-            (lambda: [FadeIn(glab), *[FadeIn(c) for c in cells.values()], *[FadeIn(s) for s in slots.values()], FadeIn(offs)], 0.8),
-            (lambda: [FadeIn(p16)], 0.3),
-            (lambda: [p16.animate.move_to([XR - p16.width / 2 - 0.05, REQ, 0])], 1.0),
+        pbox = rbox(BW, BH, GOLD_M, P_C)
+        lbox = rbox(BW, BH, BLUE_M, L_C)
+        a_req = harrow(X0 + 0.1, X1 - 0.1, REQ_Y)
+        a_ans = harrow(X1 - 0.1, X0 + 0.1, ANS_Y)
+        cells = VGroup(*[cell(o) for o in OFFS])
+        offs = VGroup(*[T(str(o), 18, GREY_B).move_to([CX[o], OFF_Y, 0]) for o in OFFS])
+
+        # ---------------- scene 1: the tunnel ----------------
+        self.steps("You're on a train, sending a message to a friend, just as it goes into a tunnel. "
+                   "The message turns red: not sent. So you tap Retry.", [
+            (lambda: [FadeIn(pbox), FadeIn(lbox), *self.ptext("your phone"), *self.ltext("your friend"), GrowArrow(a_req), GrowArrow(a_ans)], 0.9),
+            (lambda: self.put("loglab", left_at(T("your friend's chat", 18, GREY_B), -5.8, LOGLAB_Y)), 0.3),
+            (lambda: [FadeIn(cells[:3])], 0.4),
+            "into a tunnel",
+            (lambda: self.req("see you at 7?", WHITE, to_log=14, log_text="at 7?"), 1.3),
+            "turns red",
+            (lambda: [*self.pstate("not sent", RED_M), glow(pbox, RED_M, 1.03)], 0.6),
+            "you tap Retry",
+            (lambda: self.req("see you at 7?", WHITE, to_log=15, log_text="at 7?"), 1.3),
+        ])
+        self.steps("Out of the tunnel, your friend writes back: why did you send that twice?", [
+            "why did you",
+            (lambda: [*self.cap("why did you send that twice?", WHITE), glow(cells[0], RED_M, 1.05), glow(cells[1], RED_M, 1.05)], 0.8),
+        ])
+        self.steps("The red mark looked like a fact about the message. It was only a fact about your phone: it had stopped waiting. "
+                   "The first copy got through.", [
+            "It was only",
+            (lambda: [*self.pstate("stopped waiting", RED_M), *self.cap("not sent?  no: stopped waiting")], 0.6),
+            "The first copy",
+            (lambda: [glow(cells[0], GREEN_M, 1.05)], 0.7),
         ])
 
-        c16 = cell(16, "pay-16")
-        a16 = ans("ok: offset 16")
-        x1 = cross([(XL + XR) / 2 + 0.2, ANS, 0])
-        pst = pline("no answer after 30 s", PY - 0.5, RED_M)
-        self.steps("The leader writes it at offset 16. But its answer is lost on the way. "
-                   "After 30 seconds, the producer only knows it heard nothing.", [
-            (lambda: [FadeOut(p16, scale=0.6), FadeIn(c16, shift=0.15 * DOWN), FadeOut(slots[16])], 0.8),
-            "But its answer",
-            (lambda: [FadeIn(a16)], 0.3),
-            (lambda: [a16.animate.move_to([(XL + XR) / 2 + 0.2, ANS, 0])], 0.8),
-            (lambda: [a16[0].animate.set_stroke(RED_M), FadeIn(x1)], 0.4),
-            (lambda: [FadeOut(a16), FadeOut(x1)], 0.4),
-            "After 30 seconds",
-            (lambda: [FadeIn(pst)], 0.6),
+        # ---------------- scene 2: the same trap in Kafka ----------------
+        self.steps("Kafka, a program that keeps logs of messages and lets other programs read them, sets the same trap.", [
+            (lambda: [*self.uncap(), *self.clear_log(), *self.cap("Kafka: keeps logs of messages, for other programs to read")], 0.6),
+        ])
+        self.steps("The program that writes is the producer, inside the payments app. It sends each payment to the leader, "
+                   "the server that adds it to the partition's log, and waits for an answer: the offset, the payment's place in the log.", [
+            (lambda: self.ptext("producer", "inside the payments app"), 0.6),
+            "the leader",
+            (lambda: [*self.ltext("leader", "adds to the log"), *self.put("loglab", left_at(T("one partition's log", 18, GREY_B), -5.8, LOGLAB_Y)),
+                      FadeIn(cells[3:]), FadeIn(offs)], 0.8),
+            (lambda: [*self.write(14, "pay-14"), *self.write(15, "pay-15")], 0.5),
+            "waits for an answer",
+            (lambda: [*self.ans("offset 15")], 1.0),
         ])
 
-        r16 = req("pay-16, retry")
-        d17 = cell(17, "pay-16", RED_M)
-        twice = chip("pay-16 is in the log twice", RED_M, 19).move_to([0, VY, 0])
-        self.steps("So it retries. The leader can't tell a retry from a new record, so it writes pay-16 again, at offset 17. "
-                   "Every consumer will see the payment twice.", [
-            (lambda: [Transform(pst, pline("retry", PY - 0.5, GOLD_M))], 0.4),
-            (lambda: [FadeIn(r16)], 0.3),
-            (lambda: [r16.animate.move_to([XR - r16.width / 2 - 0.05, REQ, 0])], 1.0),
-            "so it writes",
-            (lambda: [FadeOut(r16, scale=0.6), FadeIn(d17, shift=0.15 * DOWN), FadeOut(slots[17])], 0.8),
-            "Every consumer",
-            (lambda: [FadeIn(twice, shift=0.1 * UP), glow(c16[0], RED_M, 1.08)], 0.9),
+        # ---------------- scene 3: a lost answer, a retry ----------------
+        self.steps("Watch pay-16. It reaches the leader, and the leader writes it at offset 16. Then the answer is lost.", [
+            (lambda: [*self.uncap(), *self.ptext("producer", "inside the payments app", "idempotence off"),
+                      *self.ltext("leader", "adds to the log", "remembers nothing")], 0.6),
+            "It reaches",
+            (lambda: self.req("pay-16", YELLOW_M, to_log=16), 1.3),
+            "Then the answer",
+            (lambda: self.ans("offset 16", GREEN_M, lost=True), 0.9),
+            (lambda: self.lost_mark(), 0.4),
+        ])
+        self.steps("After a while, all the producer knows is that it heard nothing. So it retries, on its own. "
+                   "The leader can't tell a retry from a new record, so pay-16 goes in again, at offset 17.", [
+            "it heard nothing",
+            (lambda: self.pstate("heard nothing", RED_M), 0.5),
+            "So it retries",
+            (lambda: [*self.drop("lost"), *self.req("pay-16", YELLOW_M, to_log=17)], 1.3),
+            "again, at offset 17",
+            (lambda: [glow(cells[2], RED_M, 1.05), glow(cells[3], RED_M, 1.05)], 0.8),
+        ])
+        self.steps("Every reader of this log now sees the payment twice. One coffee, charged twice. Customers have a gift for "
+                   "noticing exactly that. So the point really is: a retry is only safe if the leader can recognise it.", [
+            (lambda: [*self.write(17, "pay-16", RED_M), *self.write(16, "pay-16", RED_M)], 0.4),
+            (lambda: self.cap("every reader sees pay-16 twice", RED_M), 0.4),
+            "So the point",
+            (lambda: self.cap("a retry is safe only if the leader can recognise it", WHITE), 0.5),
         ])
 
-        pid = pline("producer id: 5", PY + 0.25, WHITE)
-        seq = pline("next sequence: 16", PY - 0.2, GOLD_M)
-        slots[16], slots[17] = empty(16), empty(17)
-        self.steps("Rewind, and switch on the idempotent producer, the default since Kafka 3.0. "
-                   "At start-up the producer gets an id from the broker, 5, and numbers its records for each partition.", [
-            (lambda: [FadeOut(VGroup(c16, d17, twice, pst)), FadeIn(slots[16]), FadeIn(slots[17])], 0.8),
-            "At start-up",
-            (lambda: [FadeIn(pid, shift=0.1 * DOWN), glow(lbox, BLUE_M, 1.02)], 0.8),
-            "and numbers",
-            (lambda: [FadeIn(seq, shift=0.1 * DOWN)], 0.7),
+        # ---------------- scene 4: reordering ----------------
+        self.steps("There's a second problem. The producer keeps up to five requests in flight at once. "
+                   "Say pay-17's request times out, while pay-18 gets through.", [
+            (lambda: [*self.uncap(), *self.clear_log(17), *self.write(16, "pay-16"), *self.cap("up to 5 requests in flight at once")], 0.6),
+            "Say pay-17",
+            (lambda: [*self.req("pay-17", WHITE, frac=0.5, lost=True)], 1.0),
+            (lambda: self.lost_mark(REQ_Y + 0.0, "timed out"), 0.3),
+            "while pay-18",
+            (lambda: self.req("pay-18", GOLD_M, to_log=17), 1.3),
+        ])
+        self.steps("The retry of pay-17 lands after pay-18. If pay-18 were a refund, it would now overtake its payment, "
+                   "inside one partition.", [
+            (lambda: self.drop("lost"), 0.1),
+            "The retry",
+            (lambda: self.req("pay-17", WHITE, to_log=18), 1.3),
+            "overtake",
+            (lambda: [*self.cap("a refund ahead of its payment, inside one partition", RED_M), glow(cells[3], RED_M, 1.05)], 0.7),
+        ])
+        self.steps("You could send one request at a time. That keeps the order, but each connection then waits a round trip "
+                   "for every batch, and the lost answer still gives you a duplicate.", [
+            (lambda: [*self.cap("one request at a time: order kept, speed lost, duplicates still there")], 0.6),
+        ])
+        self.steps("What we'd love is for the leader to say: oh, it's you again, I already have that one.", [
+            (lambda: self.cap("the wish: \"oh, it's you again. I already have that one.\"", YELLOW_M), 0.6),
+        ], after=0.4)
+
+        # ---------------- scene 5: the friend's note ----------------
+        self.steps("Back to the train. Suppose every message carries your name and a number: Sam, message 16. "
+                   "And your friend keeps a little note for each sender: the next number she expects, and the last five she got.", [
+            (lambda: [*self.uncap(), *self.clear_log(), *self.ptext("your phone", None, "Sam, message 16", YELLOW_M),
+                      *self.ltext("your friend")], 0.8),
+            "your friend keeps",
+            (lambda: self.lstate("Sam: next 17", GREEN_M), 0.6),
+            "the last five",
+            (lambda: self.put("lnote", T("and the last five she got", 16, GREY_B).move_to(L_C + 0.7 * DOWN)), 0.5),
+        ])
+        self.steps("Resent 16? She already has it. No second copy; she just replies again. "
+                   "18 before 17? She says: wait, send me 17 first.", [
+            "Resent 16",
+            (lambda: self.req("Sam 16", YELLOW_M), 1.0),
+            (lambda: self.cap("16 again: already have it, reply again", GREEN_M), 0.4),
+            "18 before 17",
+            (lambda: self.req("Sam 18", GOLD_M), 1.0),
+            (lambda: self.cap("18 before 17: \"send me 17 first\"", GOLD_M), 0.4),
+        ])
+        self.steps("Let's map it. Your name is the producer id. The number is the sequence number. "
+                   "Your friend is the leader, and her note is what the leader remembers for each producer.", [
+            "Your name",
+            (lambda: self.cap("your name: the producer id", WHITE), 0.5),
+            "The number",
+            (lambda: self.cap("the message number: the sequence number", WHITE), 0.5),
+            "Your friend",
+            (lambda: [*self.cap("your friend: the leader.   her note: what it remembers per producer", WHITE), glow(lbox, BLUE_M, 1.03)], 0.7),
         ])
 
-        s16 = req("pay-16 · producer 5 · seq 16")
-        mem = lline("producer 5: next seq 17", LY + 0.1, WHITE)
-        mem2 = lline("and its last 5 batches", LY - 0.35, GREY_B, 17)
-        c16 = cell(16, "pay-16", GREEN_M)
-        b16 = ans("ok: offset 16")
-        x2 = cross([(XL + XR) / 2 + 0.2, ANS, 0])
-        self.steps("pay-16 now carries producer 5 and sequence 16. The leader writes it and remembers that producer 5 sends 17 next. "
-                   "Again, the answer is lost.", [
-            (lambda: [FadeIn(s16)], 0.3),
-            (lambda: [s16.animate.move_to([XR - s16.width / 2 - 0.05, REQ, 0]), Transform(seq, pline("next sequence: 17", PY - 0.2, GOLD_M))], 1.0),
-            "The leader writes",
-            (lambda: [FadeOut(s16, scale=0.6), FadeIn(c16, shift=0.15 * DOWN), FadeOut(slots[16])], 0.7),
-            "and remembers",
-            (lambda: [FadeIn(mem), FadeIn(mem2)], 0.7),
-            "Again",
-            (lambda: [FadeIn(b16)], 0.3),
-            (lambda: [b16.animate.move_to([(XL + XR) / 2 + 0.2, ANS, 0])], 0.7),
-            (lambda: [b16[0].animate.set_stroke(RED_M), FadeIn(x2)], 0.3),
-            (lambda: [FadeOut(b16), FadeOut(x2)], 0.3),
+        # ---------------- scene 6: the idempotent producer ----------------
+        self.steps("Here's the real thing. At start-up, the producer gets a producer id from the broker: 5. "
+                   "It numbers its records for each partition, so pay-16 has sequence number 16.", [
+            (lambda: [*self.uncap(), *self.drop("lnote"), *self.ptext("producer", "producer id 5"), *self.ltext("leader", "adds to the log", "remembers nothing"),
+                      *self.write(14, "pay-14"), *self.write(15, "pay-15")], 0.7),
+            "pay-16 has",
+            (lambda: self.pstate("pay-16: seq 16", YELLOW_M), 0.5),
         ])
-
-        t16 = req("pay-16 · producer 5 · seq 16")
-        o16 = ans("ok: offset 16")
-        done = pline("pay-16: done", PY - 0.65, GREEN_M)
-        self.steps("The retry carries the same id and sequence. The leader finds sequence 16 among the batches it remembers, "
-                   "writes nothing, and answers with offset 16 again.", [
-            (lambda: [FadeIn(t16)], 0.3),
-            (lambda: [t16.animate.move_to([XR - t16.width / 2 - 0.05, REQ, 0])], 1.0),
-            "The leader finds",
-            (lambda: [glow(lbox, GOLD_M, 1.02), Indicate(mem2, color=GOLD_M), glow(c16[0], GOLD_M, 1.1)], 1.0),
+        self.steps("The leader writes it at offset 16, and notes: producer 5, next 17. Then the answer is lost again.", [
+            (lambda: self.req("id 5 | seq 16", YELLOW_M, to_log=16, log_text="pay-16"), 1.3),
+            "and notes",
+            (lambda: self.lstate("producer 5: next 17", GREEN_M), 0.5),
+            "the answer is lost",
+            (lambda: self.ans("offset 16", GREEN_M, lost=True), 0.9),
+            (lambda: self.lost_mark(), 0.3),
+        ])
+        self.steps("The retry carries the same id and the same number. The leader finds 16 among the last five it remembers, "
+                   "writes nothing, and answers with the offset it gave the first time: 16.", [
+            "The retry",
+            (lambda: [*self.drop("lost"), *self.req("id 5 | seq 16", YELLOW_M)], 1.0),
             "writes nothing",
-            (lambda: [FadeOut(t16, scale=0.6)], 0.5),
-            "and answers",
-            (lambda: [FadeIn(o16)], 0.3),
-            (lambda: [o16.animate.move_to([XL + o16.width / 2 + 0.05, ANS, 0])], 1.0),
-            (lambda: [FadeOut(o16, scale=0.6), FadeIn(done)], 0.5),
+            (lambda: [glow(cells[3], GREY_B, 1.05), *self.put("nothing", T("nothing written", 18, GREY_B).move_to([CX[17], NOTE_Y + 0.25, 0]))], 0.6),
+            "answers with",
+            (lambda: self.ans("offset 16", GREEN_M), 1.0),
+            (lambda: self.pstate("pay-16: offset 16", GREEN_M), 0.4),
+        ])
+        self.stamp("poster")
+        self.steps("This is the idempotent producer. Idempotent means doing something twice has the same effect as doing it once. "
+                   "It has been on by default since Kafka 3.0.", [
+            (lambda: [*self.drop("nothing"), *self.cap("the idempotent producer", YELLOW_M, 30)], 0.6),
+            "Idempotent means",
+            (lambda: self.cap("idempotent: twice has the same effect as once", WHITE), 0.5),
+            "on by default",
+            (lambda: self.cap("on by default since Kafka 3.0"), 0.5),
         ])
 
-        f17 = req("pay-17 · seq 17")
-        f18 = req("pay-18 · seq 18")
-        mid = (XL + XR) / 2
-        x3 = cross([mid + 0.4, REQ, 0])
-        infl = pline("up to 5 requests in flight", PY - 0.65, GREY_B)
-        self.steps("Now order. The producer keeps up to five requests in flight. "
-                   "pay-17's request times out, and pay-18 reaches the leader first.", [
-            (lambda: [Transform(done, infl), Transform(seq, pline("next sequence: 19", PY - 0.2, GOLD_M))], 0.7),
-            "pay-17's",
-            (lambda: [FadeIn(f17)], 0.3),
-            (lambda: [f17.animate.move_to([mid + 0.4, REQ, 0])], 0.8),
-            (lambda: [FadeIn(f18), f17[0].animate.set_stroke(RED_M), FadeIn(x3)], 0.4),
-            (lambda: [FadeOut(f17), FadeOut(x3)], 0.3),
+        # ---------------- scene 7: predict the gap ----------------
+        self.steps("Now the reordering case, with idempotence on. pay-17 times out, and pay-18 arrives first. "
+                   "The leader expects 17. What does it do with 18? Pause and guess.", [
+            (lambda: [*self.uncap(), *self.ptext("producer", "producer id 5")], 0.5),
+            "pay-17 times out",
+            (lambda: self.req("seq 17", WHITE, frac=0.5, lost=True), 1.0),
+            (lambda: self.lost_mark(REQ_Y, "timed out"), 0.3),
             "and pay-18",
-            (lambda: [f18.animate.move_to([XR - f18.width / 2 - 0.05, REQ, 0])], 1.0),
+            (lambda: self.req("seq 18", GOLD_M, frac=1.0), 1.0),
+            "The leader expects",
+            (lambda: [glow(lbox, YELLOW_M, 1.03)], 0.6),
+            "Pause and guess",
+            (lambda: self.cap("what does the leader do with 18? pause and guess", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("It refuses it, with an error called out of order sequence number. Then the producer resends 17, then 18, "
+                   "and both are written once, in send order.", [
+            (lambda: [*self.uncap(), *self.drop("lost"), *self.ans("refused: out of order", RED_M)], 1.0),
+            (lambda: self.cap("OUT_OF_ORDER_SEQUENCE_NUMBER: expected 17, got 18", RED_M), 0.4),
+            "the producer resends",
+            (lambda: self.req("seq 17", WHITE, to_log=17, log_text="pay-17"), 1.2),
+            (lambda: self.req("seq 18", GOLD_M, to_log=18, log_text="pay-18"), 1.2),
+            "in send order",
+            (lambda: [*self.lstate("producer 5: next 19", GREEN_M), *self.cap("17, then 18: once each, in send order", GREEN_M)], 0.6),
         ])
 
-        ghost = cell(17, "pay-18", RED_M)
-        refuse = lline("expects 17, got 18: refused", LY - 0.75, RED_M, 18)
-        nack = ans("out of order sequence", RED_M)
-        self.steps("Without idempotence, pay-18 would be written ahead of pay-17. "
-                   "With idempotence, the leader expects 17, sees 18, and refuses it.", [
-            (lambda: [FadeIn(ghost, shift=0.15 * DOWN)], 0.6),
-            (lambda: [glow(ghost[0], RED_M, 1.08)], 0.7),
-            "With idempotence, the",
-            (lambda: [FadeOut(ghost), FadeOut(f18, scale=0.6), Indicate(mem, color=GOLD_M)], 0.8),
-            "and refuses",
-            (lambda: [FadeIn(refuse), FadeIn(nack)], 0.4),
-            (lambda: [nack.animate.move_to([XL + nack.width / 2 + 0.05, ANS, 0])], 0.9),
+        # ---------------- scene 8: requirements, the trap, the limit ----------------
+        self.steps("It needs three settings: acks=all, retries above zero, and at most five requests in flight. "
+                   "Five is exactly how many batches the leader can recognise.", [
+            (lambda: self.cap("needs: acks=all,  retries > 0,  at most 5 in flight", WHITE), 0.6),
+            "Five is exactly",
+            (lambda: [*self.cap("5: the batches the leader remembers per producer"), glow(lbox, BLUE_M, 1.03)], 0.6),
+        ])
+        self.steps("And here's the trap. Set acks=1 for speed, without mentioning idempotence, and the producer quietly turns it off. "
+                   "No warning. Polite of it, and terrible manners for a payment.", [
+            (lambda: [*self.cap("acks=1 alone: idempotence silently off", RED_M), *self.ptext("producer", "acks=1", "idempotence off?!", RED_M)], 0.7),
+        ])
+        self.steps("So set enable.idempotence to true by name. Then the same conflict stops the producer at start-up, "
+                   "where you'll see it.", [
+            (lambda: [*self.cap("enable.idempotence=true: a conflict fails at start-up, loudly", GREEN_M),
+                      *self.ptext("producer", "producer id 5", "enable.idempotence=true", GREEN_M)], 0.7),
+        ])
+        self.steps("And know where it stops. It covers this producer's own retries. If your code catches a TimeoutException and "
+                   "calls send() again, that's a new record, with a new number. That's you, tapping Retry in the tunnel.", [
+            (lambda: self.cap("it covers the producer's own retries, nothing more"), 0.5),
+            "calls send() again",
+            (lambda: self.req("id 5 | seq 19", PURPLE_M, to_log=19, log_text="again?"), 1.3),
+            "That's you",
+            (lambda: [*self.cap("your own second send: a new number, a new record", PURPLE_M), *self.lstate("producer 5: next 20", GREEN_M)], 0.5),
+        ])
+        self.steps("A restarted program gets a new producer id, too. Copies across those lines need the payment's own "
+                   "idempotency key, checked by the consumer.", [
+                        "A restarted",
+            (lambda: self.ptext("producer", "producer id 6 (restarted)"), 0.6),
+            "the payment's own",
+            (lambda: self.cap("beyond that: the payment's own idempotency key, checked by the consumer", YELLOW_M), 0.5),
         ])
 
-        g17 = req("pay-17 · seq 17")
-        g18 = req("pay-18 · seq 18")
-        c17 = cell(17, "pay-17", GREEN_M)
-        c18 = cell(18, "pay-18", GREEN_M)
-        ok = chip("each record once, in send order", GREEN_M, 19).move_to([0, VY, 0])
-        self.steps("The producer resends pay-17, then pay-18, and both are written once, in the order they were sent.", [
-            (lambda: [FadeOut(nack, scale=0.6), FadeOut(refuse), FadeIn(g17)], 0.4),
-            (lambda: [g17.animate.move_to([XR - g17.width / 2 - 0.05, REQ, 0])], 0.8),
-            (lambda: [FadeOut(g17, scale=0.6), FadeIn(c17, shift=0.15 * DOWN), FadeOut(slots[17]),
-                      Transform(mem, lline("producer 5: next seq 18", LY + 0.1, WHITE)), FadeIn(g18)], 0.6),
-            (lambda: [g18.animate.move_to([XR - g18.width / 2 - 0.05, REQ, 0])], 0.8),
-            (lambda: [FadeOut(g18, scale=0.6), FadeIn(c18, shift=0.15 * DOWN), FadeOut(slots[18]),
-                      Transform(mem, lline("producer 5: next seq 19", LY + 0.1, WHITE))], 0.6),
-            "both are written",
-            (lambda: [FadeIn(ok, shift=0.1 * UP)], 0.6),
-        ])
+        # ---------------- scene 9: the code ----------------
+        diagram = VGroup(pbox, lbox, a_req, a_ans, cells, offs, *self.lab.values())
+        diagram.save_state()
+        jp = code_panel("Java", JAVA, -3.35)
+        kp = code_panel("Kotlin", KOTLIN, 3.35)
 
-        again = chip("send() called twice by your code: a new record, new sequence", GREY_B, 18).move_to([0, VY, 0])
-        self.steps("It only covers the producer's own retries. If your code catches a timeout and calls send again, "
-                   "that's a new record with a new sequence, and it can be written twice.", [
-            (lambda: [glow(pbox, WHITE, 1.02)], 0.8),
-            "If your code",
-            (lambda: [FadeOut(ok)], 0.4),
-            (lambda: [FadeIn(again, shift=0.1 * UP)], 0.6),
-        ])
+        def hl(rows, color):
+            return [p[2][r].animate(rate_func=there_and_back).set_color(color) for p in (jp, kp) for r in rows]
 
-        self.steps("A producer id and a sequence number let the leader spot a retry. "
-                   "Then retries can't duplicate or reorder a partition.", [
-            (lambda: [Indicate(pid, color=WHITE), Indicate(seq, color=GOLD_M)], 1.0),
-            "spot a retry",
-            (lambda: [glow(lbox, BLUE_M, 1.02), Indicate(mem, color=GOLD_M)], 0.9),
-            "Then retries",
-            (lambda: [*[glow(c[0], GREEN_M, 1.1) for c in (c16, c17, c18)]], 1.0),
+        self.steps("In Java and Kotlin, it's two lines in the producer's settings. Turn idempotence on by name, and keep acks at all.", [
+            (lambda: [*self.uncap(), diagram.animate.set_opacity(0.06)], 0.6),
+            (lambda: [FadeIn(jp, shift=0.1 * UP), FadeIn(kp, shift=0.1 * UP)], 0.7),
+            "Turn idempotence",
+            (lambda: hl((2,), YELLOW_M), 1.1),
+            "keep acks",
+            (lambda: hl((3,), GOLD_M), 1.1),
+        ], after=0.8)
+
+        # ---------------- scene 10: the moral, and a check ----------------
+        self.steps("So why did your friend get two copies? Your phone retried a message that had already arrived. "
+                   "With a name and a number on every message, the receiver spots the copy.", [
+            (lambda: [FadeOut(jp), FadeOut(kp), Restore(diagram)], 0.8),
+            (lambda: [*self.clear_log(), *self.ptext("producer", "producer id 5"), *self.ltext("leader", "adds to the log", "producer 5: next 17", GREEN_M),
+                      *self.write(14, "pay-14"), *self.write(15, "pay-15"), *self.write(16, "pay-16", YELLOW_M)], 0.7),
+            "With a name",
+            (lambda: self.req("id 5 | seq 16", YELLOW_M), 1.0),
+            (lambda: self.ans("offset 16", GREEN_M), 1.0),
         ])
-        self.wait(0.6)
+        self.steps("Retries are safe only when the receiver can recognise them. Turn idempotence on by name.", [
+            (lambda: self.cap("retries are safe only when the receiver can recognise them", YELLOW_M, 28), 0.6),
+        ], after=0.6)
+        self.steps("One quick check. Your code catches a TimeoutException for pay-20 and sends it again. Idempotence is on. "
+                   "Can pay-20 end up in the log twice? Pause and think.", [
+            (lambda: [*self.uncap(), *self.clear_log(), *self.ltext("leader", "adds to the log", "producer 5: next 20", GREEN_M)], 0.5),
+            "catches a",
+            (lambda: self.req("pay-20 | seq 20", WHITE, to_log=14, log_text="pay-20"), 1.2),
+            (lambda: self.ans("offset", GREEN_M, lost=True), 0.9),
+            "sends it again",
+            (lambda: self.pstate("TimeoutException", RED_M), 0.4),
+            "Pause and think",
+            (lambda: self.cap("twice, or once? pause and think", YELLOW_M), 0.4),
+        ], after=0)
+        self.countdown(3.0)
+        self.steps("Yes. Your second send gets a new sequence number, 21, so the leader sees a new record. "
+                   "Only the payment's own idempotency key can catch that one.", [
+            (lambda: self.uncap(), 0.3),
+            (lambda: self.req("pay-20 | seq 21", PURPLE_M, to_log=15, log_text="pay-20"), 1.3),
+            "Only the payment's",
+            (lambda: [*self.cap("a new send is a new number: only the app's own key catches it", YELLOW_M, 26),
+                      *self.lstate("producer 5: next 22", GREEN_M)], 0.6),
+        ])
+        self.wait(2.0)
